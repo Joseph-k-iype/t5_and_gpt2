@@ -1,0 +1,415 @@
+import streamlit as st
+import pandas as pd
+import duckdb
+from typing import List, Optional, Union
+from pydantic import BaseModel, Field, validator
+import plotly.express as px
+
+# ==================================================================
+# Pydantic model for pivot configuration
+# ==================================================================
+class PivotParams(BaseModel):
+    rows: List[str] = Field(
+        default=[],
+        description="Columns to use as rows in the pivot table."
+    )
+    columns: List[str] = Field(
+        default=[],
+        description="Columns to use as columns in the pivot table."
+    )
+    values: str = Field(
+        description="The numeric column to be aggregated."
+    )
+    agg_func: str = Field(
+        description="Aggregation function, e.g. SUM, AVG, COUNT, MIN, MAX."
+    )
+    filter_col: Optional[str] = Field(
+        default=None,
+        description="Optional single column to filter by."
+    )
+    filter_val: Optional[Union[str, float, int]] = Field(
+        default=None,
+        description="Value in filter_col to filter on."
+    )
+
+    @validator('agg_func')
+    def validate_agg_func(cls, value):
+        allowed_aggregations = ["SUM", "AVG", "COUNT", "MIN", "MAX"]
+        if value.upper() not in allowed_aggregations:
+            raise ValueError(f"Aggregation function not supported. Must be one of {allowed_aggregations}.")
+        return value.upper()
+
+
+# ==================================================================
+# Helper functions
+# ==================================================================
+def read_excel_to_df(file) -> pd.DataFrame:
+    """Reads an Excel file into a pandas DataFrame."""
+    return pd.read_excel(file)
+
+
+def clean_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Example data-cleaning function:
+    - Removes rows that are completely empty
+    - Removes exact duplicates
+    - Fills numeric NaNs with 0
+    """
+    if df.empty:
+        return df
+
+    df.dropna(how='all', inplace=True)      # Drop fully empty rows
+    df.drop_duplicates(inplace=True)        # Remove exact duplicates
+
+    # Fill numeric columns with 0 for any NaN
+    numeric_cols = df.select_dtypes(include='number').columns
+    df[numeric_cols] = df[numeric_cols].fillna(0)
+
+    return df
+
+
+def create_duckdb_connection():
+    """Create an in-memory DuckDB connection (no DataFrame registered yet)."""
+    return duckdb.connect()
+
+
+def register_df_as_table(con, df: pd.DataFrame, table_name: str):
+    """Register a pandas DataFrame as a table within DuckDB."""
+    con.register(table_name, df)
+
+
+def perform_join(
+    con,
+    base_table: str,
+    join_table: str,
+    join_type: str,
+    base_key: List[str],
+    join_key: List[str]
+) -> pd.DataFrame:
+    """
+    Execute a JOIN between two tables in DuckDB. Returns a DataFrame of the result.
+    join_type can be LEFT, RIGHT, INNER, or FULL.
+    base_key and join_key should be lists of columns of equal length, for multi-col joins if needed.
+    """
+
+    # Validate join_type
+    valid_join_types = ["LEFT", "RIGHT", "INNER", "FULL"]
+    join_type_upper = join_type.upper()
+    if join_type_upper not in valid_join_types:
+        raise ValueError(f"Invalid join type {join_type}. Choose from {valid_join_types}.")
+
+    # For each pair of columns in base_key and join_key, build the ON condition
+    # For example: t1.colA = t2.colB AND t1.colC = t2.colD
+    on_clauses = []
+    for b_key, j_key in zip(base_key, join_key):
+        on_clauses.append(f't1."{b_key}" = t2."{j_key}"')
+    on_statement = " AND ".join(on_clauses)
+
+    # Build SQL
+    sql = f"""
+    SELECT t1.*, t2.*
+    FROM "{base_table}" t1
+    {join_type_upper} JOIN "{join_table}" t2
+    ON {on_statement}
+    """
+
+    df_result = con.execute(sql).fetchdf()
+    return df_result
+
+
+def run_pivot_query(con, pivot_params: PivotParams, temp_table_name="joined_table") -> pd.DataFrame:
+    """
+    Build and execute an advanced pivot-like query with optional filter.
+    - rows: one or more columns
+    - columns: one or more columns
+    - values: numeric column
+    - agg_func: SUM, AVG, COUNT, MIN, MAX
+    - filter: optional single column + value
+    """
+
+    rows = pivot_params.rows
+    cols = pivot_params.columns
+    value_col = pivot_params.values
+    agg = pivot_params.agg_func
+
+    # Build a WHERE clause if filter is provided
+    filter_clause = ""
+    if pivot_params.filter_col and pivot_params.filter_val is not None:
+        # Attempt to handle string vs numeric
+        if isinstance(pivot_params.filter_val, str):
+            filter_clause = f"WHERE \"{pivot_params.filter_col}\" = '{pivot_params.filter_val}'"
+        else:
+            filter_clause = f"WHERE \"{pivot_params.filter_col}\" = {pivot_params.filter_val}"
+
+    # If columns are not specified, do a simple GROUP BY
+    if len(cols) == 0:
+        group_by_cols = ", ".join([f"\"{r}\"" for r in rows])
+        query = f"""
+        SELECT 
+            {group_by_cols},
+            {agg}("{value_col}") AS agg_value
+        FROM "{temp_table_name}"
+        {filter_clause}
+        GROUP BY {group_by_cols}
+        """
+        df_result = con.execute(query).fetchdf()
+        return df_result
+    else:
+        # Perform group-by on row + column
+        all_group_cols = ", ".join([f"\"{x}\"" for x in (rows + cols)])
+        query = f"""
+        SELECT 
+            {all_group_cols},
+            {agg}("{value_col}") AS agg_value
+        FROM "{temp_table_name}"
+        {filter_clause}
+        GROUP BY {all_group_cols}
+        """
+        df_result = con.execute(query).fetchdf()
+
+        # Convert to a wide format pivot (like Excel) with Pandas
+        pivot_index = rows
+        pivot_columns = cols
+        pivot_values = "agg_value"
+
+        df_pivoted = df_result.pivot_table(
+            index=pivot_index,
+            columns=pivot_columns,
+            values=pivot_values,
+            aggfunc='first'
+        )
+        # Flatten multi-index columns if needed
+        if isinstance(df_pivoted.columns, pd.MultiIndex):
+            df_pivoted.columns = ['_'.join([str(c) for c in col_tuple]).strip() 
+                                  for col_tuple in df_pivoted.columns.values]
+        df_pivoted.reset_index(inplace=True)
+
+        return df_pivoted
+
+
+def get_statistical_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return a basic statistical summary for all numeric columns.
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    numeric_cols = df.select_dtypes(include='number').columns
+    if len(numeric_cols) == 0:
+        return pd.DataFrame()
+
+    stats_df = df[numeric_cols].describe().transpose()
+    return stats_df
+
+
+def create_plotly_chart(
+    df: pd.DataFrame, 
+    x_col: str, 
+    y_col: str, 
+    color_col: Optional[str] = None, 
+    chart_type: str = "bar"
+):
+    """
+    Create an interactive Plotly chart.
+    chart_type can be 'bar', 'line', or 'scatter'.
+    """
+    if df.empty or x_col not in df.columns or y_col not in df.columns:
+        return None
+    if color_col and color_col not in df.columns:
+        color_col = None
+
+    if chart_type == "bar":
+        fig = px.bar(df, x=x_col, y=y_col, color=color_col)
+    elif chart_type == "line":
+        fig = px.line(df, x=x_col, y=y_col, color=color_col)
+    elif chart_type == "scatter":
+        fig = px.scatter(df, x=x_col, y=y_col, color=color_col)
+    else:
+        st.warning(f"Chart type '{chart_type}' not recognized. Defaulting to 'bar'.")
+        fig = px.bar(df, x=x_col, y=y_col, color=color_col)
+
+    return fig
+
+
+# ==================================================================
+# Streamlit Application
+# ==================================================================
+def main():
+    st.title("Advanced Data Analysis: Join Tables, Pivot, and Plot")
+
+    st.write("""
+    **Features**:
+    1. **Upload multiple Excel files**, each becoming a separate table.  
+    2. **Perform JOINs** (LEFT, RIGHT, INNER, FULL) between any two tables on selected columns.  
+    3. **Pivot** the joined dataset (rows, columns, values, optional filter).  
+    4. **Visualize** results in Plotly.  
+    5. **Custom SQL** queries on final joined data.  
+    """)
+
+    # Upload multiple excel files
+    uploaded_files = st.file_uploader("Upload Excel file(s)", accept_multiple_files=True, type=["xls", "xlsx"])
+
+    if not uploaded_files:
+        st.info("Please upload at least one Excel file.")
+        return
+
+    # Dictionary to hold dataframes as "table_name" => df
+    # We'll name each table "Table_1", "Table_2", etc.
+    tables_dict = {}
+    con = create_duckdb_connection()
+
+    for i, file in enumerate(uploaded_files, start=1):
+        table_name = f"Table_{i}"
+        df = read_excel_to_df(file)
+        df = clean_data(df)
+        register_df_as_table(con, df, table_name)
+        tables_dict[table_name] = df
+
+    st.subheader("Available Tables")
+    for tname, tdf in tables_dict.items():
+        st.markdown(f"**{tname}** - {len(tdf)} rows, {len(tdf.columns)} columns")
+        st.dataframe(tdf.head(5))
+
+    # Let user pick two tables to join
+    st.subheader("Join Configuration")
+    all_table_names = list(tables_dict.keys())
+    base_table = st.selectbox("Select the 'Base' table (Left side of JOIN)", all_table_names)
+    join_table = st.selectbox("Select the 'Join' table (Right side of JOIN)", all_table_names)
+
+    if base_table and join_table and base_table != join_table:
+        # Display columns for each table
+        base_table_cols = tables_dict[base_table].columns.tolist()
+        join_table_cols = tables_dict[join_table].columns.tolist()
+
+        st.write("#### Base Table Columns")
+        st.write(base_table_cols)
+
+        st.write("#### Join Table Columns")
+        st.write(join_table_cols)
+
+        # Pick join type
+        join_type = st.selectbox("Select JOIN Type", ["INNER", "LEFT", "RIGHT", "FULL"])
+
+        # Let user pick columns for ON condition
+        st.write("**JOIN ON**")
+        col1 = st.multiselect("Columns from Base Table", base_table_cols)
+        col2 = st.multiselect("Columns from Join Table", join_table_cols)
+
+        st.caption("You can match multiple columns: The first list matches one-to-one with the second list in order.")
+
+        if st.button("Perform JOIN"):
+            if len(col1) == 0 or len(col2) == 0 or len(col1) != len(col2):
+                st.error("Please select an equal number of columns from each table.")
+            else:
+                try:
+                    joined_df = perform_join(
+                        con,
+                        base_table=base_table,
+                        join_table=join_table,
+                        join_type=join_type,
+                        base_key=col1,
+                        join_key=col2
+                    )
+                    st.success(f"{join_type} JOIN completed!")
+                    st.write("**Joined Table Preview**:")
+                    st.dataframe(joined_df.head(50))
+
+                    # Register joined result as a new table for pivot analysis
+                    # We'll call it "joined_table"
+                    if not joined_df.empty:
+                        # Clean up any old "joined_table" if it existed
+                        try:
+                            con.execute("DROP TABLE joined_table")
+                        except:
+                            pass
+                        register_df_as_table(con, joined_df, "joined_table")
+
+                        # Pivot configuration
+                        st.subheader("Pivot the Joined Data")
+                        all_cols = joined_df.columns.tolist()
+
+                        with st.expander("Advanced Pivot Configuration", expanded=True):
+                            rows_sel = st.multiselect("Select one or more 'Rows' columns", all_cols)
+                            cols_sel = st.multiselect("Select optional 'Columns' columns", all_cols)
+                            val_sel = st.selectbox("Select 'Values' column (numeric preferred)", all_cols)
+                            agg_func = st.selectbox("Select Aggregation Function", ["SUM", "AVG", "COUNT", "MIN", "MAX"])
+
+                            # Optional filter
+                            flt_col = st.selectbox("Filter Column (optional)", ["None"] + all_cols)
+                            if flt_col != "None":
+                                unique_vals = joined_df[flt_col].unique()
+                                flt_val = st.selectbox("Filter Value", unique_vals)
+                            else:
+                                flt_col = None
+                                flt_val = None
+
+                            # Run pivot
+                            if st.button("Run Pivot on Joined Data"):
+                                if not rows_sel and not cols_sel:
+                                    st.error("Please select at least one row or column to pivot on.")
+                                else:
+                                    try:
+                                        pivot_params = PivotParams(
+                                            rows=rows_sel,
+                                            columns=cols_sel,
+                                            values=val_sel,
+                                            agg_func=agg_func,
+                                            filter_col=flt_col if flt_col != "None" else None,
+                                            filter_val=flt_val
+                                        )
+                                        pivot_result = run_pivot_query(con, pivot_params, temp_table_name="joined_table")
+                                        st.success("Pivot completed successfully!")
+                                        st.write("**Pivot Table (Preview)**")
+                                        st.dataframe(pivot_result.head(50))
+
+                                        # Plotly Visualization
+                                        st.subheader("Visualize the Pivot Result")
+                                        if not pivot_result.empty:
+                                            numeric_cols = pivot_result.select_dtypes(include='number').columns.tolist()
+                                            if numeric_cols:
+                                                x_axis = st.selectbox("Select X-axis column", pivot_result.columns)
+                                                y_axis = st.selectbox("Select Y-axis column", numeric_cols)
+                                                color_axis = st.selectbox("Select color grouping (optional)", ["None"] + list(pivot_result.columns))
+                                                color_axis = None if color_axis == "None" else color_axis
+                                                chart_type = st.selectbox("Select Chart Type", ["bar", "line", "scatter"])
+
+                                                fig = create_plotly_chart(pivot_result, x_axis, y_axis, color_axis, chart_type=chart_type)
+                                                if fig:
+                                                    st.plotly_chart(fig, use_container_width=True)
+                                            else:
+                                                st.info("No numeric columns found in the pivoted data for plotting.")
+                                    except Exception as e:
+                                        st.error(f"Error pivoting joined data: {e}")
+
+                        # Statistical summary
+                        with st.expander("Statistical Summary of Joined Data"):
+                            stats_df = get_statistical_summary(joined_df)
+                            if not stats_df.empty:
+                                st.write(stats_df)
+                            else:
+                                st.write("No numeric columns found or data is empty.")
+
+                        # Custom SQL on the joined table
+                        with st.expander("Run Custom SQL Query on Joined Table"):
+                            user_query = st.text_area(
+                                "Enter your DuckDB SQL query",
+                                "SELECT * FROM joined_table LIMIT 5"
+                            )
+                            if st.button("Execute SQL on joined_table"):
+                                try:
+                                    query_result = con.execute(user_query).fetchdf()
+                                    st.dataframe(query_result)
+                                except Exception as e:
+                                    st.error(f"Error executing query: {e}")
+
+                except Exception as e:
+                    st.error(f"Error performing join: {e}")
+        else:
+            st.info("Configure the join and click 'Perform JOIN' to proceed.")
+
+    else:
+        st.warning("Select two **distinct** tables to perform the JOIN.")
+
+
+if __name__ == "__main__":
+    main()
