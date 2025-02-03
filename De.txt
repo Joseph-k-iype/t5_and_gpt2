@@ -1,42 +1,24 @@
-"""
-Semantic Matching Script for CSV Files
-This script performs semantic matching between two CSV files using Azure OpenAI embeddings.
-"""
-
 import os
-import time
-import logging
-from pathlib import Path
-from typing import List, Dict, Tuple, Optional
-from dotenv import load_dotenv
 import pandas as pd
 import numpy as np
-import faiss
-from sklearn.preprocessing import normalize
-from openai import AzureOpenAI
+from typing import List, Dict, Tuple, Optional
+import logging
+from dotenv import load_dotenv
+from pathlib import Path
 from azure.identity import ClientSecretCredential
 from tqdm import tqdm
 import json
+import faiss
+from openai import AzureOpenAI
+from sklearn.preprocessing import normalize
+import requests
 
-# Set up logging with both file and console handlers
-def setup_logging():
-    """Configure logging with both file and console output."""
-    log_dir = Path("logs")
-    log_dir.mkdir(exist_ok=True)
-    
-    log_file = log_dir / f"semantic_matching_{time.strftime('%Y%m%d_%H%M%S')}.log"
-    
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler()
-        ]
-    )
-    return logging.getLogger(__name__)
-
-logger = setup_logging()
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 def is_file_readable(filepath: str) -> bool:
     """Check if a file exists and is readable."""
@@ -60,10 +42,11 @@ class OSEnv:
         """Initialize with configuration files and certificate path."""
         self.var_list = []
         
-        # Load configurations
+        # Load main configuration
         self.bulk_set(config_file, True)
         logger.info(f"Loaded main configuration from {config_file}")
         
+        # Load credentials
         self.bulk_set(creds_file, False)
         logger.info(f"Loaded credentials from {creds_file}")
         
@@ -151,7 +134,6 @@ class OSEnv:
             self.set("HTTP_PROXY", proxy_url, print_val=False)
             self.set("HTTPS_PROXY", proxy_url, print_val=False)
             
-            # Set no_proxy for Azure services
             no_proxy_domains = [
                 'cognitiveservices.azure.com',
                 'search.windows.net',
@@ -179,7 +161,6 @@ class OSEnv:
             self.set("AZURE_TOKEN", token.token, print_val=False)
             logger.info("Azure token acquired successfully")
             return token.token
-            
         except Exception as e:
             logger.error(f"Failed to get Azure token: {str(e)}")
             raise
@@ -187,9 +168,12 @@ class OSEnv:
 class SemanticMatcher:
     """Handles semantic matching between CSV entries using embeddings."""
     
-    def __init__(self, env_setup: OSEnv):
-        """Initialize with environment setup."""
+    def __init__(self, env_setup: OSEnv, chunk_size: int = 1000, overlap: int = 200):
+        """Initialize with environment setup and chunking parameters."""
         self.env = env_setup
+        self.chunk_size = chunk_size
+        self.overlap = overlap
+        self.batch_size = 16
         self._setup_openai_client()
         
     def _setup_openai_client(self):
@@ -200,139 +184,166 @@ class SemanticMatcher:
             azure_endpoint=self.env.get("AZURE_OPENAI_ENDPOINT")
         )
 
-    def _prepare_text(self, name: str, description: str, max_length: int = 6000) -> str:
+    def _chunk_text(self, text: str) -> List[str]:
+        """Split text into overlapping chunks."""
+        if len(text) <= self.chunk_size:
+            return [text]
+
+        chunks = []
+        start = 0
+        while start < len(text):
+            end = start + self.chunk_size
+            if end < len(text):
+                space_pos = text.rfind(' ', end - self.overlap, end)
+                if space_pos != -1:
+                    end = space_pos
+
+            chunk = text[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
+            start = max(start + self.chunk_size - self.overlap, end)
+
+        return chunks
+
+    def get_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
+        """Get embeddings for a batch of texts."""
+        try:
+            response = self.client.embeddings.create(
+                model="text-embedding-ada-002",
+                input=texts
+            )
+            return [item.embedding for item in response.data]
+        except Exception as e:
+            logger.error(f"Failed to get embeddings batch: {str(e)}")
+            raise
+
+    def _prepare_text(self, name: str, description: str) -> str:
         """Combine name and description for embedding."""
-        # Ensure name is included by limiting description length
-        max_desc_length = max_length - len(name) - 2  # 2 for ": "
-        if len(description) > max_desc_length:
-            logger.warning(f"Truncating description for {name} from {len(description)} to {max_desc_length} characters")
-            description = description[:max_desc_length] + "..."
         return f"{name}: {description}".strip()
 
     def load_csv_data(self, source_csv: str, target_csv: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Load and validate CSV files."""
-        def try_read_csv(file_path: str) -> pd.DataFrame:
-            """Try different encodings to read CSV file."""
-            encodings = ['utf-8', 'latin1', 'cp1252', 'iso-8859-1']
-            errors = []
-            
-            for encoding in encodings:
-                try:
-                    logger.info(f"Trying to read {file_path} with {encoding} encoding...")
-                    return pd.read_csv(file_path, encoding=encoding, engine='python')
-                except Exception as e:
-                    errors.append(f"{encoding}: {str(e)}")
-                    continue
-            
-            error_msg = f"Failed to read {file_path} with any encoding. Errors:\n" + "\n".join(errors)
-            logger.error(error_msg)
-            raise ValueError(error_msg)
-
+        """Load CSV files with error handling."""
         try:
+            # Load CSVs with encoding detection
+            encodings = ['utf-8', 'latin1', 'cp1252', 'iso-8859-1']
+            
+            def try_read_csv(file_path: str) -> pd.DataFrame:
+                for encoding in encodings:
+                    try:
+                        return pd.read_csv(file_path, encoding=encoding)
+                    except UnicodeDecodeError:
+                        continue
+                raise ValueError(f"Could not read {file_path} with any supported encoding")
+
             source_df = try_read_csv(source_csv)
             target_df = try_read_csv(target_csv)
-            
-            # Validate columns
+
+            # Validate required columns
             if not {'name', 'description'}.issubset(source_df.columns):
                 raise ValueError("Source CSV must have 'name' and 'description' columns")
             if not {'pbt-name', 'pbt-description'}.issubset(target_df.columns):
                 raise ValueError("Target CSV must have 'pbt-name' and 'pbt-description' columns")
-            
+
             # Clean data
             for df in [source_df, target_df]:
                 for col in df.columns:
                     df[col] = df[col].fillna('')
-                    df[col] = df[col].astype(str).str.strip()
-            
-            logger.info(f"\nLoaded CSV files:")
-            logger.info(f"Source: {len(source_df)} entries from {source_csv}")
-            logger.info(f"Target: {len(target_df)} entries from {target_csv}")
-            
+                    df[col] = df[col].str.strip()
+
+            logger.info(f"Loaded {len(source_df)} source entries and {len(target_df)} target entries")
             return source_df, target_df
-            
+
         except Exception as e:
-            logger.error(f"Failed to load CSV data: {str(e)}")
+            logger.error(f"Error loading CSV data: {str(e)}")
             raise
 
+    def build_index(self, texts: List[str]) -> Tuple[faiss.IndexFlatIP, np.ndarray]:
+        """Build FAISS index from chunked text embeddings."""
+        logger.info("Processing texts into chunks...")
+        all_chunks = []
+        for text in tqdm(texts, desc="Chunking"):
+            chunks = self._chunk_text(text)
+            all_chunks.extend(chunks)
+
+        # Get embeddings in batches
+        embeddings = []
+        for i in tqdm(range(0, len(all_chunks), self.batch_size), desc="Getting embeddings"):
+            batch = all_chunks[i:i + self.batch_size]
+            batch_embeddings = self.get_embeddings_batch(batch)
+            embeddings.extend(batch_embeddings)
+
+        # Build index
+        embeddings_array = np.array(embeddings).astype('float32')
+        embeddings_array = normalize(embeddings_array)
+        
+        dimension = len(embeddings[0])
+        index = faiss.IndexFlatIP(dimension)
+        index.add(embeddings_array)
+        
+        return index, embeddings_array
+
     def process_matches(self, source_df: pd.DataFrame, target_df: pd.DataFrame, 
-                       similarity_threshold: float = 0.75,
-                       batch_size: int = 10) -> List[Dict]:
-        """Process and find matches between dataframes with batched processing."""
+                       similarity_threshold: float = 0.75) -> List[Dict]:
+        """Find semantic matches between source and target entries."""
         try:
             matches = []
             
-            # Prepare target texts
-            logger.info("Preparing target data...")
+            # Prepare target data
             target_texts = [
                 self._prepare_text(row['pbt-name'], row['pbt-description'])
                 for _, row in target_df.iterrows()
             ]
             
-            # Process target embeddings in batches
-            logger.info("Generating embeddings for target texts...")
-            target_embeddings = []
-            for i in tqdm(range(0, len(target_texts), batch_size), desc="Processing target texts"):
-                batch = target_texts[i:i + batch_size]
-                try:
-                    response = self.client.embeddings.create(
-                        model="text-embedding-ada-002",
-                        input=batch
-                    )
-                    target_embeddings.extend([d.embedding for d in response.data])
-                except Exception as e:
-                    logger.error(f"Error processing batch {i//batch_size + 1}: {str(e)}")
-                    raise
-
-            # Convert to numpy array and normalize
-            target_embeddings_array = np.array(target_embeddings).astype('float32')
-            target_embeddings_array = normalize(target_embeddings_array)
+            # Build search index
+            index, target_embeddings = self.build_index(target_texts)
             
-            # Build FAISS index
-            dimension = len(target_embeddings[0])
-            index = faiss.IndexFlatIP(dimension)
-            index.add(target_embeddings_array)
-            
-            # Process source texts in batches
-            logger.info("Processing source texts and finding matches...")
-            for i in tqdm(range(0, len(source_df), batch_size), desc="Processing source texts"):
-                batch_df = source_df.iloc[i:i + batch_size]
-                source_texts = [
-                    self._prepare_text(row['name'], row['description'])
-                    for _, row in batch_df.iterrows()
-                ]
+            # Process source entries
+            for idx, source_row in tqdm(source_df.iterrows(), total=len(source_df), desc="Matching"):
+                source_text = self._prepare_text(
+                    source_row['name'],
+                    source_row['description']
+                )
                 
-                try:
-                    # Get embeddings for batch
-                    response = self.client.embeddings.create(
-                        model="text-embedding-ada-002",
-                        input=source_texts
+                # Get embeddings for source chunks
+                source_chunks = self._chunk_text(source_text)
+                chunk_scores = []
+                
+                for chunk in source_chunks:
+                    chunk_embedding = self.get_embeddings_batch([chunk])[0]
+                    query_embedding = normalize(
+                        np.array([chunk_embedding]).astype('float32')
                     )
-                    source_embeddings = [d.embedding for d in response.data]
                     
-                    # Convert to numpy and normalize
-                    source_embeddings_array = np.array(source_embeddings).astype('float32')
-                    source_embeddings_array = normalize(source_embeddings_array)
+                    # Find nearest neighbors
+                    k = 3
+                    similarities, indices = index.search(query_embedding, k)
                     
-                    # Search in FAISS index
-                    k = 3  # Number of nearest neighbors
-                    similarities, indices = index.search(source_embeddings_array, k)
-                    
-                    # Process results for this batch
-                    for j, (sims, idxs) in enumerate(zip(similarities, indices)):
-                        source_row = batch_df.iloc[j]
-                        for sim, idx in zip(sims, idxs):
-                            if sim >= similarity_threshold:
-                                matches.append({
-                                    'source_name': source_row['name'],
-                                    'source_description': source_row['description'],
-                                    'target_name': target_df.iloc[idx]['pbt-name'],
-                                    'target_description': target_df.iloc[idx]['pbt-description'],
-                                    'similarity_score': float(sim)
-                                })
+                    # Store best matches for this chunk
+                    for sim, target_idx in zip(similarities[0], indices[0]):
+                        if sim >= similarity_threshold:
+                            chunk_scores.append({
+                                'target_idx': target_idx,
+                                'similarity': float(sim)
+                            })
                 
-                except Exception as e:
-                    logger.error(f"Error processing batch {i//batch_size + 1}: {str(e)}")
-                    raise
+                # Aggregate chunk scores for the source entry
+                if chunk_scores:
+                    # Group by target index and take max similarity
+                    target_scores = {}
+                    for score in chunk_scores:
+                        target_idx = score['target_idx']
+                        if target_idx not in target_scores or score['similarity'] > target_scores[target_idx]:
+                            target_scores[target_idx] = score['similarity']
+                    
+                    # Add best matches to results
+                    for target_idx, similarity in target_scores.items():
+                        matches.append({
+                            'source_name': source_row['name'],
+                            'source_description': source_row['description'],
+                            'target_name': target_df.iloc[target_idx]['pbt-name'],
+                            'target_description': target_df.iloc[target_idx]['pbt-description'],
+                            'similarity_score': similarity
+                        })
             
             # Sort matches by similarity score
             matches.sort(key=lambda x: x['similarity_score'], reverse=True)
@@ -340,21 +351,105 @@ class SemanticMatcher:
             return matches
             
         except Exception as e:
-            logger.error(f"Failed to process matches: {str(e)}")
+            logger.error(f"Error processing matches: {str(e)}")
             raise
 
     def save_results(self, matches: List[Dict], output_file: str) -> None:
         """Save matches to output files."""
         try:
-            # Create output directory if it doesn't exist
-            output_dir = os.path.dirname(output_file)
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-            
-            # Convert to DataFrame for CSV
             results_df = pd.DataFrame(matches)
             results_df.to_csv(output_file, index=False)
             
-            # Save detailed JSON
             json_file = output_file.rsplit('.', 1)[0] + '.json'
-            with open(json_file, 'w', encoding='
+            with open(json_file, 'w', encoding='utf-8') as f:
+                json.dump(matches, f, indent=2)
+            
+            logger.info(f"Results saved to {output_file} and {json_file}")
+            
+        except Exception as e:
+            logger.error(f"Error saving results: {str(e)}")
+            raise
+
+def main():
+    """Main function to run the semantic matching process."""
+    try:
+        # Setup paths
+        base_dir = Path(__file__).parent.parent
+        env_dir = base_dir / 'env'
+        data_dir = base_dir / 'data'
+        output_dir = base_dir / 'output'
+        
+        # Create directories if they don't exist
+        for directory in [data_dir, output_dir]:
+            directory.mkdir(exist_ok=True)
+        
+        # Initialize environment
+        env_setup = OSEnv(
+            config_file=str(env_dir / 'config.env'),
+            creds_file=str(env_dir / 'credentials.env'),
+            certificate_path=str(env_dir / 'cacert.pem')
+        )
+        
+        # Initialize matcher with custom chunk size and overlap
+        matcher = SemanticMatcher(
+            env_setup,
+            chunk_size=1000,  # Adjust chunk size based on your needs
+            overlap=200       # Adjust overlap based on your needs
+        )
+        
+        # Set up file paths
+        source_csv = str(data_dir / 'source.csv')
+        target_csv = str(data_dir / 'target.csv')
+        output_file = str(output_dir / 'matches.csv')
+        
+        # Load and process data
+        logger.info("Loading CSV files...")
+        source_df, target_df = matcher.load_csv_data(source_csv, target_csv)
+        
+        logger.info("\nProcessing semantic matches...")
+        matches = matcher.process_matches(
+            source_df, 
+            target_df,
+            similarity_threshold=0.75  # Adjust threshold as needed
+        )
+        
+        # Save results
+        logger.info("\nSaving results...")
+        matcher.save_results(matches, output_file)
+        
+        # Print summary
+        print("\nProcess Summary:")
+        print(f"Processed {len(source_df)} source entries")
+        print(f"Processed {len(target_df)} target entries")
+        print(f"Found {len(matches)} matches above threshold")
+        
+        if matches:
+            scores = [m['similarity_score'] for m in matches]
+            print(f"Average similarity score: {sum(scores)/len(scores):.4f}")
+            print(f"Highest similarity score: {max(scores):.4f}")
+            print(f"Lowest similarity score: {min(scores):.4f}")
+        
+        print(f"\nResults saved to:")
+        print(f"- CSV: {output_file}")
+        print(f"- JSON: {output_file.rsplit('.', 1)[0] + '.json'}")
+        
+        logger.info("Process completed successfully!")
+        
+    except FileNotFoundError as e:
+        logger.error(f"File Error: {str(e)}")
+        print(f"\nFile Error: {str(e)}")
+        print("Please check your file paths and try again.")
+        
+    except ValueError as e:
+        logger.error(f"Validation Error: {str(e)}")
+        print(f"\nValidation Error: {str(e)}")
+        print("Please check your CSV files and try again.")
+        
+    except Exception as e:
+        logger.error(f"Unexpected Error: {str(e)}")
+        print(f"\nUnexpected Error: {str(e)}")
+        print("Please check the logs for more details.")
+        logger.exception("Unexpected error occurred")
+
+if __name__ == "__main__":
+    main()
