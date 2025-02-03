@@ -1,8 +1,6 @@
 import os
 import pandas as pd
 import numpy as np
-import chromadb
-from chromadb.utils import embedding_functions
 from typing import List, Dict, Tuple
 import logging
 from dotenv import load_dotenv
@@ -10,6 +8,10 @@ from pathlib import Path
 from azure.identity import ClientSecretCredential
 from tqdm import tqdm
 import json
+import faiss
+from tenacity import retry, stop_after_attempt, wait_exponential
+import openai
+from sklearn.preprocessing import normalize
 
 # Set up logging
 logging.basicConfig(
@@ -58,35 +60,41 @@ class OSEnv:
             logger.error(f"Azure authentication failed: {str(e)}")
             raise
 
+class EmbeddingGenerator:
+    """Handles text embedding generation using Azure OpenAI."""
+    
+    def __init__(self):
+        self.api_key = os.getenv("AZURE_TOKEN")
+        self.api_base = os.getenv("AZURE_OPENAI_ENDPOINT")
+        self.api_version = os.getenv("API_VERSION", "2024-02-01")
+        
+        # Configure OpenAI
+        openai.api_type = "azure"
+        openai.api_base = self.api_base
+        openai.api_version = self.api_version
+        openai.api_key = self.api_key
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    def get_embedding(self, text: str) -> List[float]:
+        """Get embedding for a text using Azure OpenAI."""
+        try:
+            response = openai.Embedding.create(
+                input=text,
+                engine="text-embedding-ada-002"
+            )
+            return response['data'][0]['embedding']
+        except Exception as e:
+            logger.error(f"Failed to get embedding: {str(e)}")
+            raise
+
 class SemanticMatcher:
     """Handles semantic matching between CSV entries using embeddings."""
     
     def __init__(self, env_setup: OSEnv):
         """Initialize with environment setup."""
         self.env = env_setup
-        self._setup_embedding_function()
-        self._setup_chroma()
+        self.embedding_generator = EmbeddingGenerator()
         
-    def _setup_embedding_function(self) -> None:
-        """Configure Azure OpenAI embedding function."""
-        self.embedding_function = embedding_functions.OpenAIEmbeddingFunction(
-            api_key=os.getenv("AZURE_TOKEN"),
-            api_base=os.getenv("AZURE_OPENAI_ENDPOINT"),
-            api_type="azure",
-            api_version=os.getenv("API_VERSION", "2024-02-01"),
-            model_name="text-embedding-ada-002"
-        )
-        logger.info("Embedding function configured")
-
-    def _setup_chroma(self) -> None:
-        """Set up ChromaDB client."""
-        self.chroma_client = chromadb.Client()
-        self.collection = self.chroma_client.create_collection(
-            name="semantic_matches",
-            embedding_function=self.embedding_function
-        )
-        logger.info("ChromaDB initialized")
-
     def _prepare_text(self, name: str, description: str) -> str:
         """Combine name and description for embedding."""
         return f"{name}: {description}".strip()
@@ -115,22 +123,38 @@ class SemanticMatcher:
             logger.error(f"Failed to load CSV data: {str(e)}")
             raise
 
+    def build_index(self, texts: List[str]) -> Tuple[faiss.IndexFlatIP, np.ndarray]:
+        """Build FAISS index from text embeddings."""
+        logger.info("Generating embeddings for target texts...")
+        embeddings = []
+        for text in tqdm(texts):
+            embedding = self.embedding_generator.get_embedding(text)
+            embeddings.append(embedding)
+        
+        # Convert to numpy array and normalize
+        embeddings_array = np.array(embeddings).astype('float32')
+        embeddings_array = normalize(embeddings_array)
+        
+        # Build FAISS index
+        dimension = len(embeddings[0])
+        index = faiss.IndexFlatIP(dimension)  # Inner product index
+        index.add(embeddings_array)
+        
+        return index, embeddings_array
+
     def process_matches(self, source_df: pd.DataFrame, target_df: pd.DataFrame, 
                        similarity_threshold: float = 0.75) -> List[Dict]:
         """Process and find matches between dataframes."""
         try:
             matches = []
             
-            # Add target entries to ChromaDB
-            logger.info("Adding target entries to ChromaDB...")
+            # Prepare target texts and build index
+            logger.info("Preparing target data...")
             target_texts = [
                 self._prepare_text(row['pbt-name'], row['pbt-description'])
                 for _, row in target_df.iterrows()
             ]
-            self.collection.add(
-                documents=target_texts,
-                ids=[f"target_{i}" for i in range(len(target_df))]
-            )
+            index, target_embeddings = self.build_index(target_texts)
             
             # Process each source entry
             logger.info("Finding matches for source entries...")
@@ -140,26 +164,25 @@ class SemanticMatcher:
                     source_row['description']
                 )
                 
-                # Query ChromaDB for matches
-                results = self.collection.query(
-                    query_texts=[source_text],
-                    n_results=3
+                # Get embedding for source text
+                source_embedding = self.embedding_generator.get_embedding(source_text)
+                query_embedding = normalize(
+                    np.array([source_embedding]).astype('float32')
                 )
                 
+                # Search in FAISS index
+                k = 3  # Number of nearest neighbors to retrieve
+                similarities, indices = index.search(query_embedding, k)
+                
                 # Process results
-                for i, (target_idx, distance) in enumerate(zip(
-                    results['ids'][0],
-                    results['distances'][0]
-                )):
-                    similarity = 1 - distance  # Convert distance to similarity
+                for similarity, target_idx in zip(similarities[0], indices[0]):
                     if similarity >= similarity_threshold:
-                        target_idx = int(target_idx.split('_')[1])
                         matches.append({
                             'source_name': source_row['name'],
                             'source_description': source_row['description'],
                             'target_name': target_df.iloc[target_idx]['pbt-name'],
                             'target_description': target_df.iloc[target_idx]['pbt-description'],
-                            'similarity_score': round(similarity, 4)
+                            'similarity_score': float(similarity)
                         })
             
             # Sort matches by similarity score
@@ -186,6 +209,15 @@ class SemanticMatcher:
                 json.dump(matches, f, indent=2)
             
             logger.info(f"Results saved to {output_file} and {json_file}")
+            
+            # Print summary statistics
+            print("\nSummary Statistics:")
+            print(f"Total matches found: {len(matches)}")
+            if matches:
+                scores = [m['similarity_score'] for m in matches]
+                print(f"Average similarity score: {sum(scores)/len(scores):.4f}")
+                print(f"Highest similarity score: {max(scores):.4f}")
+                print(f"Lowest similarity score: {min(scores):.4f}")
             
         except Exception as e:
             logger.error(f"Failed to save results: {str(e)}")
@@ -232,8 +264,6 @@ def main():
         matcher.save_results(matches, output_file)
         
         print(f"\nProcess completed successfully!")
-        print(f"Results saved to: {output_file}")
-        print(f"Total matches found: {len(matches)}")
         
     except FileNotFoundError as e:
         print(f"\nFile Error: {str(e)}")
