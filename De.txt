@@ -2,235 +2,280 @@ import os
 import pandas as pd
 import numpy as np
 import logging
+import tempfile
+import shutil
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
+from datetime import datetime
 from dotenv import load_dotenv
 from azure.identity import ClientSecretCredential
-from llama_index.core import VectorStoreIndex, StorageContext
-from llama_index.core.schema import TextNode
-from llama_index.core.vector_stores import SimpleVectorStore
-from llama_index.embeddings.openai import AzureOpenAIEmbedding
-from llama_index.core import Settings
+from langchain_openai import AzureOpenAIEmbeddings 
+from langchain.vectorstores.docarray import DocArrayInMemorySearch
+from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
 
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(f'semantic_matcher_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+    ]
 )
 logger = logging.getLogger(__name__)
 
-def str_to_bool(s: str) -> bool:
-    return s.lower() in ['true', '1', 't', 'y', 'yes']
+class ConfigurationError(Exception):
+    """Custom exception for configuration errors"""
+    pass
+
+class DataValidationError(Exception):
+    """Custom exception for data validation errors"""
+    pass
 
 class OSEnv:
-    """Full original environment management class"""
-    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
+    """Environment configuration manager"""
+    REQUIRED_VARS = {
+        'AZURE_OPENAI_API_KEY',
+        'AZURE_OPENAI_ENDPOINT',
+        'AZURE_EMBEDDING_DEPLOYMENT'
+    }
+
+    def __init__(self, config_path: Optional[str] = None, creds_path: Optional[str] = None):
+        """Initialize environment configuration"""
         self.var_list = []
-        self.token = None
-        
-        # Load configurations
-        self.bulk_set(config_file, True)
-        self.bulk_set(creds_file, False)
-        self.set_certificate_path(certificate_path)
-        
-        # Configure proxy if needed
-        if str_to_bool(self.get("PROXY_ENABLED", "False")):
-            self.set_proxy()
-            
-        # Get Azure token if required
-        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
-            self.token = self.get_azure_token()
+        self.config_path = config_path
+        self.creds_path = creds_path
+        self._load_environment()
+        self._validate_required_vars()
 
-    def set_certificate_path(self, certificate_path: str) -> None:
-        if not os.path.isfile(certificate_path):
-            raise FileNotFoundError(f"Certificate not found: {certificate_path}")
+    def _load_environment(self):
+        """Load environment variables from files"""
+        if self.config_path and Path(self.config_path).exists():
+            load_dotenv(self.config_path)
+            logger.info(f"Loaded configuration from {self.config_path}")
         
-        cert_path = str(Path(certificate_path))
-        self.set("REQUESTS_CA_BUNDLE", cert_path, False)
-        self.set("SSL_CERT_FILE", cert_path, False)
-        self.set("CURL_CA_BUNDLE", cert_path, False)
-        logger.info(f"Certificate path set: {cert_path}")
+        if self.creds_path and Path(self.creds_path).exists():
+            load_dotenv(self.creds_path)
+            logger.info(f"Loaded credentials from {self.creds_path}")
 
-    def bulk_set(self, dotenvfile: str, print_val: bool = False) -> None:
-        try:
-            with open(dotenvfile) as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith('#'):
-                        key, val = line.split('=', 1)
-                        self.set(key.strip(), val.strip().strip('"\''), print_val)
-        except Exception as e:
-            logger.error(f"Error loading {dotenvfile}: {str(e)}")
-            raise
-
-    def set(self, var_name: str, val: str, print_val: bool = True) -> None:
-        os.environ[var_name] = val
-        if var_name not in self.var_list:
-            self.var_list.append(var_name)
-        if print_val and var_name not in ['AZURE_CLIENT_SECRET', 'AD_USER_PW']:
-            logger.info(f"Set {var_name}={val}")
+    def _validate_required_vars(self):
+        """Validate that all required variables are present"""
+        missing_vars = [var for var in self.REQUIRED_VARS if not os.getenv(var)]
+        if missing_vars:
+            raise ConfigurationError(f"Missing required environment variables: {', '.join(missing_vars)}")
 
     def get(self, var_name: str, default: Optional[str] = None) -> Optional[str]:
+        """Get environment variable value"""
         return os.getenv(var_name, default)
 
-    def set_proxy(self) -> None:
-        proxy_url = f"http://{self.get('AD_USERNAME')}:{self.get('AD_USER_PW')}@{self.get('HTTPS_PROXY_DOMAIN')}"
-        self.set("HTTP_PROXY", proxy_url, False)
-        self.set("HTTPS_PROXY", proxy_url, False)
-        self.set("NO_PROXY", "localhost,127.0.0.1", False)
-        logger.info("Proxy configured")
-
-    def get_azure_token(self) -> str:
-        credential = ClientSecretCredential(
-            tenant_id=self.get("AZURE_TENANT_ID"),
-            client_id=self.get("AZURE_CLIENT_ID"),
-            client_secret=self.get("AZURE_CLIENT_SECRET")
-        )
-        token = credential.get_token("https://cognitiveservices.azure.com/.default")
-        self.set("AZURE_TOKEN", token.token, False)
-        return token.token
-
-class AzurePBTPredictor:
+class SemanticMatcher:
+    """Main semantic matching implementation"""
+    
     def __init__(self, env: OSEnv):
-        """Initialize with OSEnv configuration"""
+        """Initialize the semantic matcher"""
         self.env = env
         self.min_confidence = 0.01
-        
-        # Configure Azure OpenAI embeddings
-        Settings.embed_model = AzureOpenAIEmbedding(
-            model=env.get("AZURE_EMBEDDING_MODEL", "text-embedding-3-large"),
-            deployment_name=env.get("AZURE_EMBEDDING_DEPLOYMENT"),
-            api_key=env.get("AZURE_OPENAI_API_KEY"),
-            azure_endpoint=env.get("AZURE_OPENAI_ENDPOINT"),
-            api_version=env.get("AZURE_OPENAI_API_VERSION", "2024-02-01")
-        )
+        self.embedding_model = self._initialize_embedding_model()
+        logger.info("Initialized SemanticMatcher with Azure OpenAI embeddings")
 
-    def _create_node(self, row: pd.Series, is_source: bool) -> TextNode:
-        """Create enriched text nodes"""
+    def _initialize_embedding_model(self) -> AzureOpenAIEmbeddings:
+        """Initialize and configure the embedding model"""
+        try:
+            return AzureOpenAIEmbeddings(
+                azure_deployment=self.env.get("AZURE_EMBEDDING_DEPLOYMENT"),
+                openai_api_key=self.env.get("AZURE_OPENAI_API_KEY"),
+                azure_endpoint=self.env.get("AZURE_OPENAI_ENDPOINT"),
+                api_version=self.env.get("AZURE_OPENAI_API_VERSION", "2024-02-01"),
+                chunk_size=1000
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize embedding model: {str(e)}")
+            raise
+
+    def _validate_dataframe(self, df: pd.DataFrame, required_columns: set, name: str) -> None:
+        """Validate dataframe structure and content"""
+        if df.empty:
+            raise DataValidationError(f"{name} dataframe is empty")
+        
+        missing_cols = required_columns - set(df.columns)
+        if missing_cols:
+            raise DataValidationError(f"Missing required columns in {name}: {missing_cols}")
+
+        # Check for empty values in required columns
+        empty_cols = [col for col in required_columns if df[col].isna().any()]
+        if empty_cols:
+            raise DataValidationError(f"Found empty values in {name} columns: {empty_cols}")
+
+    def _create_document(self, row: pd.Series, is_source: bool) -> Document:
+        """Create a Document object from a dataframe row"""
         if is_source:
             text = f"Title: {row['name']}\nDescription: {row['description']}"
-            metadata = {"type": "source", **row.to_dict()}
+            metadata = {
+                "type": "source",
+                "name": row['name'],
+                "description": row['description']
+            }
         else:
             text = f"Term: {row['pbt-name']}\nDefinition: {row['pbt-definition']}"
-            metadata = {"type": "target", "pbt_name": row["pbt-name"], "pbt_definition": row["pbt-definition"]}
-        
-        return TextNode(
-            text=text,
-            metadata=metadata,
-            embedding=Settings.embed_model.get_text_embedding(text)
-        )
+            metadata = {
+                "type": "target",
+                "pbt_name": row['pbt-name'],
+                "pbt_definition": row['pbt-definition']
+            }
+        return Document(page_content=text, metadata=metadata)
 
-    def build_index(self, df: pd.DataFrame, is_source: bool) -> VectorStoreIndex:
-        """Build vector index with error handling"""
-        nodes = [self._create_node(row, is_source) for _, row in df.iterrows()]
+    def _ensure_matches(self, matches: List[Tuple[Document, float]], min_matches: int = 4) -> List[Dict]:
+        """Ensure minimum number of matches with fallbacks"""
+        formatted_matches = []
         
-        vector_store = SimpleVectorStore()
-        storage_context = StorageContext.from_defaults(vector_store=vector_store)
-        vector_store.add(nodes)
-        
-        return VectorStoreIndex.from_vector_store(
-            vector_store=vector_store,
-            storage_context=storage_context,
-            embed_model=Settings.embed_model
-        )
+        # Format existing matches
+        for doc, score in matches:
+            formatted_matches.append({
+                "pbt_name": doc.metadata.get("pbt_name", "Unknown"),
+                "pbt_definition": doc.metadata.get("pbt_definition", ""),
+                "score": 1 / (1 + score)  # Convert distance to similarity score
+            })
 
-    def _ensure_matches(self, matches: List[Dict]) -> List[Dict]:
-        """Guarantee 4 matches with fallbacks"""
-        while len(matches) < 4:
-            matches.append({
+        # Add fallback matches if needed
+        while len(formatted_matches) < min_matches:
+            formatted_matches.append({
                 "pbt_name": "No match",
                 "pbt_definition": "Insufficient matches",
-                "score": max(self.min_confidence, 0.01 * len(matches))
+                "score": max(self.min_confidence, 0.01 * len(formatted_matches))
             })
-        return sorted(matches, key=lambda x: -x["score"])[:4]
 
-    def get_predictions(self, source_df: pd.DataFrame, target_df: pd.DataFrame) -> pd.DataFrame:
-        """Main prediction workflow"""
-        target_index = self.build_index(target_df, False)
-        results = []
-        
-        for _, row in source_df.iterrows():
-            try:
-                source_node = self._create_node(row, True)
-                retriever = target_index.as_retriever(similarity_top_k=6)
-                matches = [
-                    {"pbt_name": m.node.metadata["pbt_name"], 
-                     "pbt_definition": m.node.metadata["pbt_definition"],
-                     "score": m.score}
-                    for m in retriever.retrieve(source_node.text)
-                ]
-            except Exception as e:
-                logger.error(f"Error processing {row['name']}: {str(e)}")
-                matches = []
-                
-            final_matches = self._ensure_matches(matches)
-            results.append({
-                "name": row["name"],
-                "description": row["description"],
-                **{f"match_{i+1}": m for i, m in enumerate(final_matches)}
-            })
-        
-        return self._format_output(results)
+        return sorted(formatted_matches, key=lambda x: x["score"], reverse=True)[:min_matches]
 
-    def _format_output(self, results: List[Dict]) -> pd.DataFrame:
-        """Create structured output"""
-        formatted = []
-        for entry in results:
-            row = {
-                "name": entry["name"],
-                "description": entry["description"]
-            }
-            for i in range(4):
-                match = entry.get(f"match_{i+1}", {})
-                row.update({
-                    f"match_{i+1}_pbt_name": match.get("pbt_name", "N/A"),
-                    f"match_{i+1}_score": match.get("score", 0.0),
-                    f"match_{i+1}_definition": match.get("pbt_definition", "N/A")
-                })
-            formatted.append(row)
-        return pd.DataFrame(formatted)
+    def process_matches(self, source_df: pd.DataFrame, target_df: pd.DataFrame) -> pd.DataFrame:
+        """Process and find matches between source and target dataframes"""
+        try:
+            # Validate input dataframes
+            self._validate_dataframe(source_df, {'name', 'description'}, 'source')
+            self._validate_dataframe(target_df, {'pbt-name', 'pbt-definition'}, 'target')
 
-    def save_results(self, df: pd.DataFrame, output_path: str) -> None:
-        """Save with guaranteed columns"""
-        required_cols = [f"match_{i}_{field}" for i in range(1,5) for field in ["pbt_name", "score", "definition"]]
-        for col in required_cols:
-            if col not in df.columns:
-                df[col] = "N/A"
-        df.to_csv(output_path, index=False)
+            # Create documents for vector store
+            target_docs = [self._create_document(row, False) for _, row in target_df.iterrows()]
+            
+            # Initialize vector store
+            vector_store = DocArrayInMemorySearch.from_documents(target_docs, self.embedding_model)
+            
+            results = []
+            total_rows = len(source_df)
+            
+            # Process each source row
+            for idx, (_, row) in enumerate(source_df.iterrows(), 1):
+                try:
+                    # Create query document
+                    query_doc = self._create_document(row, True)
+                    
+                    # Search for similar documents
+                    matches = vector_store.similarity_search_with_score(
+                        query_doc.page_content,
+                        k=6  # Get extra matches for filtering
+                    )
+                    
+                    # Format and ensure minimum matches
+                    final_matches = self._ensure_matches(matches)
+                    
+                    # Create result entry
+                    result = {
+                        "name": row["name"],
+                        "description": row["description"]
+                    }
+                    
+                    # Add match details
+                    for i, match in enumerate(final_matches, 1):
+                        result.update({
+                            f"match_{i}_pbt_name": match["pbt_name"],
+                            f"match_{i}_score": round(float(match["score"]), 4),
+                            f"match_{i}_definition": match["pbt_definition"]
+                        })
+                    
+                    results.append(result)
+                    
+                    # Log progress
+                    if idx % 100 == 0:
+                        logger.info(f"Processed {idx}/{total_rows} source entries")
+                        
+                except Exception as e:
+                    logger.error(f"Error processing row {idx}: {str(e)}")
+                    # Add error entry
+                    results.append({
+                        "name": row["name"],
+                        "description": row["description"],
+                        **{f"match_{i}_pbt_name": "Error",
+                           f"match_{i}_score": 0.0,
+                           f"match_{i}_definition": str(e)}
+                        for i in range(1, 5)}
+                    )
+
+            return pd.DataFrame(results)
+
+        except Exception as e:
+            logger.error(f"Failed to process matches: {str(e)}")
+            raise
+
+    def save_results(self, df: pd.DataFrame, output_path: str, create_dirs: bool = True) -> None:
+        """Save results to CSV with proper handling"""
+        try:
+            # Create output directory if needed
+            output_path = Path(output_path)
+            if create_dirs:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Ensure all required columns exist
+            required_cols = [f"match_{i}_{field}" 
+                           for i in range(1, 5) 
+                           for field in ["pbt_name", "score", "definition"]]
+            
+            for col in required_cols:
+                if col not in df.columns:
+                    df[col] = "N/A"
+
+            # Save to CSV
+            df.to_csv(output_path, index=False)
+            logger.info(f"Results saved to {output_path}")
+
+        except Exception as e:
+            logger.error(f"Failed to save results: {str(e)}")
+            raise
 
 def main():
-    """Full execution flow"""
+    """Main execution flow"""
+    start_time = datetime.now()
+    logger.info("Starting semantic matching process")
+    
     try:
         # Initialize environment
         env = OSEnv(
-            config_file="env/config.env",
-            creds_file="env/credentials.env",
-            certificate_path="env/cacert.pem"
+            config_path="config.env",
+            creds_path="credentials.env"
         )
         
-        # Load data
-        data_dir = Path("data")
-        source_df = pd.read_csv(data_dir/"source.csv").fillna("").astype(str)
-        target_df = pd.read_csv(data_dir/"target.csv").fillna("").astype(str)
+        # Create matcher instance
+        matcher = SemanticMatcher(env)
         
-        # Validate
-        for df, cols in [(source_df, {"name", "description"}), 
-                       (target_df, {"pbt-name", "pbt-definition"})]:
-            if not cols.issubset(df.columns):
-                raise ValueError(f"Missing required columns in {df.columns}")
+        # Load input data
+        logger.info("Loading input data")
+        source_df = pd.read_csv("data/source.csv")
+        target_df = pd.read_csv("data/target.csv")
         
-        # Process predictions
-        predictor = AzurePBTPredictor(env)
-        results = predictor.get_predictions(source_df, target_df)
+        # Process matches
+        logger.info("Processing semantic matches")
+        results_df = matcher.process_matches(source_df, target_df)
         
-        # Save output
-        output_dir = Path("output")
-        output_dir.mkdir(exist_ok=True)
-        predictor.save_results(results, output_dir/"pbt_predictions.csv")
-        logger.info("Processing completed successfully")
+        # Save results
+        output_path = Path("output/semantic_matches.csv")
+        matcher.save_results(results_df, output_path)
+        
+        # Log completion
+        duration = datetime.now() - start_time
+        logger.info(f"Process completed successfully in {duration}")
         
     except Exception as e:
-        logger.error(f"Critical failure: {str(e)}")
+        logger.error(f"Process failed: {str(e)}")
         raise
-
+    
 if __name__ == "__main__":
     main()
