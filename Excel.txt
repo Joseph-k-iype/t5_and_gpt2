@@ -1,381 +1,541 @@
 #!/usr/bin/env python3
 """
-Local LanceDB Storage with OpenAI Embeddings (No remote OpenAI Vector Store):
-
-1) We call the OpenAI Embeddings API only to get vectors (one-time per doc).
-2) We store + query those vectors locally with LanceDB. 
-   - target.csv => columns: [pbt-name, pbt-definition]
-   - source.csv => columns: [name, definition]
-3) We do top-K similarity search locally in LanceDB for each source row.
-
-Everything beyond embedding the text is done entirely on your local machine.
+Improved version with better error handling and connection management:
+1. Enhanced retry logic for API calls
+2. Better certificate and proxy handling
+3. Improved error messages and logging
+4. Connection pooling optimization
+5. Proper cleanup of resources
 """
 
 import os
 import time
 import json
 import logging
-from pathlib import Path
-from typing import List, Dict
+import warnings
+import requests
 import pandas as pd
+from pathlib import Path
+from typing import List, Dict, Optional
 from tqdm import tqdm
+from contextlib import contextmanager
+from urllib3.exceptions import InsecureRequestWarning
 
-# Azure Identity if needed for SECURED_ENDPOINTS
+# Azure Identity for SECURED_ENDPOINTS
 from azure.identity import ClientSecretCredential
-from dotenv import dotenv_values
+from azure.core.exceptions import AzureError
 
-# LanceDB & LangChain Embeddings
-from lancedb import connect
+# LanceDB & OpenAI
+import lancedb
 from langchain.embeddings import OpenAIEmbeddings
 from langchain.vectorstores import LanceDB
 from langchain.docstore.document import Document
+import openai
 
-import openai  # For embedding calls
-
-###########################
-# Logging
-###########################
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+# Suppress insecure warnings if using custom cert
+warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
 ###########################
-# Helper Functions
+# Enhanced Logging
 ###########################
-def is_file_readable(filepath: str) -> bool:
-    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
-        raise FileNotFoundError(f"File '{filepath}' not found or not readable.")
-    return True
-
-def str_to_bool(s: str) -> bool:
-    ls = s.strip().lower()
-    if ls == 'true':
-        return True
-    elif ls == 'false':
-        return False
-    else:
-        raise ValueError(f"Invalid boolean: {s}")
-
-###########################
-# OSEnv for environment, proxy, cert, Azure AD token
-###########################
-class OSEnv:
-    """
-    Loads environment variables, sets cert & proxy,
-    optionally fetches Azure AD token if SECURED_ENDPOINTS=True.
-    No remote vector store usage; we only embed texts and store locally.
-    """
-    def __init__(self, config_file:str, creds_file:str, cert_file:str):
-        self.var_list = []
-        self._load_env_file(config_file, True)
-        logger.info(f"Loaded config from {config_file}")
+def setup_logging(log_dir: Path) -> logging.Logger:
+    """Configure logging with both file and console handlers"""
+    logger = logging.getLogger("embeddings_matcher")
+    logger.setLevel(logging.INFO)
+    
+    # Prevent duplicate handlers
+    if logger.handlers:
+        return logger
         
-        self._load_env_file(creds_file, False)
-        logger.info(f"Loaded creds from {creds_file}")
+    # File handler with timestamp
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    fh = logging.FileHandler(log_dir / f"matcher_{timestamp}.log")
+    fh.setLevel(logging.INFO)
+    
+    # Console handler
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    
+    # Formatter
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
+    
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    
+    return logger
+
+###########################
+# Enhanced Environment Management
+###########################
+class EnhancedEnvironment:
+    """
+    Enhanced environment manager with better error handling and validation
+    """
+    def __init__(self, config_file: Path, creds_file: Path, cert_file: Path):
+        self.logger = logging.getLogger("embeddings_matcher")
+        self.vars = {}
+        self.token = None
+        self._load_configs(config_file, creds_file)
+        self._setup_cert(cert_file)
+        self._setup_proxy()
+        self._setup_azure()
+    
+    def _load_configs(self, config_file: Path, creds_file: Path):
+        """Load and validate configuration files"""
+        try:
+            # Load config first
+            if not config_file.exists():
+                raise FileNotFoundError(f"Config file not found: {config_file}")
+            self._load_env_file(config_file, is_config=True)
+            
+            # Then load credentials
+            if not creds_file.exists():
+                raise FileNotFoundError(f"Credentials file not found: {creds_file}")
+            self._load_env_file(creds_file, is_config=False)
+            
+        except Exception as e:
+            self.logger.error(f"Failed to load configuration: {str(e)}")
+            raise
+
+    def _load_env_file(self, path: Path, is_config: bool):
+        """Load single environment file with enhanced error checking"""
+        try:
+            with open(path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        if '=' in line:
+                            key, value = line.split('=', 1)
+                            key = key.strip()
+                            value = value.strip().strip("'\"")
+                            self.vars[key] = value
+                            os.environ[key] = value
+                            
+                            if is_config:
+                                # Mask sensitive values in logs
+                                log_value = value if 'SECRET' not in key else '****'
+                                self.logger.info(f"Loaded config: {key}={log_value}")
         
-        self._set_certificate(cert_file)
-        logger.info("Certificate path configured.")
+        except Exception as e:
+            self.logger.error(f"Error loading file {path}: {str(e)}")
+            raise
 
-        if str_to_bool(self.get("PROXY_ENABLED","false")):
-            self._set_proxy()
-            logger.info("Proxy configured.")
+    def _setup_cert(self, cert_file: Path):
+        """Configure SSL certificate with validation"""
+        if not cert_file.exists():
+            self.logger.warning(f"Certificate file not found: {cert_file}")
+            return
+            
+        try:
+            import ssl
+            # Validate certificate
+            ssl.create_default_context(cafile=str(cert_file))
+            
+            # Set certificate environment variables
+            cert_vars = ["REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "CURL_CA_BUNDLE"]
+            for var in cert_vars:
+                os.environ[var] = str(cert_file)
+            
+            self.logger.info(f"Certificate configured: {cert_file}")
+            
+        except ssl.SSLError as e:
+            self.logger.error(f"Invalid certificate file: {str(e)}")
+            raise
+        except Exception as e:
+            self.logger.error(f"Error setting up certificate: {str(e)}")
+            raise
 
-        if str_to_bool(self.get("SECURED_ENDPOINTS","false")):
-            logger.info("Secured endpoints => Acquiring Azure AD token.")
-            self.token = self._get_aad_token()
-        else:
-            self.token = None
+    def _setup_proxy(self):
+        """Configure proxy settings with enhanced validation"""
+        if not self.get_bool("PROXY_ENABLED", False):
+            return
+            
+        try:
+            # Get proxy credentials
+            user = self.get("AD_USERNAME")
+            pw = self.get("AD_USER_PW")
+            domain = self.get("HTTPS_PROXY_DOMAIN")
+            
+            if not all([user, pw, domain]):
+                raise ValueError("Missing proxy credentials")
+                
+            # Set up proxy URL
+            proxy_url = f"http://{user}:{pw}@{domain}"
+            os.environ["HTTP_PROXY"] = proxy_url
+            os.environ["HTTPS_PROXY"] = proxy_url
+            
+            # Configure NO_PROXY
+            no_proxy = self.get("NO_PROXY", "")
+            no_proxy_list = {d.strip() for d in no_proxy.split(",") if d.strip()}
+            
+            # Add required domains
+            required_domains = {
+                'cognitiveservices.azure.com',
+                'search.windows.net', 
+                'openai.azure.com',
+                'core.windows.net',
+                'openaipublic.blob.core.windows.net',
+                'azurewebsites.net'
+            }
+            
+            no_proxy_list.update(required_domains)
+            os.environ["NO_PROXY"] = ",".join(no_proxy_list)
+            
+            self.logger.info("Proxy configured successfully")
+            
+        except Exception as e:
+            self.logger.error(f"Error configuring proxy: {str(e)}")
+            raise
 
-    def _load_env_file(self, path: str, print_vals: bool):
-        abs_path = os.path.abspath(path)
-        if is_file_readable(abs_path):
-            with open(abs_path, 'r') as f:
-                lines = f.readlines()
-            for line in lines:
-                line=line.strip()
-                if line and not line.startswith("#"):
-                    if "=" in line:
-                        k,v = line.split("=",1)
-                        k=k.strip()
-                        v=v.strip().strip("'\"")
-                        os.environ[k]=v
-                        if print_vals:
-                            logger.info(f"Set {k}={v}")
+    def _setup_azure(self):
+        """Configure Azure authentication if needed"""
+        if not self.get_bool("SECURED_ENDPOINTS", False):
+            return
+            
+        try:
+            tenant_id = self.get("AZURE_TENANT_ID")
+            client_id = self.get("AZURE_CLIENT_ID")
+            client_secret = self.get("AZURE_CLIENT_SECRET")
+            
+            if not all([tenant_id, client_id, client_secret]):
+                raise ValueError("Missing Azure credentials")
+                
+            credential = ClientSecretCredential(tenant_id, client_id, client_secret)
+            token = credential.get_token("https://cognitiveservices.azure.com/.default")
+            self.token = token.token
+            
+            self.logger.info("Azure AD token acquired successfully")
+            
+        except Exception as e:
+            self.logger.error(f"Error setting up Azure authentication: {str(e)}")
+            raise
 
-    def _set_certificate(self, cert_file:str):
-        cf_abs = os.path.abspath(cert_file)
-        if is_file_readable(cf_abs):
-            os.environ["REQUESTS_CA_BUNDLE"]=cf_abs
-            os.environ["SSL_CERT_FILE"]     =cf_abs
-            os.environ["CURL_CA_BUNDLE"]    =cf_abs
-            logger.info(f"Using CA cert: {cf_abs}")
+    def get(self, key: str, default: str = "") -> str:
+        """Get environment variable with default"""
+        return self.vars.get(key, os.getenv(key, default))
 
-    def _set_proxy(self):
-        user = self.get("AD_USERNAME","")
-        pw   = self.get("AD_USER_PW","")
-        dom  = self.get("HTTPS_PROXY_DOMAIN","")
-        if not all([user,pw,dom]):
-            raise ValueError("Missing proxy credentials for PROXY_ENABLED=TRUE")
-        px_url = f"http://{user}:{pw}@{dom}"
-        os.environ["HTTP_PROXY"]  = px_url
-        os.environ["HTTPS_PROXY"] = px_url
-
-        no_proxy_existing = self.get("NO_PROXY","")
-        no_proxy_list = [d.strip() for d in no_proxy_existing.split(",") if d.strip()]
-        must_bypass = [
-            'cognitiveservices.azure.com',
-            'search.windows.net',
-            'openai.azure.com',
-            'core.windows.net',
-            'azurewebsites.net',
-            # If needed: 'login.microsoftonline.com'
-        ]
-        for domain in must_bypass:
-            if domain not in no_proxy_list:
-                no_proxy_list.append(domain)
-        merged = ",".join(no_proxy_list)
-        os.environ["NO_PROXY"]=merged
-        logger.info(f"NO_PROXY => {merged}")
-
-    def _get_aad_token(self)->str:
-        tenant = self.get("AZURE_TENANT_ID","")
-        cid    = self.get("AZURE_CLIENT_ID","")
-        cs     = self.get("AZURE_CLIENT_SECRET","")
-        credential = ClientSecretCredential(tenant, cid, cs)
-        token_obj = credential.get_token("https://cognitiveservices.azure.com/.default")
-        logger.info("Acquired Azure AD token for embeddings usage.")
-        return token_obj.token
-
-    def get(self, k:str, default:str="") -> str:
-        return os.getenv(k,default)
-
-###########################
-# Setup a custom requests session (optional) 
-# to fix chunked encoding errors or partial reads
-###########################
-def configure_requests_session(cacert_path:str, connect_timeout:int=10, read_timeout:int=300):
-    """
-    Creates a custom requests.Session with 
-    - verify=cacert_path 
-    - retries on 429/5xx
-    - extended timeouts
-    Then assigns openai.requestssession to it, 
-    so all embedding calls are more robust.
-    """
-    import requests
-    from requests.adapters import HTTPAdapter, Retry
-    import openai
-
-    session = requests.Session()
-    session.verify = cacert_path
-
-    retries = Retry(
-        total=3,
-        backoff_factor=1,
-        status_forcelist=[429,500,502,503,504]
-    )
-    adapter = HTTPAdapter(max_retries=retries)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-
-    openai.requestssession = session
-    openai.timeout = read_timeout
-
-    logger.info(f"Custom session => connect_timeout={connect_timeout}, read_timeout={read_timeout}")
+    def get_bool(self, key: str, default: bool = False) -> bool:
+        """Get boolean environment variable"""
+        val = self.get(key, str(default)).lower()
+        return val == 'true'
 
 ###########################
-# LanceDBIndex: local storing of vectors
+# Enhanced OpenAI Session Management
 ###########################
-class LanceDBIndex:
-    """
-    1) Use OpenAI embeddings to embed target CSV rows => store in local LanceDB
-    2) For each source row => embed => do top-K local search => collect matches
-    No connection to a remote OpenAI vector store—this is all local.
-    """
-    def __init__(self, env: OSEnv):
+@contextmanager
+def openai_session(cert_path: Optional[str] = None, timeout: int = 300):
+    """Context manager for OpenAI API session with proper cleanup"""
+    session = None
+    try:
+        session = requests.Session()
+        
+        if cert_path:
+            session.verify = cert_path
+            
+        # Configure retries
+        retries = requests.adapters.Retry(
+            total=5,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
+        )
+        adapter = requests.adapters.HTTPAdapter(max_retries=retries)
+        session.mount("https://", adapter)
+        
+        # Configure OpenAI
+        openai.requestssession = session
+        openai.timeout = timeout
+        
+        yield session
+        
+    finally:
+        if session:
+            session.close()
+
+###########################
+# Enhanced LanceDB Management
+###########################
+class EnhancedLanceDBIndex:
+    """Enhanced LanceDB manager with better error handling and cleanup"""
+    def __init__(self, env: EnhancedEnvironment, db_path: str = "./lance_vectors"):
+        self.logger = logging.getLogger("embeddings_matcher")
         self.env = env
-        self.db_path = "./lance_vectors"   # local folder
+        self.db_path = db_path
         self.table_name = "pbt_vectors"
         self._setup_embeddings()
-
+        
     def _setup_embeddings(self):
-        # read environment for azure openai embedding usage
-        api_base = self.env.get("AZURE_OPENAI_ENDPOINT","")
-        api_ver  = self.env.get("API_VERSION","2023-03-15-preview")
-        api_key  = self.env.token  # if SECURED_ENDPOINTS => AAD token
-
-        # e.g., "text-embedding-ada-002"
-        model_name = self.env.get("AZURE_EMBEDDINGS_MODEL","text-embedding-ada-002")
-        deployment_name = self.env.get("AZURE_EMBEDDINGS_DEPLOYMENT","my-embedding-deployment")
-
-        self.embedding_fn = OpenAIEmbeddings(
-            deployment=deployment_name,
-            model=model_name,
-            openai_api_type="azure",
-            openai_api_key=api_key,
-            openai_api_base=api_base,
-            openai_api_version=api_ver
-        )
-        logger.info(f"Embedding setup => deployment={deployment_name}, model={model_name}")
+        """Configure OpenAI embeddings with proper error handling"""
+        try:
+            api_base = self.env.get("AZURE_OPENAI_ENDPOINT")
+            if not api_base:
+                raise ValueError("Missing AZURE_OPENAI_ENDPOINT")
+                
+            api_version = self.env.get("API_VERSION", "2023-03-15-preview")
+            api_key = self.env.token if self.env.get_bool("SECURED_ENDPOINTS") else self.env.get("AZURE_API_KEY")
+            
+            model = self.env.get("AZURE_EMBEDDINGS_MODEL", "text-embedding-ada-002")
+            deployment = self.env.get("AZURE_EMBEDDINGS_DEPLOYMENT")
+            
+            if not deployment:
+                raise ValueError("Missing AZURE_EMBEDDINGS_DEPLOYMENT")
+            
+            self.embedding_fn = OpenAIEmbeddings(
+                deployment=deployment,
+                model=model,
+                openai_api_type="azure",
+                openai_api_key=api_key,
+                openai_api_base=api_base,
+                openai_api_version=api_version
+            )
+            
+            self.logger.info(f"Embeddings configured: model={model}, deployment={deployment}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to setup embeddings: {str(e)}")
+            raise
 
     def index_target_data(self, target_df: pd.DataFrame):
-        """
-        Convert each target row => Document => embed => store in local LanceDB
-        """
-        from lancedb import connect
-        from langchain.vectorstores import LanceDB
-        from langchain.docstore.document import Document
-
-        # connect local
-        db = connect(self.db_path)
-        # drop old table if exists
-        if self.table_name in db.table_names():
-            logger.info(f"Dropping old table '{self.table_name}'.")
-            db.drop_table(self.table_name)
-
-        docs = []
-        for _, row in target_df.iterrows():
-            text = f"{row['pbt-name']} : {row['pbt-definition']}"
-            docs.append(
-                Document(
-                    page_content=text,
-                    metadata={
-                        "pbt-name": row["pbt-name"],
-                        "pbt-definition": row["pbt-definition"]
-                    }
+        """Index target data with proper error handling and progress tracking"""
+        try:
+            db = lancedb.connect(self.db_path)
+            
+            if self.table_name in db.table_names():
+                self.logger.info(f"Removing existing table: {self.table_name}")
+                db.drop_table(self.table_name)
+            
+            docs = []
+            for _, row in tqdm(target_df.iterrows(), total=len(target_df), desc="Preparing documents"):
+                text = f"{row['pbt-name']} : {row['pbt-definition']}"
+                docs.append(
+                    Document(
+                        page_content=text,
+                        metadata={
+                            "pbt-name": row["pbt-name"],
+                            "pbt-definition": row["pbt-definition"]
+                        }
+                    )
                 )
+            
+            LanceDB.from_documents(
+                documents=docs,
+                embedding=self.embedding_fn,
+                connection=db,
+                table_name=self.table_name
             )
+            
+            self.logger.info(f"Indexed {len(docs)} documents in LanceDB at {self.db_path}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to index target data: {str(e)}")
+            raise
 
-        LanceDB.from_documents(
-            documents=docs,
-            embedding=self.embedding_fn,
-            connection=db,
-            table_name=self.table_name
-        )
-        logger.info(f"Indexed {len(docs)} PBT rows into local LanceDB => {self.db_path}")
-
-    def search_similar(
-        self, 
-        text: str, 
-        top_k: int=5
-    ) -> List[Dict]:
-        """
-        embed 'text', do top-K local LanceDB search,
-        return list of match dict {pbt-name, pbt-definition, similarity_score}
-        """
-        from lancedb import connect
-        from langchain.vectorstores import LanceDB
-        db = connect(self.db_path)
-        store = LanceDB(
-            connection=db,
-            table_name=self.table_name,
-            embedding=self.embedding_fn
-        )
-
-        results = store.similarity_search_with_score(text, k=top_k)
-        out=[]
-        for doc,score in results:
-            out.append({
+    def search_similar(self, text: str, top_k: int = 5) -> List[Dict]:
+        """Search for similar documents with error handling"""
+        try:
+            db = lancedb.connect(self.db_path)
+            store = LanceDB(
+                connection=db,
+                table_name=self.table_name,
+                embedding=self.embedding_fn
+            )
+            
+            results = store.similarity_search_with_score(text, k=top_k)
+            
+            return [{
                 "pbt-name": doc.metadata["pbt-name"],
                 "pbt-definition": doc.metadata["pbt-definition"],
                 "similarity_score": float(score)
-            })
-        return out
+            } for doc, score in results]
+            
+        except Exception as e:
+            self.logger.error(f"Error in similarity search: {str(e)}")
+            raise
 
 ###########################
-# main
+# Main Function
 ###########################
 def main():
-    """
-    1) Load environment with OSEnv => proxy, cert, optional AAD token
-    2) Optionally configure custom requests session => fix chunked encoding
-    3) Index target.csv in local LanceDB 
-    4) For each row in source.csv => embed => top-K local search => collect results
-    5) Save final matches in CSV & JSON
-    """
+    """Enhanced main function with proper error handling and cleanup"""
+    logger = None
     try:
+        # Setup paths
         base_dir = Path(__file__).parent.parent
         env_dir = base_dir / "env"
-        data_dir= base_dir / "data"
-        output_dir= base_dir / "output"
-        log_dir= base_dir / "logs"
-
+        data_dir = base_dir / "data"
+        output_dir = base_dir / "output"
+        log_dir = base_dir / "logs"
+        
+        # Create directories
         for d in [env_dir, data_dir, output_dir, log_dir]:
             d.mkdir(exist_ok=True)
-
+        
+        # Setup logging
+        logger = setup_logging(log_dir)
+        
+        # Initialize paths
         config_file = env_dir / "config.env"
-        creds_file  = env_dir / "credentials.env"
-        cert_file   = env_dir / "cacert.pem"
-        source_csv  = data_dir / "source.csv"
-        target_csv  = data_dir / "target.csv"
-
-        # Validate
-        missing = []
-        for f in [config_file, creds_file, cert_file, source_csv, target_csv]:
-            if not f.exists():
-                missing.append(str(f))
+        creds_file = env_dir / "credentials.env"
+        cert_file = env_dir / "cacert.pem"
+        source_csv = data_dir / "source.csv"
+        target_csv = data_dir / "target.csv"
+        
+        # Validate files
+        required_files = {
+            "config.env": config_file,
+            "credentials.env": creds_file,
+            "cacert.pem": cert_file,
+            "source.csv": source_csv,
+            "target.csv": target_csv
+        }
+        
+        missing = [name for name, path in required_files.items() if not path.exists()]
         if missing:
-            logger.error(f"Missing files: {missing}")
-            return
+            raise FileNotFoundError(f"Missing required files: {', '.join(missing)}")
+        
+        # Initialize environment
+        env = EnhancedEnvironment(config_file, creds_file, cert_file)
+        
+        # Setup OpenAI session
+        with openai_session(cert_path=cert_file) as session:
+            # Read and validate CSVs
+            target_df = pd.read_csv(target_csv)
+            if not {"pbt-name", "pbt-definition"}.issubset(target_df.columns):
+                raise ValueError("target.csv missing required columns")
+            
+            source_df = pd.read_csv(source_csv)
+            if not {"name", "definition"}.issubset(source_df.columns):
+                raise ValueError("source.csv missing required columns")
 
-        # 1) OSEnv
-        env_setup = OSEnv(str(config_file), str(creds_file), str(cert_file))
+            # Clean the dataframes
+            for df in [target_df, source_df]:
+                for col in df.columns:
+                    if df[col].dtype == object:
+                        df[col] = df[col].fillna("").astype(str).str.strip()
 
-        # 2) custom requests session for openai => optional
-        cacert_path = os.environ.get("REQUESTS_CA_BUNDLE","")
-        if cacert_path and Path(cacert_path).exists():
-            configure_requests_session(cacert_path, connect_timeout=10, read_timeout=300)
-
-        # read CSV
-        target_df = pd.read_csv(str(target_csv)).fillna("")
-        if not {"pbt-name","pbt-definition"}.issubset(target_df.columns):
-            raise ValueError("target.csv must have columns: pbt-name, pbt-definition")
-
-        # 3) Index target
-        indexer = LanceDBIndex(env_setup)
-        indexer.index_target_data(target_df)
-
-        # read source
-        source_df = pd.read_csv(str(source_csv)).fillna("")
-        if not {"name","definition"}.issubset(source_df.columns):
-            raise ValueError("source.csv must have columns: name, definition")
-
-        top_k = int(env_setup.get("TOP_K","5"))
-        similarity_threshold = float(env_setup.get("SIMILARITY_THRESHOLD","0.75"))
-        # store matches
-        matches = []
-
-        for idx, row in tqdm(source_df.iterrows(), total=len(source_df), desc="Matching"):
-            name_val = row["name"].strip()
-            def_val  = row["definition"].strip()
-            text = f"{name_val} : {def_val}"
-
-            results = indexer.search_similar(text, top_k=top_k)
-            # filter by threshold or keep all top_k
-            for r in results:
-                if r["similarity_score"] >= similarity_threshold:
-                    matches.append({
-                        "source_name": name_val,
-                        "source_definition": def_val,
-                        "pbt_name": r["pbt-name"],
-                        "pbt_definition": r["pbt-definition"],
-                        "similarity_score": r["similarity_score"]
-                    })
-
-        # 5) Save final
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        out_csv  = output_dir / f"matches_{timestamp}.csv"
-        out_json = out_csv.with_suffix(".json")
-
-        pd.DataFrame(matches).to_csv(str(out_csv), index=False)
-        with open(out_json, 'w', encoding='utf-8') as f:
-            json.dump(matches, f, indent=2, ensure_ascii=False)
-
-        logger.info(f"Done. Found {len(matches)} matches >= threshold {similarity_threshold}.")
-        logger.info(f"Results => {out_csv}, {out_json}")
-
+            # Initialize LanceDB
+            indexer = EnhancedLanceDBIndex(env)
+            
+            # Index target data with progress tracking
+            logger.info("Starting target data indexing...")
+            indexer.index_target_data(target_df)
+            
+            # Get matching parameters
+            top_k = int(env.get("TOP_K", "5"))
+            similarity_threshold = float(env.get("SIMILARITY_THRESHOLD", "0.75"))
+            
+            # Process source data and find matches
+            matches = []
+            errors = []
+            
+            logger.info("Starting similarity matching...")
+            with tqdm(total=len(source_df), desc="Processing") as pbar:
+                for idx, row in source_df.iterrows():
+                    try:
+                        name_val = row["name"]
+                        def_val = row["definition"]
+                        text = f"{name_val} : {def_val}"
+                        
+                        # Get similar items
+                        results = indexer.search_similar(text, top_k=top_k)
+                        
+                        # Filter by threshold
+                        filtered_results = [
+                            r for r in results 
+                            if r["similarity_score"] >= similarity_threshold
+                        ]
+                        
+                        # Add matches
+                        for r in filtered_results:
+                            matches.append({
+                                "source_name": name_val,
+                                "source_definition": def_val,
+                                "pbt_name": r["pbt-name"],
+                                "pbt_definition": r["pbt-definition"],
+                                "similarity_score": r["similarity_score"]
+                            })
+                            
+                    except Exception as e:
+                        logger.error(f"Error processing row {idx}: {str(e)}")
+                        errors.append({
+                            "row_index": idx,
+                            "source_name": name_val,
+                            "error": str(e)
+                        })
+                    
+                    pbar.update(1)
+            
+            # Generate output files
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            
+            # Save matches
+            matches_df = pd.DataFrame(matches)
+            matches_csv = output_dir / f"matches_{timestamp}.csv"
+            matches_json = output_dir / f"matches_{timestamp}.json"
+            
+            # Sort by similarity score
+            matches_df = matches_df.sort_values(
+                by=["source_name", "similarity_score"], 
+                ascending=[True, False]
+            )
+            
+            # Save as CSV
+            matches_df.to_csv(matches_csv, index=False)
+            
+            # Save as JSON with formatting
+            with open(matches_json, 'w', encoding='utf-8') as f:
+                json.dump(
+                    matches_df.to_dict(orient='records'),
+                    f,
+                    indent=2,
+                    ensure_ascii=False
+                )
+            
+            # Generate summary report
+            summary = {
+                "timestamp": timestamp,
+                "total_source_rows": len(source_df),
+                "total_target_rows": len(target_df),
+                "total_matches_found": len(matches),
+                "unique_source_items_matched": len(matches_df["source_name"].unique()),
+                "similarity_threshold": similarity_threshold,
+                "top_k": top_k,
+                "errors": len(errors),
+                "output_files": {
+                    "csv": str(matches_csv),
+                    "json": str(matches_json)
+                }
+            }
+            
+            # Save summary
+            summary_file = output_dir / f"summary_{timestamp}.json"
+            with open(summary_file, 'w', encoding='utf-8') as f:
+                json.dump(summary, f, indent=2)
+            
+            # Log completion
+            logger.info("\nProcessing completed!")
+            logger.info(f"Total matches found: {len(matches)}")
+            logger.info(f"Unique source items matched: {len(matches_df['source_name'].unique())}")
+            logger.info(f"Errors encountered: {len(errors)}")
+            logger.info(f"\nOutput files:")
+            logger.info(f"- Matches CSV: {matches_csv}")
+            logger.info(f"- Matches JSON: {matches_json}")
+            logger.info(f"- Summary: {summary_file}")
+            
+            # Log errors if any
+            if errors:
+                logger.warning("\nErrors encountered during processing:")
+                for err in errors:
+                    logger.warning(f"Row {err['row_index']} ({err['source_name']}): {err['error']}")
+            
     except Exception as e:
-        logger.exception(f"Unexpected error: {str(e)}")
-        print(f"Error: {str(e)}")
+        if logger:
+            logger.exception("Fatal error occurred")
+        else:
+            print(f"Fatal error occurred before logger initialization: {str(e)}")
+        sys.exit(1)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
