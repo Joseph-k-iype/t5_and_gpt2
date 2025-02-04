@@ -8,7 +8,11 @@ from azure.identity import ClientSecretCredential
 import pandas as pd
 from langchain_openai import AzureOpenAIEmbeddings
 from langchain_community.vectorstores import Milvus
-from pymilvus import MilvusLite, connections
+from pymilvus import MilvusClient, DataType
+from langchain.chat_models import AzureChatOpenAI
+from langchain.schema import HumanMessage, SystemMessage
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationChain
 
 # Set up logging
 logging.basicConfig(
@@ -174,21 +178,24 @@ class OSEnv:
             else:
                 logger.info(f"{var}: {self.get(var)}")
 
+
 class VectorSearch:
-    """Vector search implementation using Azure OpenAI embeddings and Milvus Lite."""
+    """Vector search implementation using Azure OpenAI embeddings and Milvus."""
     
-    def __init__(self, env: OSEnv, milvus_lite_path: str = "./milvus_lite_data"):
+    def __init__(self, env: OSEnv, host: str = "localhost", port: str = "19530"):
         """
         Initialize with OSEnv configuration.
         
         Args:
             env: OSEnv instance for configuration
-            milvus_lite_path: Path where Milvus Lite will store its data
+            host: Milvus host address
+            port: Milvus port number
         """
         self.env = env
-        self.milvus_lite_path = milvus_lite_path
+        self.host = host
+        self.port = port
         self._setup_embeddings()
-        self._setup_milvus_lite()
+        self._setup_milvus()
         
     def _setup_embeddings(self) -> None:
         """Configure Azure OpenAI embeddings."""
@@ -205,20 +212,18 @@ class VectorSearch:
             logger.error(f"Failed to initialize embeddings: {str(e)}")
             raise
 
-    def _setup_milvus_lite(self) -> None:
-        """Configure Milvus Lite connection."""
+    def _setup_milvus(self) -> None:
+        """Configure Milvus connection using MilvusClient."""
         try:
-            # Initialize Milvus Lite
-            lite = MilvusLite()
-            lite.config(path=self.milvus_lite_path)
-            
-            # Connect to Milvus Lite
-            connections.connect(alias="default", lite=lite)
-            
-            logger.info(f"Milvus Lite initialized at {self.milvus_lite_path}")
+            uri = f"http://{self.host}:{self.port}"
+            self.client = MilvusClient(
+                uri=uri,
+                token=self.env.get("MILVUS_TOKEN", "")  # Optional token if authentication is enabled
+            )
+            logger.info(f"Connected to Milvus successfully at {uri}")
             
         except Exception as e:
-            logger.error(f"Failed to configure Milvus Lite: {str(e)}")
+            logger.error(f"Failed to configure Milvus: {str(e)}")
             raise
 
     def load_data(self, csv_path: str) -> pd.DataFrame:
@@ -237,21 +242,84 @@ class VectorSearch:
                           data: pd.DataFrame,
                           text_column: str,
                           collection_name: str) -> None:
-        """Create Milvus Lite vector store from DataFrame."""
+        """Create Milvus vector store from DataFrame."""
         try:
+            # Drop existing collection if it exists
+            if self.client.has_collection(collection_name):
+                self.client.drop_collection(collection_name)
+                logger.info(f"Dropped existing collection: {collection_name}")
+            
             texts = data[text_column].tolist()
             metadatas = [{"source": str(i)} for i in range(len(texts))]
             
-            # Create Milvus collection with Lite connection
-            self.vector_store = Milvus.from_texts(
-                texts=texts,
-                embedding=self.embeddings,
+            # Create collection with schema
+            dim = 3072  # Dimension for text-embedding-3-large
+            schema = {
+                "fields": [
+                    {
+                        "name": "id",
+                        "dtype": DataType.INT64,
+                        "is_primary": True,
+                        "auto_id": True
+                    },
+                    {
+                        "name": "text",
+                        "dtype": DataType.VARCHAR,
+                        "max_length": 65535
+                    },
+                    {
+                        "name": "embedding",
+                        "dtype": DataType.FLOAT_VECTOR,
+                        "dim": dim
+                    }
+                ],
+                "enable_dynamic_field": True
+            }
+            
+            # Create the collection
+            self.client.create_collection(
                 collection_name=collection_name,
-                connection_args={"alias": "default"},  # Uses the default Lite connection
-                metadatas=metadatas
+                schema=schema
             )
             
-            logger.info(f"Successfully created Milvus Lite collection: {collection_name}")
+            # Create index on the embedding field
+            index_params = {
+                "metric_type": "L2",
+                "index_type": "IVF_FLAT",
+                "params": {"nlist": 1024}
+            }
+            self.client.create_index(
+                collection_name=collection_name,
+                field_name="embedding",
+                index_params=index_params
+            )
+            
+            # Insert the data
+            # Generate embeddings in batches to avoid memory issues
+            batch_size = 100
+            for i in range(0, len(texts), batch_size):
+                batch_texts = texts[i:i + batch_size]
+                batch_embeddings = self.embeddings.embed_documents(batch_texts)
+                
+                # Prepare batch data
+                entities = [
+                    {"text": text, "embedding": embedding}
+                    for text, embedding in zip(batch_texts, batch_embeddings)
+                ]
+                
+                # Insert batch
+                self.client.insert(
+                    collection_name=collection_name,
+                    data=entities
+                )
+            
+            # Load the collection
+            self.client.load_collection(collection_name)
+            
+            # Store the collection name for later use
+            self.collection_name = collection_name
+            
+            logger.info(f"Successfully created Milvus collection: {collection_name}")
             
         except Exception as e:
             logger.error(f"Failed to create vector store: {str(e)}")
@@ -262,12 +330,22 @@ class VectorSearch:
                         k: int = 5) -> List[Tuple[str, float]]:
         """Perform similarity search."""
         try:
-            results = self.vector_store.similarity_search_with_score(query, k=k)
+            # Generate query embedding
+            query_embedding = self.embeddings.embed_query(query)
+            
+            # Search in Milvus
+            results = self.client.search(
+                collection_name=self.collection_name,
+                data=[query_embedding],
+                field_name="embedding",
+                limit=k,
+                output_fields=["text"]
+            )
             
             # Format results
             search_results = []
-            for doc, score in results:
-                search_results.append((doc.page_content, score))
+            for hit in results[0]:  # First element contains hits for first query
+                search_results.append((hit['entity']['text'], hit['distance']))
             
             logger.info(f"Successfully performed similarity search for query: {query}")
             return search_results
@@ -277,12 +355,60 @@ class VectorSearch:
             raise
 
     def close(self):
-        """Close Milvus Lite connection."""
+        """Close Milvus connection."""
         try:
-            connections.disconnect("default")
-            logger.info("Closed Milvus Lite connection")
+            if hasattr(self, 'collection_name'):
+                self.client.release_collection(self.collection_name)
+            logger.info("Released Milvus collection")
         except Exception as e:
-            logger.error(f"Error closing Milvus Lite connection: {str(e)}")
+            logger.error(f"Error closing Milvus connection: {str(e)}")
+
+class AzureChatbot:
+    """Azure OpenAI chatbot using LangChain."""
+    
+    def __init__(self, config_file: str, creds_file: str, cert_file: str):
+        """Initialize the chatbot with configuration files and certificate."""
+        logger.info("Initializing chatbot...")
+        self.env = OSEnv(config_file, creds_file, cert_file)
+        self._setup_chat_model()
+
+    def _setup_chat_model(self) -> None:
+        """Set up the chat model and conversation chain."""
+        try:
+            self.llm = AzureChatOpenAI(
+                model_name=self.env.get("MODEL_NAME", "gpt-4o-mini"),
+                temperature=float(self.env.get("MODEL_TEMPERATURE", "0.7")),
+                max_tokens=int(self.env.get("MAX_TOKENS", "800")),
+                openai_api_version=self.env.get("API_VERSION", "2024-02-01"),
+                azure_endpoint=self.env.get("AZURE_OPENAI_ENDPOINT"),
+                azure_ad_token=self.env.token
+            )
+            
+            self.memory = ConversationBufferMemory()
+            self.conversation = ConversationChain(
+                llm=self.llm,
+                memory=self.memory,
+                verbose=True
+            )
+            
+            logger.info("Chat model initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize chat model: {str(e)}")
+            raise
+
+    def chat(self, message: str) -> str:
+        """Process a single message and return the response."""
+        if not message.strip():
+            return "Please provide a non-empty message."
+        
+        try:
+            response = self.conversation.predict(input=message)
+            return response
+        except Exception as e:
+            logger.error(f"Error in chat: {str(e)}")
+            return f"An error occurred: {str(e)}"
+
 
 def main():
     """Example usage of the vector search system."""
@@ -315,9 +441,12 @@ def main():
         print("\nInitializing environment...")
         env = OSEnv(config_path, creds_path, cert_path)
         
-        # Initialize vector search with Milvus Lite
+        # Initialize vector search
         print("\nInitializing vector search...")
-        vector_search = VectorSearch(env, milvus_lite_path="./milvus_lite_data")
+        host = input("Enter Milvus host [default: localhost]: ") or "localhost"
+        port = input("Enter Milvus port [default: 19530]: ") or "19530"
+        
+        vector_search = VectorSearch(env, host=host, port=port)
         
         try:
             # Load and process data
@@ -343,18 +472,34 @@ def main():
             # Interactive search loop
             print("\nVector store created! You can now perform similarity searches.")
             print("Type 'quit' to exit")
+            print("\nAvailable commands:")
+            print("- 'quit': Exit the program")
+            print("- 'env': Show current environment variables")
+            print("- Any other input will be treated as a search query")
             
             while True:
-                query = input("\nEnter your search query: ")
+                query = input("\nEnter your search query: ").strip()
+                
                 if query.lower() == 'quit':
                     break
-                    
-                k = int(input("How many results would you like? [default=5] ") or "5")
+                elif query.lower() == 'env':
+                    env.list_env_vars()
+                    continue
+                elif not query:
+                    print("Please enter a valid query.")
+                    continue
+                
+                try:
+                    k = int(input("How many results would you like? [default=5] ") or "5")
+                except ValueError:
+                    print("Invalid number, using default of 5")
+                    k = 5
+                
                 results = vector_search.similarity_search(query, k=k)
                 
                 print("\nSearch Results:")
                 for i, (text, score) in enumerate(results, 1):
-                    print(f"\n{i}. Similarity Score: {score:.4f}")
+                    print(f"\n{i}. Distance Score: {score:.4f}")
                     print(f"Text: {text}")
                 
         finally:
