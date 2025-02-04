@@ -1,48 +1,38 @@
 #!/usr/bin/env python3
 """
-ALTERNATIVE APPROACH: 
-Use AzureChatOpenAI via your existing OSEnv to solve the CSV matching problem 
-(name/definition vs. pbt-name/pbt-definition) purely through a prompt-based approach.
+Chunked Prompt Approach for Matching:
+-------------------------------------
+We have:
+- source.csv => columns: [name, definition]
+- target.csv => columns: [pbt-name, pbt-definition]
 
-For each row in the 'source.csv', we pass the entire list of PBTs from 'target.csv' 
-into an Azure Chat model and ask: "Which PBT is the best match for this 'name/definition'?"
+We want to find the best "pbt-name" match for each "name", using Azure Chat 
+(GPT) via your existing OSEnv logic, but without exceeding the model's 
+128k token context limit.
 
-Outputs a CSV file of matched results.
+Implementation:
+1) Load CSVs.
+2) For each row in source.csv, chunk the target PBT list into smaller pieces.
+3) "Tournament" style queries: pick the best from each chunk, 
+   then unify the winners until 1 final best remains.
+4) Save results to CSV/JSON.
 
-Configuration (from .env files):
---------------------------------
-- MODEL_NAME, MODEL_TEMPERATURE, MAX_TOKENS
-- API_VERSION, AZURE_OPENAI_ENDPOINT
-- (If secured endpoints = True, we fetch an AAD token using OSEnv)
-- Proxy, cert settings, etc. also handled by OSEnv.
-
-Usage:
-------
-1. Populate your env/config.env and env/credentials.env accordingly.
-2. Place source.csv + target.csv in data/.
-3. Run: python semantic_chat_match.py
-4. Results are saved in output/matches_<timestamp>.csv
+This solution avoids sending a massive single prompt that might exceed 
+128k tokens (which was causing a 194382-token error).
 """
 
 import os
-import csv
 import time
 import json
 import logging
 from pathlib import Path
-from typing import List, Dict
-
+from typing import List, Dict, Tuple, Optional
 import pandas as pd
 
-# The Azure Identity import is used by OSEnv when SECURED_ENDPOINTS=True
 from azure.identity import ClientSecretCredential
-
-# We re-use your code:
 from langchain.chat_models import AzureChatOpenAI
 from langchain.schema import HumanMessage, SystemMessage
-from dotenv import dotenv_values
 
-# Reuse the logging logic
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -50,209 +40,249 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 #############################
-# OSEnv + Chatbot Classes  #
+#   OSEnv Class (as before)
 #############################
 def is_file_readable(filepath: str) -> bool:
-    """Check if a file exists and is readable."""
     if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
         raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
     return True
 
 def str_to_bool(s: str) -> bool:
-    """Convert string to boolean."""
-    ls = s.strip().lower()
-    if ls == 'true':
+    s_lower = s.strip().lower()
+    if s_lower == 'true':
         return True
-    elif ls == 'false':
+    elif s_lower == 'false':
         return False
     else:
         raise ValueError(f"Invalid boolean string: {s}")
 
 class OSEnv:
-    """Environment variable and certificate management class."""
+    """
+    Minimal environment loader. 
+    (Adjust if you still want proxy/cert logic from your original OSEnv code.)
+    """
 
-    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
+    def __init__(self, config_file: str, creds_file: str, cert_file: str):
         self.var_list = []
+        self._load_env_file(config_file, print_val=True)
+        self._load_env_file(creds_file, print_val=False)
         
-        # Load main configuration
-        self.bulk_set(config_file, True)
-        logger.info(f"Loaded main configuration from {config_file}")
-        
-        # Load credentials
-        self.bulk_set(creds_file, False)
-        logger.info(f"Loaded credentials from {creds_file}")
-        
-        # Set up certificates
-        self.set_certificate_path(certificate_path)
-        logger.info("Certificate path configured")
-        
-        # Proxy
-        if str_to_bool(self.get("PROXY_ENABLED", "False")):
-            self.set_proxy()
-            logger.info("Proxy configured")
-        
-        # Possibly get Azure token
-        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
-            logger.info("Securing endpoints (AAD token)")
-            self.token = self.get_azure_token()
+        # Optionally handle certificate
+        cert_abs = os.path.abspath(cert_file)
+        if os.path.isfile(cert_abs):
+            os.environ["REQUESTS_CA_BUNDLE"] = cert_abs
+            os.environ["SSL_CERT_FILE"] = cert_abs
+            os.environ["CURL_CA_BUNDLE"] = cert_abs
+            logger.info(f"Using certificate: {cert_abs}")
+
+        # If SECURED_ENDPOINTS => get token
+        if str_to_bool(self.get("SECURED_ENDPOINTS", "false")):
+            self.token = self._get_azure_token()
         else:
             self.token = None
 
-    def set_certificate_path(self, certificate_path: str) -> None:
+    def _load_env_file(self, file_path: str, print_val: bool):
+        if os.path.isfile(file_path):
+            with open(file_path) as f:
+                for line in f:
+                    line=line.strip()
+                    if line and not line.startswith("#"):
+                        key_val = line.split("=", 1)
+                        if len(key_val)==2:
+                            k, v = key_val
+                            k = k.strip()
+                            v = v.strip().strip("'\"")
+                            os.environ[k] = v
+                            if k not in self.var_list:
+                                self.var_list.append(k)
+                            if print_val:
+                                logger.info(f"Set {k}={v}")
+
+    def get(self, key: str, default_val:str="") -> str:
+        return os.getenv(key, default_val)
+
+    def _get_azure_token(self) -> str:
         try:
-            cp_abs = os.path.abspath(certificate_path)
-            if not is_file_readable(cp_abs):
-                raise FileNotFoundError(f"Certificate file not found or not readable: {cp_abs}")
-            self.set("REQUESTS_CA_BUNDLE", cp_abs)
-            self.set("SSL_CERT_FILE", cp_abs)
-            self.set("CURL_CA_BUNDLE", cp_abs)
-            logger.info(f"Certificate path set to: {cp_abs}")
-        except Exception as e:
-            logger.error(f"Certificate configuration failed: {str(e)}")
-            raise
-
-    def bulk_set(self, dotenvfile: str, print_val: bool = False) -> None:
-        try:
-            df_abs = os.path.abspath(dotenvfile)
-            if not is_file_readable(df_abs):
-                return
-            vals = dotenv_values(df_abs)
-            for k, v in vals.items():
-                self.set(k, v, print_val)
-        except Exception as e:
-            logger.error(f"Failed to load environment file {dotenvfile}: {str(e)}")
-            raise
-
-    def set(self, var_name: str, val: str, print_val: bool = True) -> None:
-        os.environ[var_name] = val
-        if var_name not in self.var_list:
-            self.var_list.append(var_name)
-        if print_val:
-            logger.info(f"Set {var_name}={val}")
-
-    def get(self, var_name: str, default_val: str = "") -> str:
-        return os.getenv(var_name, default_val)
-
-    def set_proxy(self) -> None:
-        ad_username = self.get("AD_USERNAME")
-        ad_password = self.get("AD_USER_PW")
-        proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
-        if not all([ad_username, ad_password, proxy_domain]):
-            raise ValueError("Missing proxy credentials for PROXY_ENABLED=True")
-
-        proxy_url = f"http://{ad_username}:{ad_password}@{proxy_domain}"
-        self.set("HTTP_PROXY", proxy_url, print_val=False)
-        self.set("HTTPS_PROXY", proxy_url, print_val=False)
-        
-        no_proxy_list = [
-            'cognitiveservices.azure.com',
-            'search.windows.net',
-            'openai.azure.com',
-            'core.windows.net',
-            'azurewebsites.net'
-        ]
-        # Join them into NO_PROXY
-        self.set("NO_PROXY", ",".join(no_proxy_list), print_val=False)
-
-    def get_azure_token(self) -> str:
-        try:
-            credential = ClientSecretCredential(
-                tenant_id=self.get("AZURE_TENANT_ID"),
-                client_id=self.get("AZURE_CLIENT_ID"),
-                client_secret=self.get("AZURE_CLIENT_SECRET")
-            )
+            tenant_id = self.get("AZURE_TENANT_ID")
+            client_id = self.get("AZURE_CLIENT_ID")
+            client_secret = self.get("AZURE_CLIENT_SECRET")
+            credential = ClientSecretCredential(tenant_id, client_id, client_secret)
             token_obj = credential.get_token("https://cognitiveservices.azure.com/.default")
-            token_val = token_obj.token
-            logger.info("Acquired Azure token successfully")
-            return token_val
+            logger.info("Got AAD token for Azure OpenAI")
+            return token_obj.token
         except Exception as e:
-            logger.error(f"Failed to get Azure token: {str(e)}")
+            logger.error(f"Failed to get token: {str(e)}")
             raise
 
-class AzureChatbot:
+#############################
+#   ChunkedChatbot Class
+#############################
+class ChunkedChatbot:
     """
-    A light wrapper around Azure Chat openai (LangChain's AzureChatOpenAI) 
-    for a single prompt/response approach.
+    Uses AzureChatOpenAI with chunked prompts to avoid exceeding 128k tokens.
     """
-    
+
     def __init__(self, env: OSEnv):
         self.env = env
         self._setup_chat_model()
+        # Adjust chunk size as needed for your environment
+        self.chunk_size = int(self.env.get("CHUNK_SIZE", "50"))
 
-    def _setup_chat_model(self) -> None:
-        """Set up the chat model with environment variables."""
-        model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
-        temperature = float(self.env.get("MODEL_TEMPERATURE", "0.7"))
-        max_tokens = int(self.env.get("MAX_TOKENS", "800"))
-        api_version = self.env.get("API_VERSION", "2024-02-01")
-        azure_endpoint = self.env.get("AZURE_OPENAI_ENDPOINT")
-        azure_token = self.env.token  # AAD token if SECURED_ENDPOINTS=True
+    def _setup_chat_model(self):
+        model_name = self.env.get("MODEL_NAME","gpt-4")
+        temperature = float(self.env.get("MODEL_TEMPERATURE","0.7"))
+        max_tokens = int(self.env.get("MAX_TOKENS","800"))
+        api_version = self.env.get("API_VERSION","2023-03-15-preview")
+        endpoint = self.env.get("AZURE_OPENAI_ENDPOINT","")
+        azure_ad_token = self.env.token
 
-        # Create the LLM object
         self.llm = AzureChatOpenAI(
             model_name=model_name,
             temperature=temperature,
             max_tokens=max_tokens,
             openai_api_version=api_version,
-            azure_endpoint=azure_endpoint,
-            azure_ad_token=azure_token
+            azure_endpoint=endpoint,
+            azure_ad_token=azure_ad_token
         )
-        logger.info(f"Chat model '{model_name}' initialized (temp={temperature}, max_tokens={max_tokens}).")
+        logger.info(f"Chat model {model_name} set up with temperature={temperature}, max_tokens={max_tokens}")
 
-    def match_single_record(self, 
-                            name: str, 
-                            definition: str, 
-                            pbt_list: List[Dict[str, str]]) -> str:
+    ############################
+    #   Multi-step CHUNK logic
+    ############################
+    def pick_best_pbt_in_chunk(
+        self, 
+        name: str, 
+        definition: str, 
+        pbt_chunk: List[Dict[str,str]]
+    ) -> Dict[str,str]:
         """
-        For one row from the source CSV, 
-        pass 'name'/'definition' + the entire pbt_list into a single prompt,
-        and let the model pick the best PBT.
-        
-        Returns: The model's direct response (which hopefully names the best PBT).
+        Return a single PBT (as dict: {"pbt-name":"...", "pbt-definition":"..."}) 
+        from this chunk that best matches 'name'/'definition'.
         """
-        # 1) Create the system & user messages
-        #    (System message: instruction to pick best matching PBT. 
-        #     User message: includes the actual data.)
-        
-        system_text = (
-            "You are a helpful assistant. Your job: given a concept 'name'/'definition' and "
-            "a list of possible 'pbt-name'/'pbt-definition', pick the best matching PBT."
+        system_prompt = (
+            "You are an assistant that picks exactly one best-matching PBT from a chunk. "
+            "Return only the pbt-name and pbt-definition. Do not mention anything else."
         )
-        # Build the user message to contain the full context
-        user_text = (
-            f"Original name: {name}\n"
-            f"Original definition: {definition}\n\n"
-            f"Potential PBTs:\n"
-        )
-        for pbt in pbt_list:
-            user_text += f"- pbt-name: {pbt['pbt-name']}\n  pbt-definition: {pbt['pbt-definition']}\n\n"
-
-        user_text += (
-            "Which 'pbt-name' is the best match for the original name? "
-            "Justify your answer briefly."
+        user_prompt = (
+            f"Original Name: {name}\n"
+            f"Original Definition: {definition}\n\n"
+            f"Here is a chunk of PBTs:\n"
         )
 
-        # 2) Call the chat model
+        # Add chunk content
+        for idx, pbt in enumerate(pbt_chunk, start=1):
+            user_prompt += (
+                f"({idx}) pbt-name: {pbt['pbt-name']}\n"
+                f"    pbt-definition: {pbt['pbt-definition']}\n\n"
+            )
+
+        user_prompt += (
+            "Among these, which single pbt-name best matches the original concept? "
+            "Return your final answer in JSON with keys pbt-name and pbt-definition."
+        )
+
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt)
+        ]
         try:
-            messages = [
-                SystemMessage(content=system_text),
-                HumanMessage(content=user_text)
-            ]
             response = self.llm(messages)
-            return response.content.strip()
+            ans = response.content.strip()
+            # We'll do a naive parse looking for pbt-name and pbt-definition
+            # If the model is well-instructed, it might produce e.g.:
+            # { "pbt-name": "Customer ID", "pbt-definition": "A unique identification..." }
+            # We'll try a simple parse:
+            best = self._extract_pbt_from_json(ans)
+            return best
         except Exception as e:
-            logger.error(f"Error calling the model: {str(e)}")
-            return f"ERROR: {str(e)}"
+            logger.error(f"Error picking best from chunk: {e}")
+            # fallback: just pick the first if error
+            return pbt_chunk[0]
 
-###########################
-#   MAIN LOGIC
-###########################
+    def _extract_pbt_from_json(self, text:str) -> Dict[str,str]:
+        """
+        Very naive parse. 
+        Looks for "pbt-name" and "pbt-definition" in the text. 
+        Improve as needed or instruct the model to output valid JSON.
+        """
+        import re
+        # Regex approach. If not found, fallback.
+        name_match = re.search(r'"pbt-name"\s*:\s*"([^"]+)"', text)
+        def_match = re.search(r'"pbt-definition"\s*:\s*"([^"]+)"', text)
+
+        if name_match and def_match:
+            return {
+                "pbt-name": name_match.group(1),
+                "pbt-definition": def_match.group(1)
+            }
+        else:
+            # If parse fails, fallback
+            return {
+                "pbt-name": "UNKNOWN",
+                "pbt-definition": "UNKNOWN"
+            }
+
+    def pick_best_pbt_across_all(
+        self, 
+        name:str, 
+        definition:str, 
+        pbt_list: List[Dict[str,str]]
+    ) -> Dict[str,str]:
+        """
+        1) Break pbt_list into chunks
+        2) For each chunk, pick best with pick_best_pbt_in_chunk
+        3) If multiple chunk-winners, do a "tournament" until only 1 remains
+        """
+        # Step 1: chunk
+        chunks = [
+            pbt_list[i : i+self.chunk_size] 
+            for i in range(0, len(pbt_list), self.chunk_size)
+        ]
+        logger.info(f"Number of chunks: {len(chunks)} (chunk_size={self.chunk_size}).")
+
+        # Step 2: get chunk winners
+        winners = []
+        for c_idx, chunk in enumerate(chunks, start=1):
+            logger.info(f"Processing chunk {c_idx}/{len(chunks)} with size={len(chunk)}")
+            winner = self.pick_best_pbt_in_chunk(name, definition, chunk)
+            winners.append(winner)
+
+        # Step 3: if winners > 1, do a tournament approach
+        # keep going until we have 1 final winner
+        while len(winners) > 1:
+            logger.info(f"Tournament round with {len(winners)} winners to compare.")
+            new_winners = []
+            # chunk the "winners" again
+            chunked_winners = [
+                winners[i : i+self.chunk_size]
+                for i in range(0, len(winners), self.chunk_size)
+            ]
+            for w_chunk in chunked_winners:
+                if len(w_chunk)==1:
+                    new_winners.append(w_chunk[0])
+                else:
+                    # pick best from this chunk of winners
+                    w = self.pick_best_pbt_in_chunk(name, definition, w_chunk)
+                    new_winners.append(w)
+            winners = new_winners
+
+        # final single winner
+        if winners:
+            return winners[0]
+        else:
+            return {
+                "pbt-name": "NO MATCH",
+                "pbt-definition": "NO MATCH"
+            }
+
+############################
+#       main()
+############################
 def main():
     """
-    - Initialize environment
-    - Load CSVs
-    - For each row in source.csv, ask the chat model which pbt in target.csv is best
-    - Save results
+    1) Load env + CSVs
+    2) For each row in source, chunk + do multi-step picking
+    3) Save results
     """
     try:
         base_dir = Path(__file__).parent.parent
@@ -261,84 +291,69 @@ def main():
         output_dir = base_dir / "output"
         log_dir = base_dir / "logs"
 
-        for d in [env_dir, data_dir, output_dir, log_dir]:
-            d.mkdir(exist_ok=True)
+        for directory in [env_dir, data_dir, output_dir, log_dir]:
+            directory.mkdir(exist_ok=True)
 
-        # .env files
         config_file = env_dir / "config.env"
         creds_file = env_dir / "credentials.env"
         cert_file = env_dir / "cacert.pem"
-
-        # CSV files
         source_csv = data_dir / "source.csv"
         target_csv = data_dir / "target.csv"
 
-        # Check existence
         missing = []
         for f in [config_file, creds_file, cert_file, source_csv, target_csv]:
             if not f.exists():
                 missing.append(str(f))
         if missing:
-            print("Missing required files:")
-            for m in missing:
-                print(f"- {m}")
+            logger.error(f"Missing required files: {missing}")
             return
 
         # 1) ENV
-        logger.info("Initializing OSEnv and reading environment configs...")
         env_setup = OSEnv(str(config_file), str(creds_file), str(cert_file))
 
-        # 2) Chat model
-        logger.info("Initializing Azure Chat model (AzureChatbot)...")
-        chatbot = AzureChatbot(env_setup)
+        # 2) Chat Model with chunk logic
+        chatbot = ChunkedChatbot(env_setup)
 
-        # 3) Load data
-        logger.info("Loading CSV data...")
-        src_df = pd.read_csv(str(source_csv), dtype=str).fillna("")
-        tgt_df = pd.read_csv(str(target_csv), dtype=str).fillna("")
+        # 3) Load CSVs
+        src_df = pd.read_csv(str(source_csv)).fillna("")
+        tgt_df = pd.read_csv(str(target_csv)).fillna("")
+        if not {"name","definition"}.issubset(src_df.columns):
+            raise ValueError("source.csv must have columns: [name, definition]")
+        if not {"pbt-name","pbt-definition"}.issubset(tgt_df.columns):
+            raise ValueError("target.csv must have columns: [pbt-name, pbt-definition]")
 
-        if not {"name", "definition"}.issubset(src_df.columns):
-            raise ValueError("source.csv must have columns: name, definition")
-        if not {"pbt-name", "pbt-definition"}.issubset(tgt_df.columns):
-            raise ValueError("target.csv must have columns: pbt-name, pbt-definition")
+        pbt_list = tgt_df.to_dict("records")
+        logger.info(f"Source size={len(src_df)}, Target size={len(pbt_list)}")
 
-        # Convert target DF into a list of dicts for easy iteration
-        pbt_list = tgt_df.to_dict('records')
-
-        logger.info(f"Source CSV has {len(src_df)} rows, target CSV has {len(tgt_df)} PBT rows.")
-        
-        # 4) For each row in source, prompt the model
+        # 4) For each row, do chunked approach
         results = []
         for idx, row in src_df.iterrows():
-            name_val = row["name"].strip()
-            def_val = row["definition"].strip()
+            name_val = row["name"]
+            def_val = row["definition"]
+            logger.info(f"Row {idx+1}/{len(src_df)} => name='{name_val}'")
 
-            logger.info(f"Processing row {idx+1}/{len(src_df)}: '{name_val}'")
-
-            # Query the model
-            model_answer = chatbot.match_single_record(name_val, def_val, pbt_list)
-
-            # Append to results
+            best_pbt = chatbot.pick_best_pbt_across_all(name_val, def_val, pbt_list)
             results.append({
                 "source_name": name_val,
                 "source_definition": def_val,
-                "model_answer": model_answer
+                "best_pbt_name": best_pbt["pbt-name"],
+                "best_pbt_definition": best_pbt["pbt-definition"]
             })
-        
+
         # 5) Save results
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        out_file = output_dir / f"chat_matches_{timestamp}.csv"
-        pd.DataFrame(results).to_csv(str(out_file), index=False)
+        out_csv = output_dir / f"matches_{timestamp}.csv"
+        pd.DataFrame(results).to_csv(str(out_csv), index=False)
 
-        json_file = out_file.with_suffix(".json")
-        with open(json_file, 'w', encoding='utf-8') as f:
+        out_json = out_csv.with_suffix(".json")
+        with open(out_json,"w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
 
-        print(f"\nDone! Results saved to:\n  - {out_file}\n  - {json_file}")
+        print(f"\nDone! Results saved:\n  - {out_csv}\n  - {out_json}")
 
     except Exception as e:
         logger.exception(f"Unexpected error: {str(e)}")
         print(f"Error: {str(e)}")
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
