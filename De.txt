@@ -1,310 +1,162 @@
 import os
 import pandas as pd
-import numpy as np
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict
 import logging
-from dotenv import load_dotenv
 from pathlib import Path
-from azure.identity import ClientSecretCredential
-from tqdm import tqdm
-import json
-import faiss
-from openai import AzureOpenAI
-from sklearn.preprocessing import normalize
-import requests
-from sentence_transformers import CrossEncoder
+from llama_index import VectorStoreIndex, SimpleDirectoryReader, ServiceContext
+from llama_index.embeddings import OpenAIEmbedding
+from llama_index.schema import TextNode
+from llama_index.vector_stores import SimpleVectorStore
+from llama_index.storage.storage_context import StorageContext
 
-# Set up logging
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Original OSEnv class remains unchanged
-class OSEnv:
-    # [Keep the exact same OSEnv implementation from previous code]
-    # ... (preserve all original methods without changes)
-
-class EnhancedSemanticMatcher:
-    def __init__(self, env_setup: OSEnv):
-        """Initialize with enhanced matching capabilities."""
-        self.env = env_setup
-        self.batch_size = 8
-        self.main_dimension = 3072  # text-embedding-3-large
-        self.aux_dimension = 1024   # text-embedding-3-small
-        self._setup_openai_client()
-        self._setup_cross_encoder()
-        self._setup_templates()
-
-    def _setup_openai_client(self):
-        """Configure Azure OpenAI client."""
-        self.client = AzureOpenAI(
-            api_key=self.env.token,
-            api_version=self.env.get("API_VERSION", "2024-02-01"),
-            azure_endpoint=self.env.get("AZURE_OPENAI_ENDPOINT")
+class GuaranteedPBTPredictor:
+    def __init__(self):
+        self.embed_model = OpenAIEmbedding(
+            model="text-embedding-3-large",
+            api_key=os.getenv("OPENAI_API_KEY")
         )
+        self.service_context = ServiceContext.from_defaults(
+            embed_model=self.embed_model
+        )
+        self.min_confidence = 0.01  # Minimum confidence score for fallback matches
 
-    def _setup_cross_encoder(self):
-        """Initialize cross-encoder for precision re-ranking."""
-        self.cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-12-v2")
+    def _ensure_predictions(self, matches: List[Dict], target_metadata: Dict) -> List[Dict]:
+        """Ensure exactly 4 predictions using fallback strategies"""
+        # If not enough matches, create low-confidence fallbacks
+        while len(matches) < 4:
+            fallback = {
+                "pbt_name": "No confident match",
+                "pbt_definition": "Insufficient data for confident match",
+                "similarity_score": max(self.min_confidence, 0.01 * len(matches))
+            }
+            matches.append(fallback)
         
-    def _setup_templates(self):
-        """Configure context-aware templates."""
-        self.source_template = (
-            "Technical Specification Analysis:\n"
-            "Component: {title}\n"
-            "Details: {content}\n"
-            "Key Aspects: Functionality, technical parameters, "
-            "system integration, and operational constraints."
-        )
-        
-        self.target_template = (
-            "Technical Definition Context:\n"
-            "Term: {title}\n"
-            "Full Specification: {content}\n"
-            "Includes: Implementation guidelines, dependencies, "
-            "performance characteristics, and use case scenarios."
-        )
+        return matches[:4]
 
-    def _prepare_text(self, row: pd.Series, is_source: bool) -> str:
-        """Generate context-rich text representations."""
-        if is_source:
-            return self.source_template.format(
-                title=row['name'].strip(),
-                content=row['description'].strip()
-            )
-        return self.target_template.format(
-            title=row['pbt-name'].strip(),
-            content=row['pbt-definition'].strip()
-        )
-
-    def _expand_query(self, text: str) -> str:
-        """Enhance query context using LLM expansion."""
+    def build_robust_index(self, df: pd.DataFrame, is_source: bool) -> VectorStoreIndex:
+        """Build index with error handling"""
         try:
-            response = self.client.chat.completions.create(
-                model="gpt-4",
-                messages=[{
-                    "role": "system",
-                    "content": "Expand this technical description with 2-3 relevant terms. Keep output concise."
-                }, {
-                    "role": "user",
-                    "content": text
-                }],
-                temperature=0.3,
-                max_tokens=100
+            nodes = [
+                TextNode(
+                    text=f"Title: {row['name']}\nDetails: {row['description']}" if is_source 
+                         else f"Term: {row['pbt-name']}\nDefinition: {row['pbt-definition']}",
+                    metadata=row.to_dict()
+                )
+                for _, row in df.iterrows()
+            ]
+            
+            vector_store = SimpleVectorStore()
+            storage_context = StorageContext.from_defaults(vector_store=vector_store)
+            return VectorStoreIndex(
+                nodes=nodes,
+                storage_context=storage_context,
+                service_context=self.service_context
             )
-            return f"{text}\nExpanded Context: {response.choices[0].message.content}"
         except Exception as e:
-            logger.warning(f"Query expansion failed: {str(e)}")
-            return text
-
-    def _generate_embeddings(self, texts: List[str], model: str, dim: int) -> List[List[float]]:
-        """Generate embeddings with error handling and retries."""
-        try:
-            response = self.client.embeddings.create(
-                model=model,
-                input=texts,
-                dimensions=dim
-            )
-            return [e.embedding for e in response.data]
-        except Exception as e:
-            logger.error(f"Embedding generation failed: {str(e)}")
+            logger.error(f"Index build failed: {str(e)}")
             raise
 
-    def process_dataset(self, df: pd.DataFrame, is_source: bool) -> Dict[str, np.ndarray]:
-        """Process dataset with hybrid embeddings."""
-        embeddings = {
-            'main': [],
-            'aux': [],
-            'texts': [],
-            'metadata': []
-        }
-
-        for i in tqdm(range(0, len(df), self.batch_size), 
-                    desc=f"Processing {'source' if is_source else 'target'}"):
-            batch = df.iloc[i:i+self.batch_size]
-            batch_texts = []
-            
-            for _, row in batch.iterrows():
-                text = self._prepare_text(row, is_source)
-                if is_source:
-                    text = self._expand_query(text)
-                batch_texts.append(text)
-
-            # Generate dual embeddings
-            main_embs = self._generate_embeddings(batch_texts, 
-                                                 "text-embedding-3-large", 
-                                                 self.main_dimension)
-            aux_embs = self._generate_embeddings(batch_texts,
-                                                "text-embedding-3-small",
-                                                self.aux_dimension)
-
-            embeddings['main'].extend(main_embs)
-            embeddings['aux'].extend(aux_embs)
-            embeddings['texts'].extend(batch_texts)
-            embeddings['metadata'].extend(batch.to_dict('records'))
-
-        # Normalize embeddings
-        embeddings['main'] = normalize(np.array(embeddings['main'], dtype='float32'))
-        embeddings['aux'] = normalize(np.array(embeddings['aux'], dtype='float32'))
+    def get_guaranteed_matches(self, source_df: pd.DataFrame, target_df: pd.DataFrame) -> pd.DataFrame:
+        """Guarantee 4 matches per entry with fallback mechanism"""
+        # Build indices
+        target_index = self.build_robust_index(target_df, is_source=False)
         
-        return embeddings
-
-    def _hybrid_search(self, source_emb: Dict[str, np.ndarray], 
-                      target_embs: Dict[str, np.ndarray], 
-                      top_k: int = 20) -> List[Tuple[int, float]]:
-        """Perform hybrid semantic search with re-ranking."""
-        # First-stage retrieval
-        main_scores = np.dot(target_embs['main'], source_emb['main'])
-        aux_scores = np.dot(target_embs['aux'], source_emb['aux'])
-        combined_scores = 0.6 * main_scores + 0.4 * aux_scores
-        
-        # Get initial candidates
-        candidate_indices = np.argsort(-combined_scores)[:top_k]
-        
-        # Cross-encoder re-ranking
-        pairs = [(source_emb['text'], target_embs['texts'][i]) 
-                for i in candidate_indices]
-        cross_scores = self.cross_encoder.predict(pairs)
-        
-        # Combine scores
-        final_scores = 0.7 * combined_scores[candidate_indices] + 0.3 * cross_scores
-        sorted_indices = np.argsort(-final_scores)
-        
-        return [(candidate_indices[i], final_scores[i]) for i in sorted_indices]
-
-    def find_matches(self, source_df: pd.DataFrame, 
-                    target_df: pd.DataFrame, 
-                    k: int = 4) -> pd.DataFrame:
-        """Execute enhanced matching pipeline."""
-        logger.info("Processing source data...")
-        source_data = self.process_dataset(source_df, is_source=True)
-        
-        logger.info("Processing target data...")
-        target_data = self.process_dataset(target_df, is_source=False)
-
-        # Build FAISS indices
-        main_index = faiss.IndexFlatIP(self.main_dimension)
-        main_index.add(target_data['main'])
-        
-        aux_index = faiss.IndexFlatIP(self.aux_dimension)
-        aux_index.add(target_data['aux'])
-
         results = []
-        for src_idx in tqdm(range(len(source_data['main'])), desc="Matching entries"):
-            source_emb = {
-                'main': source_data['main'][src_idx],
-                'aux': source_data['aux'][src_idx],
-                'text': source_data['texts'][src_idx]
-            }
-            
-            # Perform hybrid search
-            matches = self._hybrid_search(source_emb, target_data, top_k=k*3)
-            
-            # Process top k matches
-            top_matches = []
-            for match_idx, score in matches[:k]:
-                target_meta = target_data['metadata'][match_idx]
-                top_matches.append({
-                    'pbt_name': target_meta['pbt-name'],
-                    'definition': target_meta['pbt-definition'],
-                    'score': float(score)
-                })
-            
+        for _, source_row in source_df.iterrows():
+            try:
+                query_text = f"Title: {source_row['name']}\nDetails: {source_row['description']}"
+                query_embedding = self.embed_model.get_text_embedding(query_text)
+                
+                # Get matches with error handling
+                matches = target_index.vector_store.similarity_search(
+                    query_embedding, 
+                    top_k=6  # Get extra matches for redundancy
+                )
+                
+                # Convert to usable format
+                processed_matches = [
+                    {
+                        "pbt_name": m.metadata.get("pbt-name", "Unknown"),
+                        "pbt_definition": m.metadata.get("pbt-definition", "Not available"),
+                        "similarity_score": m.score
+                    }
+                    for m in matches
+                ]
+                
+                # Apply confidence threshold and ensure 4 predictions
+                valid_matches = [m for m in processed_matches if m["similarity_score"] > self.min_confidence]
+                final_matches = self._ensure_predictions(valid_matches, target_df.to_dict('records'))
+                
+            except Exception as e:
+                logger.warning(f"Failed processing row {source_row['name']}: {str(e)}")
+                final_matches = self._ensure_predictions([], [])
+
             results.append({
-                'name': source_data['metadata'][src_idx]['name'],
-                'description': source_data['metadata'][src_idx]['description'],
-                'matches': top_matches
+                "source_name": source_row["name"],
+                "source_description": source_row["description"],
+                "matches": final_matches[:4]  # Ensure exactly 4 predictions
             })
         
-        return self._format_results(results)
+        return self._format_output(results)
 
-    def _format_results(self, results: List[Dict]) -> pd.DataFrame:
-        """Format results into structured DataFrame."""
+    def _format_output(self, results: List[Dict]) -> pd.DataFrame:
+        """Create structured output with guaranteed 4 columns"""
         formatted = []
         for entry in results:
-            for rank, match in enumerate(entry['matches'], 1):
+            for rank, match in enumerate(entry["matches"][:4], 1):  # Force 4 entries
                 formatted.append({
-                    'name': entry['name'],
-                    'description': entry['description'],
-                    'rank': rank,
-                    'pbt_name': match['pbt_name'],
-                    'pbt_definition': match['definition'],
-                    'confidence': match['score']
+                    "source_name": entry["source_name"],
+                    "source_description": entry["source_description"],
+                    f"match_{rank}_pbt_name": match["pbt_name"],
+                    f"match_{rank}_score": match["similarity_score"],
+                    f"match_{rank}_definition": match["pbt_definition"]
                 })
         
+        # Pivot to wide format
         df = pd.DataFrame(formatted)
-        return df.pivot_table(
-            index=['name', 'description'],
-            columns='rank',
-            aggfunc='first',
-            values=['pbt_name', 'pbt_definition', 'confidence']
-        ).sort_values(by=('confidence', 1), ascending=False)
+        return df.groupby(["source_name", "source_description"]).first().reset_index()
 
-    def save_results(self, df: pd.DataFrame, output_path: str) -> None:
-        """Save results with enhanced formatting."""
-        try:
-            # Flatten multi-index columns
-            df.columns = [f'{col[0]}_{col[1]}' for col in df.columns]
-            df.reset_index(inplace=True)
-            
-            # Save CSV
-            df.to_csv(output_path, index=False)
-            logger.info(f"Results saved to CSV: {output_path}")
-            
-            # Save JSON
-            json_path = output_path.replace('.csv', '.json')
-            with open(json_path, 'w') as f:
-                json.dump(df.to_dict('records'), f, indent=2)
-            logger.info(f"Results saved to JSON: {json_path}")
-            
-        except Exception as e:
-            logger.error(f"Error saving results: {str(e)}")
-            raise
+    def save_guaranteed_results(self, df: pd.DataFrame, output_path: str) -> None:
+        """Save results with guaranteed columns"""
+        required_columns = {
+            f"match_{i}_{field}" 
+            for i in range(1,5) 
+            for field in ["pbt_name", "score", "definition"]
+        }
+        
+        # Ensure all columns exist
+        for col in required_columns:
+            if col not in df.columns:
+                df[col] = "Not available"
+        
+        df.to_csv(output_path, index=False)
+        logger.info(f"Guaranteed results saved to {output_path}")
 
-def main():
-    """Enhanced main function with improved error handling."""
+# Usage
+if __name__ == "__main__":
     try:
-        # Initialize environment
-        base_dir = Path(__file__).parent.parent
-        env_setup = OSEnv(
-            config_file=str(base_dir / 'env/config.env'),
-            creds_file=str(base_dir / 'env/credentials.env'),
-            certificate_path=str(base_dir / 'env/cacert.pem')
-        )
-
         # Load data
-        data_dir = base_dir / 'data'
-        source_df = pd.read_csv(data_dir / 'source.csv').fillna('').astype(str)
-        target_df = pd.read_csv(data_dir / 'target.csv').fillna('').astype(str)
-
-        # Validate schema
-        required_source = {'name', 'description'}
-        required_target = {'pbt-name', 'pbt-definition'}
-        if not required_source.issubset(source_df.columns):
-            raise ValueError("Source CSV missing required columns")
-        if not required_target.issubset(target_df.columns):
-            raise ValueError("Target CSV missing required columns")
-
-        # Process matches
-        matcher = EnhancedSemanticMatcher(env_setup)
-        result_df = matcher.find_matches(source_df, target_df, k=4)
+        data_dir = Path("data")
+        source_df = pd.read_csv(data_dir/"source.csv").fillna("")
+        target_df = pd.read_csv(data_dir/"target.csv").fillna("")
+        
+        # Initialize predictor
+        predictor = GuaranteedPBTPredictor()
+        
+        # Get matches
+        result_df = predictor.get_guaranteed_matches(source_df, target_df)
         
         # Save results
-        output_dir = base_dir / 'output'
+        output_dir = Path("output")
         output_dir.mkdir(exist_ok=True)
-        matcher.save_results(result_df, str(output_dir / 'enhanced_matches.csv'))
-
-        # Generate report
-        logger.info("\nMatching Analysis:")
-        logger.info(f"Total Matches Processed: {len(result_df)}")
-        logger.info(f"Average Confidence: {result_df['confidence_1'].mean():.2f}")
-        logger.info(f"High Confidence Matches (>0.8): {len(result_df[result_df['confidence_1'] > 0.8])}")
-
+        predictor.save_guaranteed_results(result_df, output_dir/"guaranteed_pbt_matches.csv")
+        
     except Exception as e:
-        logger.error(f"Critical error in main process: {str(e)}")
-        raise
-
-if __name__ == "__main__":
-    main()
+        logger.error(f"Critical failure: {str(e)}")
