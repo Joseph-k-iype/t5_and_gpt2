@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
 """
-CHUNKED PROMPT MATCHING with CUSTOM REQUESTS SESSION to mitigate chunked encoding errors:
+Similarity Search with LanceDB + OpenAI Embeddings:
 
-1. We have 'source.csv' => columns: [name, definition]
-2. We have 'target.csv' => columns: [pbt-name, pbt-definition]
-3. We'll do chunk-based prompts via AzureChatOpenAI, but also set up:
-   - A custom requests.Session with increased timeouts, retries, 
-   - A no-proxy approach for critical domains,
-   - A single 'cacert.pem' for SSL verification.
+1) We have a "source.csv" => columns: [name, definition]
+2) We have a "target.csv" => columns: [pbt-name, pbt-definition]
+3) We'll index the target CSV in LanceDB with Azure/OpenAI embeddings once.
+4) For each row in source.csv, we embed it, do top-K similarity search in LanceDB,
+   and save the matches (with similarity scores) in a final CSV + JSON.
 
-Usage:
-1) Populate env/config.env and env/credentials.env with your variables:
-   - MODEL_NAME, MODEL_TEMPERATURE, MAX_TOKENS, API_VERSION, AZURE_OPENAI_ENDPOINT, etc.
-   - PROXY_ENABLED, SECURED_ENDPOINTS, AZURE_TENANT_ID, etc.
-2) Put 'source.csv' and 'target.csv' in 'data/'.
-3) Run: python semantic_chat_match.py
-4) Output => 'output/chat_matches_<timestamp>.csv' and '.json'
+We also incorporate a custom requests session to mitigate any chunked-encoding or SSL issues.
+See the "configure_requests_session" function for timeouts and retries.
 """
 
 import os
@@ -26,22 +20,28 @@ import requests
 from pathlib import Path
 from typing import List, Dict
 import pandas as pd
+import numpy as np
+from tqdm import tqdm
 
-from dotenv import dotenv_values
+# Azure Identity if we do SECURED_ENDPOINTS=True
 from azure.identity import ClientSecretCredential
 
-# LangChain + OpenAI
-import openai
-from langchain.chat_models import AzureChatOpenAI
-from langchain.schema import HumanMessage, SystemMessage
+# LanceDB + LangChain
+from lancedb import connect
+from langchain.vectorstores import LanceDB
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.docstore.document import Document
+
+# For environment loading
+from dotenv import dotenv_values
 
 # Logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-#############################
-# 1) HELPER + OSEnv
-#############################
+###########################
+# OSEnv Class
+###########################
 def is_file_readable(filepath: str) -> bool:
     """Check if a file is readable."""
     if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
@@ -49,50 +49,45 @@ def is_file_readable(filepath: str) -> bool:
     return True
 
 def str_to_bool(s: str) -> bool:
-    """Convert string to bool."""
     ls = s.strip().lower()
-    if ls == 'true':
+    if ls == "true":
         return True
-    elif ls == 'false':
+    elif ls == "false":
         return False
     else:
         raise ValueError(f"Invalid boolean: {s}")
 
 class OSEnv:
     """
-    Environment variable + certificate + proxy + (optional) Azure AD token.
+    Loads environment from config.env & credentials.env, sets up:
+     - SSL certificate
+     - Proxy (NO_PROXY merges)
+     - Optional Azure AD token if SECURED_ENDPOINTS=True
     """
-    def __init__(self, config_file: str, creds_file: str, cert_file: str):
+    def __init__(self, config_file:str, creds_file:str, cert_file:str):
         self.var_list = []
+        self._bulk_load(config_file, print_vals=True)
+        logger.info(f"Loaded config from {config_file}")
+        self._bulk_load(creds_file, print_vals=False)
+        logger.info(f"Loaded creds from {creds_file}")
 
-        # Load config + creds
-        self._bulk_set(config_file, print_vals=True)
-        logger.info(f"Loaded configuration from {config_file}")
-        self._bulk_set(creds_file, print_vals=False)
-        logger.info(f"Loaded credentials from {creds_file}")
-
-        # Cert
         self._set_certificate(cert_file)
-        logger.info("Certificate path configured.")
+        logger.info("Certificate configured.")
 
-        # Proxy
         if str_to_bool(self.get("PROXY_ENABLED","false")):
             self._set_proxy()
             logger.info("Proxy configured.")
 
-        # AAD token
         if str_to_bool(self.get("SECURED_ENDPOINTS","false")):
-            logger.info("Fetching Azure AD token.")
+            logger.info("Acquiring Azure AD token.")
             self.token = self._get_aad_token()
         else:
             self.token = None
 
-    def _bulk_set(self, file_path:str, print_vals:bool):
-        """Load env from .env file."""
-        if not os.path.isabs(file_path):
-            file_path = os.path.abspath(file_path)
-        if is_file_readable(file_path):
-            with open(file_path,'r') as f:
+    def _bulk_load(self, file_path:str, print_vals:bool):
+        abs_path = os.path.abspath(file_path)
+        if is_file_readable(abs_path):
+            with open(abs_path) as f:
                 lines = f.readlines()
             for line in lines:
                 line=line.strip()
@@ -114,32 +109,34 @@ class OSEnv:
             logger.info(f"Using CA cert: {cf_abs}")
 
     def _set_proxy(self):
-        user = self.get("AD_USERNAME","")
-        pw   = self.get("AD_USER_PW","")
-        dom  = self.get("HTTPS_PROXY_DOMAIN","")
-        if not all([user,pw,dom]):
+        ad_user   = self.get("AD_USERNAME","")
+        ad_pass   = self.get("AD_USER_PW","")
+        dom       = self.get("HTTPS_PROXY_DOMAIN","")
+        if not all([ad_user, ad_pass, dom]):
             raise ValueError("Missing proxy credentials for PROXY_ENABLED=TRUE")
-        px_url = f"http://{user}:{pw}@{dom}"
-        os.environ["HTTP_PROXY"]  = px_url
-        os.environ["HTTPS_PROXY"] = px_url
 
-        # Merge or set NO_PROXY if needed
-        no_proxy = self.get("NO_PROXY","")
-        no_proxy_list = [d.strip() for d in no_proxy.split(",") if d.strip()]
-        required_domains = [
+        proxy_url = f"http://{ad_user}:{ad_pass}@{dom}"
+        os.environ["HTTP_PROXY"]  = proxy_url
+        os.environ["HTTPS_PROXY"] = proxy_url
+
+        # Merge NO_PROXY if needed
+        existing_no_proxy = self.get("NO_PROXY","")
+        no_proxy_list = [d.strip() for d in existing_no_proxy.split(",") if d.strip()]
+        # Add required domains if not present
+        required_bypass = [
             "cognitiveservices.azure.com",
             "search.windows.net",
             "openai.azure.com",
             "core.windows.net",
             "azurewebsites.net",
-            # Add any domain we want to bypass, e.g. login.microsoftonline.com
+            # 'login.microsoftonline.com' if needed
         ]
-        for domain in required_domains:
-            if domain not in no_proxy_list:
-                no_proxy_list.append(domain)
-        merged_no_proxy = ",".join(no_proxy_list)
-        os.environ["NO_PROXY"] = merged_no_proxy
-        logger.info(f"NO_PROXY => {merged_no_proxy}")
+        for dom in required_bypass:
+            if dom not in no_proxy_list:
+                no_proxy_list.append(dom)
+        merged = ",".join(no_proxy_list)
+        os.environ["NO_PROXY"] = merged
+        logger.info(f"NO_PROXY => {merged}")
 
     def _get_aad_token(self) -> str:
         tenant = self.get("AZURE_TENANT_ID","")
@@ -147,182 +144,155 @@ class OSEnv:
         cs     = self.get("AZURE_CLIENT_SECRET","")
         credential = ClientSecretCredential(tenant, cid, cs)
         token_obj = credential.get_token("https://cognitiveservices.azure.com/.default")
-        logger.info("Acquired Azure AD token.")
+        logger.info("Acquired Azure AD token for openai usage.")
         return token_obj.token
 
-    def get(self, key:str, default:str="") -> str:
-        return os.getenv(key, default)
+    def get(self, k:str, default:str="") -> str:
+        return os.getenv(k, default)
 
-#############################
-# 2) FIX FOR CHUNKED ENCODING
-#############################
+############################
+# Custom Requests Session to fix chunked encoding
+############################
 def configure_requests_session(cacert_path:str, connect_timeout:int=10, read_timeout:int=300):
     """
-    Create a custom requests.Session:
-      - uses the same CA cert
-      - sets up retries
-      - sets timeouts
-    Then tell openai to use it. This mitigates chunked encoding errors 
-    by allowing retries & extended read time.
+    Create a custom requests session with:
+     - verify = cacert_path
+     - retries on 429/5xx
+     - read_timeout
+    Then set openai.requestssession to this session, to mitigate chunked encoding errors.
     """
     import requests
     from requests.adapters import HTTPAdapter, Retry
 
     session = requests.Session()
-    # Our CA cert (same as OSEnv sets for environment)
     session.verify = cacert_path
 
-    # Configure retries
     retries = Retry(
         total=3,
-        backoff_factor=1,  # wait 1s, 2s, etc.
-        status_forcelist=[429, 500, 502, 503, 504]
+        backoff_factor=1,
+        status_forcelist=[429,500,502,503,504]
     )
     adapter = HTTPAdapter(max_retries=retries)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
 
-    # We'll set read timeout globally
-    # (requests doesn’t have a global param, but we can override openai)
+    # Force openai to use this session
+    import openai
     openai.requestssession = session
+    # we can set openai timeout
     openai.timeout = read_timeout
 
-    logger.info(f"Custom requests session created. connect_timeout={connect_timeout}, read_timeout={read_timeout}")
+    logger.info(f"Custom requests session: connect_timeout={connect_timeout}, read_timeout={read_timeout}")
 
-#############################
-# 3) Chunked Approach
-#############################
-class AzureChatbot:
+############################
+# Index + Search with LanceDB
+############################
+class LancedbMatcher:
     """
-    A chunk-based approach for large target PBT sets.
-    
-    Steps:
-      - 'CHUNK_SIZE' from config => default 50
-      - "tournament" approach if multiple chunks
+    1) Index target CSV in LanceDB with OpenAI embeddings
+    2) For each row in source CSV => embed => top-K search => store matches
     """
     def __init__(self, env: OSEnv):
         self.env = env
-        self.chunk_size = int(self.env.get("CHUNK_SIZE","50"))
-        self._setup_llm()
+        self.db_dir = "./lance_vectors"
+        self.table_name = "pbt_vectors"
+        self._setup_embeddings()
 
-    def _setup_llm(self):
-        model_name   = self.env.get("MODEL_NAME", "gpt-4")
-        temperature  = float(self.env.get("MODEL_TEMPERATURE","0.7"))
-        max_tokens   = int(self.env.get("MAX_TOKENS","800"))
-        api_version  = self.env.get("API_VERSION", "2023-05-15")
-        endpoint     = self.env.get("AZURE_OPENAI_ENDPOINT","")
-        azure_token  = self.env.token
+    def _setup_embeddings(self):
+        import openai
+        from langchain.embeddings import OpenAIEmbeddings
 
-        self.llm = AzureChatOpenAI(
-            model_name=model_name,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            openai_api_version=api_version,
-            azure_endpoint=endpoint,
-            azure_ad_token=azure_token
+        # Azure settings
+        api_base   = self.env.get("AZURE_OPENAI_ENDPOINT","")
+        api_version= self.env.get("API_VERSION","2023-03-15-preview")
+        token      = self.env.token
+
+        # We assume you have a deployment for text-embedding-ada-002 or similar
+        deployment_name = self.env.get("AZURE_EMBEDDINGS_DEPLOYMENT","my-embedding-deployment")
+        model_name      = self.env.get("AZURE_EMBEDDINGS_MODEL","text-embedding-ada-002")
+
+        # In azure usage, we specify: openai_api_type="azure"
+        self.embedding_fn = OpenAIEmbeddings(
+            deployment=deployment_name,
+            model=model_name,
+            openai_api_key=token,
+            openai_api_base=api_base,
+            openai_api_type="azure",
+            openai_api_version=api_version
         )
-        logger.info(f"Chat model '{model_name}' with chunk_size={self.chunk_size}, max_tokens={max_tokens}")
+        logger.info(f"Embeddings ready: deployment={deployment_name}, model={model_name}")
 
-    def _prompt_chunk(self, name:str, definition:str, chunk:List[Dict]) -> str:
+    def index_target_data(self, target_df: pd.DataFrame):
         """
-        Ask: "Which single pbt is best from this chunk?"
-        Return entire response text.
+        Convert each row => Document and embed into LanceDB
         """
-        system_text = (
-            "You are a helpful assistant. You must pick exactly ONE best matching PBT from the chunk. "
-            "Explain briefly why it's best."
+        from lancedb import connect
+        from langchain.vectorstores import LanceDB
+        from langchain.docstore.document import Document
+
+        db = connect(self.db_dir)
+        # If table exists, drop
+        if self.table_name in db.table_names():
+            logger.info(f"Dropping existing table '{self.table_name}'.")
+            db.drop_table(self.table_name)
+
+        docs = []
+        for _, row in target_df.iterrows():
+            text = f"{row['pbt-name']} : {row['pbt-definition']}"
+            docs.append(
+                Document(
+                    page_content=text,
+                    metadata={
+                        "pbt-name": row["pbt-name"],
+                        "pbt-definition": row["pbt-definition"]
+                    }
+                )
+            )
+
+        LanceDB.from_documents(
+            documents=docs,
+            embedding=self.embedding_fn,
+            connection=db,
+            table_name=self.table_name
         )
-        user_text   = (
-            f"Original name: {name}\n"
-            f"Original definition: {definition}\n\n"
-            "Chunk of possible PBTs:\n"
+        logger.info(f"Indexed {len(docs)} PBTs into LanceDB at {self.db_dir}.")
+
+    def search_similar_pbt(self, query_text:str, top_k:int=3) -> List[Dict]:
+        """
+        1) embed query
+        2) top-K search in LanceDB
+        3) return list of results w/ similarity_score
+        """
+        from lancedb import connect
+        from langchain.vectorstores import LanceDB
+        db = connect(self.db_dir)
+        store = LanceDB(
+            connection=db,
+            table_name=self.table_name,
+            embedding=self.embedding_fn
         )
-        for idx, pbt in enumerate(chunk, start=1):
-            user_text += (f"({idx}) pbt-name: {pbt['pbt-name']}\n"
-                          f"    pbt-definition: {pbt['pbt-definition']}\n\n")
-        user_text += "Which single pbt-name is the best match, and why?"
+        # search w/score
+        results = store.similarity_search_with_score(query_text, k=top_k)
+        # convert to list of dict
+        out = []
+        for doc, score in results:
+            out.append({
+                "pbt-name": doc.metadata["pbt-name"],
+                "pbt-definition": doc.metadata["pbt-definition"],
+                "similarity_score": float(score)
+            })
+        return out
 
-        messages = [
-            SystemMessage(content=system_text),
-            HumanMessage(content=user_text)
-        ]
-        try:
-            response = self.llm(messages)
-            return response.content.strip()
-        except Exception as e:
-            logger.error(f"Error in _prompt_chunk: {str(e)}")
-            return f"ERROR chunk: {str(e)}"
-
-    def _tournament_round(self, name:str, definition:str, pbt_list:List[Dict]) -> List[str]:
-        """
-        If pbt_list is bigger than chunk_size, we do multiple chunk calls => winners.
-        Return the list of winners (strings) => each is a "virtual pbt" for next round
-        """
-        chunk_winners = []
-        for i in range(0, len(pbt_list), self.chunk_size):
-            chunk = pbt_list[i : i+self.chunk_size]
-            ans = self._prompt_chunk(name, definition, chunk)
-            chunk_winners.append(ans)
-        return chunk_winners
-
-    def match_single_record(self, 
-                            name:str,
-                            definition:str,
-                            pbt_list:List[Dict]) -> str:
-        """
-        "Tournament" approach:
-          - while we have > chunk_size pbt's, break them => get chunk winners
-          - if chunk_winners > 1 => repeat
-          - final single chunk => final answer
-          Return the textual reasoning (the model's final answer).
-        """
-        round_idx = 1
-        current_list = pbt_list
-        answers_log = []
-
-        while True:
-            list_len = len(current_list)
-            logger.info(f"Round {round_idx}, pbt count={list_len}")
-
-            if list_len <= self.chunk_size:
-                # final chunk
-                final_text = self._prompt_chunk(name, definition, current_list)
-                answers_log.append(f"(Final Round) => {final_text}")
-                break
-            else:
-                # multiple chunks
-                chunk_answers = self._tournament_round(name, definition, current_list)
-                # Each chunk answer is a freeform text. 
-                # We'll treat each as a single "virtual pbt" for next round:
-                new_pbt_list = []
-                for idx, text in enumerate(chunk_answers, start=1):
-                    new_pbt_list.append({
-                        "pbt-name": f"Round{round_idx}_chunk{idx}_winner",
-                        "pbt-definition": text
-                    })
-                answers_log.append(f"Round {round_idx} => {chunk_answers}")
-
-                if len(new_pbt_list)==1:
-                    # done
-                    answers_log.append(f"(Final) => {new_pbt_list[0]['pbt-definition']}")
-                    break
-                else:
-                    current_list = new_pbt_list
-                    round_idx += 1
-        
-        return "\n".join(answers_log)
-
-#############################
-# 4) MAIN
-#############################
+############################
+# main
+############################
 def main():
     """
     Steps:
-    1) Setup OSEnv
-    2) Configure a custom requests session => mitigate chunked encoding errors
-    3) Load CSVs
-    4) For each source row => chunk-based tournament => final best
-    5) Save
+    1) env => OSEnv
+    2) custom requests session => chunked encoding fix
+    3) index target => LanceDB
+    4) for each row in source => embed => top-K => store in final CSV
     """
     try:
         base_dir = Path(__file__).parent.parent
@@ -334,81 +304,78 @@ def main():
         for d in [env_dir, data_dir, output_dir, log_dir]:
             d.mkdir(exist_ok=True)
 
-        # .env + cert
         config_file = env_dir / "config.env"
         creds_file  = env_dir / "credentials.env"
         cert_file   = env_dir / "cacert.pem"
         source_csv  = data_dir / "source.csv"
         target_csv  = data_dir / "target.csv"
 
+        # Check if missing
         missing = []
         for f in [config_file, creds_file, cert_file, source_csv, target_csv]:
             if not f.exists():
                 missing.append(str(f))
         if missing:
-            print("Missing required files:")
-            for m in missing:
-                print(f"- {m}")
+            logger.error(f"Missing required files: {missing}")
             return
 
-        # 1) OSEnv
-        logger.info("Initializing environment...")
+        # 1) Env
         env_setup = OSEnv(str(config_file), str(creds_file), str(cert_file))
 
-        # 2) Custom requests session => fix chunked encoding
-        # We'll read the same CA cert from environment
+        # 2) custom requests session for openai => fix chunked encoding
         cacert_path = os.environ.get("REQUESTS_CA_BUNDLE","")
         if not cacert_path or not Path(cacert_path).exists():
-            logger.warning("No valid cacert path found. Not setting a custom requests session.")
+            logger.warning("No valid cacert for custom session. We'll proceed with default.")
         else:
             configure_requests_session(cacert_path, connect_timeout=10, read_timeout=300)
 
-        # 3) Initialize chunk-based chatbot
-        chatbot = AzureChatbot(env_setup)
-
-        # 4) Load CSVs
-        src_df = pd.read_csv(str(source_csv), dtype=str).fillna("")
-        tgt_df = pd.read_csv(str(target_csv), dtype=str).fillna("")
-        if not {"name","definition"}.issubset(src_df.columns):
-            raise ValueError("source.csv must have columns: name, definition")
-        if not {"pbt-name","pbt-definition"}.issubset(tgt_df.columns):
+        # 3) read target => index
+        target_df = pd.read_csv(str(target_csv), dtype=str).fillna("")
+        if not {"pbt-name","pbt-definition"}.issubset(target_df.columns):
             raise ValueError("target.csv must have columns: pbt-name, pbt-definition")
 
-        # Convert target DF to list of dict
-        pbt_list = tgt_df.to_dict('records')
+        matcher = LancedbMatcher(env_setup)
+        logger.info("Indexing target data in LanceDB...")
+        matcher.index_target_data(target_df)
 
+        # 4) read source => do top-K
+        source_df = pd.read_csv(str(source_csv), dtype=str).fillna("")
+        if not {"name","definition"}.issubset(source_df.columns):
+            raise ValueError("source.csv must have columns: name, definition")
+
+        top_k = int(env_setup.get("TOP_K","3"))
         results = []
-        logger.info(f"Source has {len(src_df)} rows, Target has {len(pbt_list)} pbt rows.")
-        for idx, row in src_df.iterrows():
+
+        for idx, row in tqdm(source_df.iterrows(), total=len(source_df), desc="Matching"):
             name_val = row["name"].strip()
             def_val  = row["definition"].strip()
+            query_text = f"{name_val}\n{def_val}"
 
-            logger.info(f"Processing {idx+1}/{len(src_df)} => {name_val}")
-            final_answer = chatbot.match_single_record(name_val, def_val, pbt_list)
+            # run similarity search
+            top_matches = matcher.search_similar_pbt(query_text, top_k=top_k)
+            # store them
+            for match in top_matches:
+                results.append({
+                    "source_name": name_val,
+                    "source_definition": def_val,
+                    "matched_pbt_name": match["pbt-name"],
+                    "matched_pbt_definition": match["pbt-definition"],
+                    "similarity_score": match["similarity_score"]
+                })
 
-            results.append({
-                "source_name": name_val,
-                "source_definition": def_val,
-                "model_answer": final_answer
-            })
-
-        # 5) Save
+        # 5) save
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        out_file = output_dir / f"chat_matches_{timestamp}.csv"
+        out_file = output_dir / f"matches_{timestamp}.csv"
         pd.DataFrame(results).to_csv(str(out_file), index=False)
-
-        json_file = out_file.with_suffix(".json")
-        with open(json_file,'w',encoding='utf-8') as f:
+        out_json = out_file.with_suffix(".json")
+        with open(out_json,'w',encoding='utf-8') as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
 
-        print(f"\nDone! Results => {out_file}\nAlso => {json_file}")
+        logger.info(f"\nDone! Results => {out_file} and {out_json}")
 
     except Exception as e:
-        logger.exception(f"Unexpected error: {str(e)}")
+        logger.exception(f"Error in main: {str(e)}")
         print(f"Error: {str(e)}")
 
-#############################
-# 5) RUN
-#############################
 if __name__=="__main__":
     main()
