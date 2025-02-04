@@ -1,3 +1,18 @@
+#!/usr/bin/env python3
+"""
+Semantic Matching with Azure OpenAI, LangChain, and LanceDB.
+
+This script:
+  1) Reads environment variables using the OSEnv class.
+  2) Loads two CSV files:
+     - source.csv (columns: name, definition)
+     - target.csv (columns: pbt-name, pbt-definition)
+  3) Embeds target rows, stores them in LanceDB.
+  4) Embeds source rows, performs similarity search in LanceDB.
+  5) Saves matches above a similarity threshold to CSV & JSON.
+  6) Logs key events for production readiness.
+"""
+
 import os
 import time
 import json
@@ -6,126 +21,293 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
-from dotenv import load_dotenv
+
+# --- LangChain & LanceDB ---
 from langchain.embeddings import OpenAIEmbeddings
 from langchain.vectorstores import LanceDB
-from langchain.schema import Document
-from openai import AzureOpenAI
+from langchain.docstore.document import Document
 
-# Ensure OSEnv is defined & imported
-# from ose_env import OSEnv  # Uncomment if OSEnv is in another file
+# --- OpenAI for Azure usage ---
+import openai
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# --- LanceDB connection ---
+from lancedb import connect
+
+# Logging Configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
+def is_file_readable(filepath: str) -> bool:
+    """Check if a file exists and is readable."""
+    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
+        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable.")
+    return True
+
+def str_to_bool(s: str) -> bool:
+    """Convert string to boolean."""
+    s_lower = s.strip().lower()
+    if s_lower == "true":
+        return True
+    elif s_lower == "false":
+        return False
+    else:
+        raise ValueError(f"Invalid boolean string: {s}")
+
+class OSEnv:
+    """
+    Production-ready environment and credential manager class.
+    Loads environment variables from config files, sets them, 
+    and can handle Azure tokens if needed.
+    """
+
+    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
+        """Initialize with configuration, credentials, and an optional certificate."""
+        self.var_list = []
+        
+        # Load environment data
+        self.bulk_set(config_file, print_val=True)
+        logger.info(f"Loaded main configuration from {config_file}")
+        
+        self.bulk_set(creds_file, print_val=False)
+        logger.info(f"Loaded credentials from {creds_file}")
+        
+        # Certificate Path Setup
+        self.set_certificate_path(certificate_path)
+        logger.info("Certificate path configured.")
+
+        # If a direct 'AZURE_API_KEY' is provided, we can use that as self.token
+        # Otherwise, the user may set up their own token logic or client credential flow.
+        azure_api_key = os.getenv("AZURE_API_KEY", "")
+        if azure_api_key:
+            self.token = azure_api_key
+            logger.info("Using AZURE_API_KEY from environment as token.")
+        else:
+            # Or, set self.token to something else or retrieve via MSAL/ClientSecretCredential
+            logger.warning("No direct AZURE_API_KEY found; ensure self.token is set properly.")
+            self.token = None
+
+    def set_certificate_path(self, certificate_path: str) -> None:
+        """Set up the certificate path for SSL verification, if provided."""
+        if certificate_path and os.path.exists(certificate_path):
+            cert_path = str(Path(certificate_path))
+            self.set("REQUESTS_CA_BUNDLE", cert_path, print_val=False)
+            self.set("SSL_CERT_FILE", cert_path, print_val=False)
+            self.set("CURL_CA_BUNDLE", cert_path, print_val=False)
+            logger.info(f"SSL certificate path set to: {cert_path}")
+
+    def bulk_set(self, dotenvfile: str, print_val: bool = False) -> None:
+        """Load and set environment variables from a .env file."""
+        if not os.path.exists(dotenvfile):
+            logger.warning(f".env file not found: {dotenvfile}. Skipping.")
+            return
+        
+        is_file_readable(str(dotenvfile))  # Will raise if not
+        with open(dotenvfile, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                try:
+                    key, val = line.split("=", 1)
+                    key, val = key.strip(), val.strip().strip("'\"")
+                    self.set(key, val, print_val)
+                except ValueError:
+                    continue
+
+    def set(self, var_name: str, val: str, print_val: bool = True) -> None:
+        """Set an environment variable."""
+        os.environ[var_name] = val
+        if var_name not in self.var_list:
+            self.var_list.append(var_name)
+        if print_val and var_name not in ["AZURE_API_KEY", "AZURE_CLIENT_SECRET", "AD_USER_PW"]:
+            logger.info(f"Set {var_name}={val}")
+
+    def get(self, var_name: str, default_val: str = "") -> str:
+        """Get an environment variable value."""
+        return os.getenv(var_name, default_val)
+
 class SemanticMatcher:
-    """Handles semantic matching using LangChain, LanceDB, and Azure OpenAI."""
+    """
+    Performs semantic matching between two CSVs using:
+      - Azure OpenAI embeddings (text-embedding-3-large by default)
+      - LanceDB vector storage & search
+      - Basic prompt engineering
+    """
 
-    def __init__(self, env: OSEnv):
-        self.env = env
-        self._setup_openai_client()
-        self._setup_embedding_model()
-        self._setup_vector_db()
+    def __init__(self, env_setup: OSEnv):
+        """
+        Initialize and configure OpenAI + LanceDB usage.
+        """
+        self.env = env_setup
+        self._setup_openai()
+        self._setup_embeddings()
+        self._setup_lancedb()
 
-    def _setup_openai_client(self):
-        """Initialize Azure OpenAI Client."""
-        self.client = AzureOpenAI(
-            api_key=self.env.token,
-            api_version=self.env.get("API_VERSION", "2024-02-01"),
-            azure_endpoint=self.env.get("AZURE_OPENAI_ENDPOINT")
-        )
+    def _setup_openai(self):
+        """
+        Configure the openai package to use Azure endpoints.
+        If you have an explicit API key, ensure it's in self.env.token.
+        """
+        openai.api_type = "azure"
+        openai.api_base = self.env.get("AZURE_OPENAI_ENDPOINT", "")
+        openai.api_version = self.env.get("API_VERSION", "2023-03-15-preview")
 
-    def _setup_embedding_model(self):
-        """Initialize LangChain's OpenAI Embeddings Model."""
+        # Must be set for Azure usage
+        if not self.env.token:
+            raise ValueError("No Azure OpenAI token found in OSEnv. "
+                             "Set AZURE_API_KEY or implement your own auth.")
+        openai.api_key = self.env.token
+
+    def _setup_embeddings(self):
+        """
+        Create a LangChain Embeddings object using the Azure OpenAI deployment.
+        """
+        # By default, the user wants text-embedding-3-large 
+        # (Make sure your Azure resource has a deployment named something like 'my-embedding-deployment')
+        deployment_name = self.env.get("AZURE_EMBEDDINGS_DEPLOYMENT", "my-embedding-deployment")
+        model_name = self.env.get("AZURE_EMBEDDINGS_MODEL", "text-embedding-3-large")
+
         self.embeddings_model = OpenAIEmbeddings(
-            model="text-embedding-3-large",
-            openai_api_key=self.env.token,
-            openai_api_base=self.env.get("AZURE_OPENAI_ENDPOINT")
+            deployment=deployment_name,
+            model=model_name,
+            openai_api_key=openai.api_key,
+            openai_api_base=openai.api_base,
+            openai_api_type=openai.api_type,
+            openai_api_version=openai.api_version
         )
+        logger.info(f"LangChain Embeddings set up for deployment: {deployment_name}, model: {model_name}")
 
-    def _setup_vector_db(self):
-        """Initialize LanceDB for efficient vector storage and retrieval."""
-        self.lance_db = LanceDB("./lance_vectors")  # Path to store vectors
+    def _setup_lancedb(self):
+        """
+        Connect or create a local LanceDB store for vector embeddings.
+        """
+        # Directory for LanceDB to store data
+        self.db = connect("./lance_vectors")
+        self.table_name = "pbt_vectors"
+        logger.info("LanceDB connection established at ./lance_vectors")
 
-    def _prepare_text(self, name: str, description: str) -> str:
-        """Format input text for embedding using prompt engineering."""
-        prompt_template = (
-            "You are given a financial term and its description. "
-            "Match it with the most semantically similar Preferred Business Term (PBT).\n\n"
-            "Financial Term: {name}\n"
-            "Description: {description}\n"
-            "Find the best matching PBT."
-        )
-        return prompt_template.format(name=name.strip(), description=description.strip())
+    def _prepare_text(self, name: str, definition: str) -> str:
+        """
+        Minimal prompt engineering - combine name and definition into a single text string.
+        Extend or modify as needed for your domain.
+        """
+        return f"Term: {name.strip()}\nDefinition: {definition.strip()}"
 
-    def load_csv_data(self, source_csv: str, target_csv: str) -> tuple:
-        """Load and validate CSV files."""
-        src_df, tgt_df = pd.read_csv(source_csv), pd.read_csv(target_csv)
+    def load_csv_data(self, source_csv: str, target_csv: str):
+        """
+        Load CSVs:
+          - source_csv => columns: [name, definition]
+          - target_csv => columns: [pbt-name, pbt-definition]
+        """
+        src_df = pd.read_csv(source_csv).fillna("")
+        tgt_df = pd.read_csv(target_csv).fillna("")
 
         if not {"name", "definition"}.issubset(src_df.columns):
-            raise ValueError("Source CSV must have 'name' and 'definition' columns")
+            raise ValueError("Source CSV must have 'name' and 'definition' columns.")
         if not {"pbt-name", "pbt-definition"}.issubset(tgt_df.columns):
-            raise ValueError("Target CSV must have 'pbt-name' and 'pbt-definition' columns")
+            raise ValueError("Target CSV must have 'pbt-name' and 'pbt-definition' columns.")
 
+        # Clean string columns
         for df in [src_df, tgt_df]:
-            df.fillna("", inplace=True)
-            df = df.astype(str).applymap(str.strip)
+            for col in df.columns:
+                df[col] = df[col].astype(str).str.strip()
 
         logger.info(f"Loaded {len(src_df)} source records and {len(tgt_df)} target records.")
         return src_df, tgt_df
 
-    def index_target_data(self, tgt_df):
-        """Embed target (PBT) definitions and store them in LanceDB."""
-        docs = [
-            Document(
-                page_content=self._prepare_text(row["pbt-name"], row["pbt-definition"]),
-                metadata={"pbt-name": row["pbt-name"], "pbt-definition": row["pbt-definition"]}
+    def index_target_data(self, target_df: pd.DataFrame):
+        """
+        Embed each target row into LanceDB. 
+        If the table exists, we drop and recreate it for a fresh index.
+        """
+        if self.table_name in self.db.table_names():
+            logger.info(f"Table '{self.table_name}' exists; dropping to rebuild.")
+            self.db.drop_table(self.table_name)
+
+        docs = []
+        for _, row in target_df.iterrows():
+            content = self._prepare_text(row["pbt-name"], row["pbt-definition"])
+            docs.append(
+                Document(
+                    page_content=content,
+                    metadata={
+                        "pbt-name": row["pbt-name"],
+                        "pbt-definition": row["pbt-definition"]
+                    }
+                )
             )
-            for _, row in tgt_df.iterrows()
-        ]
 
-        logger.info("Generating embeddings for target PBT data...")
-        self.lance_db.from_documents(docs, self.embeddings_model)
-        logger.info("Target data indexed successfully in LanceDB.")
+        logger.info("Creating LanceDB vector store from target documents...")
+        LanceDB.from_documents(
+            documents=docs,
+            embedding=self.embeddings_model,
+            connection=self.db,
+            table_name=self.table_name
+        )
+        logger.info("Target data successfully indexed into LanceDB.")
 
-    def process_matches(self, src_df, similarity_threshold=0.75):
-        """Find semantic matches using LanceDB vector search."""
-        matches = []
-        
-        for _, row in tqdm(src_df.iterrows(), total=len(src_df), desc="Matching terms"):
-            query_text = self._prepare_text(row["name"], row["definition"])
-            query_embedding = self.embeddings_model.embed_documents([query_text])
+    def process_matches(self, source_df: pd.DataFrame, similarity_threshold=0.75, k=3):
+        """
+        For each source entry, embed it and search LanceDB for top-K matches.
+        Return a list of dicts with matches above similarity_threshold.
+        """
+        vector_store = LanceDB(
+            connection=self.db,
+            table_name=self.table_name,
+            embedding=self.embeddings_model
+        )
 
-            # Search for the best matching PBT
-            results = self.lance_db.similarity_search(query_embedding, k=3)
+        all_matches = []
+        for _, src_row in tqdm(source_df.iterrows(), total=len(source_df), desc="Matching Source Rows"):
+            query_text = self._prepare_text(src_row["name"], src_row["definition"])
+            # similarity_search_with_score(query, k) => [(Document, score), ...]
+            results = vector_store.similarity_search_with_score(query_text, k=k)
 
-            for res in results:
-                if res.score >= similarity_threshold:
-                    matches.append({
-                        "source_name": row["name"],
-                        "source_definition": row["definition"],
-                        "matched_pbt_name": res.metadata["pbt-name"],
-                        "matched_pbt_definition": res.metadata["pbt-definition"],
-                        "similarity_score": float(res.score),
+            for doc, score in results:
+                # score is typically 'cosine similarity' in [0..1], adjust threshold accordingly
+                if score >= similarity_threshold:
+                    all_matches.append({
+                        "source_name": src_row["name"],
+                        "source_definition": src_row["definition"],
+                        "matched_pbt_name": doc.metadata["pbt-name"],
+                        "matched_pbt_definition": doc.metadata["pbt-definition"],
+                        "similarity_score": float(score),
                     })
 
-        logger.info(f"Found {len(matches)} matches above threshold.")
-        return matches
+        logger.info(f"Found {len(all_matches)} total matches with similarity >= {similarity_threshold}.")
+        return all_matches
 
-    def save_results(self, matches, output_file):
-        """Save matched results to CSV and JSON files."""
-        results_df = pd.DataFrame(matches)
-        results_df.to_csv(output_file, index=False)
+    def save_results(self, matches, output_file: str):
+        """
+        Save matches (list of dicts) to CSV and JSON.
+        """
+        if not matches:
+            logger.warning("No matches to save.")
+            return
+
+        df = pd.DataFrame(matches)
+        df.to_csv(output_file, index=False)
 
         json_file = output_file.replace(".csv", ".json")
         with open(json_file, "w", encoding="utf-8") as f:
             json.dump(matches, f, indent=2, ensure_ascii=False)
 
-        logger.info(f"Results saved to {output_file} and {json_file}")
+        logger.info(f"Results saved to:\n  - {output_file}\n  - {json_file}")
 
 def main():
-    """Run the semantic matching process."""
+    """
+    Main execution:
+      1) Setup directories.
+      2) Load environment + OSEnv.
+      3) Load CSVs.
+      4) Index target data in LanceDB.
+      5) Match source data against target index.
+      6) Save results.
+    """
     try:
         base_dir = Path(__file__).parent
         env_dir = base_dir / "env"
@@ -133,39 +315,58 @@ def main():
         output_dir = base_dir / "output"
         log_dir = base_dir / "logs"
 
+        # Ensure directories exist
         for directory in [data_dir, output_dir, log_dir]:
             directory.mkdir(exist_ok=True)
 
+        # Define required file paths
         config_file = env_dir / "config.env"
         creds_file = env_dir / "credentials.env"
-        cert_file = env_dir / "cacert.pem"
+        cert_file = env_dir / "cacert.pem"   # If you have a custom certificate
         source_csv = data_dir / "source.csv"
         target_csv = data_dir / "target.csv"
 
+        # Check existence
+        missing = []
+        for f in [config_file, creds_file, source_csv, target_csv]:
+            if not f.exists():
+                missing.append(str(f))
+        if missing:
+            raise FileNotFoundError(f"Missing required files: {missing}")
+
+        # Initialize environment
+        logger.info("Initializing OSEnv and environment variables...")
         env_setup = OSEnv(str(config_file), str(creds_file), str(cert_file))
+
+        # Initialize our matcher
         matcher = SemanticMatcher(env_setup)
 
-        # Load CSVs
+        # Load CSV data
         source_df, target_df = matcher.load_csv_data(str(source_csv), str(target_csv))
 
-        # Index PBT Data
+        # Build index from target CSV
         matcher.index_target_data(target_df)
 
-        # Process Matches
-        matches = matcher.process_matches(source_df, similarity_threshold=0.75)
+        # Perform matching
+        results = matcher.process_matches(
+            source_df,
+            similarity_threshold=0.75,  # Adjust as needed
+            k=3  # Top-3 results
+        )
 
-        # Save Results
-        output_file = output_dir / f"matches_{time.strftime('%Y%m%d_%H%M%S')}.csv"
-        matcher.save_results(matches, str(output_file))
+        # Save results
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        output_file = output_dir / f"matches_{timestamp}.csv"
+        matcher.save_results(results, str(output_file))
 
-        print(f"\nProcess completed successfully! Results saved to {output_file}")
+        print(f"\nProcess completed successfully! Results saved in {output_file}")
 
     except FileNotFoundError as e:
-        logger.error(f"File Error: {str(e)}")
+        logger.error(f"File Error: {e}")
     except ValueError as e:
-        logger.error(f"Validation Error: {str(e)}")
+        logger.error(f"Value Error: {e}")
     except Exception as e:
-        logger.error(f"Unexpected Error: {str(e)}")
+        logger.exception(f"Unexpected Error: {e}")
         raise
 
 if __name__ == "__main__":
