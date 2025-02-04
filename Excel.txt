@@ -1,222 +1,281 @@
-def find_top_k_matches(self, source_df: pd.DataFrame, target_df: pd.DataFrame, k: int = 4, threshold: float = 0.60) -> pd.DataFrame:
-    """
-    Find top k semantic matches using enhanced matching logic with threshold.
-    
-    Args:
-        source_df: Source dataframe
-        target_df: Target dataframe
-        k: Number of matches to find
-        threshold: Minimum similarity score threshold (default: 0.60)
-    """
-    logger.info(f"Processing semantic matches with {threshold*100}% threshold...")
-    
-    # Preprocess dataframes
-    source_df = source_df.copy()
-    target_df = target_df.copy()
-    
-    # Convert columns to string and clean
-    source_df['name'] = source_df['name'].astype(str).apply(lambda x: x.strip())
-    source_df['description'] = source_df['description'].astype(str).apply(lambda x: x.strip())
-    target_df['pbt-name'] = target_df['pbt-name'].astype(str).apply(lambda x: x.strip())
-    target_df['pbt-definition'] = target_df['pbt-definition'].astype(str).apply(lambda x: x.strip())
-    
-    # Process target entries with enhanced context
-    logger.info("Processing target entries...")
-    target_data = self.process_embeddings(
-        target_df, 
-        is_source=False, 
-        desc="Processing target entries"
-    )
-    
-    # Create target table in LanceDB with semantic configuration
-    target_table = self.db.create_table(
-        "target_vectors",
-        data=target_data,
-        mode="overwrite"
-    )
-    
-    # Process source entries and find matches
-    results = []
-    batch_size = min(self.batch_size, len(source_df))
-    
-    for i in tqdm(range(0, len(source_df), batch_size), desc="Finding matches"):
-        batch_df = source_df.iloc[i:i + batch_size]
-        source_data = self.process_embeddings(
-            batch_df,
-            is_source=True,
-            desc=f"Processing batch {i//batch_size + 1}"
+import os
+import pandas as pd
+import numpy as np
+from typing import List, Dict, Tuple, Optional
+import logging
+from dotenv import load_dotenv
+from pathlib import Path
+from azure.identity import ClientSecretCredential
+from tqdm import tqdm
+import json
+from openai import AzureOpenAI
+import lancedb
+from lancedb.pynarro import LinearCombinationReranker
+import tempfile
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class SemanticMatcherLance:
+    def __init__(self, env_setup: OSEnv):
+        """Initialize with environment setup."""
+        self.env = env_setup
+        self.batch_size = 16
+        self.dimension = 3072  # dimension for text-embedding-3-large
+        self._setup_openai_client()
+        self.temp_dir = tempfile.mkdtemp()
+        self.db = lancedb.connect(self.temp_dir)
+        
+        # Initialize reranker
+        self.reranker = LinearCombinationReranker([
+            ("vector_score", 0.4),    # Base vector similarity
+            ("name_match", 0.3),      # Name matching score
+            ("context_match", 0.3)    # Context matching score
+        ])
+        
+    def _setup_openai_client(self):
+        """Configure OpenAI client with Azure settings."""
+        self.client = AzureOpenAI(
+            api_key=self.env.token if self.env.token else self.env.get("AZURE_OPENAI_API_KEY"),
+            api_version=self.env.get("API_VERSION", "2024-02-01"),
+            azure_endpoint=self.env.get("AZURE_OPENAI_ENDPOINT")
+        )
+
+    def prepare_text(self, row: pd.Series, is_source: bool = True) -> str:
+        """
+        Enhanced text preparation with structured prompts for better semantic understanding.
+        """
+        try:
+            if is_source:
+                name = str(row['name']).strip() if pd.notna(row['name']) else ""
+                description = str(row['description']).strip() if pd.notna(row['description']) else ""
+                
+                # Create structured prompt for source items
+                prompt = f"""
+                Product or Service Analysis:
+                Name: {name}
+                Primary Description: {description}
+                Key Features:
+                - Product/Service Identity: {name}
+                - Main Purpose: {description}
+                - Key Characteristics: Derived from {name} and its attributes
+                - Application Domain: Based on {description} and its context
+                
+                Context: This represents a specific product or service that needs to be matched 
+                with appropriate product-based targeting categories.
+                """
+                
+                return prompt.strip()
+            else:
+                pbt_name = str(row['pbt-name']).strip() if pd.notna(row['pbt-name']) else ""
+                pbt_definition = str(row['pbt-definition']).strip() if pd.notna(row['pbt-definition']) else ""
+                
+                # Create structured prompt for target categories
+                prompt = f"""
+                Product-Based Targeting Category:
+                Category: {pbt_name}
+                Definition: {pbt_definition}
+                Classification Criteria:
+                - Category Type: {pbt_name}
+                - Scope: {pbt_definition}
+                - Target Products: Products/Services that align with {pbt_name}
+                - Application: Based on {pbt_definition}
+                
+                Context: This represents a targeting category that defines a specific 
+                product or service classification for matching purposes.
+                """
+                
+                return prompt.strip()
+        except Exception as e:
+            logger.error(f"Error in text preparation: {str(e)}")
+            return ""
+
+    def get_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
+        """Get embeddings using text-embedding-3-large model."""
+        try:
+            response = self.client.embeddings.create(
+                model=self.env.get("AZURE_EMBEDDING_MODEL", "text-embedding-3-large"),
+                input=texts,
+                dimensions=self.dimension
+            )
+            return [item.embedding for item in response.data]
+        except Exception as e:
+            logger.error(f"Failed to get embeddings batch: {str(e)}")
+            raise
+
+    def calculate_match_scores(self, source_item: Dict, target_item: Dict) -> Dict[str, float]:
+        """
+        Calculate multiple similarity scores for reranking.
+        """
+        # Vector score is already calculated by LanceDB
+        vector_score = 1 / (1 + float(target_item['_distance']))
+        
+        # Calculate name match score
+        source_name = source_item['name'].lower()
+        target_name = target_item['pbt_name'].lower()
+        name_match = self._calculate_name_similarity(source_name, target_name)
+        
+        # Calculate context match score
+        source_desc = source_item['description'].lower()
+        target_desc = target_item['pbt_definition'].lower()
+        context_match = self._calculate_context_similarity(source_desc, target_desc)
+        
+        return {
+            "vector_score": vector_score,
+            "name_match": name_match,
+            "context_match": context_match
+        }
+
+    def find_top_k_matches(self, source_df: pd.DataFrame, target_df: pd.DataFrame, k: int = 4, threshold: float = 0.60) -> pd.DataFrame:
+        """Find top k semantic matches using enhanced reranking approach."""
+        logger.info(f"Processing semantic matches with {threshold*100}% threshold...")
+        
+        # Preprocess dataframes
+        source_df = source_df.copy()
+        target_df = target_df.copy()
+        
+        # Process target entries
+        logger.info("Processing target entries...")
+        target_data = self.process_embeddings(target_df, is_source=False)
+        
+        # Create target table in LanceDB
+        target_table = self.db.create_table(
+            "target_vectors",
+            data=target_data,
+            mode="overwrite"
         )
         
-        for source_item in source_data:
-            try:
-                # Get initial matches
-                initial_matches = target_table.search(source_item['vector'])\
-                    .limit(k * 3)\  # Get more matches initially for filtering
-                    .to_list()
-                
-                # Enhanced filtering and scoring
-                scored_matches = []
-                for match in initial_matches:
-                    # Calculate base similarity score
-                    base_score = 1 / (1 + float(match['_distance']))  # Convert distance to similarity
-                    
-                    # Calculate additional similarity scores
-                    name_similarity = self._calculate_name_similarity(
-                        source_item['name'],
-                        match['pbt_name']
-                    )
-                    
-                    context_similarity = self._calculate_context_similarity(
-                        source_item['description'],
-                        match['pbt_definition']
-                    )
-                    
-                    # Combined score with weights
-                    final_score = (
-                        base_score * 0.4 +  # Base embedding similarity
-                        name_similarity * 0.3 +  # Name similarity importance
-                        context_similarity * 0.3  # Context similarity importance
-                    )
-                    
-                    # Only keep matches above threshold
-                    if final_score >= threshold:
-                        scored_matches.append({
-                            'pbt_name': match['pbt_name'],
-                            'pbt_definition': match['pbt_definition'],
-                            'score': final_score
-                        })
-                
-                # Sort matches by score
-                scored_matches.sort(key=lambda x: x['score'], reverse=True)
-                
-                # Create result entry
-                result = {
-                    'name': source_item['name'],
-                    'description': source_item['description']
-                }
-                
-                # Add matches if we found any above threshold
-                if scored_matches:
-                    for rank in range(1, k + 1):
-                        if rank <= len(scored_matches):
-                            match = scored_matches[rank - 1]
-                            result.update({
-                                f'match_{rank}_pbt_name': match['pbt_name'],
-                                f'match_{rank}_score': round(match['score'], 4),
-                                f'match_{rank}_definition': match['pbt_definition']
-                            })
-                        else:
-                            result.update({
-                                f'match_{rank}_pbt_name': 'PBT not available',
-                                f'match_{rank}_score': 0.0,
-                                f'match_{rank}_definition': 'No match found above threshold'
-                            })
-                else:
-                    # No matches above threshold
-                    for rank in range(1, k + 1):
-                        result.update({
-                            f'match_{rank}_pbt_name': 'PBT not available',
-                            f'match_{rank}_score': 0.0,
-                            f'match_{rank}_definition': 'No match found above threshold'
-                        })
-                
-                results.append(result)
-                
-            except Exception as e:
-                logger.error(f"Error processing match: {str(e)}")
-                self._add_error_result(results, source_item, k, str(e))
-    
-    # Convert to DataFrame
-    result_df = pd.DataFrame(results)
-    
-    # Add summary statistics
-    score_cols = [f'match_{i}_score' for i in range(1, k+1)]
-    result_df['avg_score'] = result_df[score_cols].mean(axis=1)
-    result_df['max_score'] = result_df[score_cols].max(axis=1)
-    result_df['min_score'] = result_df[score_cols].min(axis=1)
-    
-    # Add match quality indicators
-    result_df['has_match'] = result_df['match_1_pbt_name'] != 'PBT not available'
-    result_df['match_count'] = result_df.apply(
-        lambda row: sum(1 for i in range(1, k+1) 
-                       if row[f'match_{i}_pbt_name'] != 'PBT not available'),
-        axis=1
-    )
-    
-    # Sort by best match score
-    result_df.sort_values(by=['has_match', 'match_1_score'], 
-                         ascending=[False, False], 
-                         inplace=True)
-    
-    # Log matching statistics
-    total_items = len(result_df)
-    items_with_matches = result_df['has_match'].sum()
-    logger.info(f"Matching complete: {items_with_matches}/{total_items} items matched above {threshold*100}% threshold")
-    
-    return result_df
-
-def _calculate_name_similarity(self, source_name: str, target_name: str) -> float:
-    """Calculate normalized similarity between source and target names."""
-    try:
-        # Convert to lowercase and split into words
-        source_words = set(source_name.lower().split())
-        target_words = set(target_name.lower().split())
+        results = []
+        batch_size = min(self.batch_size, len(source_df))
         
-        # Calculate word overlap
-        common_words = source_words.intersection(target_words)
-        total_words = source_words.union(target_words)
-        
-        if not total_words:
-            return 0.0
-        
-        # Calculate Jaccard similarity
-        return len(common_words) / len(total_words)
-    except Exception:
-        return 0.0
-
-def _calculate_context_similarity(self, source_desc: str, target_desc: str) -> float:
-    """Calculate normalized context similarity between descriptions."""
-    try:
-        # Convert to lowercase
-        source_desc = source_desc.lower()
-        target_desc = target_desc.lower()
-        
-        # Split into words and remove common stop words
-        source_words = set(source_desc.split())
-        target_words = set(target_desc.split())
-        
-        # Calculate word overlap
-        common_words = source_words.intersection(target_words)
-        total_words = source_words.union(target_words)
-        
-        if not total_words:
-            return 0.0
+        for i in tqdm(range(0, len(source_df), batch_size), desc="Finding matches"):
+            batch_df = source_df.iloc[i:i + batch_size]
+            source_data = self.process_embeddings(batch_df, is_source=True)
             
-        # Calculate weighted similarity
-        word_similarity = len(common_words) / len(total_words)
+            for source_item in source_data:
+                try:
+                    # Get initial candidates using vector search
+                    initial_matches = target_table.search(source_item['vector'])\
+                        .limit(k * 3)\
+                        .to_list()
+                    
+                    # Calculate scores for reranking
+                    scored_matches = []
+                    for match in initial_matches:
+                        scores = self.calculate_match_scores(source_item, match)
+                        
+                        # Apply reranking
+                        final_score = self.reranker.compute_score(scores)
+                        
+                        if final_score >= threshold:
+                            scored_matches.append({
+                                'pbt_name': match['pbt_name'],
+                                'pbt_definition': match['pbt_definition'],
+                                'score': final_score,
+                                **scores  # Store individual scores for analysis
+                            })
+                    
+                    # Sort by final score
+                    scored_matches.sort(key=lambda x: x['score'], reverse=True)
+                    
+                    # Create result entry
+                    result = {
+                        'name': source_item['name'],
+                        'description': source_item['description']
+                    }
+                    
+                    # Add matches if we found any above threshold
+                    if scored_matches:
+                        for rank in range(1, k + 1):
+                            if rank <= len(scored_matches):
+                                match = scored_matches[rank - 1]
+                                result.update({
+                                    f'match_{rank}_pbt_name': match['pbt_name'],
+                                    f'match_{rank}_score': round(match['score'], 4),
+                                    f'match_{rank}_definition': match['pbt_definition'],
+                                    f'match_{rank}_vector_score': round(match['vector_score'], 4),
+                                    f'match_{rank}_name_score': round(match['name_match'], 4),
+                                    f'match_{rank}_context_score': round(match['context_match'], 4)
+                                })
+                            else:
+                                self._add_empty_match(result, rank)
+                    else:
+                        # No matches above threshold
+                        for rank in range(1, k + 1):
+                            self._add_empty_match(result, rank)
+                    
+                    results.append(result)
+                    
+                except Exception as e:
+                    logger.error(f"Error processing match: {str(e)}")
+                    self._add_error_result(results, source_item, k, str(e))
         
-        # Add phrase matching
-        source_phrases = self._extract_key_phrases(source_desc)
-        target_phrases = self._extract_key_phrases(target_desc)
+        # Convert to DataFrame and add statistics
+        result_df = self._create_results_dataframe(results, k)
         
-        phrase_similarity = len(set(source_phrases) & set(target_phrases)) / \
-                          max(1, len(set(source_phrases) | set(target_phrases)))
+        # Log matching statistics
+        self._log_matching_statistics(result_df, threshold)
         
-        # Combine word and phrase similarity
-        return (word_similarity * 0.6) + (phrase_similarity * 0.4)
-    except Exception:
-        return 0.0
+        return result_df
 
-def _add_error_result(self, results: List[Dict], source_item: Dict, k: int, error_msg: str):
-    """Add error result entry."""
-    result = {
-        'name': source_item.get('name', 'Error'),
-        'description': source_item.get('description', 'Error')
-    }
-    for rank in range(1, k + 1):
+    def _create_results_dataframe(self, results: List[Dict], k: int) -> pd.DataFrame:
+        """Create and enhance results DataFrame."""
+        result_df = pd.DataFrame(results)
+        
+        # Add summary statistics
+        score_cols = [f'match_{i}_score' for i in range(1, k+1)]
+        result_df['avg_score'] = result_df[score_cols].mean(axis=1)
+        result_df['max_score'] = result_df[score_cols].max(axis=1)
+        result_df['min_score'] = result_df[score_cols].min(axis=1)
+        
+        # Add match quality indicators
+        result_df['has_match'] = result_df['match_1_pbt_name'] != 'PBT not available'
+        result_df['match_count'] = result_df.apply(
+            lambda row: sum(1 for i in range(1, k+1) 
+                          if row[f'match_{i}_pbt_name'] != 'PBT not available'),
+            axis=1
+        )
+        
+        # Sort by match presence and score
+        result_df.sort_values(
+            by=['has_match', 'match_1_score'],
+            ascending=[False, False],
+            inplace=True
+        )
+        
+        return result_df
+
+    def _add_empty_match(self, result: Dict, rank: int):
+        """Add empty match entry."""
         result.update({
             f'match_{rank}_pbt_name': 'PBT not available',
             f'match_{rank}_score': 0.0,
-            f'match_{rank}_definition': f'Error: {error_msg}'
+            f'match_{rank}_definition': 'No match found above threshold',
+            f'match_{rank}_vector_score': 0.0,
+            f'match_{rank}_name_score': 0.0,
+            f'match_{rank}_context_score': 0.0
         })
-    results.append(result)
+
+    def _log_matching_statistics(self, result_df: pd.DataFrame, threshold: float):
+        """Log detailed matching statistics."""
+        total_items = len(result_df)
+        items_with_matches = result_df['has_match'].sum()
+        avg_matches_per_item = result_df['match_count'].mean()
+        
+        logger.info(f"Matching Summary:")
+        logger.info(f"- Total items processed: {total_items}")
+        logger.info(f"- Items matched above {threshold*100}% threshold: {items_with_matches}")
+        logger.info(f"- Match success rate: {(items_with_matches/total_items)*100:.2f}%")
+        logger.info(f"- Average matches per item: {avg_matches_per_item:.2f}")
+
+    def __del__(self):
+        """Cleanup temporary directory."""
+        try:
+            import shutil
+            shutil.rmtree(self.temp_dir)
+        except Exception as e:
+            logger.warning(f"Failed to cleanup temporary directory: {str(e)}")
