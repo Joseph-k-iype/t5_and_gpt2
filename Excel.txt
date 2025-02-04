@@ -1,186 +1,239 @@
 import os
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional
 import logging
-from dotenv import load_dotenv
 from pathlib import Path
-from azure.identity import ClientSecretCredential
 from tqdm import tqdm
 import json
-from openai import AzureOpenAI
-import lancedb
-from lancedb.pynarro import LinearCombinationReranker
 import tempfile
+from datetime import datetime
+
+# LanceDB imports
+import lancedb
+from lancedb.pydantic import LanceModel, Vector
+from lancedb.rerankers import LinearCombinationReranker
+from pydantic import BaseModel, Field
+
+# Langchain imports
+from langchain_openai import AzureOpenAIEmbeddings
+from langchain.embeddings.base import Embeddings
 
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(f'semantic_matcher_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+    ]
 )
 logger = logging.getLogger(__name__)
 
+class SourceItem(LanceModel):
+    """Source item schema for LanceDB."""
+    vector: Vector(3072) = Field(
+        description="Embedding vector for the source item"
+    )
+    name: str = Field(
+        description="Name of the source item"
+    )
+    description: str = Field(
+        description="Description of the source item"
+    )
+    text: str = Field(
+        description="Combined text representation"
+    )
+
+class TargetItem(LanceModel):
+    """Target item schema for LanceDB."""
+    vector: Vector(3072) = Field(
+        description="Embedding vector for the target item"
+    )
+    pbt_name: str = Field(
+        description="PBT category name"
+    )
+    pbt_definition: str = Field(
+        description="PBT category definition"
+    )
+    text: str = Field(
+        description="Combined text representation"
+    )
+
 class SemanticMatcherLance:
-    def __init__(self, env_setup: OSEnv):
+    def __init__(self, env_setup: 'OSEnv'):
         """Initialize with environment setup."""
         self.env = env_setup
         self.batch_size = 16
-        self.dimension = 3072  # dimension for text-embedding-3-large
-        self._setup_openai_client()
+        self.embedding_model = self._setup_embedding_model()
         self.temp_dir = tempfile.mkdtemp()
         self.db = lancedb.connect(self.temp_dir)
         
-        # Initialize reranker
+        # Initialize reranker with component weights
         self.reranker = LinearCombinationReranker([
-            ("vector_score", 0.4),    # Base vector similarity
-            ("name_match", 0.3),      # Name matching score
-            ("context_match", 0.3)    # Context matching score
+            ("vector_score", 0.4),     # Base vector similarity
+            ("name_match", 0.3),       # Name similarity
+            ("context_match", 0.2),    # Context similarity
+            ("key_terms_match", 0.1)   # Key terms overlap
         ])
         
-    def _setup_openai_client(self):
-        """Configure OpenAI client with Azure settings."""
-        self.client = AzureOpenAI(
-            api_key=self.env.token if self.env.token else self.env.get("AZURE_OPENAI_API_KEY"),
-            api_version=self.env.get("API_VERSION", "2024-02-01"),
-            azure_endpoint=self.env.get("AZURE_OPENAI_ENDPOINT")
+    def _setup_embedding_model(self) -> Embeddings:
+        """Configure Azure OpenAI embeddings using Langchain."""
+        return AzureOpenAIEmbeddings(
+            azure_deployment=self.env.get("AZURE_EMBEDDING_DEPLOYMENT"),
+            openai_api_key=self.env.get("AZURE_OPENAI_API_KEY"),
+            azure_endpoint=self.env.get("AZURE_OPENAI_ENDPOINT"),
+            api_version=self.env.get("AZURE_OPENAI_API_VERSION", "2024-02-01"),
+            chunk_size=self.batch_size
         )
 
     def prepare_text(self, row: pd.Series, is_source: bool = True) -> str:
-        """
-        Enhanced text preparation with structured prompts for better semantic understanding.
-        """
+        """Create structured text representation."""
         try:
             if is_source:
                 name = str(row['name']).strip() if pd.notna(row['name']) else ""
                 description = str(row['description']).strip() if pd.notna(row['description']) else ""
                 
-                # Create structured prompt for source items
                 prompt = f"""
-                Product or Service Analysis:
-                Name: {name}
-                Primary Description: {description}
-                Key Features:
-                - Product/Service Identity: {name}
-                - Main Purpose: {description}
-                - Key Characteristics: Derived from {name} and its attributes
-                - Application Domain: Based on {description} and its context
+                Product Profile:
+                Title: {name}
+                Description: {description}
+                Key Aspects:
+                - Product Type: {name}
+                - Main Features: {description}
+                - Target Application: Based on {name} characteristics
+                - Use Case: Derived from {description}
                 
-                Context: This represents a specific product or service that needs to be matched 
-                with appropriate product-based targeting categories.
+                Classification Context: This product needs to be matched with relevant 
+                PBT categories based on its characteristics and intended use.
                 """
-                
-                return prompt.strip()
             else:
                 pbt_name = str(row['pbt-name']).strip() if pd.notna(row['pbt-name']) else ""
                 pbt_definition = str(row['pbt-definition']).strip() if pd.notna(row['pbt-definition']) else ""
                 
-                # Create structured prompt for target categories
                 prompt = f"""
-                Product-Based Targeting Category:
+                PBT Category Profile:
                 Category: {pbt_name}
                 Definition: {pbt_definition}
                 Classification Criteria:
                 - Category Type: {pbt_name}
                 - Scope: {pbt_definition}
-                - Target Products: Products/Services that align with {pbt_name}
-                - Application: Based on {pbt_definition}
+                - Product Fit: Products that match {pbt_name} characteristics
+                - Applications: Aligned with {pbt_definition}
                 
-                Context: This represents a targeting category that defines a specific 
-                product or service classification for matching purposes.
+                Matching Context: This category defines criteria for matching 
+                relevant products based on their characteristics.
                 """
-                
-                return prompt.strip()
+            
+            return prompt.strip()
+            
         except Exception as e:
             logger.error(f"Error in text preparation: {str(e)}")
             return ""
 
-    def get_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
-        """Get embeddings using text-embedding-3-large model."""
-        try:
-            response = self.client.embeddings.create(
-                model=self.env.get("AZURE_EMBEDDING_MODEL", "text-embedding-3-large"),
-                input=texts,
-                dimensions=self.dimension
-            )
-            return [item.embedding for item in response.data]
-        except Exception as e:
-            logger.error(f"Failed to get embeddings batch: {str(e)}")
-            raise
+    def create_item_embedding(self, row: pd.Series, is_source: bool = True) -> Dict:
+        """Create embedding and structured item for LanceDB."""
+        text = self.prepare_text(row, is_source)
+        vector = self.embedding_model.embed_query(text)
+        
+        if is_source:
+            return SourceItem(
+                vector=vector,
+                name=str(row['name']),
+                description=str(row['description']),
+                text=text
+            ).dict()
+        else:
+            return TargetItem(
+                vector=vector,
+                pbt_name=str(row['pbt-name']),
+                pbt_definition=str(row['pbt-definition']),
+                text=text
+            ).dict()
 
-    def calculate_match_scores(self, source_item: Dict, target_item: Dict) -> Dict[str, float]:
-        """
-        Calculate multiple similarity scores for reranking.
-        """
-        # Vector score is already calculated by LanceDB
-        vector_score = 1 / (1 + float(target_item['_distance']))
+    def process_data(self, df: pd.DataFrame, is_source: bool = True) -> List[Dict]:
+        """Process dataframe and create embeddings."""
+        processed_items = []
         
-        # Calculate name match score
-        source_name = source_item['name'].lower()
-        target_name = target_item['pbt_name'].lower()
-        name_match = self._calculate_name_similarity(source_name, target_name)
+        for i in tqdm(range(0, len(df), self.batch_size), 
+                     desc="Processing " + ("source" if is_source else "target") + " items"):
+            batch_df = df.iloc[i:i + self.batch_size]
+            
+            for _, row in batch_df.iterrows():
+                try:
+                    item = self.create_item_embedding(row, is_source)
+                    processed_items.append(item)
+                except Exception as e:
+                    logger.error(f"Error processing row: {str(e)}")
         
-        # Calculate context match score
-        source_desc = source_item['description'].lower()
-        target_desc = target_item['pbt_definition'].lower()
-        context_match = self._calculate_context_similarity(source_desc, target_desc)
-        
-        return {
-            "vector_score": vector_score,
-            "name_match": name_match,
-            "context_match": context_match
-        }
+        return processed_items
 
-    def find_top_k_matches(self, source_df: pd.DataFrame, target_df: pd.DataFrame, k: int = 4, threshold: float = 0.60) -> pd.DataFrame:
-        """Find top k semantic matches using enhanced reranking approach."""
+    def find_top_k_matches(self, 
+                          source_df: pd.DataFrame, 
+                          target_df: pd.DataFrame, 
+                          k: int = 4, 
+                          threshold: float = 0.60) -> pd.DataFrame:
+        """Find top k semantic matches using LanceDB and reranking."""
         logger.info(f"Processing semantic matches with {threshold*100}% threshold...")
         
-        # Preprocess dataframes
-        source_df = source_df.copy()
-        target_df = target_df.copy()
+        # Process target data
+        target_data = self.process_data(target_df, is_source=False)
         
-        # Process target entries
-        logger.info("Processing target entries...")
-        target_data = self.process_embeddings(target_df, is_source=False)
-        
-        # Create target table in LanceDB
+        # Create target table with schema
         target_table = self.db.create_table(
             "target_vectors",
+            schema=TargetItem,
             data=target_data,
             mode="overwrite"
         )
-        
+
         results = []
-        batch_size = min(self.batch_size, len(source_df))
-        
-        for i in tqdm(range(0, len(source_df), batch_size), desc="Finding matches"):
+        # Process source items in batches
+        for i in tqdm(range(0, len(source_df), self.batch_size), desc="Finding matches"):
             batch_df = source_df.iloc[i:i + batch_size]
-            source_data = self.process_embeddings(batch_df, is_source=True)
+            source_items = self.process_data(batch_df, is_source=True)
             
-            for source_item in source_data:
+            for source_item in source_items:
                 try:
-                    # Get initial candidates using vector search
-                    initial_matches = target_table.search(source_item['vector'])\
+                    # Initial vector search
+                    vector_matches = target_table.search(source_item['vector'])\
                         .limit(k * 3)\
-                        .to_list()
+                        .to_pandas()
                     
-                    # Calculate scores for reranking
-                    scored_matches = []
-                    for match in initial_matches:
-                        scores = self.calculate_match_scores(source_item, match)
+                    # Prepare matches for reranking
+                    candidates = []
+                    for _, match in vector_matches.iterrows():
+                        # Calculate component scores
+                        scores = {
+                            "vector_score": 1 / (1 + match['_distance']),
+                            "name_match": self._calculate_name_similarity(
+                                source_item['name'], 
+                                match['pbt_name']
+                            ),
+                            "context_match": self._calculate_context_similarity(
+                                source_item['description'], 
+                                match['pbt_definition']
+                            ),
+                            "key_terms_match": self._calculate_key_terms_overlap(
+                                source_item['text'],
+                                match['text']
+                            )
+                        }
                         
                         # Apply reranking
                         final_score = self.reranker.compute_score(scores)
                         
                         if final_score >= threshold:
-                            scored_matches.append({
+                            candidates.append({
                                 'pbt_name': match['pbt_name'],
                                 'pbt_definition': match['pbt_definition'],
                                 'score': final_score,
-                                **scores  # Store individual scores for analysis
+                                **scores
                             })
                     
-                    # Sort by final score
-                    scored_matches.sort(key=lambda x: x['score'], reverse=True)
+                    # Sort candidates by final score
+                    candidates.sort(key=lambda x: x['score'], reverse=True)
+                    top_matches = candidates[:k]
                     
                     # Create result entry
                     result = {
@@ -188,25 +241,30 @@ class SemanticMatcherLance:
                         'description': source_item['description']
                     }
                     
-                    # Add matches if we found any above threshold
-                    if scored_matches:
-                        for rank in range(1, k + 1):
-                            if rank <= len(scored_matches):
-                                match = scored_matches[rank - 1]
-                                result.update({
-                                    f'match_{rank}_pbt_name': match['pbt_name'],
-                                    f'match_{rank}_score': round(match['score'], 4),
-                                    f'match_{rank}_definition': match['pbt_definition'],
-                                    f'match_{rank}_vector_score': round(match['vector_score'], 4),
-                                    f'match_{rank}_name_score': round(match['name_match'], 4),
-                                    f'match_{rank}_context_score': round(match['context_match'], 4)
-                                })
-                            else:
-                                self._add_empty_match(result, rank)
-                    else:
-                        # No matches above threshold
-                        for rank in range(1, k + 1):
-                            self._add_empty_match(result, rank)
+                    # Add matches
+                    if top_matches:
+                        for rank, match in enumerate(top_matches, 1):
+                            result.update({
+                                f'match_{rank}_pbt_name': match['pbt_name'],
+                                f'match_{rank}_score': round(match['score'], 4),
+                                f'match_{rank}_definition': match['pbt_definition'],
+                                f'match_{rank}_vector_score': round(match['vector_score'], 4),
+                                f'match_{rank}_name_score': round(match['name_match'], 4),
+                                f'match_{rank}_context_score': round(match['context_match'], 4),
+                                f'match_{rank}_key_terms_score': round(match['key_terms_match'], 4)
+                            })
+                    
+                    # Fill remaining slots if needed
+                    for rank in range(len(top_matches) + 1, k + 1):
+                        result.update({
+                            f'match_{rank}_pbt_name': 'PBT not available',
+                            f'match_{rank}_score': 0.0,
+                            f'match_{rank}_definition': 'No match found above threshold',
+                            f'match_{rank}_vector_score': 0.0,
+                            f'match_{rank}_name_score': 0.0,
+                            f'match_{rank}_context_score': 0.0,
+                            f'match_{rank}_key_terms_score': 0.0
+                        })
                     
                     results.append(result)
                     
@@ -214,25 +272,117 @@ class SemanticMatcherLance:
                     logger.error(f"Error processing match: {str(e)}")
                     self._add_error_result(results, source_item, k, str(e))
         
-        # Convert to DataFrame and add statistics
+        # Create DataFrame and add statistics
         result_df = self._create_results_dataframe(results, k)
-        
-        # Log matching statistics
         self._log_matching_statistics(result_df, threshold)
         
         return result_df
 
-    def _create_results_dataframe(self, results: List[Dict], k: int) -> pd.DataFrame:
-        """Create and enhance results DataFrame."""
+    def _calculate_key_terms_overlap(self, source_text: str, target_text: str) -> float:
+        """Calculate overlap of key terms between texts."""
+        try:
+            import re
+            
+            def extract_key_terms(text: str) -> set:
+                # Convert to lowercase and split into words
+                words = text.lower().split()
+                # Remove common words and keep meaningful terms
+                meaningful_terms = set(word for word in words 
+                                    if len(word) > 3 and not word.isnumeric())
+                return meaningful_terms
+            
+            source_terms = extract_key_terms(source_text)
+            target_terms = extract_key_terms(target_text)
+            
+            if not source_terms or not target_terms:
+                return 0.0
+            
+            # Calculate Jaccard similarity of terms
+            overlap = len(source_terms.intersection(target_terms))
+            total = len(source_terms.union(target_terms))
+            
+            return overlap / total
+            
+        except Exception:
+            return 0.0
+
+    def __del__(self):
+        """Cleanup temporary files."""
+        try:
+            import shutil
+            shutil.rmtree(self.temp_dir)
+        except Exception as e:
+            logger.warning(f"Failed to cleanup temporary directory: {str(e)}")
+
+
+
+
+def _calculate_context_similarity(self, source_desc: str, target_desc: str) -> float:
+    """Calculate enhanced context similarity."""
+    try:
+        source_desc = source_desc.lower()
+        target_desc = target_desc.lower()
+        
+        # Word-level similarity
+        source_words = set(source_desc.split())
+        target_words = set(target_desc.split())
+        
+        if not source_words or not target_words:
+            return 0.0
+        
+        # Word overlap similarity
+        common_words = source_words.intersection(target_words)
+        total_words = source_words.union(target_words)
+        word_similarity = len(common_words) / len(total_words)
+        
+        # N-gram phrase similarity
+        def get_ngrams(text: str, n: int) -> set:
+            words = text.split()
+            return set(' '.join(words[i:i+n]) for i in range(len(words)-n+1))
+        
+        # Get bigrams and trigrams
+        source_bigrams = get_ngrams(source_desc, 2)
+        target_bigrams = get_ngrams(target_desc, 2)
+        source_trigrams = get_ngrams(source_desc, 3)
+        target_trigrams = get_ngrams(target_desc, 3)
+        
+        # Calculate phrase similarities
+        bigram_sim = len(source_bigrams.intersection(target_bigrams)) / \
+                    max(1, len(source_bigrams.union(target_bigrams)))
+        trigram_sim = len(source_trigrams.intersection(target_trigrams)) / \
+                     max(1, len(source_trigrams.union(target_trigrams)))
+        
+        # Weighted combination of similarities
+        return (0.4 * word_similarity + 0.35 * bigram_sim + 0.25 * trigram_sim)
+        
+    except Exception as e:
+        logger.error(f"Error in context similarity calculation: {str(e)}")
+        return 0.0
+
+def _create_results_dataframe(self, results: List[Dict], k: int) -> pd.DataFrame:
+    """Create and enhance results DataFrame with statistics."""
+    try:
         result_df = pd.DataFrame(results)
         
         # Add summary statistics
         score_cols = [f'match_{i}_score' for i in range(1, k+1)]
+        vector_cols = [f'match_{i}_vector_score' for i in range(1, k+1)]
+        name_cols = [f'match_{i}_name_score' for i in range(1, k+1)]
+        context_cols = [f'match_{i}_context_score' for i in range(1, k+1)]
+        key_terms_cols = [f'match_{i}_key_terms_score' for i in range(1, k+1)]
+        
+        # Overall scores
         result_df['avg_score'] = result_df[score_cols].mean(axis=1)
         result_df['max_score'] = result_df[score_cols].max(axis=1)
         result_df['min_score'] = result_df[score_cols].min(axis=1)
         
-        # Add match quality indicators
+        # Component-wise statistics
+        result_df['avg_vector_score'] = result_df[vector_cols].mean(axis=1)
+        result_df['avg_name_score'] = result_df[name_cols].mean(axis=1)
+        result_df['avg_context_score'] = result_df[context_cols].mean(axis=1)
+        result_df['avg_key_terms_score'] = result_df[key_terms_cols].mean(axis=1)
+        
+        # Match quality indicators
         result_df['has_match'] = result_df['match_1_pbt_name'] != 'PBT not available'
         result_df['match_count'] = result_df.apply(
             lambda row: sum(1 for i in range(1, k+1) 
@@ -248,34 +398,121 @@ class SemanticMatcherLance:
         )
         
         return result_df
+        
+    except Exception as e:
+        logger.error(f"Error creating results DataFrame: {str(e)}")
+        raise
 
-    def _add_empty_match(self, result: Dict, rank: int):
-        """Add empty match entry."""
-        result.update({
-            f'match_{rank}_pbt_name': 'PBT not available',
-            f'match_{rank}_score': 0.0,
-            f'match_{rank}_definition': 'No match found above threshold',
-            f'match_{rank}_vector_score': 0.0,
-            f'match_{rank}_name_score': 0.0,
-            f'match_{rank}_context_score': 0.0
-        })
-
-    def _log_matching_statistics(self, result_df: pd.DataFrame, threshold: float):
-        """Log detailed matching statistics."""
+def _log_matching_statistics(self, result_df: pd.DataFrame, threshold: float):
+    """Log detailed matching statistics."""
+    try:
         total_items = len(result_df)
         items_with_matches = result_df['has_match'].sum()
-        avg_matches_per_item = result_df['match_count'].mean()
+        avg_matches = result_df['match_count'].mean()
         
-        logger.info(f"Matching Summary:")
-        logger.info(f"- Total items processed: {total_items}")
-        logger.info(f"- Items matched above {threshold*100}% threshold: {items_with_matches}")
-        logger.info(f"- Match success rate: {(items_with_matches/total_items)*100:.2f}%")
-        logger.info(f"- Average matches per item: {avg_matches_per_item:.2f}")
+        # Calculate average scores
+        avg_overall = result_df['avg_score'].mean()
+        avg_vector = result_df['avg_vector_score'].mean()
+        avg_name = result_df['avg_name_score'].mean()
+        avg_context = result_df['avg_context_score'].mean()
+        avg_key_terms = result_df['avg_key_terms_score'].mean()
+        
+        logger.info("\nMatching Statistics Summary:")
+        logger.info(f"Total items processed: {total_items}")
+        logger.info(f"Items matched above {threshold*100}% threshold: {items_with_matches}")
+        logger.info(f"Match success rate: {(items_with_matches/total_items)*100:.2f}%")
+        logger.info(f"Average matches per item: {avg_matches:.2f}")
+        logger.info("\nScore Component Averages:")
+        logger.info(f"- Overall Score: {avg_overall:.4f}")
+        logger.info(f"- Vector Score: {avg_vector:.4f}")
+        logger.info(f"- Name Score: {avg_name:.4f}")
+        logger.info(f"- Context Score: {avg_context:.4f}")
+        logger.info(f"- Key Terms Score: {avg_key_terms:.4f}")
+        
+    except Exception as e:
+        logger.error(f"Error logging statistics: {str(e)}")
 
-    def __del__(self):
-        """Cleanup temporary directory."""
-        try:
-            import shutil
-            shutil.rmtree(self.temp_dir)
-        except Exception as e:
-            logger.warning(f"Failed to cleanup temporary directory: {str(e)}")
+def _add_error_result(self, results: List[Dict], source_item: Dict, k: int, error_msg: str):
+    """Add error result entry with proper structure."""
+    try:
+        result = {
+            'name': source_item.get('name', 'Error'),
+            'description': source_item.get('description', 'Error')
+        }
+        
+        for rank in range(1, k + 1):
+            result.update({
+                f'match_{rank}_pbt_name': 'PBT not available',
+                f'match_{rank}_score': 0.0,
+                f'match_{rank}_definition': f'Error: {error_msg}',
+                f'match_{rank}_vector_score': 0.0,
+                f'match_{rank}_name_score': 0.0,
+                f'match_{rank}_context_score': 0.0,
+                f'match_{rank}_key_terms_score': 0.0
+            })
+            
+        results.append(result)
+        
+    except Exception as e:
+        logger.error(f"Error adding error result: {str(e)}")
+
+def main():
+    """Main execution function."""
+    try:
+        # Setup paths
+        base_dir = Path(__file__).parent.parent
+        env_dir = base_dir / 'env'
+        data_dir = base_dir / 'data'
+        output_dir = base_dir / 'output'
+        
+        # Create directories if they don't exist
+        for directory in [data_dir, output_dir]:
+            directory.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize environment
+        env_setup = OSEnv(
+            config_file=str(env_dir / 'config.env'),
+            creds_file=str(env_dir / 'credentials.env'),
+            certificate_path=str(env_dir / 'cacert.pem')
+        )
+        
+        # Load data
+        logger.info("Loading source and target data...")
+        source_df = pd.read_csv(
+            data_dir / 'source.csv',
+            dtype={'name': str, 'description': str}
+        )
+        target_df = pd.read_csv(
+            data_dir / 'target.csv',
+            dtype={'pbt-name': str, 'pbt-definition': str}
+        )
+        
+        # Initialize matcher
+        matcher = SemanticMatcherLance(env_setup)
+        
+        # Process matches
+        results = matcher.find_top_k_matches(
+            source_df=source_df,
+            target_df=target_df,
+            k=4,
+            threshold=0.60
+        )
+        
+        # Save results
+        output_file = output_dir / 'semantic_matches.csv'
+        results.to_csv(output_file, index=False)
+        logger.info(f"Results saved to: {output_file}")
+        
+        # Save detailed JSON results
+        json_file = output_dir / 'semantic_matches.json'
+        results_dict = results.to_dict(orient='records')
+        with open(json_file, 'w', encoding='utf-8') as f:
+            json.dump(results_dict, f, indent=2, ensure_ascii=False)
+        logger.info(f"Detailed results saved to: {json_file}")
+        
+    except Exception as e:
+        logger.error(f"Process failed: {str(e)}")
+        raise
+
+if __name__ == "__main__":
+    main()
