@@ -1,56 +1,60 @@
 #!/usr/bin/env python3
 """
-CHUNKED PROMPT APPROACH:
-------------------------
-For each row in the 'source.csv' (columns: name, definition), we:
-1) Break the 'target.csv' PBTs (pbt-name, pbt-definition) into CHUNK_SIZE pieces.
-2) Ask AzureChatOpenAI which PBT is best in each chunk => get chunk winners.
-3) If multiple chunk winners => do a 'tournament' until only 1 final PBT remains.
-4) Store the model's final textual explanation or direct answer in 'model_answer'.
+HYBRID APPROACH to Speed Up Matching:
+-------------------------------------
+We have:
+ - source.csv => columns: [name, definition]
+ - target.csv => columns: [pbt-name, pbt-definition]  (5,000+ rows)
 
-WHY:
-----
-This avoids hitting the model's maximum token limit if you have many PBT rows.
+STEPS:
+1) Embed all PBTs (pbt-name+pbt-definition) with Azure/OpenAI embeddings
+   and store in LanceDB (or any vector DB).
+2) For each source row:
+   a) Embed (name + definition).
+   b) Vector search => get top-K PBTs (e.g. 30).
+   c) Then do chunked GPT approach on just those top-K => final best PBT.
 
-Usage:
-------
-1. Populate env/config.env & env/credentials.env with your settings 
-   (MODEL_NAME, AZURE_OPENAI_ENDPOINT, etc.).
-2. Place source.csv + target.csv in data/.
-3. Run: python semantic_chat_match.py
-4. Results -> output/chat_matches_<timestamp>.csv & .json
+Result: Far fewer GPT calls dealing with large data, much faster.
+
+NOTE: 
+ - You must have 'langchain', 'lancedb', 'pandas', 'numpy', 'tqdm', 
+   'azure-identity', 'openai' installed.
+ - Adjust CHUNK_SIZE, K, or the chunking logic for your needs.
 """
 
 import os
-import csv
 import time
 import json
 import logging
 from pathlib import Path
-from typing import List, Dict
-
+from typing import Dict, List
 import pandas as pd
+import numpy as np
+from tqdm import tqdm
 
-# The Azure Identity import is used by OSEnv when SECURED_ENDPOINTS=True
+# OSEnv + Azure Identity
 from azure.identity import ClientSecretCredential
-
-# We'll use your updated chunk approach via AzureChatOpenAI
-from langchain.chat_models import AzureChatOpenAI
-from langchain.schema import HumanMessage, SystemMessage
 from dotenv import dotenv_values
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+# LangChain
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.chat_models import AzureChatOpenAI
+from langchain.schema import HumanMessage, SystemMessage
+
+# Local Vector Store (LanceDB)
+from lancedb import connect
+from langchain.vectorstores import LanceDB
+from langchain.docstore.document import Document
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 #############################
-# OSEnv Class (Unchanged)
+# OSEnv
 #############################
 def is_file_readable(filepath: str) -> bool:
     if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
-        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
+        raise FileNotFoundError(f"{filepath} not found or not readable")
     return True
 
 def str_to_bool(s: str) -> bool:
@@ -60,166 +64,205 @@ def str_to_bool(s: str) -> bool:
     elif ls == 'false':
         return False
     else:
-        raise ValueError(f"Invalid boolean string: {s}")
+        raise ValueError(f"Invalid boolean: {s}")
 
 class OSEnv:
-    """Environment variable and certificate management class."""
-
-    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
+    """
+    Basic environment manager for config + proxy + Azure token if needed.
+    """
+    def __init__(self, config_file:str, creds_file:str, cert_file:str):
         self.var_list = []
-        
-        # Load main configuration
-        self.bulk_set(config_file, True)
-        logger.info(f"Loaded main configuration from {config_file}")
-        
-        # Load credentials
-        self.bulk_set(creds_file, False)
-        logger.info(f"Loaded credentials from {creds_file}")
-        
-        # Set up certificates
-        self.set_certificate_path(certificate_path)
-        logger.info("Certificate path configured")
-        
-        # Proxy
-        if str_to_bool(self.get("PROXY_ENABLED", "False")):
-            self.set_proxy()
-            logger.info("Proxy configured")
-        
-        # Possibly get Azure token
-        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
-            logger.info("Securing endpoints (AAD token)")
-            self.token = self.get_azure_token()
+        self._load_file(config_file, True)
+        self._load_file(creds_file, False)
+        self._set_cert(cert_file)
+
+        if str_to_bool(self.get("PROXY_ENABLED","false")):
+            self._set_proxy()
+
+        if str_to_bool(self.get("SECURED_ENDPOINTS","false")):
+            self.token = self._aad_token()
         else:
             self.token = None
 
-    def set_certificate_path(self, certificate_path: str) -> None:
-        try:
-            cp_abs = os.path.abspath(certificate_path)
-            if not is_file_readable(cp_abs):
-                raise FileNotFoundError(f"Certificate file not found or not readable: {cp_abs}")
-            self.set("REQUESTS_CA_BUNDLE", cp_abs)
-            self.set("SSL_CERT_FILE", cp_abs)
-            self.set("CURL_CA_BUNDLE", cp_abs)
-            logger.info(f"Certificate path set to: {cp_abs}")
-        except Exception as e:
-            logger.error(f"Certificate configuration failed: {str(e)}")
-            raise
+    def _load_file(self, file_path:str, print_val:bool):
+        if is_file_readable(file_path):
+            with open(file_path) as f:
+                lines = f.readlines()
+            for line in lines:
+                line=line.strip()
+                if line and not line.startswith("#"):
+                    if "=" in line:
+                        k,v = line.split("=",1)
+                        k=k.strip()
+                        v=v.strip().strip("'\"")
+                        os.environ[k] = v
+                        if print_val:
+                            logger.info(f"Set {k}={v}")
 
-    def bulk_set(self, dotenvfile: str, print_val: bool = False) -> None:
-        try:
-            df_abs = os.path.abspath(dotenvfile)
-            if not is_file_readable(df_abs):
-                return
-            vals = dotenv_values(df_abs)
-            for k, v in vals.items():
-                self.set(k, v, print_val)
-        except Exception as e:
-            logger.error(f"Failed to load environment file {dotenvfile}: {str(e)}")
-            raise
+    def _set_cert(self, cert_file:str):
+        cert_abs = os.path.abspath(cert_file)
+        if is_file_readable(cert_abs):
+            os.environ["REQUESTS_CA_BUNDLE"] = cert_abs
+            os.environ["SSL_CERT_FILE"]      = cert_abs
+            os.environ["CURL_CA_BUNDLE"]     = cert_abs
+            logger.info(f"Using cert: {cert_abs}")
 
-    def set(self, var_name: str, val: str, print_val: bool = True) -> None:
-        os.environ[var_name] = val
-        if var_name not in self.var_list:
-            self.var_list.append(var_name)
-        if print_val:
-            logger.info(f"Set {var_name}={val}")
+    def _set_proxy(self):
+        ad_user   = self.get("AD_USERNAME","")
+        ad_pass   = self.get("AD_USER_PW","")
+        proxy_dom = self.get("HTTPS_PROXY_DOMAIN","")
+        if not all([ad_user, ad_pass, proxy_dom]):
+            raise ValueError("Missing proxy credentials for PROXY_ENABLED=TRUE")
+        proxy_url = f"http://{ad_user}:{ad_pass}@{proxy_dom}"
+        os.environ["HTTP_PROXY"]  = proxy_url
+        os.environ["HTTPS_PROXY"] = proxy_url
+        # Merge NO_PROXY if needed, omitted for brevity
+        logger.info(f"Proxy set to {proxy_url}")
 
-    def get(self, var_name: str, default_val: str = "") -> str:
-        return os.getenv(var_name, default_val)
+    def _aad_token(self) -> str:
+        tenant = self.get("AZURE_TENANT_ID","")
+        cid    = self.get("AZURE_CLIENT_ID","")
+        cs     = self.get("AZURE_CLIENT_SECRET","")
+        credential = ClientSecretCredential(tenant, cid, cs)
+        token_obj = credential.get_token("https://cognitiveservices.azure.com/.default")
+        logger.info("Acquired AAD token for Azure OpenAI.")
+        return token_obj.token
 
-    def set_proxy(self) -> None:
-        ad_username = self.get("AD_USERNAME")
-        ad_password = self.get("AD_USER_PW")
-        proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
-        if not all([ad_username, ad_password, proxy_domain]):
-            raise ValueError("Missing proxy credentials for PROXY_ENABLED=True")
-
-        proxy_url = f"http://{ad_username}:{ad_password}@{proxy_domain}"
-        self.set("HTTP_PROXY", proxy_url, print_val=False)
-        self.set("HTTPS_PROXY", proxy_url, print_val=False)
-        
-        no_proxy_list = [
-            'cognitiveservices.azure.com',
-            'search.windows.net',
-            'openai.azure.com',
-            'core.windows.net',
-            'azurewebsites.net'
-        ]
-        # Join them into NO_PROXY
-        self.set("NO_PROXY", ",".join(no_proxy_list), print_val=False)
-
-    def get_azure_token(self) -> str:
-        try:
-            credential = ClientSecretCredential(
-                tenant_id=self.get("AZURE_TENANT_ID"),
-                client_id=self.get("AZURE_CLIENT_ID"),
-                client_secret=self.get("AZURE_CLIENT_SECRET")
-            )
-            token_obj = credential.get_token("https://cognitiveservices.azure.com/.default")
-            token_val = token_obj.token
-            logger.info("Acquired Azure token successfully")
-            return token_val
-        except Exception as e:
-            logger.error(f"Failed to get Azure token: {str(e)}")
-            raise
+    def get(self, k:str, default:str="") -> str:
+        return os.getenv(k, default)
 
 #############################
-# AzureChatbot with Chunking
+# Hybrid Approach Classes
 #############################
-class AzureChatbot:
+class PBTVecStore:
     """
-    A wrapper around AzureChatOpenAI that does:
-      - multi-chunk approach for PBT lists
-      - "tournament" style to avoid token overflow
+    Handles:
+      - reading target.csv
+      - embedding each pbt
+      - storing in LanceDB
+      - searching top-K
     """
     def __init__(self, env: OSEnv):
         self.env = env
-        self._setup_chat_model()
-        # Default chunk size = 50 (or define CHUNK_SIZE in config.env)
-        self.chunk_size = int(self.env.get("CHUNK_SIZE","50"))
+        self.db = connect("./lance_pbt")   # local folder for LanceDB
+        self.table_name = "pbt_vectors"
+        self._setup_embeddings()
 
-    def _setup_chat_model(self) -> None:
-        model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
-        temperature = float(self.env.get("MODEL_TEMPERATURE", "0.7"))
-        max_tokens = int(self.env.get("MAX_TOKENS", "800"))
-        api_version = self.env.get("API_VERSION", "2024-02-01")
-        azure_endpoint = self.env.get("AZURE_OPENAI_ENDPOINT")
-        azure_token = self.env.token  # AAD token if SECURED_ENDPOINTS=True
+    def _setup_embeddings(self):
+        # Basic openai config from env
+        api_base   = self.env.get("AZURE_OPENAI_ENDPOINT","")
+        api_version= self.env.get("API_VERSION","2023-03-15-preview")
+        token      = self.env.token
+
+        # If you want "text-embedding-ada-002", ensure you have that model deployed
+        model_deployment = self.env.get("AZURE_EMB_DEPLOY","my-embedding-deployment")
+        self.embeddings = OpenAIEmbeddings(
+            deployment=model_deployment,
+            model=self.env.get("AZURE_EMB_MODEL","text-embedding-ada-002"),
+            openai_api_base=api_base,
+            openai_api_version=api_version,
+            openai_api_key=token,
+            openai_api_type="azure"
+        )
+        logger.info(f"Embeddings setup, model={self.env.get('AZURE_EMB_MODEL','text-embedding-ada-002')}")
+
+    def index_pbt(self, pbt_df: pd.DataFrame):
+        """
+        Convert pbt df into Documents, store in LanceDB. If table exists, drop & rebuild.
+        """
+        if self.table_name in self.db.table_names():
+            logger.info("Dropping old pbt_vectors table.")
+            self.db.drop_table(self.table_name)
+
+        docs = []
+        for _, row in pbt_df.iterrows():
+            # combine name & definition
+            text = f"{row['pbt-name']} | {row['pbt-definition']}"
+            docs.append(
+                Document(
+                    page_content=text,
+                    metadata={
+                        "pbt-name": row["pbt-name"],
+                        "pbt-definition": row["pbt-definition"]
+                    }
+                )
+            )
+
+        from langchain.vectorstores import LanceDB
+        LanceDB.from_documents(
+            documents=docs,
+            embedding=self.embeddings,
+            connection=self.db,
+            table_name=self.table_name
+        )
+        logger.info(f"Indexed {len(docs)} PBT docs in LanceDB.")
+
+    def top_k_pbt(self, query_text:str, k:int=30) -> List[Dict[str,str]]:
+        """
+        1) embed query_text
+        2) search top-K in LanceDB
+        3) return list of {pbt-name, pbt-definition, score}
+        """
+        from langchain.vectorstores import LanceDB
+        store = LanceDB(
+            connection=self.db,
+            table_name=self.table_name,
+            embedding=self.embeddings
+        )
+        results = store.similarity_search_with_score(query_text, k=k)
+        # results => List[(Document, float)]
+        pbt_result = []
+        for doc, score in results:
+            pbt_result.append({
+                "pbt-name": doc.metadata["pbt-name"],
+                "pbt-definition": doc.metadata["pbt-definition"],
+                "similarity_score": score
+            })
+        return pbt_result
+
+class ChunkedGPT:
+    """
+    Chat-based chunk approach to pick 1 best PBT from smaller lists.
+    """
+    def __init__(self, env: OSEnv):
+        self.env = env
+        self._setup_chat()
+        self.chunk_size = int(self.env.get("CHUNK_SIZE","20"))
+
+    def _setup_chat(self):
+        model_name = self.env.get("MODEL_NAME","gpt-4")
+        temp       = float(self.env.get("MODEL_TEMPERATURE","0.7"))
+        max_tokens = int(self.env.get("MAX_TOKENS","800"))
+        api_ver    = self.env.get("API_VERSION","2023-03-15-preview")
+        endpoint   = self.env.get("AZURE_OPENAI_ENDPOINT","")
+        token      = self.env.token
 
         self.llm = AzureChatOpenAI(
             model_name=model_name,
-            temperature=temperature,
+            temperature=temp,
             max_tokens=max_tokens,
-            openai_api_version=api_version,
-            azure_endpoint=azure_endpoint,
-            azure_ad_token=azure_token
+            openai_api_version=api_ver,
+            azure_endpoint=endpoint,
+            azure_ad_token=token
         )
-        logger.info(f"Chat model '{model_name}' initialized (temp={temperature}, max_tokens={max_tokens}).")
+        logger.info(f"ChunkedGPT => model={model_name}, chunk_size={self.chunk_size}")
 
-    #############################
-    # 1) Chunk-level picking
-    #############################
-    def _pick_best_in_chunk(self, name:str, definition:str, pbt_chunk:List[Dict]) -> str:
+    def pick_best_in_chunk(self, name:str, definition:str, chunk:List[Dict]) -> str:
         """
-        Prompt the model for a single chunk of PBTs:
-          "Which pbt is best among these N pbt-names & definitions?"
-        Return the raw model answer text (the user can parse it).
+        Ask GPT: "which single pbt is best in this chunk?"
+        Return entire text from GPT as 1 answer. 
+        (Could parse further if you only want the pbt name.)
         """
-        system_text = (
-            "You are a helpful assistant. You must pick exactly one best matching PBT "
-            "from the chunk. Provide a short justification."
+        system_text = "You must pick exactly one best match from this chunk."
+        user_text   = (
+            f"Name: {name}\nDefinition: {definition}\n\n"
+            f"Among these PBTs, pick only ONE best match:\n"
         )
-        user_text = (
-            f"Original name: {name}\n"
-            f"Original definition: {definition}\n\n"
-            f"Potential PBTs in this chunk:\n"
-        )
-        for idx, pbt in enumerate(pbt_chunk, start=1):
-            user_text += (f"({idx}) pbt-name: {pbt['pbt-name']}\n"
-                          f"    pbt-definition: {pbt['pbt-definition']}\n\n")
-        user_text += (
-            "Out of these, which single pbt-name is the best match, and why?"
-        )
+        for idx, pbt in enumerate(chunk, start=1):
+            user_text += (f"{idx}) pbt-name={pbt['pbt-name']}\n"
+                          f"   pbt-definition={pbt['pbt-definition']}\n\n")
+
+        user_text += "Which pbt-name is best, and why?"
 
         messages = [
             SystemMessage(content=system_text),
@@ -229,179 +272,137 @@ class AzureChatbot:
             response = self.llm(messages)
             return response.content.strip()
         except Exception as e:
-            logger.error(f"Error in _pick_best_in_chunk: {str(e)}")
-            return f"ERROR picking chunk: {str(e)}"
+            logger.error(f"Error in pick_best_in_chunk: {e}")
+            return f"ERROR chunk: {str(e)}"
 
-    def _chunk_and_pick(self, name:str, definition:str, pbt_list:List[Dict]) -> List[str]:
+    def tournament_pick(self, name:str, definition:str, pbt_list:List[Dict]) -> str:
         """
-        Break pbt_list into chunk_size pieces, 
-        pick 1 "winner" from each chunk => store the model's textual answer in chunk_answers.
-        Return the list of chunk answers (strings).
+        "Tournament" approach:
+          - chunk pbt_list => pick winner from each chunk => new "virtual pbt list"
+          - repeat until 1 final
+          - Return GPT's final text
         """
-        chunk_answers = []
-        # slice pbt_list into chunks
-        for i in range(0, len(pbt_list), self.chunk_size):
-            chunk = pbt_list[i : i+self.chunk_size]
-            ans = self._pick_best_in_chunk(name, definition, chunk)
-            chunk_answers.append(ans)
-        return chunk_answers
-
-    #############################
-    # 2) "Tournament" approach
-    #############################
-    def match_single_record(self, 
-                            name: str, 
-                            definition: str, 
-                            pbt_list: List[Dict[str, str]]) -> str:
-        """
-        For 1 row in source CSV, do multi-round chunk picking until we have 1 final best:
-          1) chunk pbt_list => pick 1 from each => chunk_winners
-          2) if multiple chunk_winners => treat them as new "pbt list", repeat
-          3) final answer = last single chunk's answer
-        Return the final textual reasoning from the model.
-        
-        (Note: This approach doesn't strictly unify all chunk picks 
-               into 1 final text, but it ensures we never exceed tokens.)
-        """
-        # We'll store each "round" in a list so user can see the final round's text
-        round_texts = []
-
-        # Convert entire pbt_list into "fake PBT" items if we do multiple rounds.
-        # But we won't parse each chunk's answer to get a single actual "pbt-definition". 
-        # We'll treat the chunk's entire text as 1 "pbt" for next round.
-
-        # Start with "virtual" PBT items = the actual pbt_list
-        current_pbt_list = pbt_list
-
-        round_index = 1
+        round_idx=1
+        current_list = pbt_list
+        answers_text = []
         while True:
-            logger.info(f"Round {round_index}, PBT count={len(current_pbt_list)}")
-
-            if len(current_pbt_list) <= self.chunk_size:
-                # Just do one chunk pick => final
-                final_answer = self._pick_best_in_chunk(name, definition, current_pbt_list)
-                round_texts.append(f"(Final) => {final_answer}")
+            logger.info(f"Tournament Round {round_idx}, pbt size={len(current_list)}")
+            if len(current_list) <= self.chunk_size:
+                # final chunk
+                final_ans = self.pick_best_in_chunk(name, definition, current_list)
+                answers_text.append(f"Round{round_idx} final: {final_ans}")
                 break
             else:
                 # multiple chunks
-                chunk_answers = self._chunk_and_pick(name, definition, current_pbt_list)
-                # Each chunk answer is a freeform text from the model
-                # We'll treat each answer as a single "virtual" PBT item for next round
-                new_pbt_list = []
+                chunk_answers = []
+                for i in range(0, len(current_list), self.chunk_size):
+                    chunk = current_list[i : i+self.chunk_size]
+                    ans = self.pick_best_in_chunk(name, definition, chunk)
+                    chunk_answers.append(ans)
+                # Now treat each chunk's textual answer as 1 "virtual pbt"
+                new_list = []
                 for idx, ans_text in enumerate(chunk_answers, start=1):
-                    # We'll create a single pbt item out of the chunk answer
-                    # so in next round, the user can pick from these "answers".
-                    new_pbt_list.append({
-                        "pbt-name": f"Round{round_index}_chunk{idx}_pick",
+                    new_list.append({
+                        "pbt-name": f"Round{round_idx}_Chunk{idx}",
                         "pbt-definition": ans_text
                     })
-                round_texts.append(f"(Round {round_index}) => {chunk_answers}")
+                answers_text.append(f"Round{round_idx} => {chunk_answers}")
 
-                # if only 1 chunk answer => final
-                if len(new_pbt_list) == 1:
-                    final_answer = new_pbt_list[0]["pbt-definition"]
-                    round_texts.append(f"(Final) => {final_answer}")
+                if len(new_list) == 1:
+                    # done
+                    answers_text.append(f"Single final => {new_list[0]['pbt-definition']}")
                     break
                 else:
-                    current_pbt_list = new_pbt_list
-                    round_index += 1
+                    current_list = new_list
+                    round_idx += 1
+        # Combine all round logs
+        return "\n".join(answers_text)
 
-        # Return the final textual reasoning
-        return "\n".join(round_texts)
-
-###########################
-#   MAIN LOGIC
-###########################
+#############################
+# Main
+#############################
 def main():
     """
-    - Initialize environment
-    - Load CSVs
-    - For each row in source.csv, do chunk-based "tournament" matching
-    - Save results
+    1) Load env
+    2) Index target.csv in LanceDB
+    3) For each row in source.csv, embed + top-K => chunked GPT => final best
+    4) Save results
     """
     try:
         base_dir = Path(__file__).parent.parent
         env_dir = base_dir / "env"
         data_dir = base_dir / "data"
         output_dir = base_dir / "output"
-        log_dir = base_dir / "logs"
 
-        for d in [env_dir, data_dir, output_dir, log_dir]:
-            d.mkdir(exist_ok=True)
-
-        # .env files
         config_file = env_dir / "config.env"
-        creds_file = env_dir / "credentials.env"
-        cert_file = env_dir / "cacert.pem"
+        creds_file  = env_dir / "credentials.env"
+        cert_file   = env_dir / "cacert.pem"
+        source_csv  = data_dir / "source.csv"
+        target_csv  = data_dir / "target.csv"
 
-        # CSV files
-        source_csv = data_dir / "source.csv"
-        target_csv = data_dir / "target.csv"
-
-        # Check existence
-        missing = []
         for f in [config_file, creds_file, cert_file, source_csv, target_csv]:
             if not f.exists():
-                missing.append(str(f))
-        if missing:
-            print("Missing required files:")
-            for m in missing:
-                print(f"- {m}")
-            return
-
-        # 1) ENV
-        logger.info("Initializing OSEnv and reading environment configs...")
+                logger.error(f"Missing file: {f}")
+                return
+        
         env_setup = OSEnv(str(config_file), str(creds_file), str(cert_file))
 
-        # 2) Chat model with chunking
-        logger.info("Initializing Azure Chat model (chunk approach)...")
-        chatbot = AzureChatbot(env_setup)
-
-        # 3) Load data
-        logger.info("Loading CSV data...")
-        src_df = pd.read_csv(str(source_csv), dtype=str).fillna("")
-        tgt_df = pd.read_csv(str(target_csv), dtype=str).fillna("")
-
-        if not {"name", "definition"}.issubset(src_df.columns):
-            raise ValueError("source.csv must have columns: name, definition")
-        if not {"pbt-name", "pbt-definition"}.issubset(tgt_df.columns):
+        # Load PBT
+        pbt_df = pd.read_csv(str(target_csv)).fillna("")
+        if not {"pbt-name","pbt-definition"}.issubset(pbt_df.columns):
             raise ValueError("target.csv must have columns: pbt-name, pbt-definition")
 
-        # Convert target DF to list of dicts
-        pbt_list = tgt_df.to_dict('records')
+        # 1) Index target in local vector store
+        pbt_indexer = PBTVecStore(env_setup)
+        pbt_indexer.index_pbt(pbt_df)
 
-        logger.info(f"Source CSV has {len(src_df)} rows, target CSV has {len(tgt_df)} PBT rows.")
-        
-        # 4) For each row in source, run chunk-based approach
+        # 2) Prepare chunk-based GPT
+        chunked_gpt = ChunkedGPT(env_setup)
+
+        # 3) For each row in source => embed => topK => chunk => final
+        src_df = pd.read_csv(str(source_csv)).fillna("")
+        if not {"name","definition"}.issubset(src_df.columns):
+            raise ValueError("source.csv must have columns: name, definition")
+
+        top_k = int(env_setup.get("TOP_K","30"))
+
         results = []
-        for idx, row in src_df.iterrows():
+        for idx, row in tqdm(src_df.iterrows(), total=len(src_df), desc="Matching"):
             name_val = row["name"].strip()
-            def_val = row["definition"].strip()
+            def_val  = row["definition"].strip()
 
-            logger.info(f"Processing row {idx+1}/{len(src_df)}: '{name_val}'")
-            # Run tournament
-            model_answer = chatbot.match_single_record(name_val, def_val, pbt_list)
+            # embed => local search
+            query_text = f"{name_val} | {def_val}"
+            top_pbt = pbt_indexer.top_k_pbt(query_text, k=top_k)  # returns list of pbt dict with similarity_score
 
-            # Append to results
+            # chunk approach on top_pbt
+            # remove 'similarity_score' field, not needed in chunk
+            smaller_list = []
+            for p in top_pbt:
+                smaller_list.append({
+                    "pbt-name": p["pbt-name"],
+                    "pbt-definition": p["pbt-definition"]
+                })
+            final_ans = chunked_gpt.tournament_pick(name_val, def_val, smaller_list)
+
             results.append({
                 "source_name": name_val,
                 "source_definition": def_val,
-                "model_answer": model_answer
+                "model_answer": final_ans
             })
-        
-        # 5) Save results
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        out_file = output_dir / f"chat_matches_{timestamp}.csv"
-        pd.DataFrame(results).to_csv(str(out_file), index=False)
 
-        json_file = out_file.with_suffix(".json")
-        with open(json_file, 'w', encoding='utf-8') as f:
+        # 4) Save
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        out_csv = output_dir / f"matches_{timestamp}.csv"
+        pd.DataFrame(results).to_csv(str(out_csv), index=False)
+        out_json = out_csv.with_suffix(".json")
+        with open(out_json,"w",encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
 
-        print(f"\nDone! Results saved to:\n  - {out_file}\n  - {json_file}")
+        logger.info(f"Done! Saved results => {out_csv}, {out_json}")
 
     except Exception as e:
-        logger.exception(f"Unexpected error: {str(e)}")
+        logger.exception(f"Error in main: {str(e)}")
         print(f"Error: {str(e)}")
 
 if __name__ == "__main__":
