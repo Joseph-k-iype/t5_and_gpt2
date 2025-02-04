@@ -1,30 +1,70 @@
 #!/usr/bin/env python3
 """
-Example script demonstrating:
-- OSEnv class with a fixed set_proxy() that merges NO_PROXY and adds required domains 
-  (like login.microsoftonline.com) to bypass corporate proxy for client auth.
-- A simple AzureChatOpenAI usage via LangChain to show the environment in action.
+PROBLEM STATEMENT
+-----------------
+We have two CSV files:
 
-Edit or extend this code to match your actual usage (e.g. CSV matching, chatbot, etc.).
+1) First CSV ("source.csv"):
+   - name: the original label or identifier for a concept
+   - definition: a descriptive explanation or context for that concept
+
+2) Second CSV ("target.csv"):
+   - pbt-name: the business-approved or "preferred" label for that concept
+   - pbt-definition: the descriptive explanation or context for that PBT
+
+GOAL:
+-----
+For each (name, definition) in the first CSV, find the best matching pbt-name
+from the second CSV. We'll use:
+
+ - Our original OSEnv class for environment & proxy handling
+ - AzureChatOpenAI for the language model
+ - A chunked "tournament" approach to avoid exceeding model max token limits
+
+HOW IT WORKS (Chunk Approach):
+------------------------------
+1) Load all PBTs from target.csv, chunk them into small subsets (default 50).
+2) For each chunk, ask GPT "which single PBT is best?" => 1 "winner".
+3) If multiple chunks => we get multiple winners => repeat until we have only 1 final best PBT.
+4) Save final results in output/matches_<timestamp>.csv & .json
+
+CONFIG:
+-------
+Your env/config.env, env/credentials.env, etc., can hold:
+ - PROXY_ENABLED, SECURED_ENDPOINTS
+ - AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
+ - AZURE_OPENAI_ENDPOINT, API_VERSION
+ - MODEL_NAME, MODEL_TEMPERATURE, MAX_TOKENS
+ - CHUNK_SIZE (to control how many PBTs per chunk)
+ 
+If SECURED_ENDPOINTS=True, we fetch an Azure AD token from login.microsoftonline.com,
+so we must add that domain (and others) to NO_PROXY to avoid client auth errors.
+
+DEPENDENCIES:
+-------------
+pip install langchain openai azure-identity python-dotenv pandas numpy tqdm
 """
 
 import os
+import re
 import time
+import json
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import List, Dict
+import pandas as pd
+from tqdm import tqdm
 
-# For .env loading
-from dotenv import dotenv_values
-
-# For Azure AD token (if SECURED_ENDPOINTS=True)
+# Azure Identity for AAD token if SECURED_ENDPOINTS=True
 from azure.identity import ClientSecretCredential
 
-# For demonstration: use a simple AzureChatOpenAI call
+# LangChain's AzureChatOpenAI
 from langchain.chat_models import AzureChatOpenAI
-from langchain.schema import SystemMessage, HumanMessage
+from langchain.schema import HumanMessage, SystemMessage
 
-# Set up logging
+###########################
+# Logging Setup
+###########################
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -32,10 +72,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ###########################
-#       OSEnv Class
+# OSEnv Class with proxy fix
 ###########################
 def is_file_readable(filepath: str) -> bool:
-    """Check if file exists and is readable."""
     if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
         raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
     return True
@@ -51,192 +90,337 @@ def str_to_bool(s: str) -> bool:
 
 class OSEnv:
     """
-    Environment variable & certificate management. 
-    Includes a set_proxy() that merges NO_PROXY and adds required bypass domains.
+    Loads .env config, sets certificate + proxy, merges NO_PROXY with critical bypass domains,
+    and optionally retrieves an Azure AD token if SECURED_ENDPOINTS=True.
     """
-    
-    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
+    def __init__(self, config_file: str, creds_file: str, cert_file: str):
         self.var_list = []
+        self._load_env_file(config_file, print_val=True)
+        logger.info(f"Loaded config from {config_file}")
         
-        # Load main configuration
-        self.bulk_set(config_file, print_val=True)
-        logger.info(f"Loaded main configuration from {config_file}")
-        
-        # Load credentials
-        self.bulk_set(creds_file, print_val=False)
+        self._load_env_file(creds_file, print_val=False)
         logger.info(f"Loaded credentials from {creds_file}")
         
-        # Set up certificate
-        self.set_certificate_path(certificate_path)
+        # Set certificate
+        self._set_certificate(cert_file)
         logger.info("Certificate path configured.")
         
-        # Possibly set up proxy
+        # Possibly set proxy
         if str_to_bool(self.get("PROXY_ENABLED", "false")):
-            self.set_proxy()
+            self._set_proxy()
             logger.info("Proxy configured.")
         
-        # Possibly get Azure token if SECURED_ENDPOINTS=True
+        # Possibly get Azure token
         if str_to_bool(self.get("SECURED_ENDPOINTS", "false")):
-            logger.info("Securing endpoints (AAD token flow).")
-            self.token = self.get_azure_token()
+            logger.info("Acquiring Azure AD token.")
+            self.token = self._get_azure_token()
         else:
             self.token = None
 
-    def bulk_set(self, dotenvfile: str, print_val: bool) -> None:
-        """Load environment variables from a .env file."""
-        try:
-            if not os.path.isabs(dotenvfile):
-                dotenvfile = os.path.abspath(dotenvfile)
-            if is_file_readable(dotenvfile):
-                env_dict = dotenv_values(dotenvfile)
-                for k, v in env_dict.items():
-                    self.set(k, v if v else "", print_val=print_val)
-        except Exception as e:
-            logger.error(f"Failed to load environment file {dotenvfile}: {str(e)}")
-            raise
+    def _load_env_file(self, file_path: str, print_val: bool):
+        if not os.path.isabs(file_path):
+            file_path = os.path.abspath(file_path)
+        if is_file_readable(file_path):
+            with open(file_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            for line in lines:
+                line=line.strip()
+                if line and not line.startswith("#"):
+                    kv = line.split("=",1)
+                    if len(kv)==2:
+                        k,v = kv
+                        k=k.strip()
+                        v=v.strip().strip("'\"")
+                        self._set_env(k,v,print_val)
 
-    def set_certificate_path(self, certificate_path: str):
-        """Set the certificate env variables if file is readable."""
-        if not os.path.isabs(certificate_path):
-            certificate_path = os.path.abspath(certificate_path)
-        if not is_file_readable(certificate_path):
-            raise FileNotFoundError(f"Certificate file not found or not readable: {certificate_path}")
-        
-        self.set("REQUESTS_CA_BUNDLE", certificate_path)
-        self.set("SSL_CERT_FILE", certificate_path)
-        self.set("CURL_CA_BUNDLE", certificate_path)
-        logger.info(f"Using certificate path: {certificate_path}")
-
-    def set(self, var_name: str, val: str, print_val: bool=True):
-        """Set an environment variable for this process."""
+    def _set_env(self, var_name: str, val: str, print_val: bool=True):
         os.environ[var_name] = val
         if var_name not in self.var_list:
             self.var_list.append(var_name)
         if print_val:
-            # Hide sensitive vars
-            if var_name in ['AZURE_CLIENT_SECRET', 'AD_USER_PW']:
+            if var_name in ['AZURE_CLIENT_SECRET','AD_USER_PW']:
                 logger.info(f"Set {var_name}=[HIDDEN]")
             else:
                 logger.info(f"Set {var_name}={val}")
 
-    def get(self, var_name: str, default_val: str="") -> str:
-        return os.getenv(var_name, default_val)
+    def get(self, key: str, default_val:str="") -> str:
+        return os.getenv(key, default_val)
 
-    def set_proxy(self) -> None:
-        """
-        Configure proxy and merge NO_PROXY with required bypass domains 
-        to avoid client authentication errors.
-        """
+    def _set_certificate(self, cert_file: str):
+        cf_abs = os.path.abspath(cert_file)
+        if not is_file_readable(cf_abs):
+            raise FileNotFoundError(f"CACert not found: {cf_abs}")
+        os.environ["REQUESTS_CA_BUNDLE"] = cf_abs
+        os.environ["SSL_CERT_FILE"]      = cf_abs
+        os.environ["CURL_CA_BUNDLE"]     = cf_abs
+        logger.info(f"Using cert: {cf_abs}")
+
+    def _set_proxy(self):
         ad_username = self.get("AD_USERNAME")
         ad_password = self.get("AD_USER_PW")
         proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
-        
         if not all([ad_username, ad_password, proxy_domain]):
             raise ValueError("Missing proxy credentials for PROXY_ENABLED=True.")
         
         proxy_url = f"http://{ad_username}:{ad_password}@{proxy_domain}"
-        # Set HTTP_PROXY / HTTPS_PROXY
-        self.set("HTTP_PROXY", proxy_url, print_val=False)
-        self.set("HTTPS_PROXY", proxy_url, print_val=False)
+        # Set
+        os.environ["HTTP_PROXY"]  = proxy_url
+        os.environ["HTTPS_PROXY"] = proxy_url
         
-        # Merge existing NO_PROXY with new domains we want to bypass
-        existing_no_proxy = self.get("NO_PROXY", "")
+        existing_no_proxy = self.get("NO_PROXY","")
         no_proxy_list = [d.strip() for d in existing_no_proxy.split(",") if d.strip()]
 
-        # Add critical domains for Azure AD, OpenAI, etc.
         required_no_proxy = [
             'cognitiveservices.azure.com',
             'search.windows.net',
             'openai.azure.com',
             'core.windows.net',
             'azurewebsites.net',
-            'login.microsoftonline.com',  # crucial for AAD token retrieval
+            # Bypass AAD endpoints => no client auth errors
+            'login.microsoftonline.com',
+            # For model blob files
             'openaiPublic.blob.core.windows.net'
         ]
-
         for domain in required_no_proxy:
             if domain not in no_proxy_list:
                 no_proxy_list.append(domain)
 
         merged_no_proxy = ",".join(no_proxy_list)
-        self.set("NO_PROXY", merged_no_proxy, print_val=False)
-        logger.info(f"Proxy config complete. NO_PROXY={merged_no_proxy}")
+        os.environ["NO_PROXY"] = merged_no_proxy
+        logger.info(f"Merged NO_PROXY={merged_no_proxy}")
 
-    def get_azure_token(self) -> str:
-        """
-        Acquire Azure AD token if you have AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET.
-        Bypass proxy for login.microsoftonline.com is crucial.
-        """
+    def _get_azure_token(self) -> str:
         try:
             tenant_id = self.get("AZURE_TENANT_ID")
             client_id = self.get("AZURE_CLIENT_ID")
             client_secret = self.get("AZURE_CLIENT_SECRET")
             credential = ClientSecretCredential(tenant_id, client_id, client_secret)
             token_obj = credential.get_token("https://cognitiveservices.azure.com/.default")
-            logger.info("Acquired Azure token successfully.")
+            logger.info("Successfully acquired Azure AD token.")
             return token_obj.token
         except Exception as e:
             logger.error(f"Failed to get Azure token: {str(e)}")
             raise
 
-###############################
-# Example usage with AzureChatOpenAI
-###############################
-def main():
+###########################
+# Chunked Prompt Approach
+###########################
+class ChunkedGPTMatcher:
     """
-    Demonstrate:
-      1) Loading .env config
-      2) Setting proxy with NO_PROXY merges 
-      3) A simple chat call via AzureChatOpenAI
+    Uses AzureChatOpenAI to find the best match among many PBT definitions
+    by chunking them to avoid token limit overload. 
     """
-    try:
-        # Setup paths
-        base_dir = Path(__file__).parent.parent
-        env_dir = base_dir / "env"
-        config_file = env_dir / "config.env"
-        creds_file = env_dir / "credentials.env"
-        cert_file = env_dir / "cacert.pem"
+    def __init__(self, env: OSEnv):
+        self.env = env
+        self._setup_llm()
+        # CHUNK_SIZE can be in config.env if you want; default to 50
+        self.chunk_size = int(self.env.get("CHUNK_SIZE","50"))
 
-        # Validate
-        for f in [config_file, creds_file, cert_file]:
-            if not f.exists():
-                print(f"Missing: {f}")
-                return
+    def _setup_llm(self):
+        model_name = self.env.get("MODEL_NAME","gpt-4")
+        temperature = float(self.env.get("MODEL_TEMPERATURE","0.7"))
+        max_tokens = int(self.env.get("MAX_TOKENS","800"))
+        api_version = self.env.get("API_VERSION","2023-03-15-preview")
+        endpoint = self.env.get("AZURE_OPENAI_ENDPOINT","")
+        aad_token = self.env.token  # If SECURED_ENDPOINTS=True, we have an AAD token
 
-        # Init env
-        env_setup = OSEnv(str(config_file), str(creds_file), str(cert_file))
-
-        # Construct an AzureChatOpenAI instance
-        # We'll pass in the azure_ad_token if SECURED_ENDPOINTS=True
-        from langchain.chat_models import AzureChatOpenAI
-        model_name = env_setup.get("MODEL_NAME", "gpt-4")
-        temperature = float(env_setup.get("MODEL_TEMPERATURE", "0.7"))
-        max_tokens = int(env_setup.get("MAX_TOKENS", "800"))
-        api_version = env_setup.get("API_VERSION","2023-03-15-preview")
-        endpoint = env_setup.get("AZURE_OPENAI_ENDPOINT","")
-
-        azure_token = env_setup.token  # if SECURED_ENDPOINTS=True, we have an AAD token
-        logger.info(f"Using model '{model_name}', temp={temperature}, max_tokens={max_tokens}")
-
-        # Create the LLM object
-        llm = AzureChatOpenAI(
+        self.llm = AzureChatOpenAI(
             model_name=model_name,
             temperature=temperature,
             max_tokens=max_tokens,
             openai_api_version=api_version,
             azure_endpoint=endpoint,
-            azure_ad_token=azure_token
+            azure_ad_token=aad_token
+        )
+        logger.info(f"AzureChatOpenAI: model={model_name}, temp={temperature}, max_tokens={max_tokens}")
+
+    def pick_best_pbt_in_chunk(self, 
+                               name: str, 
+                               definition: str, 
+                               pbt_chunk: List[Dict[str,str]]) -> Dict[str,str]:
+        """
+        Single prompt to pick exactly one best PBT out of the chunk.
+        Returns a dict with { 'pbt-name': ..., 'pbt-definition': ... } 
+        or fallback if parse fails.
+        """
+        system_text = (
+            "You are an assistant that picks exactly one best-matching PBT from a chunk. "
+            "Output valid JSON with 'pbt-name' and 'pbt-definition'."
+        )
+        user_text = (
+            f"Original name: {name}\n"
+            f"Original definition: {definition}\n\n"
+            f"Here is a chunk of PBTs:\n"
+        )
+        for idx, pbt in enumerate(pbt_chunk, start=1):
+            user_text += (
+                f"({idx}) pbt-name: {pbt['pbt-name']}\n"
+                f"    pbt-definition: {pbt['pbt-definition']}\n\n"
+            )
+        user_text += (
+            "Which single pbt is the best match? "
+            "Return JSON as: {'pbt-name':'...','pbt-definition':'...'}"
         )
 
-        # Let's do a quick test call
-        system_msg = SystemMessage(content="You are a helpful assistant.")
-        user_msg = HumanMessage(content="Hi, can you confirm if I'm bypassing the proxy for Azure AD?")
-        response = llm([system_msg, user_msg])
-        print(f"\nModel's response:\n{response.content}")
+        messages = [
+            SystemMessage(content=system_text),
+            HumanMessage(content=user_text)
+        ]
+
+        try:
+            response = self.llm(messages)
+            content = response.content.strip()
+            return self._extract_pbt_json(content) or pbt_chunk[0]
+        except Exception as e:
+            logger.error(f"pick_best_pbt_in_chunk error: {str(e)}")
+            return pbt_chunk[0]  # fallback if error
+
+    def _extract_pbt_json(self, text: str) -> Dict[str,str]:
+        """
+        Attempt to parse JSON for 'pbt-name' and 'pbt-definition'.
+        If parse fails, return None.
+        """
+        # super naive parse
+        import json
+        try:
+            data = json.loads(text)
+            # Must have pbt-name, pbt-definition
+            if "pbt-name" in data and "pbt-definition" in data:
+                return {
+                    "pbt-name": data["pbt-name"],
+                    "pbt-definition": data["pbt-definition"]
+                }
+        except Exception:
+            pass
+        return None
+
+    def pick_best_pbt_across_all(self, 
+                                 name: str, 
+                                 definition: str, 
+                                 pbt_list: List[Dict[str,str]]) -> Dict[str,str]:
+        """
+        1) Break pbt_list into chunks of chunk_size
+        2) For each chunk => pick winner
+        3) If multiple chunk-winners => do a 'tournament' 
+           until only one final winner remains
+        """
+        # chunk
+        chunks = [
+            pbt_list[i : i+self.chunk_size]
+            for i in range(0, len(pbt_list), self.chunk_size)
+        ]
+        logger.info(f"Number of chunks: {len(chunks)} for {len(pbt_list)} PBTs (chunk_size={self.chunk_size})")
+
+        # chunk winners
+        winners = []
+        for c_idx, chunk in enumerate(chunks, start=1):
+            logger.info(f"Chunk {c_idx}/{len(chunks)} => size={len(chunk)}")
+            w = self.pick_best_pbt_in_chunk(name, definition, chunk)
+            winners.append(w)
+
+        # tournament if needed
+        while len(winners) > 1:
+            logger.info(f"Tournament round with {len(winners)} winners left")
+            new_winners = []
+            chunked_winners = [
+                winners[i : i+self.chunk_size]
+                for i in range(0, len(winners), self.chunk_size)
+            ]
+            for w_chunk in chunked_winners:
+                if len(w_chunk)==1:
+                    new_winners.append(w_chunk[0])
+                else:
+                    wpick = self.pick_best_pbt_in_chunk(name, definition, w_chunk)
+                    new_winners.append(wpick)
+            winners = new_winners
+
+        if winners:
+            return winners[0]
+        else:
+            return {"pbt-name":"NO MATCH","pbt-definition":"NO MATCH"}
+
+###########################
+# main() 
+###########################
+def main():
+    """
+    1) Load OSEnv & config
+    2) Create a ChunkedGPTMatcher 
+    3) Load source.csv & target.csv
+    4) For each row in source => chunk approach => final best PBT
+    5) Save results
+    """
+    try:
+        base_dir = Path(__file__).parent.parent
+        env_dir = base_dir / "env"
+        data_dir = base_dir / "data"
+        output_dir = base_dir / "output"
+        log_dir = base_dir / "logs"
+
+        for folder in [env_dir, data_dir, output_dir, log_dir]:
+            folder.mkdir(exist_ok=True)
+
+        config_file = env_dir / "config.env"
+        creds_file = env_dir / "credentials.env"
+        cert_file  = env_dir / "cacert.pem"
+        source_csv = data_dir / "source.csv"
+        target_csv = data_dir / "target.csv"
+
+        # Validate
+        missing_files = []
+        for f in [config_file, creds_file, cert_file, source_csv, target_csv]:
+            if not f.exists():
+                missing_files.append(str(f))
+        if missing_files:
+            logger.error(f"Missing required files: {missing_files}")
+            return
+
+        # 1) init environment
+        env_setup = OSEnv(str(config_file), str(creds_file), str(cert_file))
+        
+        # 2) chunk-based GPT approach
+        matcher = ChunkedGPTMatcher(env_setup)
+
+        # 3) load CSV data
+        logger.info(f"Reading {source_csv} and {target_csv}")
+        src_df = pd.read_csv(str(source_csv)).fillna("")
+        tgt_df = pd.read_csv(str(target_csv)).fillna("")
+        
+        if not {"name","definition"}.issubset(src_df.columns):
+            raise ValueError("source.csv must have columns: name, definition")
+        if not {"pbt-name","pbt-definition"}.issubset(tgt_df.columns):
+            raise ValueError("target.csv must have columns: pbt-name, pbt-definition")
+
+        pbt_list = tgt_df.to_dict("records")
+        logger.info(f"Source has {len(src_df)} rows, Target has {len(pbt_list)} PBTs")
+
+        # 4) for each row => pick best
+        results = []
+        for idx, row in tqdm(src_df.iterrows(), total=len(src_df), desc="Matching"):
+            name_val = row["name"].strip()
+            def_val  = row["definition"].strip()
+            best_pbt = matcher.pick_best_pbt_across_all(name_val, def_val, pbt_list)
+            results.append({
+                "source_name": name_val,
+                "source_definition": def_val,
+                "matched_pbt_name": best_pbt["pbt-name"],
+                "matched_pbt_definition": best_pbt["pbt-definition"]
+            })
+
+        # 5) Save results
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        out_csv = output_dir / f"matches_{timestamp}.csv"
+        pd.DataFrame(results).to_csv(str(out_csv), index=False)
+
+        out_json = out_csv.with_suffix(".json")
+        with open(out_json,"w",encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+
+        print(f"\nDone! Results stored:\n  - {out_csv}\n  - {out_json}")
 
     except Exception as e:
-        logger.exception("Error in main()")
+        logger.exception(f"Unexpected error in main: {str(e)}")
         print(f"Error: {str(e)}")
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
