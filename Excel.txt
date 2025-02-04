@@ -1,61 +1,57 @@
 #!/usr/bin/env python3
 """
-PROBLEM STATEMENT
------------------
-We have two CSV files:
+ALTERNATIVE APPROACH: 
+Use AzureChatOpenAI via your existing OSEnv to solve the CSV matching problem 
+(name/definition vs. pbt-name/pbt-definition) purely through a prompt-based approach.
 
-1) The first CSV has:
-   - name: the original label or identifier for a concept
-   - definition: a descriptive explanation or context for that concept
+For each row in the 'source.csv', we pass the entire list of PBTs from 'target.csv' 
+into an Azure Chat model and ask: "Which PBT is the best match for this 'name/definition'?"
 
-2) The second CSV has:
-   - pbt-name: the business-approved or "preferred" label for that concept
-   - pbt-definition: the descriptive explanation or context for that PBT
+Outputs a CSV file of matched results.
 
-We want to 'semantically match' each 'name' in the first CSV with the most similar 'pbt-name'
-from the second CSV, taking advantage of both definitions to provide context.
+Configuration (from .env files):
+--------------------------------
+- MODEL_NAME, MODEL_TEMPERATURE, MAX_TOKENS
+- API_VERSION, AZURE_OPENAI_ENDPOINT
+- (If secured endpoints = True, we fetch an AAD token using OSEnv)
+- Proxy, cert settings, etc. also handled by OSEnv.
 
-IMPLEMENTATION
---------------
-- Use your original `OSEnv` class for environment, certificate, and Azure token handling.
-- Use Azure OpenAI embeddings (LangChain) + LanceDB (instead of Faiss) for vector search.
-- Integrate a structured prompt in `_prepare_text()` to leverage definitions for contextual understanding.
-
-FIXES
------
-1) In `set_proxy()`, preserve & append to NO_PROXY, ensuring domains like
-   'openaiPublic.blob.core.windows.net' aren't overwritten.
-2) Guarantee that the single SSL file 'cacert.pem' is used for all traffic
-   (both direct & via proxy) by setting 'REQUESTS_CA_BUNDLE', 'SSL_CERT_FILE',
-   and 'CURL_CA_BUNDLE'.
+Usage:
+------
+1. Populate your env/config.env and env/credentials.env accordingly.
+2. Place source.csv + target.csv in data/.
+3. Run: python semantic_chat_match.py
+4. Results are saved in output/matches_<timestamp>.csv
 """
 
 import os
+import csv
 import time
-import logging
 import json
+import logging
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict
 
 import pandas as pd
-import numpy as np
-from tqdm import tqdm
 
-# LanceDB & LangChain
-from lancedb import connect
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.vectorstores import LanceDB
-from langchain.docstore.document import Document
-
-# OpenAI for Azure usage
-import openai
-
-# Azure Identity only if used by OSEnv's get_azure_token
+# The Azure Identity import is used by OSEnv when SECURED_ENDPOINTS=True
 from azure.identity import ClientSecretCredential
 
-##############################################################################
-# Helper Functions
-##############################################################################
+# We re-use your code:
+from langchain.chat_models import AzureChatOpenAI
+from langchain.schema import HumanMessage, SystemMessage
+from dotenv import dotenv_values
+
+# Reuse the logging logic
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+#############################
+# OSEnv + Chatbot Classes  #
+#############################
 def is_file_readable(filepath: str) -> bool:
     """Check if a file exists and is readable."""
     if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
@@ -64,457 +60,285 @@ def is_file_readable(filepath: str) -> bool:
 
 def str_to_bool(s: str) -> bool:
     """Convert string to boolean."""
-    if s.strip().lower() == 'true':
+    ls = s.strip().lower()
+    if ls == 'true':
         return True
-    elif s.strip().lower() == 'false':
+    elif ls == 'false':
         return False
     else:
         raise ValueError(f"Invalid boolean string: {s}")
 
-##############################################################################
-# OSEnv Class (Updated set_proxy to preserve NO_PROXY + force SSL cert usage)
-##############################################################################
 class OSEnv:
-    """
-    Environment and certificate management class (original) with fixes:
-      1) We merge existing NO_PROXY with required domains
-      2) We ensure that 'cacert.pem' is used for all SSL traffic
-    """
-    
+    """Environment variable and certificate management class."""
+
     def __init__(self, config_file: str, creds_file: str, certificate_path: str):
         self.var_list = []
         
-        # Load configurations
+        # Load main configuration
         self.bulk_set(config_file, True)
-        logging.info(f"Loaded main configuration from {config_file}")
+        logger.info(f"Loaded main configuration from {config_file}")
         
+        # Load credentials
         self.bulk_set(creds_file, False)
-        logging.info(f"Loaded credentials from {creds_file}")
+        logger.info(f"Loaded credentials from {creds_file}")
         
         # Set up certificates
         self.set_certificate_path(certificate_path)
-        logging.info("Certificate path configured.")
+        logger.info("Certificate path configured")
         
-        # Configure proxy if enabled
+        # Proxy
         if str_to_bool(self.get("PROXY_ENABLED", "False")):
             self.set_proxy()
-            logging.info("Proxy configured.")
+            logger.info("Proxy configured")
         
-        # Set up Azure token if secure endpoints enabled
+        # Possibly get Azure token
         if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
-            logging.info("Securing endpoints via AAD token flow.")
+            logger.info("Securing endpoints (AAD token)")
             self.token = self.get_azure_token()
         else:
-            self.token = self.get("AZURE_API_KEY", None)  # Possibly a direct API key
-            if not self.token:
-                logging.warning("No token or API key found. Ensure environment is correct.")
+            self.token = None
 
     def set_certificate_path(self, certificate_path: str) -> None:
-        """Set up the certificate path for SSL verification."""
         try:
-            if is_file_readable(certificate_path):
-                cert_path = str(Path(certificate_path))
-                # Force the entire environment to trust this CA bundle
-                self.set("REQUESTS_CA_BUNDLE", cert_path)
-                self.set("SSL_CERT_FILE", cert_path)
-                self.set("CURL_CA_BUNDLE", cert_path)
-                logging.info(f"Certificate path set to: {cert_path}")
+            cp_abs = os.path.abspath(certificate_path)
+            if not is_file_readable(cp_abs):
+                raise FileNotFoundError(f"Certificate file not found or not readable: {cp_abs}")
+            self.set("REQUESTS_CA_BUNDLE", cp_abs)
+            self.set("SSL_CERT_FILE", cp_abs)
+            self.set("CURL_CA_BUNDLE", cp_abs)
+            logger.info(f"Certificate path set to: {cp_abs}")
         except Exception as e:
-            logging.error(f"Certificate configuration failed: {str(e)}")
+            logger.error(f"Certificate configuration failed: {str(e)}")
             raise
 
     def bulk_set(self, dotenvfile: str, print_val: bool = False) -> None:
-        """Read and set environment variables from a dotenv file."""
         try:
-            if is_file_readable(dotenvfile):
-                logging.info(f"Loading environment variables from {dotenvfile}")
-                with open(dotenvfile) as f:
-                    lines = f.readlines()
-                
-                for line in lines:
-                    line = line.strip()
-                    if line and not line.startswith('#'):
-                        try:
-                            key, value = line.split('=', 1)
-                            key, value = key.strip(), value.strip().strip("'").strip('"')
-                            self.set(key, value, print_val)
-                        except ValueError:
-                            continue
-                            
-                logging.info(f"Successfully loaded variables from {dotenvfile}")
+            df_abs = os.path.abspath(dotenvfile)
+            if not is_file_readable(df_abs):
+                return
+            vals = dotenv_values(df_abs)
+            for k, v in vals.items():
+                self.set(k, v, print_val)
         except Exception as e:
-            logging.error(f"Failed to load environment file {dotenvfile}: {str(e)}")
+            logger.error(f"Failed to load environment file {dotenvfile}: {str(e)}")
             raise
 
     def set(self, var_name: str, val: str, print_val: bool = True) -> None:
-        """Set an environment variable in the current process."""
-        try:
-            os.environ[var_name] = val
-            if var_name not in self.var_list:
-                self.var_list.append(var_name)
-            if print_val and var_name not in ['AZURE_CLIENT_SECRET', 'AD_USER_PW']:
-                logging.info(f"Set {var_name}={val}")
-        except Exception as e:
-            logging.error(f"Failed to set environment variable {var_name}: {str(e)}")
-            raise
+        os.environ[var_name] = val
+        if var_name not in self.var_list:
+            self.var_list.append(var_name)
+        if print_val:
+            logger.info(f"Set {var_name}={val}")
 
-    def get(self, var_name: str, default: Optional[str] = None) -> Optional[str]:
-        """Get an environment variable value."""
-        return os.getenv(var_name, default)
+    def get(self, var_name: str, default_val: str = "") -> str:
+        return os.getenv(var_name, default_val)
 
     def set_proxy(self) -> None:
-        """
-        Set up proxy configuration with authentication.
-        Also merges existing NO_PROXY with the must-have bypass domains.
-        """
-        try:
-            ad_username = self.get("AD_USERNAME")
-            ad_password = self.get("AD_USER_PW")
-            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
-            
-            if not all([ad_username, ad_password, proxy_domain]):
-                raise ValueError("Missing proxy credentials. Check AD_USERNAME, AD_USER_PW, HTTPS_PROXY_DOMAIN.")
-            
-            # Example: "http://username:pw@proxy.corp:8080"
-            proxy_url = f"http://{ad_username}:{ad_password}@{proxy_domain}"
+        ad_username = self.get("AD_USERNAME")
+        ad_password = self.get("AD_USER_PW")
+        proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
+        if not all([ad_username, ad_password, proxy_domain]):
+            raise ValueError("Missing proxy credentials for PROXY_ENABLED=True")
 
-            # Tell Python requests / OpenAI / etc. to route traffic via this proxy
-            self.set("HTTP_PROXY", proxy_url, print_val=False)
-            self.set("HTTPS_PROXY", proxy_url, print_val=False)
-            
-            # Merge existing NO_PROXY with required Azure endpoints
-            existing_no_proxy = self.get("NO_PROXY", "")
-            no_proxy_list = [d.strip() for d in existing_no_proxy.split(",") if d.strip()]
-
-            # Must-have domains we want to bypass (esp. openaiPublic.blob.core.windows.net if needed)
-            required_no_proxy = [
-                'cognitiveservices.azure.com',
-                'search.windows.net',
-                'openai.azure.com',
-                'core.windows.net',
-                'azurewebsites.net',
-                'openaiPublic.blob.core.windows.net'  # critical if you want to bypass proxy for blob
-            ]
-            for domain in required_no_proxy:
-                if domain not in no_proxy_list:
-                    no_proxy_list.append(domain)
-
-            merged_no_proxy = ",".join(no_proxy_list)
-            self.set("NO_PROXY", merged_no_proxy)
-
-            logging.info(f"Proxy config complete. NO_PROXY={merged_no_proxy}")
-        except Exception as e:
-            logging.error(f"Proxy configuration failed: {str(e)}")
-            raise
+        proxy_url = f"http://{ad_username}:{ad_password}@{proxy_domain}"
+        self.set("HTTP_PROXY", proxy_url, print_val=False)
+        self.set("HTTPS_PROXY", proxy_url, print_val=False)
+        
+        no_proxy_list = [
+            'cognitiveservices.azure.com',
+            'search.windows.net',
+            'openai.azure.com',
+            'core.windows.net',
+            'azurewebsites.net'
+        ]
+        # Join them into NO_PROXY
+        self.set("NO_PROXY", ",".join(no_proxy_list), print_val=False)
 
     def get_azure_token(self) -> str:
-        """
-        Get Azure authentication token using ClientSecretCredential
-        (assuming environment has AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET).
-        """
         try:
             credential = ClientSecretCredential(
                 tenant_id=self.get("AZURE_TENANT_ID"),
                 client_id=self.get("AZURE_CLIENT_ID"),
                 client_secret=self.get("AZURE_CLIENT_SECRET")
             )
-            token = credential.get_token("https://cognitiveservices.azure.com/.default")
-            self.set("AZURE_TOKEN", token.token, print_val=False)
-            logging.info("Azure token acquired successfully via OSEnv.get_azure_token()")
-            return token.token
+            token_obj = credential.get_token("https://cognitiveservices.azure.com/.default")
+            token_val = token_obj.token
+            logger.info("Acquired Azure token successfully")
+            return token_val
         except Exception as e:
-            logging.error(f"Failed to get Azure token: {str(e)}")
+            logger.error(f"Failed to get Azure token: {str(e)}")
             raise
 
-##############################################################################
-# Logging Setup
-##############################################################################
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-##############################################################################
-# SemanticMatcher Class (using LanceDB)
-##############################################################################
-class SemanticMatcher:
+class AzureChatbot:
     """
-    Performs semantic matching using:
-      - OSEnv for environment & token (self.env.token)
-      - Azure OpenAI embeddings (LangChain)
-      - LanceDB for vector similarity
-      - A structured prompt for combining name/definition
+    A light wrapper around Azure Chat openai (LangChain's AzureChatOpenAI) 
+    for a single prompt/response approach.
     """
-    def __init__(self, env_setup: OSEnv):
-        self.env = env_setup
-        self._setup_openai()
-        self._setup_embeddings()
-        self._setup_lancedb()
+    
+    def __init__(self, env: OSEnv):
+        self.env = env
+        self._setup_chat_model()
 
-    def _setup_openai(self):
-        """
-        Configure the openai package with your OSEnv settings.
-        openai.api_key is assigned from env_setup.token
-        """
-        openai.api_type = "azure"
-        openai.api_base = self.env.get("AZURE_OPENAI_ENDPOINT", "")
-        openai.api_version = self.env.get("API_VERSION", "2023-03-15-preview")
+    def _setup_chat_model(self) -> None:
+        """Set up the chat model with environment variables."""
+        model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
+        temperature = float(self.env.get("MODEL_TEMPERATURE", "0.7"))
+        max_tokens = int(self.env.get("MAX_TOKENS", "800"))
+        api_version = self.env.get("API_VERSION", "2024-02-01")
+        azure_endpoint = self.env.get("AZURE_OPENAI_ENDPOINT")
+        azure_token = self.env.token  # AAD token if SECURED_ENDPOINTS=True
 
-        if not self.env.token:
-            msg = "No token found in OSEnv. Ensure SECURED_ENDPOINTS=True or AZURE_API_KEY is set."
-            logger.error(msg)
-            raise ValueError(msg)
-
-        openai.api_key = self.env.token
-        logger.info("OpenAI configured with OSEnv token.")
-
-        # Ensure Python + requests use the cacert.pem for all calls
-        # (Already done in OSEnv, but you can double-check here if needed)
-        requests_ca = os.environ.get("REQUESTS_CA_BUNDLE", "")
-        logger.info(f"Using SSL cert file: {requests_ca if requests_ca else 'None'}")
-
-    def _setup_embeddings(self):
-        """
-        Create a LangChain Embeddings object referencing your Azure deployment.
-        """
-        deployment_name = self.env.get("AZURE_EMBEDDINGS_DEPLOYMENT", "my-embedding-deployment")
-        model_name = self.env.get("AZURE_EMBEDDINGS_MODEL", "text-embedding-3-large")
-
-        self.embeddings_model = OpenAIEmbeddings(
-            deployment=deployment_name,
-            model=model_name,
-            openai_api_key=openai.api_key,
-            openai_api_base=openai.api_base,
-            openai_api_type=openai.api_type,
-            openai_api_version=openai.api_version
+        # Create the LLM object
+        self.llm = AzureChatOpenAI(
+            model_name=model_name,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            openai_api_version=api_version,
+            azure_endpoint=azure_endpoint,
+            azure_ad_token=azure_token
         )
-        logger.info(f"LangChain Embeddings set up for deployment '{deployment_name}' "
-                    f"with model '{model_name}'.")
+        logger.info(f"Chat model '{model_name}' initialized (temp={temperature}, max_tokens={max_tokens}).")
 
-    def _setup_lancedb(self):
+    def match_single_record(self, 
+                            name: str, 
+                            definition: str, 
+                            pbt_list: List[Dict[str, str]]) -> str:
         """
-        Connect or create local LanceDB storage for vector embeddings.
+        For one row from the source CSV, 
+        pass 'name'/'definition' + the entire pbt_list into a single prompt,
+        and let the model pick the best PBT.
+        
+        Returns: The model's direct response (which hopefully names the best PBT).
         """
-        self.db = connect("./lance_vectors")  # stored in local folder
-        self.table_name = "pbt_vectors"
-        logger.info("Connected to LanceDB at ./lance_vectors")
-
-    def _prepare_text(self, name: str, definition: str) -> str:
-        """
-        Integrate a structured prompt referencing the problem statement:
-        We combine 'name' and 'definition' to provide full context for embeddings.
-        """
-        prompt = (
-            f"You are given the following information about a concept:\n\n"
-            f"- Original Name: {name}\n"
-            f"- Original Definition: {definition}\n\n"
-            f"Your task is to find the best matching 'Preferred Business Term (PBT)' "
-            f"from a set of PBT-Names and PBT-Definitions.\n"
-            f"Focus on semantic similarity.\n"
+        # 1) Create the system & user messages
+        #    (System message: instruction to pick best matching PBT. 
+        #     User message: includes the actual data.)
+        
+        system_text = (
+            "You are a helpful assistant. Your job: given a concept 'name'/'definition' and "
+            "a list of possible 'pbt-name'/'pbt-definition', pick the best matching PBT."
         )
-        return prompt
-
-    def load_csv_data(self, source_csv: str, target_csv: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        Load and validate CSV files:
-          source.csv => columns: [name, definition]
-          target.csv => columns: [pbt-name, pbt-definition]
-        """
-        def read_csv_safely(file_path: str) -> pd.DataFrame:
-            encodings = ['utf-8', 'latin1', 'cp1252', 'iso-8859-1']
-            for enc in encodings:
-                try:
-                    return pd.read_csv(file_path, encoding=enc)
-                except Exception:
-                    continue
-            raise ValueError(f"Unable to read {file_path} with standard encodings.")
-
-        src_df = read_csv_safely(source_csv).fillna("")
-        tgt_df = read_csv_safely(target_csv).fillna("")
-
-        if not {"name", "definition"}.issubset(src_df.columns):
-            raise ValueError("Source CSV must have 'name' and 'definition' columns.")
-        if not {"pbt-name", "pbt-definition"}.issubset(tgt_df.columns):
-            raise ValueError("Target CSV must have 'pbt-name' and 'pbt-definition' columns.")
-
-        # Clean whitespace
-        for df in [src_df, tgt_df]:
-            for col in df.columns:
-                df[col] = df[col].astype(str).str.strip()
-
-        logger.info(f"Loaded {len(src_df)} source records from {source_csv}")
-        logger.info(f"Loaded {len(tgt_df)} target records from {target_csv}")
-        return src_df, tgt_df
-
-    def index_target_data(self, target_df: pd.DataFrame):
-        """
-        Build a LanceDB index from pbt-name + pbt-definition.
-        If the table already exists, we drop it and re-create.
-        """
-        if self.table_name in self.db.table_names():
-            logger.info(f"Dropping existing LanceDB table '{self.table_name}' to rebuild.")
-            self.db.drop_table(self.table_name)
-
-        docs = []
-        for _, row in target_df.iterrows():
-            pbt_text = (
-                f"PBT-Name: {row['pbt-name']}\n"
-                f"PBT-Definition: {row['pbt-definition']}\n"
-            )
-            docs.append(
-                Document(
-                    page_content=pbt_text,
-                    metadata={
-                        "pbt-name": row["pbt-name"],
-                        "pbt-definition": row["pbt-definition"]
-                    }
-                )
-            )
-
-        logger.info("Indexing target data into LanceDB...")
-        LanceDB.from_documents(
-            documents=docs,
-            embedding=self.embeddings_model,
-            connection=self.db,
-            table_name=self.table_name
+        # Build the user message to contain the full context
+        user_text = (
+            f"Original name: {name}\n"
+            f"Original definition: {definition}\n\n"
+            f"Potential PBTs:\n"
         )
-        logger.info("Target data indexed successfully.")
+        for pbt in pbt_list:
+            user_text += f"- pbt-name: {pbt['pbt-name']}\n  pbt-definition: {pbt['pbt-definition']}\n\n"
 
-    def process_matches(self, source_df: pd.DataFrame, similarity_threshold=0.75, top_k=3) -> List[Dict]:
-        """
-        For each row in source_df, embed the _prepare_text() result,
-        do a similarity search in LanceDB, and return matches above threshold.
-        """
-        vector_store = LanceDB(
-            connection=self.db,
-            table_name=self.table_name,
-            embedding=self.embeddings_model
+        user_text += (
+            "Which 'pbt-name' is the best match for the original name? "
+            "Justify your answer briefly."
         )
 
-        matches = []
-        for _, src_row in tqdm(source_df.iterrows(), total=len(source_df), desc="Matching Rows"):
-            query_prompt = self._prepare_text(src_row["name"], src_row["definition"])
-            results = vector_store.similarity_search_with_score(query_prompt, k=top_k)
+        # 2) Call the chat model
+        try:
+            messages = [
+                SystemMessage(content=system_text),
+                HumanMessage(content=user_text)
+            ]
+            response = self.llm(messages)
+            return response.content.strip()
+        except Exception as e:
+            logger.error(f"Error calling the model: {str(e)}")
+            return f"ERROR: {str(e)}"
 
-            for doc, score in results:
-                # Typically 'score' is 0..1 if using cosine similarity
-                if score >= similarity_threshold:
-                    matches.append({
-                        "source_name": src_row["name"],
-                        "source_definition": src_row["definition"],
-                        "matched_pbt_name": doc.metadata["pbt-name"],
-                        "matched_pbt_definition": doc.metadata["pbt-definition"],
-                        "similarity_score": float(score),
-                    })
-
-        logger.info(f"Found {len(matches)} total matches >= {similarity_threshold}")
-        return matches
-
-    def save_results(self, matches: List[Dict], output_file: str):
-        """
-        Save matched results to a CSV and JSON file with the same base name.
-        """
-        if not matches:
-            logger.warning("No matches to save.")
-            return
-
-        df = pd.DataFrame(matches)
-        df.to_csv(output_file, index=False)
-
-        json_file = output_file.replace(".csv", ".json")
-        with open(json_file, "w", encoding="utf-8") as f:
-            json.dump(matches, f, indent=2, ensure_ascii=False)
-
-        logger.info(f"Results saved to: {output_file} and {json_file}")
-
-##############################################################################
-# Main
-##############################################################################
+###########################
+#   MAIN LOGIC
+###########################
 def main():
     """
-    1) Build paths for env/, data/, output/, logs/ from one level above src/
-    2) Initialize OSEnv with the original logic for token retrieval (with proxy + SSL cert fix)
-    3) Load CSV data
-    4) Index target data in LanceDB
-    5) Match source data
-    6) Save results
+    - Initialize environment
+    - Load CSVs
+    - For each row in source.csv, ask the chat model which pbt in target.csv is best
+    - Save results
     """
     try:
-        # We are in src/, so go up 1 level to find env, data, etc.
         base_dir = Path(__file__).parent.parent
         env_dir = base_dir / "env"
         data_dir = base_dir / "data"
         output_dir = base_dir / "output"
         log_dir = base_dir / "logs"
 
-        for directory in [data_dir, output_dir, log_dir]:
-            directory.mkdir(exist_ok=True)
+        for d in [env_dir, data_dir, output_dir, log_dir]:
+            d.mkdir(exist_ok=True)
 
-        # Required files
+        # .env files
         config_file = env_dir / "config.env"
         creds_file = env_dir / "credentials.env"
         cert_file = env_dir / "cacert.pem"
+
+        # CSV files
         source_csv = data_dir / "source.csv"
         target_csv = data_dir / "target.csv"
 
-        missing_files = []
-        for f in [config_file, creds_file, source_csv, target_csv]:
+        # Check existence
+        missing = []
+        for f in [config_file, creds_file, cert_file, source_csv, target_csv]:
             if not f.exists():
-                missing_files.append(str(f))
-        if missing_files:
-            print("\nMissing required files:")
-            for mf in missing_files:
-                print(f" - {mf}")
+                missing.append(str(f))
+        if missing:
+            print("Missing required files:")
+            for m in missing:
+                print(f"- {m}")
             return
 
-        # Initialize environment
-        print("Initializing environment with original OSEnv (plus SSL/proxy fixes)...")
-        env_setup = OSEnv(
-            config_file=str(config_file),
-            creds_file=str(creds_file),
-            certificate_path=str(cert_file)
-        )
+        # 1) ENV
+        logger.info("Initializing OSEnv and reading environment configs...")
+        env_setup = OSEnv(str(config_file), str(creds_file), str(cert_file))
 
-        # Initialize matcher
-        matcher = SemanticMatcher(env_setup)
+        # 2) Chat model
+        logger.info("Initializing Azure Chat model (AzureChatbot)...")
+        chatbot = AzureChatbot(env_setup)
 
-        # Prepare output file
+        # 3) Load data
+        logger.info("Loading CSV data...")
+        src_df = pd.read_csv(str(source_csv), dtype=str).fillna("")
+        tgt_df = pd.read_csv(str(target_csv), dtype=str).fillna("")
+
+        if not {"name", "definition"}.issubset(src_df.columns):
+            raise ValueError("source.csv must have columns: name, definition")
+        if not {"pbt-name", "pbt-definition"}.issubset(tgt_df.columns):
+            raise ValueError("target.csv must have columns: pbt-name, pbt-definition")
+
+        # Convert target DF into a list of dicts for easy iteration
+        pbt_list = tgt_df.to_dict('records')
+
+        logger.info(f"Source CSV has {len(src_df)} rows, target CSV has {len(tgt_df)} PBT rows.")
+        
+        # 4) For each row in source, prompt the model
+        results = []
+        for idx, row in src_df.iterrows():
+            name_val = row["name"].strip()
+            def_val = row["definition"].strip()
+
+            logger.info(f"Processing row {idx+1}/{len(src_df)}: '{name_val}'")
+
+            # Query the model
+            model_answer = chatbot.match_single_record(name_val, def_val, pbt_list)
+
+            # Append to results
+            results.append({
+                "source_name": name_val,
+                "source_definition": def_val,
+                "model_answer": model_answer
+            })
+        
+        # 5) Save results
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        output_file = output_dir / f"matches_{timestamp}.csv"
+        out_file = output_dir / f"chat_matches_{timestamp}.csv"
+        pd.DataFrame(results).to_csv(str(out_file), index=False)
 
-        # Load CSV data
-        print("\nLoading CSV data...")
-        source_df, target_df = matcher.load_csv_data(str(source_csv), str(target_csv))
+        json_file = out_file.with_suffix(".json")
+        with open(json_file, 'w', encoding='utf-8') as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
 
-        # Index target data
-        print("Indexing target data in LanceDB...")
-        matcher.index_target_data(target_df)
+        print(f"\nDone! Results saved to:\n  - {out_file}\n  - {json_file}")
 
-        # Process matches
-        print("Processing semantic matches...")
-        matches = matcher.process_matches(
-            source_df=source_df,
-            similarity_threshold=0.75,  # Adjust threshold as desired
-            top_k=3                     # top 3 neighbors
-        )
-
-        # Save results
-        print("Saving match results...")
-        matcher.save_results(matches, str(output_file))
-
-        print(f"\nProcess completed successfully. Results saved at {output_file}")
-
-    except FileNotFoundError as e:
-        print(f"File Error: {str(e)}")
-        logger.exception("File path issue")
-    except ValueError as e:
-        print(f"Value Error: {str(e)}")
-        logger.exception("Value issue encountered")
     except Exception as e:
-        print(f"Unexpected error: {str(e)}")
-        logger.exception("Unexpected error occurred")
-        raise
+        logger.exception(f"Unexpected error: {str(e)}")
+        print(f"Error: {str(e)}")
 
 if __name__ == "__main__":
     main()
