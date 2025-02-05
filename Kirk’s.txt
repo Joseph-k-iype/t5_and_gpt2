@@ -1,19 +1,18 @@
 import os
 import time
-import logging
 import glob
+import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 from dotenv import dotenv_values
 from azure.identity import ClientSecretCredential
 
-# Import the new Azure-specific classes from langchain_openai.
+# Import Azure-specific chat model and CSV loader from langchain_openai and langchain
 from langchain_openai import AzureChatOpenAI
-from langchain.schema import HumanMessage, SystemMessage
+from langchain.schema import SystemMessage
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationChain
-# We'll use CSVLoader to load CSV files.
 from langchain.document_loaders import CSVLoader
 
 # --------------------- Logging Configuration ---------------------
@@ -43,9 +42,9 @@ def str_to_bool(s: str) -> bool:
 class OSEnv:
     """Environment variable and certificate management."""
     def __init__(self, config_file: str, creds_file: str, certificate_path: str):
-        self.var_list = []  # Track environment variables set via this class
+        self.var_list = []  # Track variables set via this class
         
-        # Load main configuration and credentials
+        # Load configuration and credentials
         self.bulk_set(config_file, print_val=True)
         logger.info(f"Loaded main configuration from {config_file}")
         self.bulk_set(creds_file, print_val=False)
@@ -68,7 +67,7 @@ class OSEnv:
             self.token = None
 
     def set_certificate_path(self, certificate_path: str) -> None:
-        """Set up the certificate path for SSL verification."""
+        """Set the certificate path for SSL verification."""
         if not os.path.isabs(certificate_path):
             certificate_path = os.path.abspath(certificate_path)
         if not is_file_readable(certificate_path):
@@ -79,7 +78,7 @@ class OSEnv:
         logger.info(f"Certificate path set to: {certificate_path}")
 
     def bulk_set(self, dotenvfile: str, print_val: bool = False) -> None:
-        """Load and set environment variables from a dotenv file."""
+        """Load environment variables from a dotenv file."""
         if not os.path.isabs(dotenvfile):
             dotenvfile = os.path.abspath(dotenvfile)
         if is_file_readable(dotenvfile):
@@ -146,85 +145,122 @@ class OSEnv:
             else:
                 logger.info(f"{var}: {self.get(var)}")
 
-# --------------------- Agent-Based Chatbot with CSV Knowledge ---------------------
+# --------------------- Agent-Based Chatbot with CSV-Based RAG ---------------------
 class AzureChatbot:
     """
     An agent-based chatbot that uses an Azure OpenAI chat model.
-    Additionally, it loads CSV file(s) from a knowledge folder, concatenates their contents,
-    and injects that content as a system message to inform the agent.
+    It loads CSV file(s) from a knowledge folder, splits them into chunks,
+    and at query time uses the LLM to select the most relevant chunks.
+    The selected context is then injected into the final prompt for answering.
     """
     def __init__(self, config_file: str, creds_file: str, cert_file: str, knowledge_dir: Optional[str] = None):
-        logger.info("Initializing agent-based chatbot...")
+        logger.info("Initializing agent-based chatbot with CSV RAG...")
         self.env = OSEnv(config_file, creds_file, cert_file)
         self.knowledge_dir = knowledge_dir
-        self.knowledge_context = ""
+        self.csv_chunks = []
         if self.knowledge_dir:
-            self.knowledge_context = self.load_csv_context(self.knowledge_dir)
-        self._setup_chat_model()
+            self.csv_chunks = self.load_csv_chunks(self.knowledge_dir)
+        # Initialize the chat model (without pre-injecting all knowledge)
+        self.llm = AzureChatOpenAI(
+            model_name=self.env.get("MODEL_NAME", "gpt-4"),
+            deployment_name=self.env.get("CHAT_MODEL_DEPLOYMENT", self.env.get("MODEL_NAME", "gpt-4")),
+            temperature=float(self.env.get("MODEL_TEMPERATURE", "0.7")),
+            max_tokens=int(self.env.get("MAX_TOKENS", "800")),
+            openai_api_version=self.env.get("API_VERSION", "2024-02-01"),
+            azure_endpoint=self.env.get("AZURE_OPENAI_ENDPOINT"),
+            azure_ad_token=self.env.token
+        )
+        self.memory = ConversationBufferMemory()
+        # Use a ConversationChain for multi-turn chat
+        self.conversation = ConversationChain(
+            llm=self.llm,
+            memory=self.memory,
+            verbose=True
+        )
 
-    def load_csv_context(self, directory: str) -> str:
+    def load_csv_chunks(self, directory: str) -> List[str]:
         """
-        Load all CSV files from the given directory and combine their content into a single context string.
+        Load all CSV files from the directory and split their content into smaller chunks.
+        This helps avoid exceeding token limits.
         """
-        try:
-            # Use glob to find all CSV files recursively
-            csv_files = glob.glob(os.path.join(directory, "**/*.csv"), recursive=True)
-            if not csv_files:
-                logger.info("No CSV files found in the knowledge directory.")
-                return ""
-            all_text = []
-            for csv_file in csv_files:
-                logger.info(f"Loading CSV file: {csv_file}")
+        chunks = []
+        csv_files = glob.glob(os.path.join(directory, "**/*.csv"), recursive=True)
+        if not csv_files:
+            logger.info("No CSV files found in the knowledge directory.")
+            return chunks
+        for csv_file in csv_files:
+            logger.info(f"Loading CSV file: {csv_file}")
+            try:
                 loader = CSVLoader(file_path=csv_file)
                 docs = loader.load()
-                # Each document's page_content holds the CSV content (or a string representation thereof)
-                all_text.extend([doc.page_content for doc in docs])
-            combined_text = "\n\n".join(all_text)
-            logger.info(f"Combined CSV context length: {len(combined_text)} characters")
-            return combined_text
-        except Exception as e:
-            logger.error(f"Error loading CSV knowledge: {str(e)}")
-            return ""
+                for doc in docs:
+                    text = doc.page_content
+                    words = text.split()
+                    chunk_size = 200  # adjust as needed
+                    for i in range(0, len(words), chunk_size):
+                        chunk = " ".join(words[i:i+chunk_size])
+                        chunks.append(chunk)
+            except Exception as e:
+                logger.error(f"Error processing {csv_file}: {str(e)}")
+        logger.info(f"Total CSV chunks loaded: {len(chunks)}")
+        return chunks
 
-    def _setup_chat_model(self) -> None:
-        """Set up the Azure chat model and conversation chain; include CSV knowledge context if available."""
+    def get_relevance_score(self, query: str, text_chunk: str) -> float:
+        """
+        Use the LLM to score how relevant a text chunk is to the given query.
+        The prompt asks for a number between 0 (not relevant) and 10 (extremely relevant).
+        """
+        prompt = (
+            f"On a scale of 0 to 10, where 0 is not relevant at all and 10 is extremely relevant, "
+            f"how relevant is the following text to answering the question: \"{query}\"?\n\n"
+            f"Text:\n{text_chunk}\n\nAnswer with only a number."
+        )
         try:
-            self.llm = AzureChatOpenAI(
-                model_name=self.env.get("MODEL_NAME", "gpt-4"),
-                deployment_name=self.env.get("CHAT_MODEL_DEPLOYMENT", self.env.get("MODEL_NAME", "gpt-4")),
-                temperature=float(self.env.get("MODEL_TEMPERATURE", "0.7")),
-                max_tokens=int(self.env.get("MAX_TOKENS", "800")),
-                openai_api_version=self.env.get("API_VERSION", "2024-02-01"),
-                azure_endpoint=self.env.get("AZURE_OPENAI_ENDPOINT"),
-                azure_ad_token=self.env.token
-            )
-            self.memory = ConversationBufferMemory()
-            self.conversation = ConversationChain(
-                llm=self.llm,
-                memory=self.memory,
-                verbose=True
-            )
-            # If CSV knowledge is available, inject it as a system message for context.
-            if self.knowledge_context:
-                system_prompt = (
-                    "The following CSV data has been loaded from the knowledge base. "
-                    "Use this background information to help answer any related questions.\n\n"
-                    f"{self.knowledge_context}"
-                )
-                # Insert the system message at the beginning of the conversation memory.
-                self.memory.chat_memory.messages.insert(0, SystemMessage(content=system_prompt))
-                logger.info("CSV knowledge context injected as a system message.")
-            logger.info("Chat model initialized successfully.")
+            response = self.llm.predict(prompt)
+            score = float(response.strip())
         except Exception as e:
-            logger.error(f"Failed to initialize chat model: {str(e)}")
-            raise
+            logger.error(f"Error scoring chunk: {str(e)}")
+            score = 0.0
+        return score
+
+    def get_relevant_context(self, query: str) -> str:
+        """
+        Evaluate all CSV chunks and select the top relevant ones.
+        Returns a string combining the most relevant chunks.
+        """
+        scored_chunks = []
+        for chunk in self.csv_chunks:
+            score = self.get_relevance_score(query, chunk)
+            scored_chunks.append((score, chunk))
+        # Sort chunks in descending order of relevance
+        scored_chunks.sort(key=lambda x: x[0], reverse=True)
+        # Pick top 3 chunks that have a score of at least 5 (adjust threshold as needed)
+        top_chunks = [chunk for score, chunk in scored_chunks if score >= 5.0][:3]
+        logger.info(f"Selected {len(top_chunks)} chunks for context.")
+        return "\n\n".join(top_chunks)
 
     def chat(self, message: str) -> str:
-        """Process a user message and return the chatbot's response."""
+        """
+        Process a user message by retrieving relevant CSV context and
+        constructing a final prompt that combines conversation history,
+        relevant context, and the user query.
+        """
         if not message.strip():
             return "Please provide a non-empty message."
         try:
-            response = self.conversation.predict(input=message)
+            relevant_context = self.get_relevant_context(message)
+            conversation_history = self.memory.buffer  # Retrieve conversation history
+            final_prompt = (
+                "You are an expert assistant. Use the conversation history and the following CSV-derived context "
+                "to help answer the user's question.\n\n"
+                "Conversation History:\n" + conversation_history + "\n\n"
+                "Relevant CSV Context:\n" + relevant_context + "\n\n"
+                "User Question: " + message
+            )
+            response = self.llm.predict(final_prompt)
+            # Update conversation memory for multi-turn interactions.
+            self.memory.chat_memory.add_user_message(message)
+            self.memory.chat_memory.add_ai_message(response)
             return response
         except Exception as e:
             logger.error(f"Error during chat: {str(e)}")
@@ -232,17 +268,17 @@ class AzureChatbot:
 
 # --------------------- Main Function ---------------------
 def main():
-    """Main function to run the agent-based chatbot with CSV knowledge context."""
+    """Main function to run the CSV-based RAG chatbot without a vector DB."""
     try:
         base_dir = os.path.dirname(os.path.abspath(__file__))
         env_dir = os.path.join(base_dir, '..', 'env')
         config_path = os.path.join(env_dir, 'config.env')
         creds_path = os.path.join(env_dir, 'credentials.env')
         cert_path = os.path.join(env_dir, 'cacert.pem')
-        # Set the knowledge directory to where your CSV file is located.
+        # Set the knowledge directory to your folder containing CSV files.
         knowledge_dir = os.path.join(base_dir, '..', 'knowledge')
         
-        print("\nInitializing agent-based chatbot with CSV knowledge...")
+        print("\nInitializing CSV-based RAG chatbot (no vector DB)...")
         chatbot = AzureChatbot(
             config_file=config_path,
             creds_file=creds_path,
