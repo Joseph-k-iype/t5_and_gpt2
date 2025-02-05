@@ -1,145 +1,194 @@
 import os
-import pandas as pd
+import logging
+from pathlib import Path
+from dotenv import dotenv_values
+from azure.identity import ClientSecretCredential
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+class OSEnv:
+    """Manages environment variables, credentials, and proxy setup."""
+
+    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
+        """Initialize environment settings from config files."""
+        self.var_list = []
+        self.bulk_set(config_file, True)
+        self.bulk_set(creds_file, False)
+        self.set_certificate_path(certificate_path)
+        
+        if self.get("PROXY_ENABLED", "False") == "True":
+            self.set_proxy()
+        
+        if self.get("SECURED_ENDPOINTS", "False") == "True":
+            self.token = self.get_azure_token()
+        else:
+            self.token = None
+
+    def bulk_set(self, dotenvfile: str, print_val: bool = False):
+        """Load environment variables from a dotenv file."""
+        env_vars = dotenv_values(dotenvfile)
+        for k, v in env_vars.items():
+            self.set(k, v, print_val)
+
+    def set(self, var_name: str, val: str, print_val: bool = True):
+        """Set an environment variable."""
+        os.environ[var_name] = val
+        self.var_list.append(var_name)
+        logger.info(f"Set {var_name}" + (" = [HIDDEN]" if not print_val else f" = {val}"))
+
+    def get(self, var_name: str, default: str = None):
+        """Retrieve an environment variable."""
+        return os.environ.get(var_name, default)
+
+    def set_certificate_path(self, certificate_path: str):
+        """Configure SSL certificate path."""
+        if not Path(certificate_path).is_file():
+            raise FileNotFoundError(f"❌ SSL Certificate missing: {certificate_path}")
+        self.set("REQUESTS_CA_BUNDLE", certificate_path)
+        self.set("SSL_CERT_FILE", certificate_path)
+
+    def set_proxy(self):
+        """Configure proxy settings if enabled."""
+        proxy_url = f"http://{self.get('AD_USERNAME')}:{self.get('AD_USER_PW')}@{self.get('HTTPS_PROXY_DOMAIN')}"
+        self.set("HTTP_PROXY", proxy_url, False)
+        self.set("HTTPS_PROXY", proxy_url, False)
+
+    def get_azure_token(self):
+        """Retrieve an Azure authentication token."""
+        credential = ClientSecretCredential(
+            tenant_id=self.get("AZURE_TENANT_ID"),
+            client_id=self.get("AZURE_CLIENT_ID"),
+            client_secret=self.get("AZURE_CLIENT_SECRET")
+        )
+        token = credential.get_token("https://cognitiveservices.azure.com/.default")
+        self.set("AZURE_TOKEN", token.token, False)
+        return token.token
+
+
+
 import openai
+import logging
+from genai_env_setup import OSEnv
+
+logger = logging.getLogger(__name__)
+
+class EmbeddingClient:
+    """Handles embedding generation using Azure OpenAI's text-embedding-3-large model."""
+
+    def __init__(self, env: OSEnv):
+        """Initialize the embedding client."""
+        self.env = env
+        openai.api_type = "azure"
+        openai.api_base = env.get("AZURE_OPENAI_ENDPOINT")
+        openai.api_key = env.get("AZURE_OPENAI_API_KEY")
+        openai.api_version = env.get("API_VERSION", "2024-02-01")
+        
+        if not openai.api_base:
+            raise ValueError("❌ Missing AZURE_OPENAI_ENDPOINT in environment variables.")
+
+    def generate_embeddings(self, text: str):
+        """Generate and return embeddings for the given text."""
+        try:
+            response = openai.Embedding.create(
+                input=text,
+                engine="text-embedding-3-large"
+            )
+            return response['data'][0]['embedding']
+        except Exception as e:
+            logger.error(f"❌ Embedding generation failed: {e}")
+            return None
+
+
+
+
+
+import os
+import time
+import pandas as pd
 import chromadb
+import logging
 from chromadb.config import Settings
 from dotenv import load_dotenv
-import logging
-import time
+from azoi_embedding_client import EmbeddingClient
+from genai_env_setup import OSEnv
 
 # Load environment variables
 load_dotenv()
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("chatbot.log"),
-        logging.StreamHandler()
-    ]
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # Disable ChromaDB telemetry
 chroma_settings = Settings(
     chroma_db_impl="duckdb+parquet",
-    persist_directory="chroma_db",  # Store embeddings locally
-    anonymized_telemetry=False  # ✅ Disable telemetry
+    persist_directory="chroma_db",
+    anonymized_telemetry=False
 )
 
 # Initialize ChromaDB client
 client = chromadb.Client(chroma_settings)
-
-# Create or get a collection
 collection = client.get_or_create_collection(name="definitions")
 
-# Set OpenAI API credentials
-openai.api_type = "azure"
-openai.api_base = os.getenv("AZURE_OPENAI_ENDPOINT")
-openai.api_key = os.getenv("AZURE_OPENAI_API_KEY")
-openai.api_version = "2024-02-01"  # Ensure this matches your deployment
+# Load Environment Settings
+env = OSEnv("env/config.env", "env/credentials.env", "env/cacert.pem")
+embedding_client = EmbeddingClient(env)
 
 
 def load_and_store_embeddings(csv_path):
     """Load CSV data, generate embeddings, and store them in ChromaDB."""
-    try:
-        df = pd.read_csv(csv_path)
+    df = pd.read_csv(csv_path)
 
-        # Validate CSV structure
-        if 'name' not in df.columns or 'definition' not in df.columns:
-            raise ValueError("❌ ERROR: CSV must contain 'name' and 'definition' columns.")
+    if 'name' not in df.columns or 'definition' not in df.columns:
+        raise ValueError("CSV must contain 'name' and 'definition' columns.")
 
-        for idx, row in df.iterrows():
-            name = row['name']
-            definition = row['definition']
-
-            # Retry embedding generation up to 3 times
-            retries = 3
-            embedding = None
-            while retries > 0:
-                try:
-                    response = openai.Embedding.create(
-                        input=definition,
-                        engine="text-embedding-3-large"  # Ensure this matches your deployment
-                    )
-                    embedding = response['data'][0]['embedding']
-                    break  # If successful, break out of retry loop
-                except Exception as e:
-                    retries -= 1
-                    logger.warning(f"⚠️ Retrying embedding generation ({3 - retries}/3): {e}")
-                    time.sleep(2)
-                    if retries == 0:
-                        logger.error(f"❌ Failed to generate embeddings after multiple attempts: {e}")
-                        return
-
-            # Store in ChromaDB
+    for idx, row in df.iterrows():
+        name, definition = row['name'], row['definition']
+        embedding = embedding_client.generate_embeddings(definition)
+        
+        if embedding:
             collection.add(
                 documents=[definition],
                 metadatas=[{"name": name}],
                 ids=[f"id_{idx}"],
                 embeddings=[embedding]
             )
+        else:
+            logger.warning(f"⚠️ Skipped embedding for {name} due to failure.")
 
-        logger.info("✅ Embeddings successfully stored in ChromaDB.")
-    except Exception as e:
-        logger.error(f"❌ Error in load_and_store_embeddings: {e}")
+    logger.info("✅ Embeddings stored in ChromaDB.")
 
 
 def query_chatbot(user_query):
-    """Generate embedding for user query and retrieve the most relevant name."""
-    try:
-        response = openai.Embedding.create(
-            input=user_query,
-            engine="text-embedding-3-large"
-        )
-        query_embedding = response['data'][0]['embedding']
+    """Find the most relevant name for a user query."""
+    embedding = embedding_client.generate_embeddings(user_query)
+    
+    if not embedding:
+        return "❌ Failed to process your query."
 
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=1,  # Retrieve the most relevant name
-            include=["metadatas"]
-        )
+    results = collection.query(
+        query_embeddings=[embedding],
+        n_results=1,
+        include=["metadatas"]
+    )
 
-        if results['metadatas']:
-            most_relevant = results['metadatas'][0]
-            return f"🔍 The most relevant name for your query is: {most_relevant['name']}"
-        else:
-            return "❌ No relevant name found for your query."
-    except Exception as e:
-        logger.error(f"❌ Error in query_chatbot: {e}")
-        return "❌ An error occurred while processing your request."
+    return f"🔍 Most relevant name: {results['metadatas'][0]['name']}" if results['metadatas'] else "No relevant match found."
 
 
 def main():
-    """Main function to initialize and run the chatbot."""
-    try:
-        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        knowledge_dir = os.path.join(base_dir, "knowledge")
-        csv_path = os.path.join(knowledge_dir, "your_data.csv")  # Update with your CSV filename
+    """Initialize chatbot and run interactive mode."""
+    knowledge_dir = os.path.abspath("knowledge/your_data.csv")
+    load_and_store_embeddings(knowledge_dir)
 
-        # Print and log knowledge folder path
-        print(f"📂 Knowledge Folder Path: {knowledge_dir}")
-        logger.info(f"📂 Knowledge Folder Path: {knowledge_dir}")
-
-        # Load CSV data and store embeddings
-        load_and_store_embeddings(csv_path)
-
-        print("\n🚀 Chatbot initialized! You can now ask questions based on the CSV data.")
-        print("Type 'quit' to exit.\n")
-
-        while True:
-            user_input = input("You: ").strip()
-            if user_input.lower() in ['quit', 'exit', 'bye']:
-                print("👋 Goodbye!")
-                break
-
-            response = query_chatbot(user_input)
-            print(f"\n🤖 Bot: {response}\n")
-
-    except Exception as e:
-        logger.error(f"❌ Unexpected error in main function: {e}")
-        print("❌ A critical error occurred. Check logs for details.")
+    print("🚀 Chatbot initialized! Type 'quit' to exit.")
+    while True:
+        user_input = input("You: ").strip()
+        if user_input.lower() in ['quit', 'exit']:
+            print("👋 Goodbye!")
+            break
+        print(f"\n🤖 Bot: {query_chatbot(user_input)}\n")
 
 
 if __name__ == "__main__":
