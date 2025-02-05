@@ -1,114 +1,860 @@
-def _init_embeddings(self) -> AzureOpenAIEmbeddings:
-    """Initialize Azure OpenAI embeddings using specific configuration."""
+import os
+import time
+import logging
+import pandas as pd
+import chromadb
+from pathlib import Path
+from typing import List, Dict, Any, Tuple, Optional
+from dotenv import dotenv_values
+from azure.identity import DefaultAzureCredential
+from langchain_openai import AzureOpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_core.documents import Document
+from chromadb.config import Settings
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('chromadb.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+def is_file_readable(filepath: str) -> bool:
+    """Check if a file exists and is readable."""
+    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
+        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
+    return True
+
+def str_to_bool(s: str) -> bool:
+    """Convert string to boolean."""
+    if s.lower() in ['true', '1', 't', 'y', 'yes']:
+        return True
+    elif s.lower() in ['false', '0', 'f', 'n', 'no']:
+        return False
+    else:
+        raise ValueError(f"Invalid boolean string: {s}")
+
+class OSEnv:
+    """Environment variable and certificate management class."""
+    
+    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
+        """Initialize environment with configuration files and certificate."""
+        self.var_list = []
+        self.token = None
+        self.token_expiry = None
+        
+        # Load configurations
+        self.bulk_set(config_file, True)
+        logger.info(f"Loaded main configuration from {config_file}")
+        
+        self.bulk_set(creds_file, False)
+        logger.info(f"Loaded credentials from {creds_file}")
+        
+        # Set up certificates
+        self.set_certificate_path(certificate_path)
+        logger.info("Certificate path configured")
+        
+        # Configure proxy if enabled
+        if str_to_bool(self.get("PROXY_ENABLED", "False")):
+            self.set_proxy()
+            logger.info("Proxy configured")
+            
+        # Set up Azure token if secure endpoints enabled
+        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
+            logger.info("Securing endpoints")
+            self.token = self.get_azure_token()
+
+    def set_certificate_path(self, certificate_path: str) -> None:
+        """Set up certificate path for SSL verification."""
+        try:
+            if not os.path.isabs(certificate_path):
+                certificate_path = os.path.abspath(certificate_path)
+            
+            if not is_file_readable(certificate_path):
+                raise Exception("Certificate file missing or not readable")
+            
+            self.set("REQUESTS_CA_BUNDLE", certificate_path)
+            self.set("SSL_CERT_FILE", certificate_path)
+            self.set("CURL_CA_BUNDLE", certificate_path)
+            
+        except Exception as e:
+            logger.error(f"Certificate configuration failed: {str(e)}")
+            raise
+
+    def bulk_set(self, dotenvfile: str, print_val: bool = False) -> None:
+        """Read and set environment variables from a dotenv file."""
+        try:
+            if not os.path.isabs(dotenvfile):
+                dotenvfile = os.path.abspath(dotenvfile)
+                
+            if is_file_readable(dotenvfile):
+                temp_dict = dotenv_values(dotenvfile)
+                for k, v in temp_dict.items():
+                    self.set(k, v, print_val)
+                del temp_dict
+        except Exception as e:
+            logger.error(f"Failed to load environment file {dotenvfile}: {str(e)}")
+            raise
+
+    def set(self, var_name: str, val: str, print_val: bool = True) -> None:
+        """Set environment variable securely."""
+        try:
+            os.environ[var_name] = val
+            if var_name not in self.var_list:
+                self.var_list.append(var_name)
+            if print_val and var_name not in ['AZURE_CLIENT_SECRET', 'AD_USER_PW']:
+                logger.info(f"Set {var_name}={val}")
+            elif print_val:
+                logger.info(f"Set {var_name}=[HIDDEN]")
+        except Exception as e:
+            logger.error(f"Failed to set environment variable {var_name}: {str(e)}")
+            raise
+
+    def get(self, var_name: str, default: Optional[str] = None) -> Optional[str]:
+        """Get environment variable safely."""
+        try:
+            return os.environ[var_name]
+        except KeyError:
+            logger.warning(f"Environment variable {var_name} not found")
+            return default
+
+    def set_proxy(self) -> None:
+        """Set up proxy configuration with authentication."""
+        try:
+            ad_username = self.get("AD_USERNAME")
+            ad_password = self.get("AD_USER_PW")
+            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
+            
+            if not all([ad_username, ad_password, proxy_domain]):
+                raise ValueError("Missing proxy credentials")
+            
+            proxy_url = f"http://{ad_username}:{ad_password}@{proxy_domain}"
+            self.set("HTTP_PROXY", proxy_url, print_val=False)
+            self.set("HTTPS_PROXY", proxy_url, print_val=False)
+            
+            # Set no_proxy for Azure services
+            no_proxy_domains = [
+                'cognitiveservices.azure.com',
+                'search.windows.net',
+                'openai.azure.com',
+                'core.windows.net',
+                'azurewebsites.net'
+            ]
+            self.set("NO_PROXY", ",".join(no_proxy_domains))
+            logger.info("Proxy settings configured successfully")
+            
+        except Exception as e:
+            logger.error(f"Proxy configuration failed: {str(e)}")
+            raise
+
+    def get_azure_token(self, force_refresh: bool = False) -> str:
+        """Get Azure authentication token with automatic refresh."""
+        try:
+            current_time = time.time()
+            
+            # Check if we need to refresh the token
+            if (force_refresh or 
+                self.token is None or 
+                self.token_expiry is None or 
+                current_time >= self.token_expiry - 300):  # Refresh 5 minutes before expiry
+                
+                credential = DefaultAzureCredential()
+                token = credential.get_token("https://cognitiveservices.azure.com/.default")
+                self.token = token.token
+                self.token_expiry = current_time + 3600  # Token typically expires in 1 hour
+                self.set("AZURE_TOKEN", self.token, print_val=False)
+                logger.info("Azure token refreshed successfully")
+                
+            return self.token
+            
+        except Exception as e:
+            logger.error(f"Failed to get Azure token: {str(e)}")
+            raise
+
+    def list_env_vars(self) -> None:
+        """List all environment variables set by this class."""
+        sensitive_vars = {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET'}
+        for var in self.var_list:
+            if var in sensitive_vars:
+                logger.info(f"{var}: [HIDDEN]")
+            else:
+                logger.info(f"{var}: {self.get(var)}")
+
+
+class ChromaVectorStore:
+    """ChromaDB vector store manager with Azure OpenAI integration"""
+    
+    def __init__(self, env: OSEnv):
+        """Initialize the vector store with environment configuration."""
+        self.env = env
+        self._validate_azure_credentials()
+        self.embeddings = self._init_embeddings()
+        self.vector_store = None
+        self.collection_name = None
+        self.client = self._init_chroma_client()
+        logger.info("ChromaVectorStore initialized successfully")
+
+    def _init_chroma_client(self) -> chromadb.Client:
+        """Initialize ChromaDB client for local storage."""
+        try:
+            persist_directory = self.env.get("CHROMA_PERSIST_DIR", "./chroma_db")
+            os.makedirs(persist_directory, exist_ok=True)
+            
+            client = chromadb.Client(Settings(
+                anonymized_telemetry=False,
+                is_persistent=True,
+                persist_directory=persist_directory,
+                allow_reset=True
+            ))
+            
+            logger.info(f"Initialized local ChromaDB client at {persist_directory}")
+            return client
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize ChromaDB client: {str(e)}")
+            raise
+
+    def _validate_azure_credentials(self) -> None:
+        """Validate required Azure OpenAI credentials."""
+        required_vars = [
+            "AZURE_TENANT_ID",
+            "AZURE_CLIENT_ID",
+            "AZURE_CLIENT_SECRET",
+            "AZURE_EMBEDDING_DEPLOYMENT",
+            "AZURE_EMBEDDING_MODEL",
+            "AZURE_API_VERSION",
+            "AZURE_OPENAI_ENDPOINT"
+        ]
+        
+        missing = [var for var in required_vars if not self.env.get(var)]
+        if missing:
+            raise ValueError(f"Missing required Azure variables: {', '.join(missing)}")
+        logger.info("Azure credentials validated successfully")
+
+    def _init_embeddings(self) -> AzureOpenAIEmbeddings:
+        """Initialize Azure OpenAI embeddings with proper configuration."""
+        try:
+            # Get Azure AD token through OSEnv (which handles proxy if enabled)
+            token = self.env.get_azure_token(force_refresh=True)
+            
+            # Initialize embeddings using environment configuration
+            embeddings = AzureOpenAIEmbeddings(
+                deployment=str(self.env.get("AZURE_EMBEDDING_DEPLOYMENT")),
+                model=str(self.env.get("AZURE_EMBEDDING_MODEL")),
+                api_version=str(self.env.get("AZURE_API_VERSION")),
+                azure_endpoint=str(self.env.get("AZURE_OPENAI_ENDPOINT")),
+                azure_ad_token=token,
+                openai_api_type="azure_ad",
+                chunk_size=8,
+                max_retries=3,
+                timeout=30.0,
+                show_progress_bar=True
+            )
+            
+            # Test connection with retry logic
+            max_test_retries = 3
+            last_error = None
+            
+            for attempt in range(max_test_retries):
+                try:
+                    logger.info(f"Testing embeddings connection (attempt {attempt + 1})...")
+                    test_embedding = embeddings.embed_query("test")
+                    logger.info(f"Successfully connected to Azure OpenAI embeddings. Dimension: {len(test_embedding)}")
+                    return embeddings
+                except Exception as e:
+                    last_error = e
+                    if attempt < max_test_retries - 1:
+                        logger.warning(f"Test attempt {attempt + 1} failed: {str(e)}")
+                        time.sleep(2 ** attempt)
+                        # Refresh token and proxy settings
+                        token = self.env.get_azure_token(force_refresh=True)
+                        if str_to_bool(self.env.get("PROXY_ENABLED", "False")):
+                            self.env.set_proxy()
+            
+            raise Exception(f"Failed to initialize embeddings after {max_test_retries} attempts. Last error: {str(last_error)}")
+            
+        except Exception as e:
+            error_msg = f"Failed to initialize Azure OpenAI embeddings: {str(e)}"
+            logger.error(error_msg)
+            logger.error("Full error details:", exc_info=True)
+            raise
+
+    @staticmethod
+    def _read_csv_safely(file_path: Path) -> pd.DataFrame:
+        """Read CSV with multiple encoding attempts."""
+        encodings = ['utf-8', 'latin1', 'iso-8859-1', 'cp1252']
+        errors = []
+        
+        for encoding in encodings:
+            try:
+                logger.info(f"Attempting to read CSV with {encoding} encoding")
+                return pd.read_csv(file_path, encoding=encoding)
+            except Exception as e:
+                errors.append(f"{encoding}: {str(e)}")
+                continue
+
+
+        raise ValueError(f"Failed to read CSV with any encoding. Errors:\n" + "\n".join(errors))
+   def create_collection(self, csv_path: Path, text_columns: List[str], 
+                         chunk_size: int = 1000, chunk_overlap: int = 100,
+                         separator: str = " | ", batch_size: int = 50) -> None:
+        """Create collection with batched processing and retry logic."""
+        try:
+            logger.info(f"Reading CSV file: {csv_path}")
+            df = self._read_csv_safely(csv_path)
+            
+            missing_cols = [col for col in text_columns if col not in df.columns]
+            if missing_cols:
+                raise ValueError(f"Columns not found in CSV: {', '.join(missing_cols)}")
+            
+            logger.info(f"Processing columns: {', '.join(text_columns)}")
+            all_documents = []
+            total_rows = len(df)
+            
+            # Process in small batches
+            batch_size = min(batch_size, 25)
+            for start_idx in range(0, total_rows, batch_size):
+                end_idx = min(start_idx + batch_size, total_rows)
+                batch_df = df.iloc[start_idx:end_idx]
+                
+                batch_documents = self._process_csv_multi_column(
+                    batch_df, text_columns, chunk_size, chunk_overlap, separator
+                )
+                all_documents.extend(batch_documents)
+                
+                logger.info(f"Processed rows {start_idx + 1} to {end_idx} of {total_rows}")
+            
+            self.collection_name = csv_path.stem.lower()
+            persist_directory = self.env.get("CHROMA_PERSIST_DIR", "./chroma_db")
+            os.makedirs(persist_directory, exist_ok=True)
+            
+            # Create with retry logic
+            max_retries = 3
+            last_error = None
+            
+            for attempt in range(max_retries):
+                try:
+                    logger.info(f"Attempt {attempt + 1} to create Chroma collection...")
+                    
+                    # Start with small batch
+                    initial_documents = all_documents[:5]
+                    self.vector_store = Chroma.from_documents(
+                        documents=initial_documents,
+                        embedding=self.embeddings,
+                        collection_name=self.collection_name,
+                        persist_directory=persist_directory,
+                        client=self.client
+                    )
+                    
+                    # If successful, add remaining documents in small batches
+                    if len(all_documents) > 5:
+                        logger.info("Adding remaining documents...")
+                        for i in range(5, len(all_documents), 10):
+                            batch = all_documents[i:i + 10]
+                            self.vector_store.add_documents(batch)
+                            logger.info(f"Added documents {i} to {i + len(batch)}")
+                            time.sleep(0.5)  # Small delay between batches
+                    
+                    logger.info(f"Created collection '{self.collection_name}' with {len(all_documents)} documents")
+                    self.vector_store.persist()
+                    return  # Success
+                    
+                except Exception as e:
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Attempt {attempt + 1} failed: {str(e)}. Retrying...")
+                        time.sleep(2 ** attempt)
+                        # Refresh embeddings for next attempt
+                        self.embeddings = self._init_embeddings()
+            
+            # If we get here, all attempts failed
+            raise Exception(f"Failed to create collection after {max_retries} attempts. Last error: {str(last_error)}")
+            
+        except Exception as e:
+            error_msg = f"Collection creation failed: {str(e)}"
+            logger.error(error_msg)
+            logger.error("Full error details:", exc_info=True)
+            raise
+
+    def _process_csv_multi_column(
+        self, df: pd.DataFrame, 
+        text_columns: List[str],
+        chunk_size: int = 1000, 
+        chunk_overlap: int = 100,
+        separator: str = " | "
+    ) -> List[Document]:
+        """Process CSV data with multiple text columns."""
+        documents = []
+        
+        try:
+            for idx, row in df.iterrows():
+                # Combine text from specified columns
+                text_parts = []
+                for col in text_columns:
+                    if pd.notna(row[col]):
+                        # Clean and normalize text
+                        text = str(row[col]).strip()
+                        text = text.replace('\n', ' ').replace('\r', ' ')
+                        text_parts.append(f"{col}: {text}")
+                
+                combined_text = separator.join(text_parts)
+                if not combined_text.strip():
+                    logger.warning(f"Empty combined text found in row {idx}, skipping")
+                    continue
+                
+                # Create metadata from non-text columns
+                metadata = {
+                    col: str(row[col])
+                    for col in df.columns
+                    if col not in text_columns and pd.notna(row[col])
+                }
+                metadata['row_index'] = str(idx)
+                
+                # Chunk text if necessary
+                if len(combined_text) > chunk_size:
+                    chunks = self._chunk_text(combined_text, chunk_size, chunk_overlap)
+                    for i, chunk in enumerate(chunks):
+                        chunk_metadata = metadata.copy()
+                        chunk_metadata['chunk_index'] = str(i)
+                        chunk_metadata['total_chunks'] = str(len(chunks))
+                        documents.append(Document(page_content=chunk, metadata=chunk_metadata))
+                else:
+                    documents.append(Document(page_content=combined_text, metadata=metadata))
+            
+            return documents
+            
+        except Exception as e:
+            logger.error(f"Error processing CSV row {idx}: {str(e)}")
+            raise
+
+    def _chunk_text(self, text: str, chunk_size: int, overlap: int) -> List[str]:
+        """Split text into overlapping chunks."""
+        chunks = []
+        start = 0
+        text_len = len(text)
+        
+        while start < text_len:
+            end = start + chunk_size
+            chunk = text[start:end]
+            
+            # Adjust chunk to not break words
+            if end < text_len:
+                last_space = chunk.rfind(' ')
+                if last_space != -1:
+                    end = start + last_space + 1
+                    chunk = text[start:end]
+            
+            chunks.append(chunk)
+            start = end - overlap
+            
+        return chunks
+
+    def search(self, query: str, k: int = 5, 
+              min_relevance_score: float = 0.0) -> List[Tuple[str, float, Dict]]:
+        """Perform similarity search using locally stored vectors."""
+        try:
+            if not self.vector_store:
+                raise ValueError("No collection loaded")
+                
+            logger.info("Converting search query to vector via Azure OpenAI...")
+            results = self.vector_store.similarity_search_with_score(query, k=k)
+            
+            logger.info("Performing similarity search on local vectors...")
+            processed_results = []
+            for doc, score in results:
+                relevance = 1 - score  # Convert distance to similarity score
+                if relevance >= min_relevance_score:
+                    processed_results.append((doc.page_content, relevance, doc.metadata))
+            
+            logger.info(f"Found {len(processed_results)} relevant results")
+            return processed_results
+            
+        except Exception as e:
+            logger.error(f"Search failed: {str(e)}")
+            raise
+
+    def add_texts(self, texts: List[str], metadatas: Optional[List[Dict]] = None) -> None:
+        """Add new texts to existing collection."""
+        try:
+            if not self.vector_store:
+                raise ValueError("No collection loaded")
+            
+            logger.info(f"Adding {len(texts)} new texts to collection '{self.collection_name}'")
+            
+            if metadatas and len(metadatas) != len(texts):
+                raise ValueError("Number of metadata items must match number of texts")
+            
+            # Create Document objects
+            documents = []
+            for i, text in enumerate(texts):
+                metadata = metadatas[i] if metadatas else {}
+                documents.append(Document(page_content=text, metadata=metadata))
+            
+            # Add to vector store in batches
+            batch_size = 10
+            for i in range(0, len(documents), batch_size):
+                batch = documents[i:i + batch_size]
+                self.vector_store.add_documents(batch)
+                logger.info(f"Added documents {i} to {i + len(batch)}")
+                time.sleep(0.5)  # Small delay between batches
+            
+            # Persist changes
+            self.vector_store.persist()
+            logger.info("New texts added and persisted to local storage")
+            
+        except Exception as e:
+            logger.error(f"Failed to add texts: {str(e)}")
+            raise
+
+    def load_existing_collection(self, collection_name: str) -> None:
+        """Load an existing collection from local storage."""
+        try:
+            persist_directory = self.env.get("CHROMA_PERSIST_DIR", "./chroma_db")
+            if not os.path.exists(persist_directory):
+                raise ValueError(f"Persist directory not found: {persist_directory}")
+            
+            collection_path = Path(persist_directory) / collection_name
+            if not collection_path.exists():
+                raise ValueError(f"Collection '{collection_name}' not found in {persist_directory}")
+            
+            self.collection_name = collection_name
+            self.vector_store = Chroma(
+                collection_name=collection_name,
+                embedding_function=self.embeddings,
+                persist_directory=persist_directory,
+                client=self.client
+            )
+            
+            collection_count = len(self.vector_store.get()['ids'])
+            logger.info(f"Loaded existing collection '{collection_name}' with {collection_count} documents")
+            
+        except Exception as e:
+            logger.error(f"Failed to load collection: {str(e)}")
+            raise
+
+    def delete_collection(self, collection_name: str) -> None:
+        """Delete a collection from local storage."""
+        try:
+            if collection_name in self.client.list_collections():
+                self.client.delete_collection(collection_name)
+                logger.info(f"Deleted collection '{collection_name}'")
+                
+                # Reset current store if it was the active collection
+                if self.collection_name == collection_name:
+                    self.vector_store = None
+                    self.collection_name = None
+            else:
+                raise ValueError(f"Collection '{collection_name}' not found")
+                
+        except Exception as e:
+            logger.error(f"Failed to delete collection: {str(e)}")
+            raise
+
+    def list_collections(self) -> List[str]:
+        """List all available collections in local storage."""
+        try:
+            collections = [col.name for col in self.client.list_collections()]
+            logger.info(f"Found {len(collections)} local collections: {collections}")
+            return collections
+            
+        except Exception as e:
+            logger.error(f"Failed to list collections: {str(e)}")
+            raise
+
+    def get_collection_stats(self) -> Dict[str, Any]:
+        """Get statistics about the current collection."""
+        try:
+            if not self.collection_name or not self.vector_store:
+                raise ValueError("No collection loaded")
+            
+            collection = self.client.get_collection(self.collection_name)
+            count = collection.count()
+            
+            stats = {
+                "collection_name": self.collection_name,
+                "document_count": count,
+                "storage_path": self.env.get("CHROMA_PERSIST_DIR", "./chroma_db")
+            }
+            
+            logger.info(f"Collection statistics: {stats}")
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Failed to get collection statistics: {str(e)}")
+            raise
+
+    def close(self) -> None:
+        """Clean up resources and persist data."""
+        try:
+            if self.vector_store:
+                self.vector_store.persist()
+                logger.info("Vector store persisted successfully")
+            
+        except Exception as e:
+            logger.error(f"Error during cleanup: {str(e)}")
+            raise
+
+def main():
+    """Main application entry point with interactive interface."""
+    chroma_db = None
+    
     try:
-        # Get Azure AD token
-        token = self.env.get_azure_token(force_refresh=True)
+        # Get the base directory for environment files
+        base_dir = Path(__file__).resolve().parent.parent
+        env_dir = base_dir / "env"
         
-        # Use the specific endpoint from your configuration
-        azure_endpoint = "https://abc.openai.azure.com/openai/deployments/text-embedding-1-large"
+        # Define paths
+        config_path = env_dir / "config.env"
+        creds_path = env_dir / "credentials.env"
+        cert_path = env_dir / "cacert.pem"
         
-        logger.info(f"Initializing embeddings with endpoint: {azure_endpoint}")
+        # Validate required files exist
+        required_files = {
+            'config.env': config_path,
+            'credentials.env': creds_path,
+            'cacert.pem': cert_path
+        }
         
-        # Initialize embeddings with your specific configuration
-        embeddings = AzureOpenAIEmbeddings(
-            deployment="text-embedding-1-large",  # From your MODEL setting
-            model="text-embedding-1-large",       # Match the deployment
-            api_version="2023-05-15",            # From your configuration
-            azure_endpoint=azure_endpoint,
-            azure_ad_token=token,
-            openai_api_type="azure_ad",
-            chunk_size=8,                        # Smaller batch size for reliability
-            max_retries=3                        # Add retries for reliability
+        missing_files = [
+            name for name, path in required_files.items() 
+            if not path.exists()
+        ]
+        
+        if missing_files:
+            raise FileNotFoundError(
+                f"Missing required files in {env_dir}:\n" +
+                "\n".join(f"- {f}" for f in missing_files)
+            )
+        
+        # Initialize environment and vector store
+        logger.info("Initializing environment...")
+        env = OSEnv(
+            config_file=str(config_path),
+            creds_file=str(creds_path),
+            certificate_path=str(cert_path)
         )
         
-        # Test the connection
-        logger.info("Testing embeddings connection...")
-        test_embedding = embeddings.embed_query("test")
-        logger.info(f"Successfully connected to Azure OpenAI embeddings. Dimension: {len(test_embedding)}")
+        logger.info("Initializing ChromaDB vector store...")
+        chroma_db = ChromaVectorStore(env)
         
-        return embeddings
-        
-    except Exception as e:
-        error_msg = f"Failed to initialize Azure OpenAI embeddings: {str(e)}"
-        logger.error(error_msg)
-        logger.error("Full error details:", exc_info=True)
-        raise Exception(error_msg)
-
-def create_collection(self, csv_path: Path, text_columns: List[str], 
-                     chunk_size: int = 1000, chunk_overlap: int = 100,
-                     separator: str = " | ", batch_size: int = 100) -> None:
-    """Create collection with specific Azure OpenAI configuration."""
-    try:
-        logger.info(f"Reading CSV file: {csv_path}")
-        df = self._read_csv_safely(csv_path)
-        
-        missing_cols = [col for col in text_columns if col not in df.columns]
-        if missing_cols:
-            raise ValueError(f"Columns not found in CSV: {', '.join(missing_cols)}")
-        
-        logger.info(f"Processing columns: {', '.join(text_columns)}")
-        all_documents = []
-        total_rows = len(df)
-        
-        # Process in smaller batches for reliability
-        batch_size = min(batch_size, 50)  # Limit batch size
-        
-        for start_idx in range(0, total_rows, batch_size):
-            end_idx = min(start_idx + batch_size, total_rows)
-            batch_df = df.iloc[start_idx:end_idx]
+        while True:
+            print("\n" + "="*50)
+            print("Vector Store Management Interface")
+            print("="*50)
+            print("\nAvailable commands:")
+            print("1. Create new collection from CSV")
+            print("2. Load existing collection")
+            print("3. List all collections")
+            print("4. Delete collection")
+            print("5. Search current collection")
+            print("6. Show collection statistics")
+            print("7. Show environment variables")
+            print("8. Add texts to current collection")
+            print("9. Exit")
+            print("\n" + "-"*50)
             
-            batch_documents = self._process_csv_multi_column(
-                batch_df, text_columns, chunk_size, chunk_overlap, separator
-            )
-            all_documents.extend(batch_documents)
+            choice = input("\nEnter your choice (1-9): ").strip()
             
-            logger.info(f"Processed rows {start_idx + 1} to {end_idx} of {total_rows}")
-        
-        self.collection_name = csv_path.stem.lower()
-        persist_directory = self.env.get("CHROMA_PERSIST_DIR", "./chroma_db")
-        os.makedirs(persist_directory, exist_ok=True)
-        
-        # Disable telemetry explicitly
-        chromadb.Client(Settings(anonymized_telemetry=False))
-        
-        # Create the vector store with retries
-        max_retries = 3
-        for attempt in range(max_retries):
             try:
-                logger.info(f"Attempt {attempt + 1} to create Chroma collection...")
+                if choice == '1':
+                    # Create new collection
+                    csv_path = input("\nEnter CSV file path: ").strip()
+                    if not os.path.exists(csv_path):
+                        print(f"Error: File not found: {csv_path}")
+                        continue
+                        
+                    csv_path = Path(csv_path)
+                    df = chroma_db._read_csv_safely(csv_path)
+                    
+                    print("\nAvailable columns:")
+                    for idx, col in enumerate(df.columns, 1):
+                        print(f"{idx}. {col}")
+                    
+                    try:
+                        col_indices = input("\nEnter column numbers (comma-separated): ").strip()
+                        selected_cols = [
+                            df.columns[int(idx.strip()) - 1] 
+                            for idx in col_indices.split(',')
+                        ]
+                        
+                        print(f"\nSelected columns: {', '.join(selected_cols)}")
+                        separator = input("Enter separator for combining columns (default ' | '): ").strip() or " | "
+                        
+                        chunk_size = int(input("Enter chunk size (default 1000): ") or "1000")
+                        chunk_overlap = int(input("Enter chunk overlap (default 100): ") or "100")
+                        batch_size = int(input("Enter batch size (default 25): ") or "25")
+                        
+                        print("\nCreating collection... This may take a while.")
+                        chroma_db.create_collection(
+                            csv_path=csv_path,
+                            text_columns=selected_cols,
+                            chunk_size=chunk_size,
+                            chunk_overlap=chunk_overlap,
+                            separator=separator,
+                            batch_size=batch_size
+                        )
+                        print("\nCollection created successfully!")
+                        
+                    except ValueError as ve:
+                        print(f"\nError: Invalid input - {str(ve)}")
+                    except Exception as e:
+                        print(f"\nError creating collection: {str(e)}")
                 
-                # Start with a small batch to test
-                initial_documents = all_documents[:5]
-                self.vector_store = Chroma.from_documents(
-                    documents=initial_documents,
-                    embedding=self.embeddings,
-                    collection_name=self.collection_name,
-                    persist_directory=persist_directory,
-                    client=self.client
-                )
+                elif choice == '2':
+                    # Load existing collection
+                    collections = chroma_db.list_collections()
+                    if not collections:
+                        print("\nNo collections found")
+                        continue
+                    
+                    print("\nAvailable collections:")
+                    for idx, name in enumerate(collections, 1):
+                        print(f"{idx}. {name}")
+                    
+                    try:
+                        col_idx = int(input("\nEnter collection number: ")) - 1
+                        if 0 <= col_idx < len(collections):
+                            chroma_db.load_existing_collection(collections[col_idx])
+                            print(f"\nLoaded collection: {collections[col_idx]}")
+                        else:
+                            print("\nError: Invalid collection number")
+                    except ValueError:
+                        print("\nError: Please enter a valid number")
                 
-                # If initial batch succeeds, add the rest
-                if len(all_documents) > 5:
-                    logger.info("Adding remaining documents...")
-                    for i in range(5, len(all_documents), batch_size):
-                        batch = all_documents[i:i + batch_size]
-                        self.vector_store.add_documents(batch)
-                        logger.info(f"Added documents {i} to {i + len(batch)}")
+                elif choice == '3':
+                    # List collections
+                    collections = chroma_db.list_collections()
+                    if collections:
+                        print("\nAvailable collections:")
+                        for idx, name in enumerate(collections, 1):
+                            print(f"{idx}. {name}")
+                    else:
+                        print("\nNo collections found")
                 
-                logger.info(f"Created collection '{self.collection_name}' with {len(all_documents)} documents")
-                self.vector_store.persist()
-                logger.info(f"Vectors stored locally in {persist_directory}")
-                break
+                elif choice == '4':
+                    # Delete collection
+                    collections = chroma_db.list_collections()
+                    if not collections:
+                        print("\nNo collections found")
+                        continue
+                    
+                    print("\nAvailable collections:")
+                    for idx, name in enumerate(collections, 1):
+                        print(f"{idx}. {name}")
+                    
+                    try:
+                        col_idx = int(input("\nEnter collection number to delete: ")) - 1
+                        if 0 <= col_idx < len(collections):
+                            confirm = input(f"\nAre you sure you want to delete '{collections[col_idx]}'? (yes/no): ")
+                            if confirm.lower() == 'yes':
+                                chroma_db.delete_collection(collections[col_idx])
+                                print(f"\nCollection '{collections[col_idx]}' deleted")
+                        else:
+                            print("\nError: Invalid collection number")
+                    except ValueError:
+                        print("\nError: Please enter a valid number")
+                
+                elif choice == '5':
+                    # Search collection
+                    if not chroma_db.collection_name:
+                        print("\nPlease load a collection first")
+                        continue
+                    
+                    query = input("\nEnter search query: ")
+                    k = int(input("Number of results to return (default 5): ") or "5")
+                    min_score = float(input("Minimum relevance score (0-1, default 0): ") or "0")
+                    
+                    results = chroma_db.search(query, k, min_score)
+                    print(f"\nFound {len(results)} results:")
+                    for i, (text, score, metadata) in enumerate(results, 1):
+                        print(f"\n{i}. Relevance Score: {score:.4f}")
+                        print("Content:")
+                        for part in text.split(" | "):
+                            print(f"  {part}")
+                        print("Metadata:")
+                        for key, value in metadata.items():
+                            if key not in ['chunk_index', 'total_chunks']:
+                                print(f"  {key}: {value}")
+                        if 'chunk_index' in metadata:
+                            print(f"  Chunk: {metadata['chunk_index']}/{metadata['total_chunks']}")
+                
+                elif choice == '6':
+                    # Show collection statistics
+                    if not chroma_db.collection_name:
+                        print("\nPlease load a collection first")
+                        continue
+                    
+                    stats = chroma_db.get_collection_stats()
+                    print("\nCollection Statistics:")
+                    for key, value in stats.items():
+                        print(f"{key}: {value}")
+                
+                elif choice == '7':
+                    # Show environment variables
+                    print("\nEnvironment Variables:")
+                    env.list_env_vars()
+                
+                elif choice == '8':
+                    # Add texts to collection
+                    if not chroma_db.collection_name:
+                        print("\nPlease load a collection first")
+                        continue
+                    
+                    texts = []
+                    metadatas = []
+                    print("\nEnter texts (empty line to finish):")
+                    while True:
+                        text = input("> ")
+                        if not text:
+                            break
+                        
+                        metadata = {}
+                        print("Enter metadata (empty line to finish):")
+                        while True:
+                            meta_input = input("key=value: ")
+                            if not meta_input:
+                                break
+                            try:
+                                key, value = meta_input.split('=', 1)
+                                metadata[key.strip()] = value.strip()
+                            except ValueError:
+                                print("Invalid format. Use key=value")
+                        
+                        texts.append(text)
+                        metadatas.append(metadata)
+                    
+                    if texts:
+                        chroma_db.add_texts(texts, metadatas)
+                        print(f"\nAdded {len(texts)} texts to collection")
+                
+                elif choice == '9':
+                    print("\nExiting...")
+                    break
+                
+                else:
+                    print("\nInvalid choice")
                 
             except Exception as e:
-                if attempt < max_retries - 1:
-                    logger.warning(f"Attempt {attempt + 1} failed: {str(e)}. Retrying...")
-                    time.sleep(2 ** attempt)  # Exponential backoff
-                else:
-                    raise Exception(f"Failed to create collection after {max_retries} attempts: {str(e)}")
+                logger.error(f"Operation failed: {str(e)}")
+                print(f"\nError: {str(e)}")
+                print("Check chromadb.log for more details")
         
     except Exception as e:
-        error_msg = f"Collection creation failed: {str(e)}"
-        logger.error(error_msg)
-        logger.error("Full error details:", exc_info=True)
-        raise Exception(error_msg)
+        logger.error(f"Application error: {str(e)}")
+        print(f"\nError: {str(e)}")
+        print("Check chromadb.log for more details")
+    
+    finally:
+        if chroma_db is not None:
+            try:
+                chroma_db.close()
+                logger.info("Application shutdown complete")
+            except Exception as e:
+                logger.error(f"Error during shutdown: {str(e)}")
+
+if __name__ == "__main__":
+    main()
