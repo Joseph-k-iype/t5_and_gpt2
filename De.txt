@@ -1,339 +1,93 @@
 import os
-import re
 import json
 import logging
-import csv
-import uuid
-import shutil
-import time
-import PyPDF2
-import httpx
 import requests
 from dotenv import load_dotenv
 from azure.identity import DefaultAzureCredential
-from openai import AzureOpenAI
-import chromadb
-
-# ------------------------------
-# Global Configuration
-# ------------------------------
-MAX_TOTAL_CHARS = 5461  # Maximum characters per API call
 
 # ------------------------------
 # Load Environment Variables
 # ------------------------------
-load_dotenv("config/dev")         # Loads general settings
-load_dotenv("config/dev.creds")    # Loads credentials
+load_dotenv("config/dev")         # General settings
+load_dotenv("config/dev.creds")    # Credential settings
 
-# Read base endpoints and deployment names.
+# Get endpoints and deployment names from environment variables
 chat_endpoint = os.getenv("AZURE_OPENAI_CHAT_ENDPOINT")
 embedding_endpoint = os.getenv("AZURE_OPENAI_EMBEDDINGS_ENDPOINT")
 chat_deployment = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", "gpt-4o-mini")
 embedding_deployment = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
+embedding_api_key = os.getenv("AZURE_OPENAI_EMBEDDINGS_API_KEY")
+openai_api_version = os.getenv("OPENAI_API_VERSION", "2023-05-15")
 
 if not chat_endpoint or not embedding_endpoint:
-    raise ValueError("Please set both AZURE_OPENAI_CHAT_ENDPOINT and AZURE_OPENAI_EMBEDDINGS_ENDPOINT to the base URL (e.g. 'https://abc.azurewebsites.net').")
+    raise ValueError("Please set both AZURE_OPENAI_CHAT_ENDPOINT and AZURE_OPENAI_EMBEDDINGS_ENDPOINT.")
 
-# Ensure the chat endpoint includes "/openai"
+# Ensure endpoints include "/openai" as required by Azure OpenAI
 if "/openai" not in chat_endpoint:
     chat_endpoint = chat_endpoint.rstrip("/") + "/openai"
+if "/openai" not in embedding_endpoint:
+    embedding_endpoint = embedding_endpoint.rstrip("/") + "/openai"
 
 # ------------------------------
-# Set Up Proxy and CA Bundle
+# Setup Logging
 # ------------------------------
-ad_username = os.getenv("AD_USERNAME")
-ad_user_id = os.getenv("AD_USER_ID")
-http_proxy_config = os.getenv("HTTP_PROXY")  # e.g., "@abc.uk.systems:80"
-proxy_url = f"http://{ad_username}:{ad_user_id}{http_proxy_config}"
-
-os.environ['HTTP_PROXY'] = proxy_url
-os.environ['HTTPS_PROXY'] = proxy_url
-os.environ["REQUESTS_CA_BUNDLE"] = os.getenv("CONF_PEM_PATH", "cacert.pem")
-
-custom_client = httpx.Client(verify=os.getenv("CONF_PEM_PATH", "cacert.pem"), proxy=proxy_url)
-
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-if not os.getenv("NO_PROXY"):
-    NO_PROXY_DOMAINS = [
-        '.cognitiveservices.azure.com',
-        '.search.windows.net',
-        '.openai.azure.com',
-        '.core.windows.net',
-        '.azurewebsites.net'
-    ]
-    os.environ['NO_PROXY'] = ','.join(NO_PROXY_DOMAINS)
-
-session = requests.Session()
-session.verify = os.getenv("CONF_PEM_PATH", "cacert.pem")
-session.proxies = {'http': None, 'https': None}
-
 # ------------------------------
-# Token Provider Function
+# Token Provider (if not using API key)
 # ------------------------------
-def get_bearer_token_provider():
-    """
-    Returns a callable that fetches a fresh bearer token for the scope
-    "https://cognitiveservices.azure.com/.default" using DefaultAzureCredential.
-    """
+def get_bearer_token():
     credential = DefaultAzureCredential()
-    def token_provider():
-        return credential.get_token("https://cognitiveservices.azure.com/.default").token
-    return token_provider
-
-token_provider = get_bearer_token_provider()
+    token = credential.get_token("https://cognitiveservices.azure.com/.default")
+    return token.token
 
 # ------------------------------
-# Chunking Functions (Stable Only)
+# Function to Get Embedding for a Text
 # ------------------------------
-def stable_chunk_text(text, max_chars=MAX_TOTAL_CHARS):
-    """
-    Splits text into chunks at sentence boundaries using regex.
-    If a sentence exceeds max_chars, it is split arbitrarily.
-    """
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    chunks = []
-    current_chunk = ""
-    for sentence in sentences:
-        if len(sentence) > max_chars:
-            if current_chunk:
-                chunks.append(current_chunk.strip())
-                current_chunk = ""
-            for i in range(0, len(sentence), max_chars):
-                chunks.append(sentence[i:i+max_chars])
-        else:
-            if len(current_chunk) + len(sentence) + 1 <= max_chars:
-                current_chunk = (current_chunk + " " + sentence) if current_chunk else sentence
-            else:
-                chunks.append(current_chunk.strip())
-                current_chunk = sentence
-    if current_chunk:
-        chunks.append(current_chunk.strip())
-    return chunks
-
-def average_embeddings(embeddings):
-    """Averages a list of embedding vectors element-wise."""
-    if not embeddings:
-        return None
-    n = len(embeddings)
-    dim = len(embeddings[0])
-    avg = [0.0] * dim
-    for emb in embeddings:
-        for i, val in enumerate(emb):
-            avg[i] += val
-    return [x / n for x in avg]
-
-# ------------------------------
-# Embeddings API Functions using Token Provider or API Key
-# ------------------------------
-# For embeddings, some Azure OpenAI deployments require an API key.
-embedding_api_key = os.getenv("AZURE_OPENAI_EMBEDDINGS_API_KEY")  # Optional
-
-def get_embedding_for_text(text, endpoint, deployment_name=embedding_deployment, max_chars=MAX_TOTAL_CHARS):
-    """
-    Splits a document using stable chunking, computes embeddings for each chunk, and averages them.
-    Uses an API key if provided; otherwise uses a fresh bearer token.
-    """
-    chunks = stable_chunk_text(text, max_chars)
-    chunk_embeddings = []
-    openai_api_version = os.getenv("OPENAI_API_VERSION", "2023-05-15")
-    for chunk in chunks:
-        payload = {"input": [chunk]}
-        if embedding_api_key:
-            headers = {
-                'api-key': embedding_api_key,
-                'Content-Type': 'application/json'
-            }
-        else:
-            token = token_provider()
-            headers = {
-                'Authorization': f'Bearer {token}',
-                'Content-Type': 'application/json'
-            }
-        api_url = f"{endpoint}/openai/deployments/{deployment_name}/embeddings?api-version={openai_api_version}"
-        try:
-            response = session.post(api_url, headers=headers, json=payload)
-            if response.status_code == 200:
-                data = response.json()
-                emb = data['data'][0]['embedding']
-                chunk_embeddings.append(emb)
-                logger.info(f"Processed chunk (length {len(chunk)})")
-            else:
-                logger.error(f"Embedding API call failed with status {response.status_code} for chunk starting with '{chunk[:30]}...'")
-                chunk_embeddings.append(None)
-            time.sleep(0.1)
-        except Exception as e:
-            logger.error(f"Error during embedding API call: {str(e)}")
-            chunk_embeddings.append(None)
-    valid_embeddings = [emb for emb in chunk_embeddings if emb is not None]
-    return average_embeddings(valid_embeddings) if valid_embeddings else None
-
-def get_embeddings_for_documents(documents, endpoint, deployment_name=embedding_deployment, max_chars=MAX_TOTAL_CHARS):
-    return [get_embedding_for_text(doc, endpoint, deployment_name, max_chars) for doc in documents]
-
-def test_connection(endpoint):
-    try:
-        test_text = "Hello World"
-        emb = get_embedding_for_text(test_text, endpoint)
-        if emb:
-            print(f"Test embedding dimension: {len(emb)}")
-            return True
-        else:
-            print("Failed to retrieve test embedding.")
-            return False
-    except Exception as e:
-        print(f"Connection test error: {str(e)}")
-        return False
-
-# ------------------------------
-# Configure Azure OpenAI LLM (Chat Completions) using Token Provider
-# ------------------------------
-def get_llm_token():
-    return token_provider()
-
-try:
-    llm_token_value = get_llm_token()
-    llm_client = AzureOpenAI(
-        api_key=llm_token_value,
-        base_url=chat_endpoint,  # Uses the chat endpoint (which includes '/openai')
-        azure_deployment=chat_deployment,
-        api_version="2023-03-15-preview"
-    )
+def get_embedding_for_text(text, endpoint, deployment, api_version):
+    payload = {"input": [text]}
+    # Choose authentication method: API key if provided; else, use bearer token.
+    if embedding_api_key:
+        headers = {
+            'api-key': embedding_api_key,
+            'Content-Type': 'application/json'
+        }
+    else:
+        token = get_bearer_token()
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json'
+        }
     
-    def run_llm_agent(prompt: str) -> str:
-        try:
-            response = llm_client.chat.completions.create(
-                model=chat_deployment,
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.7,
-            )
-            answer = response.choices[0].message.content
-            logger.info(f"LLM agent response: {answer}")
-            return answer
-        except Exception as e:
-            logger.error(f"LLM agent error: {str(e)}")
-            return "Error generating response."
-except Exception as e:
-    logger.error(f"Failed to configure Azure OpenAI for LLM: {str(e)}")
-    raise
-
-# ------------------------------
-# File Processing Functions
-# ------------------------------
-def process_pdf(file_path):
-    documents = []
+    # Construct the API URL for embeddings
+    api_url = f"{endpoint}/deployments/{deployment}/embeddings?api-version={api_version}"
+    logger.info(f"Requesting embedding from URL: {api_url}")
+    
     try:
-        with open(file_path, "rb") as f:
-            reader = PyPDF2.PdfReader(f)
-            for page in reader.pages:
-                text = page.extract_text()
-                if text:
-                    documents.append(text.strip())
-        return documents
+        response = requests.post(api_url, headers=headers, json=payload)
+        if response.status_code == 200:
+            data = response.json()
+            # Assuming response structure: { "data": [ { "embedding": [...] } ] }
+            embedding = data.get("data", [{}])[0].get("embedding")
+            if embedding:
+                return embedding
+            else:
+                logger.error("No embedding found in response.")
+                logger.error(json.dumps(data, indent=2))
+        else:
+            logger.error(f"Embedding API call failed with status {response.status_code}: {response.text}")
     except Exception as e:
-        logger.error(f"Error processing PDF file: {str(e)}")
-        return []
-
-def process_txt(file_path):
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            text = f.read()
-        return [text.strip()]
-    except Exception as e:
-        logger.error(f"Error processing TXT file: {str(e)}")
-        return []
-
-def process_csv(file_path):
-    documents = []
-    try:
-        with open(file_path, "r", encoding="utf-8") as csvfile:
-            reader = csv.DictReader(csvfile)
-            fieldnames = reader.fieldnames
-            if not fieldnames:
-                logger.error("CSV file has no header")
-                return []
-            print(f"CSV Columns: {fieldnames}")
-            main_col = input("Enter the name of the main column: ").strip()
-            support_cols = input("Enter supporting column names (comma-separated), or leave blank: ").split(",")
-            support_cols = [col.strip() for col in support_cols if col.strip()]
-            for row in reader:
-                parts = []
-                if main_col in row:
-                    parts.append(row[main_col])
-                for col in support_cols:
-                    if col in row:
-                        parts.append(row[col])
-                doc_text = " ".join(parts)
-                documents.append(doc_text.strip())
-        return documents
-    except Exception as e:
-        logger.error(f"Error processing CSV file: {str(e)}")
-        return []
-
-# ------------------------------
-# ChromaDB Integration (chromadb==0.5.3)
-# ------------------------------
-persist_dir = "./chroma_db"
-try:
-    chroma_client = chromadb.PersistentClient(path=persist_dir)
-except ValueError as e:
-    print("Migration error encountered. Removing old persistent data and retrying.")
-    shutil.rmtree(persist_dir)
-    chroma_client = chromadb.PersistentClient(path=persist_dir)
-
-collection = chroma_client.get_or_create_collection(name="documents_collection")
-
-def store_documents_in_vector_db(documents, source_filename=""):
-    if not documents:
-        print("No documents to store.")
-        return
-    doc_embeddings = get_embeddings_for_documents(documents, embedding_endpoint, deployment_name=embedding_deployment)
-    ids = [str(uuid.uuid4()) for _ in documents]
-    metadatas = [{"source": source_filename, "doc_index": i} for i in range(len(documents))]
-    collection.add(ids=ids, documents=documents, embeddings=doc_embeddings, metadatas=metadatas)
-    print(f"Stored {len(documents)} documents in the vector database.")
-
-def answer_question(query: str) -> str:
-    try:
-        query_emb = get_embedding_for_text(query, embedding_endpoint, deployment_name=embedding_deployment)
-        results = collection.query(query_emb, n_results=5)
-        context = "\n\n".join(results.get("documents", []))
-        combined_prompt = f"Use the following context to answer the question:\n\nContext:\n{context}\n\nQuestion: {query}"
-        return run_llm_agent(combined_prompt)
-    except Exception as e:
-        logger.error(f"Error in answering question: {str(e)}")
-        return "Error generating answer."
+        logger.error(f"Error during embedding API call: {str(e)}")
+    return None
 
 # ------------------------------
 # Main Execution
 # ------------------------------
 if __name__ == "__main__":
-    if test_connection(embedding_endpoint):
-        print("Embeddings connection successful")
+    test_text = "Hello, world!"
+    embedding = get_embedding_for_text(test_text, embedding_endpoint, embedding_deployment, openai_api_version)
+    if embedding:
+        print(f"Test embedding dimension: {len(embedding)}")
     else:
-        print("Embeddings connection failed")
-    
-    current_file = input("Enter the path of the file to upload (pdf, txt, csv) or press Enter to skip: ").strip()
-    docs = []
-    if current_file:
-        if current_file.lower().endswith(".pdf"):
-            docs = process_pdf(current_file)
-        elif current_file.lower().endswith(".txt"):
-            docs = process_txt(current_file)
-        elif current_file.lower().endswith(".csv"):
-            docs = process_csv(current_file)
-        else:
-            print("Unsupported file type.")
-        if docs:
-            store_documents_in_vector_db(docs, source_filename=os.path.basename(current_file))
-    
-    print("\nNow you can ask questions based on the stored data. Type 'exit' to quit.")
-    while True:
-        user_query = input("Your question: ").strip()
-        if user_query.lower() in ["exit", "quit"]:
-            break
-        print("Answer:", answer_question(user_query))
+        print("Failed to retrieve test embedding.")
