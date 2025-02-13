@@ -1,76 +1,346 @@
 import os
+import time
+import logging
 import json
-from azure.identity import ClientSecretCredential
-from langchain_openai import AzureOpenAI  # latest non-deprecated class
-from langchain.chains import LLMChain
-from langchain.prompts import PromptTemplate
+from pathlib import Path
+from typing import Optional, List
+from dotenv import load_dotenv, dotenv_values
+import requests
 
-# ========= Corporate Proxy & Custom CA Configuration =========
-# Set your proxy credentials and host details
-AD_USERNAME = "your_ad_username"       # e.g. "john.doe"
-AD_USERID   = "your_ad_userid"         # e.g. your proxy password or identifier
-PROXY_HOST  = "abc.com"
-PROXY_PORT  = "80"
+from azure.identity import ClientSecretCredential, get_bearer_token_provider
+from langchain.chat_models import AzureChatOpenAI
+from langchain.schema import HumanMessage, SystemMessage
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationChain
 
-# Build the proxy URL and set environment variables so that underlying HTTP calls use your proxy and custom CA
-proxy_url = f"http://{AD_USERNAME}:{AD_USERID}@{PROXY_HOST}:{PROXY_PORT}"
-os.environ["HTTP_PROXY"]  = proxy_url
-os.environ["HTTPS_PROXY"] = proxy_url
-os.environ["REQUESTS_CA_BUNDLE"] = "cacert.pem"  # Path to your custom CA certificate file
-
-# ========= Azure Identity & OpenAI Configuration =========
-# Set your Azure AD service principal credentials explicitly
-CLIENT_ID = os.getenv("AZURE_CLIENT_ID", "your_azure_client_id")
-CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET", "your_azure_client_secret")
-TENANT_ID = os.getenv("AZURE_TENANT_ID", "your_azure_tenant_id")
-
-# Azure OpenAI instance details (replace with your actual values)
-AZURE_OPENAI_INSTANCE = "your_resource_name"  # e.g. "myresource" (without protocol)
-API_VERSION = "2023-06-01-preview"            # Adjust as needed
-DEPLOYMENT_NAME = "gpt-4o-mini"                 # Your deployment name in Azure OpenAI
-
-# ========= Create Credential and Token Provider =========
-# Use ClientSecretCredential to explicitly pass client ID, client secret, and tenant ID
-credential = ClientSecretCredential(
-    tenant_id=TENANT_ID,
-    client_id=CLIENT_ID,
-    client_secret=CLIENT_SECRET
+# ------------------------------
+# Logging Configuration
+# ------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
+logger = logging.getLogger(__name__)
 
-def azure_ad_token_provider():
-    # Return a token for the Cognitive Services scope using the service principal
-    return credential.get_token("https://cognitiveservices.azure.com/.default").token
+# ------------------------------
+# Helper Functions
+# ------------------------------
+def is_file_readable(filepath: str) -> bool:
+    """Check if a file exists and is readable."""
+    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
+        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
+    return True
 
-# ========= Instantiate the LangChain LLM =========
-# Use the new AzureOpenAI class with azureADTokenProvider
-llm = AzureOpenAI(
-    azureADTokenProvider=azure_ad_token_provider,  # function that returns a bearer token
-    azureOpenAIApiInstanceName=f"{AZURE_OPENAI_INSTANCE}.openai.azure.com",
-    azureOpenAIApiDeploymentName=DEPLOYMENT_NAME,
-    azureOpenAIApiVersion=API_VERSION,
-    temperature=0.7,  # adjust as needed
-)
+def str_to_bool(s: str) -> bool:
+    """Convert string to boolean."""
+    if s == 'True':
+        return True
+    elif s == 'False':
+        return False
+    else:
+        raise ValueError(f"Invalid boolean string: {s}")
 
-print("Azure AD token acquired and AzureOpenAI LLM configured using ClientSecretCredential.")
+# ------------------------------
+# OSEnv Class: Loads environment variables,
+# sets certificate & proxy, and obtains an Azure token.
+# ------------------------------
+class OSEnv:
+    """Environment variable and certificate management class."""
+    
+    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
+        """Initialize with configuration files and certificate path."""
+        self.var_list = []  # hold vars that were set via this class
+        
+        # Load main configuration
+        self.bulk_set(config_file, True)
+        logger.info(f"Loaded main configuration from {config_file}")
+        
+        # Load credentials
+        self.bulk_set(creds_file, False)
+        logger.info(f"Loaded credentials from {creds_file}")
+        
+        # Set up certificates
+        self.set_certificate_path(certificate_path)
+        logger.info("Certificate path configured")
+        
+        # Configure proxy if enabled
+        if str_to_bool(self.get("PROXY_ENABLED", "False")):
+            self.set_proxy()
+            logger.info("Proxy configured")
+        
+        # Set up Azure token if SECURED_ENDPOINTS is enabled
+        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
+            logger.info("Securing endpoints")
+            self.token = self.get_azure_token()
+        else:
+            self.token = None
 
-# ========= Build a LangChain LLMChain =========
-prompt_template = PromptTemplate(
-    input_variables=["question"],
-    template="Answer the following question concisely:\n\n{question}"
-)
-chain = LLMChain(llm=llm, prompt=prompt_template)
+    def set_certificate_path(self, certificate_path: str) -> None:
+        """Set up the certificate path for SSL verification."""
+        try:
+            if not os.path.isabs(certificate_path):
+                certificate_path = os.path.abspath(certificate_path)
+            
+            if not is_file_readable(certificate_path):
+                raise Exception("Certificate file missing or not readable")
+            
+            # Set the certificate environment variables
+            self.set("REQUESTS_CA_BUNDLE", certificate_path)
+            self.set("SSL_CERT_FILE", certificate_path)
+            self.set("CURL_CA_BUNDLE", certificate_path)
+            
+            logger.info(f"Certificate path set to: {certificate_path}")
+            
+        except Exception as e:
+            logger.error(f"Certificate configuration failed: {str(e)}")
+            raise
 
-# ========= Run the Chain with an Example Question =========
-question = "What is the capital of France?"
-result = chain.run(question)
-print("Chain output:")
-print(result)
+    def bulk_set(self, dotenvfile: str, print_val: bool = False) -> None:
+        """Read and set environment variables from a dotenv file."""
+        try:
+            if not os.path.isabs(dotenvfile):
+                dotenvfile = os.path.abspath(dotenvfile)
+                
+            if is_file_readable(dotenvfile):
+                logger.info(f"Loading environment variables from {dotenvfile}")
+                temp_dict = dotenv_values(dotenvfile)
+                for k, v in temp_dict.items():
+                    self.set(k, v, print_val)
+                del temp_dict
+        except Exception as e:
+            logger.error(f"Failed to load environment file {dotenvfile}: {str(e)}")
+            raise
 
-# ========= Visualize the Chain using LangGraph =========
-try:
-    from langgraph import Graph
-    graph = Graph.from_chain(chain)
-    graph.render()
-except Exception as e:
-    print("LangGraph visualization is unavailable or failed:")
-    print(e)
+    def set(self, var_name: str, val: str, print_val: bool = True) -> None:
+        """Set an environment variable."""
+        try:
+            os.environ[var_name] = val
+            if var_name not in self.var_list:
+                self.var_list.append(var_name)
+            if print_val:
+                logger.info(f"Set {var_name}={val}")
+        except Exception as e:
+            logger.error(f"Failed to set environment variable {var_name}: {str(e)}")
+            raise
+
+    def get(self, var_name: str, default: Optional[str] = None) -> Optional[str]:
+        """Get an environment variable value."""
+        try:
+            return os.environ[var_name]
+        except KeyError:
+            logger.warning(f"Environment variable {var_name} not found")
+            return default
+
+    def set_proxy(self) -> None:
+        """Set up proxy configuration with authentication."""
+        try:
+            ad_username = self.get("AD_USERNAME")
+            ad_password = self.get("AD_USER_PW")
+            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
+            
+            if not all([ad_username, ad_password, proxy_domain]):
+                raise ValueError("Missing proxy credentials")
+            
+            proxy_url = f"http://{ad_username}:{ad_password}@{proxy_domain}"
+            self.set("HTTP_PROXY", proxy_url, print_val=False)
+            self.set("HTTPS_PROXY", proxy_url, print_val=False)
+            
+            # Set no_proxy for Azure services
+            no_proxy_domains = [
+                'cognitiveservices.azure.com',
+                'search.windows.net',
+                'openai.azure.com',
+                'core.windows.net',
+                'azurewebsites.net'
+            ]
+            self.set("NO_PROXY", ",".join(no_proxy_domains))
+            
+            logger.info("Proxy configuration completed")
+            
+        except Exception as e:
+            logger.error(f"Proxy configuration failed: {str(e)}")
+            raise
+
+    def get_azure_token(self) -> str:
+        """Get Azure authentication token using ClientSecretCredential."""
+        try:
+            credential = ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID"),
+                client_id=self.get("AZURE_CLIENT_ID"),
+                client_secret=self.get("AZURE_CLIENT_SECRET")
+            )
+            token = credential.get_token("https://cognitiveservices.azure.com/.default")
+            self.set("AZURE_TOKEN", token.token, print_val=False)
+            logger.info("Azure token acquired successfully")
+            return token.token
+        except Exception as e:
+            logger.error(f"Failed to get Azure token: {str(e)}")
+            raise
+
+    def list_env_vars(self) -> None:
+        """List all environment variables set by this class."""
+        for var in self.var_list:
+            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET'}:
+                logger.info(f"{var}: [HIDDEN]")
+            else:
+                logger.info(f"{var}: {self.get(var)}")
+
+# ------------------------------
+# AzureChatbot: Chat using Azure OpenAI (LangChain)
+# ------------------------------
+class AzureChatbot:
+    """Azure OpenAI chatbot using LangChain."""
+    
+    def __init__(self, config_file: str, creds_file: str, cert_file: str):
+        """Initialize the chatbot with configuration files and certificate."""
+        logger.info("Initializing chatbot...")
+        self.env = OSEnv(config_file, creds_file, cert_file)
+        self._setup_chat_model()
+
+    def _setup_chat_model(self) -> None:
+        """Set up the chat model and conversation chain."""
+        try:
+            self.llm = AzureChatOpenAI(
+                model_name=self.env.get("MODEL_NAME", "gpt-4o-mini"),
+                temperature=float(self.env.get("MODEL_TEMPERATURE", "0.7")),
+                max_tokens=int(self.env.get("MAX_TOKENS", "800")),
+                openai_api_version=self.env.get("API_VERSION", "2024-02-01"),
+                azure_endpoint=self.env.get("AZURE_OPENAI_ENDPOINT"),
+                azure_ad_token=self.env.token
+            )
+            
+            self.memory = ConversationBufferMemory()
+            self.conversation = ConversationChain(
+                llm=self.llm,
+                memory=self.memory,
+                verbose=True
+            )
+            
+            logger.info("Chat model initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize chat model: {str(e)}")
+            raise
+
+    def chat(self, message: str) -> str:
+        """Process a single message and return the response."""
+        if not message.strip():
+            return "Please provide a non-empty message."
+        
+        try:
+            response = self.conversation.predict(input=message)
+            return response
+        except Exception as e:
+            logger.error(f"Error in chat: {str(e)}")
+            return f"An error occurred: {str(e)}"
+
+# ------------------------------
+# AzureEmbeddingClient: Generate embeddings via Azure OpenAI
+# ------------------------------
+class AzureEmbeddingClient:
+    """Client for generating embeddings using Azure OpenAI."""
+    
+    def __init__(self, env: OSEnv):
+        """
+        Initialize with the environment (OSEnv instance). Assumes the following are set:
+          - AZURE_OPENAI_EMBEDDINGS_ENDPOINT
+          - EMBEDDINGS_DEPLOYMENT (or use a default)
+          - EMBEDDINGS_API_VERSION (default to "2023-05-15")
+        """
+        self.env = env
+        self.endpoint = self.env.get("AZURE_OPENAI_EMBEDDINGS_ENDPOINT")
+        if "/openai" not in self.endpoint:
+            self.endpoint = self.endpoint.rstrip("/") + "/openai"
+        self.deployment = self.env.get("EMBEDDINGS_DEPLOYMENT", "text-embedding-3-large")
+        self.api_version = self.env.get("EMBEDDINGS_API_VERSION", "2023-05-15")
+        
+        # Create a requests session with proxy and SSL settings
+        proxy = self.env.get("HTTP_PROXY")
+        self.session = requests.Session()
+        self.session.trust_env = False
+        self.session.verify = self.env.get("REQUESTS_CA_BUNDLE", "cacert.pem")
+        if proxy:
+            self.session.proxies = {"http": proxy, "https": proxy}
+        logger.info("AzureEmbeddingClient session configured")
+        
+    def get_embeddings(self, texts: List[str], batch_size: int = 100) -> List[Optional[List[float]]]:
+        """Get embeddings for a list of texts."""
+        headers = {
+            'Authorization': f'Bearer {self.env.token}',
+            'Content-Type': 'application/json'
+        }
+        api_url = f"{self.endpoint}/deployments/{self.deployment}/embeddings?api-version={self.api_version}"
+        logger.info(f"Requesting embeddings from URL: {api_url}")
+        all_embeddings = []
+        
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i+batch_size]
+            payload = {"input": batch}
+            try:
+                response = self.session.post(api_url, headers=headers, json=payload)
+                if response.status_code == 200:
+                    data = response.json()
+                    batch_embeds = [item.get("embedding") for item in data.get("data", [])]
+                    all_embeddings.extend(batch_embeds)
+                    logger.info(f"Received embeddings for batch {i+1}-{min(i+batch_size, len(texts))}")
+                else:
+                    logger.error(f"Failed for batch {i+1}-{min(i+batch_size, len(texts))} (status {response.status_code}): {response.text}")
+                    all_embeddings.extend([None] * len(batch))
+            except Exception as e:
+                logger.error(f"Error processing batch {i+1}-{min(i+batch_size, len(texts))}: {str(e)}")
+                all_embeddings.extend([None] * len(batch))
+        return all_embeddings
+
+# ------------------------------
+# Main Function
+# ------------------------------
+def main():
+    try:
+        # Define paths to configuration files and certificate
+        base_dir = Path(__file__).resolve().parent / "env"
+        config_path = str(base_dir / "config.env")
+        creds_path = str(base_dir / "credentials.env")
+        cert_path = str(base_dir / "cacert.pem")
+        
+        # Check that all required files exist
+        for f in [config_path, creds_path, cert_path]:
+            if not os.path.exists(f):
+                print(f"Missing required file: {f}")
+                return
+        
+        print("Initializing environment...")
+        env = OSEnv(config_path, creds_path, cert_path)
+        
+        # Initialize Chatbot
+        print("Initializing chatbot...")
+        chatbot = AzureChatbot(config_path, creds_path, cert_path)
+        
+        # Initialize Embedding Client
+        print("Initializing embedding client...")
+        embedding_client = AzureEmbeddingClient(env)
+        
+        # Test the embedding functionality
+        test_text = "Hello, world!"
+        embeddings = embedding_client.get_embeddings([test_text])
+        if embeddings and embeddings[0]:
+            print(f"Embedding dimension: {len(embeddings[0])}")
+        else:
+            print("Failed to retrieve embeddings.")
+        
+        # Start Chatbot interaction
+        print("\nChatbot is ready. Type 'exit' to quit.")
+        while True:
+            user_input = input("You: ").strip()
+            if user_input.lower() in ['exit', 'quit', 'bye']:
+                print("Goodbye!")
+                break
+            elif user_input.lower() == 'env':
+                env.list_env_vars()
+            else:
+                response = chatbot.chat(user_input)
+                print(f"Bot: {response}")
+    except Exception as e:
+        logger.exception(f"Unexpected error: {str(e)}")
+
+if __name__ == "__main__":
+    main()
