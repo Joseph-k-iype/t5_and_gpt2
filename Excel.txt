@@ -1,38 +1,220 @@
-import logging
-from typing import List, Dict, Any
-from langchain.chat_models import AzureChatOpenAI
-from langchain.chains import ConversationChain
-from langchain.memory import ConversationBufferMemory
+#########################
+# main.py (Integrated)
+#########################
 
+import os
+import re
+import uuid
+import json
+import logging
+import chardet
+import pandas as pd
+import requests
+import chromadb
+from chromadb.config import Settings
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
+from dotenv import load_dotenv, dotenv_values
+from azure.identity import ClientSecretCredential
+
+# For LangChain 0.3.18:
+from langchain.chat_models import AzureChatOpenAI
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationChain
+
+# We'll assume your snippet is in "ooai_client_sdk.azopenaiembrdding" and has:
+#   class Document(BaseModel):
+#       text: str
+#       embedding: List[float] = []
+#   class EmbeddingClient:
+#       def generate_embeddings(self, doc: Document) -> Document:
+#           # sets doc.embedding
+from ooai_client_sdk.azopenaiembrdding import Document, EmbeddingClient
+
+#########################
+# Logging Setup
+#########################
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
+#########################
+# Helper Functions
+#########################
+def is_file_readable(filepath: str) -> bool:
+    """Check if a file exists and is readable."""
+    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
+        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
+    return True
+
+def remove_invisible_chars(s: str) -> str:
+    """Remove invisible directional characters like \\u202a, \\u202b, etc."""
+    return re.sub(r'[\u202a\u202b\u202c\u202d\u202e]', '', s).strip()
+
+def guess_file_encoding(file_path: str, num_bytes: int = 4096) -> Optional[str]:
+    """Use chardet to guess file encoding."""
+    with open(file_path, 'rb') as f:
+        raw_data = f.read(num_bytes)
+    guess = chardet.detect(raw_data)
+    encoding = guess.get('encoding', None)
+    if encoding:
+        logger.info(f"chardet guessed encoding='{encoding}' for {file_path}")
+    else:
+        logger.warning(f"chardet could not guess encoding for {file_path}")
+    return encoding
+
+def read_csv_flexible(csv_path: str) -> pd.DataFrame:
+    """Try reading a CSV with chardet guess, then fallback to known encodings, skipping bad lines."""
+    enc = guess_file_encoding(csv_path)
+    if enc:
+        try:
+            df = pd.read_csv(
+                csv_path,
+                encoding=enc,
+                engine='python',
+                on_bad_lines='skip',
+                errors='replace'
+            )
+            return df
+        except Exception as e:
+            logger.warning(f"Reading with guessed encoding '{enc}' failed: {e}")
+
+    fallback_encodings = ['utf-8-sig', 'utf-8', 'latin1', 'cp1252']
+    for enc in fallback_encodings:
+        try:
+            df = pd.read_csv(
+                csv_path,
+                encoding=enc,
+                engine='python',
+                on_bad_lines='skip',
+                errors='replace'
+            )
+            logger.info(f"Successfully read CSV with fallback encoding='{enc}'")
+            return df
+        except Exception as e:
+            logger.warning(f"Failed reading with encoding={enc}: {e}")
+
+    raise ValueError("Unable to read CSV in any known encoding or chardet guess.")
+
+#########################
+# OSEnv Class
+#########################
+class OSEnv:
+    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
+        self.var_list: List[str] = []
+        self.bulk_set(config_file, True)
+        logger.info(f"Loaded main configuration from {config_file}")
+        self.bulk_set(creds_file, False)
+        logger.info(f"Loaded credentials from {creds_file}")
+        self.set_certificate_path(certificate_path)
+        logger.info("Certificate path configured")
+
+        # If PROXY_ENABLED is True, set the proxy environment
+        if self.get("PROXY_ENABLED", "False") == "True":
+            self.set_proxy()
+            logger.info("Proxy configured")
+
+        # If SECURED_ENDPOINTS is True, fetch an Azure AD token
+        if self.get("SECURED_ENDPOINTS", "False") == "True":
+            logger.info("Securing endpoints using Azure AD")
+            self.token = self.get_azure_token()
+        else:
+            self.token = None
+
+    def bulk_set(self, dotenvfile: str, print_val: bool = False) -> None:
+        if not os.path.isabs(dotenvfile):
+            dotenvfile = os.path.abspath(dotenvfile)
+        if is_file_readable(dotenvfile):
+            logger.info(f"Loading environment variables from {dotenvfile}")
+            temp_dict = dotenv_values(dotenvfile)
+            for k, v in temp_dict.items():
+                self.set(k, v, print_val)
+            del temp_dict
+
+    def set_certificate_path(self, certificate_path: str) -> None:
+        if not os.path.isabs(certificate_path):
+            certificate_path = os.path.abspath(certificate_path)
+        if not is_file_readable(certificate_path):
+            raise Exception("Certificate file missing or not readable")
+        self.set("REQUESTS_CA_BUNDLE", certificate_path)
+        self.set("SSL_CERT_FILE", certificate_path)
+        self.set("CURL_CA_BUNDLE", certificate_path)
+
+    def set(self, var_name: str, val: str, print_val: bool = True) -> None:
+        os.environ[var_name] = val
+        if var_name not in self.var_list:
+            self.var_list.append(var_name)
+        if print_val:
+            logger.info(f"Set {var_name}={val}")
+
+    def get(self, var_name: str, default: Optional[str] = None) -> Optional[str]:
+        return os.environ.get(var_name, default)
+
+    def set_proxy(self) -> None:
+        ad_username = self.get("AD_USERNAME")
+        ad_password = self.get("AD_USER_PW")
+        proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
+        if not all([ad_username, ad_password, proxy_domain]):
+            raise ValueError("Missing proxy credentials for AD_USERNAME, AD_USER_PW, HTTPS_PROXY_DOMAIN.")
+        proxy_url = f"http://{ad_username}:{ad_password}@{proxy_domain}"
+        self.set("HTTP_PROXY", proxy_url, print_val=False)
+        self.set("HTTPS_PROXY", proxy_url, print_val=False)
+
+    def get_azure_token(self) -> str:
+        tenant_id = self.get("AZURE_TENANT_ID")
+        client_id = self.get("AZURE_CLIENT_ID")
+        client_secret = self.get("AZURE_CLIENT_SECRET")
+        credential = ClientSecretCredential(tenant_id, client_id, client_secret)
+        token_obj = credential.get_token("https://cognitiveservices.azure.com/.default")
+        token_val = token_obj.token
+        self.set("AZURE_TOKEN", token_val, print_val=False)
+        return token_val
+
+    def list_env_vars(self) -> None:
+        for var in self.var_list:
+            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET'}:
+                logger.info(f"{var}: [HIDDEN]")
+            else:
+                logger.info(f"{var}: {self.get(var)}")
+
+#########################
+# AzureChatbot for LangChain==0.3.18
+#########################
 class AzureChatbot:
     def __init__(self, config_file: str, creds_file: str, cert_file: str):
-        logger.info("Initializing chatbot...")
+        logger.info("Initializing AzureChatbot...")
         self.env = OSEnv(config_file, creds_file, cert_file)
         self._setup_chat_model()
 
     def _setup_chat_model(self) -> None:
-        # Instead of azure_endpoint, we do openai_api_base
-        openai_api_base = self.env.get("OPENAI_API_BASE")  # from your new .env variable
-        if not openai_api_base:
-            raise ValueError("Missing OPENAI_API_BASE. Please set in .env (e.g. 'https://my-resource.openai.azure.com').")
-
-        openai_api_version = self.env.get("API_VERSION", "2023-05-15")
-        deployment_name = self.env.get("MODEL_NAME", "gpt-4o-mini")  # your Azure deployment name
+        """
+        For LangChain 0.3.18, the AzureChatOpenAI constructor expects:
+          azure_openai_api_base
+          azure_openai_api_version
+          azure_openai_api_key
+          deployment_name
+        We must NOT pass azure_endpoint or base_url or openai_api_base.
+        """
+        azure_openai_api_base = self.env.get("AZURE_OPENAI_API_BASE")
+        if not azure_openai_api_base:
+            raise ValueError("Missing AZURE_OPENAI_API_BASE. Rename your old AZURE_OPENAI_ENDPOINT if needed.")
+        
+        azure_openai_api_version = self.env.get("AZURE_OPENAI_API_VERSION", "2023-03-15-preview")
+        deployment_name = self.env.get("MODEL_NAME", "gpt-4o-mini")  # Azure deployment name
         temperature = float(self.env.get("MODEL_TEMPERATURE", "0.7"))
         max_tokens = int(self.env.get("MAX_TOKENS", "800"))
 
-        # Must have an AD token if using azure_ad
+        # We pass the AD token as the "azure_openai_api_key" string
         if not self.env.token:
-            raise ValueError("Missing Azure AD token. Please set SECURED_ENDPOINTS=True and provide credentials.")
+            raise ValueError("Missing Azure AD token. SECURED_ENDPOINTS=True or credentials not set.")
 
-        # Use new param style for Azure Chat in LangChain
         self.llm = AzureChatOpenAI(
-            openai_api_base=openai_api_base,
-            openai_api_version=openai_api_version,
-            openai_api_type="azure_ad",    # for bearer token usage
-            openai_api_key=self.env.token, # pass your bearer token here
+            azure_openai_api_base=azure_openai_api_base,
+            azure_openai_api_version=azure_openai_api_version,
+            azure_openai_api_key=self.env.token,  # AD token as a string
             deployment_name=deployment_name,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -40,22 +222,19 @@ class AzureChatbot:
 
         self.memory = ConversationBufferMemory()
         self.conversation = ConversationChain(llm=self.llm, memory=self.memory, verbose=True)
-        logger.info("Chat model initialized successfully")
+        logger.info("AzureChatOpenAI model (LangChain 0.3.18) initialized successfully")
 
     def validate_matches(self, query: str, matches: List[Dict[str, Any]]) -> str:
-        prompt = f"""You are an expert validation agent. Given the query:
-"{query}"
-and the following candidate matches:
-"""
+        prompt = f"You are an expert validation agent. The user query is:\n{query}\n\nCandidate matches:\n"
         for idx, match in enumerate(matches, start=1):
-            prompt += f"\n{idx}. Name: {match.get('name')}\n   Definition: {match.get('definition')}\n"
-        prompt += "\nIf these matches are satisfactory, simply reply OK. Otherwise, suggest the best matching candidate..."
+            prompt += f"{idx}. Name: {match.get('name')}\n   Definition: {match.get('definition')}\n"
+        prompt += "\nIf these matches are good, reply 'OK'. Otherwise, suggest a better match."
 
         try:
             response = self.conversation.predict(input=prompt)
             return response.strip()
         except Exception as e:
-            logger.error(f"Validation agent error: {str(e)}")
+            logger.error(f"Validation error: {str(e)}")
             return "Validation failed"
 
     def chat(self, message: str) -> str:
@@ -65,5 +244,139 @@ and the following candidate matches:
             response = self.conversation.predict(input=message)
             return response
         except Exception as e:
-            logger.error(f"Error in chat: {str(e)}")
-            return f"An error occurred: {str(e)}"
+            logger.error(f"Chat error: {str(e)}")
+            return f"Error: {str(e)}"
+
+#########################
+# VectorStoreManager
+#########################
+class VectorStoreManager:
+    def __init__(self, persist_dir: str = "./chroma_db"):
+        self.client = chromadb.PersistentClient(path=persist_dir)
+        self.collection = self.client.get_or_create_collection(name="knowledge_base")
+
+    def add_documents(self, documents: List[Dict[str, Any]], embeddings: List[List[float]]):
+        if len(documents) != len(embeddings):
+            raise ValueError("Documents/embeddings mismatch.")
+        ids = [str(uuid.uuid4()) for _ in documents]
+        metadatas = [{"name": d["name"], "definition": d["definition"]} for d in documents]
+        contents = [d["name"] + " " + d["definition"] for d in documents]
+        self.collection.add(ids=ids, documents=contents, embeddings=embeddings, metadatas=metadatas)
+
+    def query(self, query_embedding: List[float], n_results: int = 4) -> List[Dict[str, Any]]:
+        results = self.collection.query(query_embedding, n_results=n_results)
+        out = []
+        if results and "metadatas" in results:
+            for meta in results["metadatas"]:
+                out.append(meta)
+        return out
+
+#########################
+# Main Execution
+#########################
+def main():
+    """
+    - Loads environment from config.env & credentials.env
+    - Creates AzureChatbot with azure_openai_api_base + AD token
+    - Uses EmbeddingClient row-by-row for knowledge CSV
+    - Stores embeddings in Chroma
+    - Processes queries, top-4 matches, validation
+    - Saves final CSV
+    """
+    from pathlib import Path
+    if '__file__' in globals():
+        base_path = Path(__file__).resolve().parent
+    else:
+        base_path = Path.cwd()
+    base_dir = base_path / "env"
+
+    config_path = str(base_dir / "config.env")
+    creds_path = str(base_dir / "credentials.env")
+    cert_path = str(base_dir / "cacert.pem")
+
+    for f in [config_path, creds_path, cert_path]:
+        if not os.path.exists(f):
+            print(f"Missing required file: {f}")
+            return
+
+    logger.info("Initializing environment (OSEnv)...")
+    env = OSEnv(config_path, creds_path, cert_path)
+
+    logger.info("Initializing AzureChatbot (LangChain 0.3.18 style)...")
+    chatbot = AzureChatbot(config_path, creds_path, cert_path)
+
+    logger.info("Initializing EmbeddingClient from snippet (pydantic doc).")
+    embedding_client = EmbeddingClient()
+
+    logger.info("Initializing local ChromaDB vector store...")
+    vector_store = VectorStoreManager(persist_dir="./chroma_db")
+
+    # Step 1: Knowledge CSV
+    kb_csv = input("Enter path to knowledge base CSV: ").strip()
+    kb_csv = remove_invisible_chars(kb_csv)
+    kb_df = read_csv_flexible(kb_csv)
+    if not {"name", "definition"}.issubset(set(kb_df.columns)):
+        raise ValueError("Knowledge CSV must contain 'name' and 'definition' columns")
+
+    kb_docs = []
+    kb_embeddings = []
+    for _, row in kb_df.iterrows():
+        name = str(row["name"])
+        definition = str(row["definition"])
+        text_for_embedding = name + " " + definition
+
+        # Create doc for embedding
+        from ooai_client_sdk.azopenaiembrdding import Document
+        doc_obj = Document(text=text_for_embedding)
+        doc_emb = embedding_client.generate_embeddings(doc_obj)  # returns doc with doc.embedding
+        emb = doc_emb.embedding
+        if not emb:
+            logger.error(f"Embedding error for row with name={name[:20]}...")
+            kb_embeddings.append([])
+        else:
+            kb_embeddings.append(emb)
+
+        kb_docs.append({"name": name, "definition": definition})
+
+    vector_store.add_documents(kb_docs, kb_embeddings)
+
+    # Step 2: Query CSV
+    query_csv = input("Enter path to query CSV: ").strip()
+    query_csv = remove_invisible_chars(query_csv)
+    query_df = read_csv_flexible(query_csv)
+    if not {"name", "definition"}.issubset(set(query_df.columns)):
+        raise ValueError("Query CSV must contain 'name' and 'definition' columns")
+
+    results = []
+    for index, row in query_df.iterrows():
+        q_name = str(row["name"])
+        q_def = str(row["definition"])
+        text_for_embedding = q_name + " " + q_def
+
+        doc_obj = Document(text=text_for_embedding)
+        doc_emb = embedding_client.generate_embeddings(doc_obj)
+        emb = doc_emb.embedding
+        if not emb:
+            logger.error(f"Embedding error for query row name={q_name[:20]}...")
+            matches = []
+            validation = "Embedding error"
+        else:
+            matches = vector_store.query(emb, n_results=4)
+            validation = chatbot.validate_matches(text_for_embedding, matches)
+
+        results.append({
+            "query_name": q_name,
+            "query_definition": q_def,
+            "matches": json.dumps(matches),
+            "validation": validation
+        })
+
+    # Step 3: Save results
+    output_csv = input("Enter path for output CSV (e.g. output.csv): ").strip()
+    output_csv = remove_invisible_chars(output_csv)
+    pd.DataFrame(results).to_csv(output_csv, index=False)
+    logger.info(f"Results saved to {output_csv}")
+    print("Workflow completed successfully.")
+
+if __name__ == "__main__":
+    main()
