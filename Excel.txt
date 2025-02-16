@@ -1,599 +1,77 @@
-import os
-import sys
-import csv
-import uuid
-import logging
-from pathlib import Path
-from typing import Optional, Dict, Any, List
-
-from dotenv import dotenv_values
-from azure.identity import ClientSecretCredential, DefaultAzureCredential, get_bearer_token_provider
-from openai import AzureOpenAI
-from pydantic import BaseModel
-
-# LangChain + Community imports
-from langchain.chat_models import AzureChatOpenAI
-from langchain.schema import HumanMessage, SystemMessage
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationChain
-from langchain.docstore.document import Document as LC_Document
-from langchain.embeddings.base import Embeddings
-from langchain.vectorstores import Chroma
-from langchain.agents import Tool, ZeroShotAgent, AgentExecutor
-from langchain_community.graphs.index_creator import GraphIndexCreator
-from langchain_community.graphs.networkx_graph import NetworkxEntityGraph
-from langchain_community.chains.graph_qa.base import GraphQAChain
-from chromadb.config import Settings
-
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-###############################################################################
-# GLOBAL CONSTANTS for file paths (instead of __file__ references)
-###############################################################################
-ENV_DIR = "../env"
-CONFIG_PATH = f"{ENV_DIR}/config.env"
-CREDS_PATH = f"{ENV_DIR}/credentials.env"
-CERT_PATH = f"{ENV_DIR}/cacert.pem"
-CSV_PATH = "knowledgebase.csv"
-
-###############################################################################
-# Utility functions
-###############################################################################
-def is_file_readable(filepath: str) -> bool:
-    """Check if a file exists and is readable."""
-    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
-        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
-    return True
-
-def str_to_bool(s: str) -> bool:
-    """Convert string to boolean."""
-    if s == 'True':
-        return True
-    elif s == 'False':
-        return False
-    else:
-        raise ValueError(f"Invalid boolean string: {s}")
-
-###############################################################################
-# OSEnv class
-###############################################################################
-class OSEnv:
-    """Environment variable and certificate management class."""
-    
-    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
-        """Initialize with configuration files and certificate path."""
-        self.var_list = []  # hold vars that were set via this class
-        
-        # Load main configuration
-        self.bulk_set(config_file, True)
-        logger.info(f"Loaded main configuration from {config_file}")
-        
-        # Load credentials
-        self.bulk_set(creds_file, False)
-        logger.info(f"Loaded credentials from {creds_file}")
-        
-        # Set up certificates
-        self.set_certificate_path(certificate_path)
-        logger.info("Certificate path configured")
-        
-        # Configure proxy if enabled
-        if str_to_bool(self.get("PROXY_ENABLED", "False")):
-            self.set_proxy()
-            logger.info("Proxy configured")
-        
-        # Set up Azure token if secure endpoints enabled
-        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
-            logger.info("Securing endpoints")
-            self.token = self.get_azure_token()
-        else:
-            self.token = None
-
-    def set_certificate_path(self, certificate_path: str) -> None:
-        """Set up the certificate path for SSL verification."""
-        try:
-            # Use absolute path, but do not rely on __file__
-            if not os.path.isabs(certificate_path):
-                certificate_path = os.path.abspath(certificate_path)
-            
-            if not is_file_readable(certificate_path):
-                raise Exception("Certificate file missing or not readable")
-            
-            # Set the certificate environment variables
-            self.set("REQUESTS_CA_BUNDLE", certificate_path)
-            self.set("SSL_CERT_FILE", certificate_path)
-            self.set("CURL_CA_BUNDLE", certificate_path)
-            
-            logger.info(f"Certificate path set to: {certificate_path}")
-            
-        except Exception as e:
-            logger.error(f"Certificate configuration failed: {str(e)}")
-            raise
-
-    def bulk_set(self, dotenvfile: str, print_val: bool = False) -> None:
-        """Read and set environment variables from a dotenv file."""
-        try:
-            if not os.path.isabs(dotenvfile):
-                dotenvfile = os.path.abspath(dotenvfile)
-                
-            if is_file_readable(dotenvfile):
-                logger.info(f"Loading environment variables from {dotenvfile}")
-                temp_dict = dotenv_values(dotenvfile)
-                for k, v in temp_dict.items():
-                    self.set(k, v, print_val)
-                del temp_dict
-        except Exception as e:
-            logger.error(f"Failed to load environment file {dotenvfile}: {str(e)}")
-            raise
-
-    def set(self, var_name: str, val: str, print_val: bool = True) -> None:
-        """Set an environment variable."""
-        try:
-            os.environ[var_name] = val
-            if var_name not in self.var_list:
-                self.var_list.append(var_name)
-            if print_val:
-                logger.info(f"Set {var_name}={val}")
-        except Exception as e:
-            logger.error(f"Failed to set environment variable {var_name}: {str(e)}")
-            raise
-
-    def get(self, var_name: str, default: Optional[str] = None) -> Optional[str]:
-        """Get an environment variable value."""
-        try:
-            return os.environ[var_name]
-        except KeyError:
-            logger.warning(f"Environment variable {var_name} not found")
-            return default
-
-    def set_proxy(self) -> None:
-        """Set up proxy configuration with authentication."""
-        try:
-            ad_username = self.get("AD_USERNAME")
-            ad_password = self.get("AD_USER_PW")
-            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
-            
-            if not all([ad_username, ad_password, proxy_domain]):
-                raise ValueError("Missing proxy credentials")
-            
-            proxy_url = f"http://{ad_username}:{ad_password}@{proxy_domain}"
-            self.set("HTTP_PROXY", proxy_url, print_val=False)
-            self.set("HTTPS_PROXY", proxy_url, print_val=False)
-            
-            # Set no_proxy for Azure services
-            no_proxy_domains = [
-                'cognitiveservices.azure.com',
-                'search.windows.net',
-                'openai.azure.com',
-                'core.windows.net',
-                'azurewebsites.net'
-            ]
-            self.set("NO_PROXY", ",".join(no_proxy_domains))
-            
-            logger.info("Proxy configuration completed")
-            
-        except Exception as e:
-            logger.error(f"Proxy configuration failed: {str(e)}")
-            raise
-
-    def get_azure_token(self) -> str:
-        """Get Azure authentication token."""
-        try:
-            credential = ClientSecretCredential(
-                tenant_id=self.get("AZURE_TENANT_ID"),
-                client_id=self.get("AZURE_CLIENT_ID"),
-                client_secret=self.get("AZURE_CLIENT_SECRET")
-            )
-            token = credential.get_token("https://cognitiveservices.azure.com/.default")
-            self.set("AZURE_TOKEN", token.token, print_val=False)
-            logger.info("Azure token acquired successfully")
-            return token.token
-            
-        except Exception as e:
-            logger.error(f"Failed to get Azure token: {str(e)}")
-            raise
-
-    def list_env_vars(self) -> None:
-        """List all environment variables set by this class."""
-        for var in self.var_list:
-            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET'}:
-                logger.info(f"{var}: [HIDDEN]")
-            else:
-                logger.info(f"{var}: {self.get(var)}")
-
-###############################################################################
-# Document + EmbeddingClient logic
-###############################################################################
-class Document(BaseModel):
-    text: str = ""
-    embedding: List[float] = []
-    metadata: Dict[str, Any] = {}
-    id: str = ""
-
-class EmbeddingClient:
+class QualityCheckChain:
     """
-    Real embedding logic using AzureOpenAI embeddings,
-    with a token provider from DefaultAzureCredential.
+    Uses an LLM to produce { "rating": "...", "reason": "..." } as JSON
+    rating in [Green, Amber, Red]
     """
-    def __init__(self, azure_api_version: str = "2023-05-15", embeddings_model: str = "text-embedding-3-large"):
-        self.azure_api_version = azure_api_version
-        self.embeddings_model = embeddings_model
-        self.direct_azure_client = self.get_direct_azure_client()
+    def __init__(self, llm):
+        self.llm = llm
+        # define a custom prompt
+        template = """
+You are a rating agent that receives:
+- user_input: the user's name + definition
+- candidate_doc: a knowledge base match (with name + definition)
 
-    def get_direct_azure_client(self):
-        token_provider = get_bearer_token_provider(
-            DefaultAzureCredential(),
-            "https://cognitiveservices.azure.com/.default"
+You MUST return a JSON with exactly two fields: "rating" and "reason".
+No extra keys. No extra text outside JSON.
+
+"rating" must be one of ["Green","Amber","Red"].
+If you think it's a strong match, rating="Green".
+If partial match, rating="Amber" (explain partial reason).
+If no match, rating="Red" with reason like "No data found" or something.
+
+Output only valid JSON. For example:
+{
+  "rating": "Green",
+  "reason": "They match strongly"
+}
+
+---
+User input: {user_input}
+Candidate doc: {candidate_doc}
+"""
+        self.prompt = PromptTemplate(
+            input_variables=["user_input", "candidate_doc"],
+            template=template
         )
-        return AzureOpenAI(
-            api_version=self.azure_api_version,
-            azure_ad_token_provider=token_provider
-        )
-    
-    def generate_embeddings(self, document: Document) -> Document:
+        self.chain = LLMChain(llm=self.llm, prompt=self.prompt)
+
+    def check_quality(self, user_input: str, candidate_doc: str) -> Dict[str, str]:
         """
-        Generate embeddings for the document.text using the specified embeddings_model.
+        Returns a dict { "rating": "...", "reason": "..." }.
+        If parsing fails, we default to rating=Red, reason="Failed to parse JSON".
         """
         try:
-            response = self.direct_azure_client.embeddings.create(
-                deployment_name=self.embeddings_model,
-                input=document.text
-            ).data[0].embedding
-            document.embedding = response
-            return document
-        except Exception as e:
-            logging.error(f"Error generating embeddings for document {document.id}: {str(e)}")
-            return document
-
-###############################################################################
-# KnowledgeBase (CSV-based)
-###############################################################################
-class KnowledgeBase:
-    """Loads CSV rows as LangChain Document objects for RAG."""
-    def __init__(self, csv_path: str):
-        self.csv_path = csv_path
-        self.docs = self._load_csv_as_documents()
-
-    def _load_csv_as_documents(self) -> List[LC_Document]:
-        if not os.path.isfile(self.csv_path):
-            raise FileNotFoundError(f"CSV file not found: {self.csv_path}")
-        docs = []
-        with open(self.csv_path, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                text = f"{row['name']}: {row['definition']}"
-                doc_id = str(uuid.uuid4())
-                metadata = {"name": row["name"], "id": doc_id}
-                docs.append(LC_Document(page_content=text, metadata=metadata))
-        return docs
-
-###############################################################################
-# AzureOpenAIEmbeddings: an adapter for EmbeddingClient => LangChain Embeddings
-###############################################################################
-class AzureOpenAIEmbeddings(Embeddings):
-    """
-    Adapts the EmbeddingClient for usage in LangChain (Chroma, etc.).
-    """
-    def __init__(self, azure_api_version="2023-05-15", embeddings_model="text-embedding-3-large"):
-        self.client = EmbeddingClient(
-            azure_api_version=azure_api_version,
-            embeddings_model=embeddings_model
-        )
-
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        embeddings = []
-        for txt in texts:
-            doc = Document(text=txt, id="doc-embed")
-            updated_doc = self.client.generate_embeddings(doc)
-            embeddings.append(updated_doc.embedding)
-        return embeddings
-
-    def embed_query(self, text: str) -> List[float]:
-        doc = Document(text=text, id="query-embed")
-        updated_doc = self.client.generate_embeddings(doc)
-        return updated_doc.embedding
-
-###############################################################################
-# AzureChatbot with conversation + RAG
-###############################################################################
-class AzureChatbot:
-    """
-    Chatbot with:
-      - OSEnv for environment
-      - AzureChatOpenAI for chat
-      - Chroma vector store for RAG
-      - Knowledge graph for RAG
-      - Multi-tool agent
-    """
-
-    def __init__(self, config_file: str, creds_file: str, cert_file: str, csv_path: str):
-        logger.info("Initializing AzureChatbot with RAG capabilities...")
-        self.env = OSEnv(config_file, creds_file, cert_file)
-
-        # 1) Chat model
-        self._setup_chat_model()
-
-        # 2) Normal conversation chain
-        self.memory = ConversationBufferMemory()
-        self.conversation = ConversationChain(llm=self.llm, memory=self.memory, verbose=True)
-
-        # 3) Load CSV-based knowledge
-        self.kb = KnowledgeBase(csv_path)
-
-        # 4) Vector store with real Azure embeddings
-        self._setup_vectorstore()
-
-        # 5) Knowledge graph from docs
-        self._setup_graph()
-
-        # 6) Multi-tool agent
-        self._setup_agent()
-
-        logger.info("AzureChatbot (RAG) initialized successfully")
-
-    def _setup_chat_model(self) -> None:
-        """Initialize the AzureChatOpenAI for normal chat usage."""
-        try:
-            model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
-            temperature = float(self.env.get("MODEL_TEMPERATURE", "0.7"))
-            max_tokens = int(self.env.get("MAX_TOKENS", "800"))
-            api_version = self.env.get("API_VERSION", "2023-05-15")
-            azure_endpoint = self.env.get("AZURE_OPENAI_ENDPOINT", "")
-            azure_ad_token = self.env.token
-
-            self.llm = AzureChatOpenAI(
-                model_name=model_name,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                openai_api_version=api_version,
-                azure_endpoint=azure_endpoint,
-                azure_ad_token=azure_ad_token
+            resp = self.chain.run(
+                user_input=user_input,
+                candidate_doc=candidate_doc
             )
-            logger.info("Chat model initialized successfully")
+            resp = resp.strip()
+
+            # 1) Try direct parse
+            try:
+                data = json.loads(resp)
+                rating = data.get("rating","Red")
+                reason = data.get("reason","No reason provided")
+                return {"rating":rating, "reason":reason}
+            except:
+                pass
+
+            # 2) If direct parse fails, attempt substring extraction
+            start_idx = resp.find("{")
+            end_idx = resp.rfind("}")
+            if start_idx == -1 or end_idx == -1:
+                # no braces found
+                return {"rating":"Red","reason":"Failed to parse JSON (no braces)"}
+
+            json_str = resp[start_idx:end_idx+1]
+            try:
+                data = json.loads(json_str)
+                rating = data.get("rating","Red")
+                reason = data.get("reason","No reason provided")
+                return {"rating":rating, "reason":reason}
+            except:
+                return {"rating":"Red","reason":"Failed to parse JSON substring."}
+
         except Exception as e:
-            logger.error(f"Failed to initialize chat model: {str(e)}")
-            raise
-
-    def _setup_vectorstore(self) -> None:
-        """Create a Chroma vector store from the CSV docs using real Azure embeddings."""
-        try:
-            azure_embeddings_model = self.env.get("EMBEDDINGS_MODEL", "text-embedding-3-large")
-            azure_api_version = self.env.get("EMBEDDINGS_API_VERSION", "2023-05-15")
-
-            embedding = AzureOpenAIEmbeddings(
-                azure_api_version=azure_api_version,
-                embeddings_model=azure_embeddings_model
-            )
-            chroma_settings = Settings(anonymized_telemetry=False, persist_directory="chromadb-data")
-            self.vs = Chroma.from_documents(
-                documents=self.kb.docs,
-                embedding=embedding,
-                collection_name="kb_collection",
-                client_settings=chroma_settings
-            )
-            logger.info("Chroma vector store created successfully (Azure embeddings)")
-        except Exception as e:
-            logger.error(f"Failed to set up vector store: {str(e)}")
-            raise
-
-    def _setup_graph(self) -> None:
-        """Build a single knowledge graph from the CSV docs."""
-        try:
-            graph_creator = GraphIndexCreator(llm=self.llm, graph_type=NetworkxEntityGraph)
-            main_graph = graph_creator.graph_type()
-            for doc in self.kb.docs:
-                partial_graph = graph_creator.from_text(doc.page_content)
-                for triple in partial_graph.get_triples():
-                    main_graph.add_triple(triple)
-            self.graph = main_graph
-            self.graph_qa_chain = GraphQAChain.from_llm(self.llm, graph=self.graph)
-            logger.info("Knowledge graph created successfully")
-        except Exception as e:
-            logger.error(f"Failed to set up knowledge graph: {str(e)}")
-            raise
-
-    def _setup_agent(self) -> None:
-        """Define Tools for Graph QA vs. Vector store search, create an agent."""
-        try:
-            def _graph_qa(query: str) -> str:
-                return self.graph_qa_chain.run(query)
-
-            def _vectorstore_search(query: str) -> str:
-                results = self.vs.similarity_search_with_score(query, k=3)
-                if not results:
-                    return "No relevant matches found."
-                lines = []
-                for idx, (doc, score) in enumerate(results, start=1):
-                    confidence = max(0.0, min(1.0, 1.0 - score))
-                    if confidence >= 0.8:
-                        rating = "Green"
-                    elif confidence >= 0.5:
-                        rating = "Amber"
-                    else:
-                        rating = "Red"
-                    reason = (
-                        f"Confidence is {confidence:.2f}, which is {rating}. "
-                        f"Definition matched: {doc.page_content}"
-                    )
-                    line = (
-                        f"Match #{idx}\n"
-                        f"Name: {doc.metadata.get('name','Unknown')}\n"
-                        f"ID: {doc.metadata.get('id','No ID')}\n"
-                        f"Confidence: {confidence:.2f}\n"
-                        f"Rating: {rating}\n"
-                        f"Reason: {reason}\n"
-                    )
-                    lines.append(line)
-                return "\n".join(lines)
-
-            graph_tool = Tool(
-                name="GraphQATool",
-                func=_graph_qa,
-                description="Query the knowledge graph for relationships/definitions"
-            )
-            vs_tool = Tool(
-                name="VectorStoreSearch",
-                func=_vectorstore_search,
-                description="Semantic search with confidence, R/A/G rating, reason"
-            )
-            self.tools = [graph_tool, vs_tool]
-
-            prefix = "You are an AI assistant with access to the following tools:"
-            suffix = "Begin!"
-            prompt = ZeroShotAgent.create_prompt(
-                self.tools,
-                prefix=prefix,
-                suffix=suffix,
-                input_variables=["input"]
-            )
-            agent = ZeroShotAgent(llm=self.llm, tools=self.tools, prompt=prompt, verbose=True)
-            self.agent_executor = AgentExecutor.from_agent_and_tools(
-                agent=agent,
-                tools=self.tools,
-                verbose=True
-            )
-            logger.info("Multi-tool RAG agent created successfully")
-        except Exception as e:
-            logger.error(f"Failed to set up RAG agent: {str(e)}")
-            raise
-
-    ###############################################################################
-    # Public methods
-    ###############################################################################
-    def chat(self, message: str) -> str:
-        """Process a single message with the normal conversation chain (no RAG)."""
-        if not message.strip():
-            return "Please provide a non-empty message."
-        try:
-            response = self.conversation.predict(input=message)
-            return response
-        except Exception as e:
-            logger.error(f"Error in chat: {str(e)}")
-            return f"An error occurred: {str(e)}"
-
-    def rag_query(self, query: str) -> str:
-        """Use the multi-tool RAG agent (Graph or Vector) to answer a query."""
-        if not query.strip():
-            return "Please provide a non-empty query."
-        try:
-            response = self.agent_executor.run(query)
-            return response
-        except Exception as e:
-            logger.error(f"Error in RAG query: {str(e)}")
-            return f"An error occurred: {str(e)}"
-
-###############################################################################
-# Test suite
-###############################################################################
-def run_tests(chatbot: AzureChatbot):
-    """
-    Test suite to verify:
-      1) The Azure endpoint is set (print it).
-      2) A sample chat message.
-      3) A sample embedding generation.
-      4) A sample RAG query.
-    """
-    print("\n=== Running Test Suite ===")
-
-    # 1) Show the endpoint from environment
-    endpoint = chatbot.env.get("AZURE_OPENAI_ENDPOINT", "N/A")
-    print(f"Test 1: Azure endpoint => {endpoint}")
-
-    # 2) Test chat
-    sample_chat = "Hello, how are you?"
-    chat_response = chatbot.chat(sample_chat)
-    print(f"\nTest 2: Chat test\nUser: {sample_chat}\nBot: {chat_response}")
-
-    # 3) Test embedding
-    embed_client = EmbeddingClient()
-    test_doc = Document(text="Sample text for embedding test", id="test-doc")
-    updated_doc = embed_client.generate_embeddings(test_doc)
-    vector_len = len(updated_doc.embedding) if updated_doc.embedding else 0
-    print(f"\nTest 3: Embedding test\nDocument text: {test_doc.text}\nEmbedding length: {vector_len}")
-
-    # 4) Test RAG query
-    sample_rag_query = "rag What is the definition of the first entry in the CSV?"
-    rag_response = chatbot.rag_query(sample_rag_query.replace("rag ", ""))
-    print(f"\nTest 4: RAG test\nQuery: {sample_rag_query}\nRAG Response:\n{rag_response}")
-
-    print("\n=== Test Suite Complete ===")
-
-###############################################################################
-# Main
-###############################################################################
-def main():
-    """Main function to run the chatbot + RAG + tests."""
-    try:
-        # Check for missing files
-        required_files = {
-            "config.env": CONFIG_PATH,
-            "credentials.env": CREDS_PATH,
-            "cacert.pem": CERT_PATH,
-            "knowledgebase.csv": CSV_PATH
-        }
-        missing_files = []
-        for name, path in required_files.items():
-            if not os.path.exists(path):
-                missing_files.append(name)
-        if missing_files:
-            print(f"\nMissing required files: {', '.join(missing_files)}")
-            sys.exit(1)
-
-        print("\nInitializing AzureChatbot with RAG capabilities...")
-        chatbot = AzureChatbot(
-            config_file=CONFIG_PATH,
-            creds_file=CREDS_PATH,
-            cert_file=CERT_PATH,
-            csv_path=CSV_PATH
-        )
-        print("Chatbot initialized successfully!\n")
-
-        # Run test suite
-        run_tests(chatbot)
-
-        print("\nAvailable commands:")
-        print("- 'quit', 'exit', or 'bye': End the conversation")
-        print("- 'env': Show current environment variables")
-        print("- 'rag <query>': Run a query through the RAG multi-tool agent")
-        print("- anything else: normal chat conversation")
-        print("\nType your message to begin chatting or testing further...")
-        print("-" * 50)
-
-        while True:
-            user_input = input("\nYou: ").strip()
-            if user_input.lower() in ["quit", "exit", "bye"]:
-                print("Goodbye!")
-                break
-
-            if user_input.lower() == "env":
-                chatbot.env.list_env_vars()
-                continue
-
-            # If user types "rag <query>", run RAG
-            if user_input.lower().startswith("rag "):
-                query = user_input[4:].strip()
-                response = chatbot.rag_query(query)
-                print(f"\nRAG: {response}")
-                continue
-
-            # Otherwise, normal conversation
-            response = chatbot.chat(user_input)
-            print(f"\nBot: {response}")
-
-    except FileNotFoundError as e:
-        print(f"\nFile Error: {str(e)}")
-        print("Please check your configuration files and certificate path.")
-    except ValueError as e:
-        print(f"\nConfiguration Error: {str(e)}")
-        print("Please check your environment variables and settings.")
-    except Exception as e:
-        print(f"\nUnexpected Error: {str(e)}")
-        print("Please check the logs for more details.")
-        logger.exception("Unexpected error occurred")
-
-if __name__ == "__main__":
-    main()
+            logger.error(f"Error in check_quality: {str(e)}")
+            return {"rating":"Red","reason":"Parsing or chain error."}
