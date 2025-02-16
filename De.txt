@@ -34,8 +34,8 @@ ENV_DIR = "../env"
 CONFIG_PATH = f"{ENV_DIR}/config.env"
 CREDS_PATH = f"{ENV_DIR}/credentials.env"
 CERT_PATH = f"{ENV_DIR}/cacert.pem"
-CSV_PATH = "knowledgebase.csv"
-INPUT_JSON_PATH = "input.json"  # can be single object or list of objects
+CSV_PATH = "knowledgebase.csv"      # CSV with columns: name, definition, [id]
+INPUT_JSON_PATH = "input.json"      # single object or list of objects
 
 ###############################################################################
 # Utility
@@ -192,7 +192,7 @@ class EmbeddingClient:
             return doc
 
 ###############################################################################
-# KnowledgeBase => read CSV (chardet) => docs + networkx
+# KnowledgeBase => read CSV with chardet => docs + networkx
 ###############################################################################
 class KnowledgeBase:
     def __init__(self, csv_path: str):
@@ -253,7 +253,7 @@ class KnowledgeBase:
         logger.info(f"Built graph with {self.graph.number_of_nodes()} nodes and {self.graph.number_of_edges()} edges")
 
 ###############################################################################
-# AzureOpenAIEmbeddings => for Chroma
+# AzureOpenAIEmbeddings => for Chroma (cosine similarity)
 ###############################################################################
 class AzureOpenAIEmbeddings(Embeddings):
     def __init__(self, azure_api_version="2023-05-15", embeddings_model="text-embedding-3-large"):
@@ -273,29 +273,36 @@ class AzureOpenAIEmbeddings(Embeddings):
         return updated_doc.embedding
 
 ###############################################################################
-# QualityCheckChain => Agent/Chain to determine R/A/G + reason
+# QualityCheckChain => parse rating + reason from JSON
 ###############################################################################
 class QualityCheckChain:
     """
-    Uses an LLM to produce { "rating": "...", "reason": "..." } as JSON
-    rating in [Green, Amber, Red]
+    Uses an LLM to produce strictly { "rating": "...", "reason": "..." } as JSON.
+    rating ∈ {Green, Amber, Red}.
     """
     def __init__(self, llm):
         self.llm = llm
-        # define a custom prompt
+
         template = """
 You are a rating agent that receives:
 - user_input: the user's name + definition
 - candidate_doc: a knowledge base match (with name + definition)
 
-You must return a JSON with exactly two fields: "rating" and "reason".
-"rating" must be one of ["Green","Amber","Red"].
-If you think it's a strong match, rating=Green.
-If partial match, rating=Amber (explain partial reason).
-If no match, rating=Red with reason "No data found" or something.
+You MUST return a JSON with exactly two fields: "rating" and "reason".
+No extra keys, no leading/trailing whitespace in key names.
+No text outside the JSON.
 
-Output only valid JSON with these two fields, e.g.
-{"rating":"Green","reason":"They match strongly"}
+"rating" must be one of ["Green","Amber","Red"].
+If you think it's a strong match, rating="Green".
+If partial match, rating="Amber" (explain partial reason).
+If no match, rating="Red" with reason like "No data found".
+
+Output only valid JSON. For example:
+{
+  "rating": "Green",
+  "reason": "They match strongly"
+}
+
 ---
 User input: {user_input}
 Candidate doc: {candidate_doc}
@@ -306,28 +313,54 @@ Candidate doc: {candidate_doc}
         )
         self.chain = LLMChain(llm=self.llm, prompt=self.prompt)
 
+    def _normalize_keys(self, data: dict) -> dict:
+        """
+        Forcefully remove newlines, quotes, or stray chars from each key.
+        So if we get '\n "rating"' => 'rating'.
+        """
+        normalized = {}
+        for k, v in data.items():
+            new_k = k.replace('"','').replace("'","").replace('\n','').replace('\r','').strip()
+            normalized[new_k] = v
+        return normalized
+
     def check_quality(self, user_input: str, candidate_doc: str) -> Dict[str, str]:
         """
-        Returns a dict { "rating": "...", "reason": "..." }.
-        If parsing fails, we default to Red + reason.
+        Returns { "rating": "...", "reason": "..." } or a fallback if parse fails.
         """
         try:
             resp = self.chain.run(
                 user_input=user_input,
                 candidate_doc=candidate_doc
             )
-            # Attempt to parse JSON
-            resp = resp.strip()
-            # we can do a naive parse
-            start_idx = resp.find("{")
-            end_idx = resp.rfind("}")
+            raw_resp = resp.strip()
+
+            # 1) Attempt direct parse
+            try:
+                data = json.loads(raw_resp)
+                data = self._normalize_keys(data)
+                rating = data.get("rating","Red")
+                reason = data.get("reason","No reason provided")
+                return {"rating": rating, "reason": reason}
+            except:
+                pass
+
+            # 2) If direct parse fails, attempt substring extraction
+            start_idx = raw_resp.find("{")
+            end_idx = raw_resp.rfind("}")
             if start_idx == -1 or end_idx == -1:
-                return {"rating":"Red","reason":"Failed to parse JSON"}
-            json_str = resp[start_idx:end_idx+1]
-            data = json.loads(json_str)
-            rating = data.get("rating","Red")
-            reason = data.get("reason","No reason provided")
-            return {"rating":rating, "reason":reason}
+                return {"rating":"Red","reason":"Failed to parse JSON (no braces)"}
+
+            json_str = raw_resp[start_idx:end_idx+1]
+            try:
+                data = json.loads(json_str)
+                data = self._normalize_keys(data)
+                rating = data.get("rating","Red")
+                reason = data.get("reason","No reason provided")
+                return {"rating": rating, "reason": reason}
+            except:
+                return {"rating":"Red","reason":"Failed to parse JSON substring."}
+
         except Exception as e:
             logger.error(f"Error in check_quality: {str(e)}")
             return {"rating":"Red","reason":"Parsing or chain error."}
@@ -337,7 +370,7 @@ Candidate doc: {candidate_doc}
 ###############################################################################
 class AzureChatbot:
     def __init__(self, config_file: str, creds_file: str, cert_file: str, csv_path: str):
-        logger.info("Initializing AzureChatbot with chardet + networkx approach + RAG agent.")
+        logger.info("Initializing AzureChatbot with chardet + networkx + R/A/G approach.")
         self.env = OSEnv(config_file, creds_file, cert_file)
 
         # 1) Chat model for normal conversation
@@ -351,7 +384,7 @@ class AzureChatbot:
         self.kb = KnowledgeBase(csv_path)
         self.graph = self.kb.graph
 
-        # 4) Vector store
+        # 4) Create vector store (cosine similarity by default in Chroma)
         self._setup_vectorstore()
 
         # 5) QualityCheckChain for rating
@@ -390,7 +423,12 @@ class AzureChatbot:
                 azure_api_version=azure_api_version,
                 embeddings_model=azure_embeddings_model
             )
-            chroma_settings = Settings(anonymized_telemetry=False, persist_directory="chromadb-data")
+            # We'll do cosine similarity by default
+            chroma_settings = Settings(
+                anonymized_telemetry=False,
+                persist_directory="chromadb-data"
+                # By default, Chroma uses "cosine" for similarity
+            )
             self.vs = Chroma.from_documents(
                 documents=self.kb.docs,
                 embedding=embedding,
@@ -484,16 +522,18 @@ class AzureChatbot:
                 "matched_doc":None
             }
 
+        last_amber_reason = "No strong match found"
         for idx, (doc, score) in enumerate(results, start=1):
-            # Build candidate doc text
             candidate_text = f"Name={doc.metadata.get('name','Unknown')}, Def={doc.page_content}"
-            qc_result = self.quality_chain.check_quality(user_input=user_input, candidate_doc=candidate_text)
+            qc_result = self.quality_chain.check_quality(
+                user_input=user_input,
+                candidate_doc=candidate_text
+            )
 
             rating = qc_result.get("rating","Red")
             reason = qc_result.get("reason","No reason")
 
             if rating == "Green":
-                # We finalize
                 return {
                     "rating":"Green",
                     "reason":reason,
@@ -504,22 +544,20 @@ class AzureChatbot:
                     }
                 }
             elif rating == "Amber":
-                # partial match => try next match
-                # but store the reason if we end up with no better match
+                # partial => try next match
                 last_amber_reason = reason
                 continue
             else:  # rating == "Red"
-                # agent says no match
                 return {
                     "rating":"Red",
                     "reason":reason,
                     "matched_doc":None
                 }
 
-        # If we exhausted all matches, let's say last was Amber => no better match
+        # If we exhausted all matches => last was Amber
         return {
             "rating":"Amber",
-            "reason": last_amber_reason if 'last_amber_reason' in locals() else "No strong match found",
+            "reason": last_amber_reason,
             "matched_doc":None
         }
 
@@ -566,7 +604,7 @@ def process_input_json_with_quality(chatbot: AzureChatbot, json_file: str):
     with open(json_file, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # If 'data' is a list, handle multiple items. If single object, wrap in list.
+    # If 'data' is a dict => wrap in list
     if isinstance(data, dict):
         data = [data]
     elif not isinstance(data, list):
