@@ -6,7 +6,7 @@ import logging
 import chardet
 import pandas as pd
 import networkx as nx
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 from pathlib import Path
 
 from dotenv import dotenv_values
@@ -14,16 +14,16 @@ from azure.identity import ClientSecretCredential, DefaultAzureCredential, get_b
 from openai import AzureOpenAI
 from pydantic import BaseModel
 
-# LangChain + Chroma imports
+# LangChain + Chroma
 from langchain.chat_models import AzureChatOpenAI
 from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationChain
+from langchain.chains import ConversationChain, LLMChain
 from langchain.docstore.document import Document as LC_Document
 from langchain.embeddings.base import Embeddings
 from langchain.vectorstores import Chroma
+from langchain.prompts import PromptTemplate
 from chromadb.config import Settings
 
-# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -34,8 +34,8 @@ ENV_DIR = "../env"
 CONFIG_PATH = f"{ENV_DIR}/config.env"
 CREDS_PATH = f"{ENV_DIR}/credentials.env"
 CERT_PATH = f"{ENV_DIR}/cacert.pem"
-CSV_PATH = "knowledgebase.csv"  # CSV with columns: name, definition, [id]
-INPUT_JSON_PATH = "input.json"  # For input.json processing
+CSV_PATH = "knowledgebase.csv"
+INPUT_JSON_PATH = "input.json"  # can be single object or list of objects
 
 ###############################################################################
 # Utility
@@ -192,7 +192,7 @@ class EmbeddingClient:
             return doc
 
 ###############################################################################
-# KnowledgeBase: read CSV with chardet => docs + networkx graph
+# KnowledgeBase => read CSV (chardet) => docs + networkx
 ###############################################################################
 class KnowledgeBase:
     def __init__(self, csv_path: str):
@@ -273,26 +273,89 @@ class AzureOpenAIEmbeddings(Embeddings):
         return updated_doc.embedding
 
 ###############################################################################
-# AzureChatbot => normal chat + vector store + naive graph search
+# QualityCheckChain => Agent/Chain to determine R/A/G + reason
+###############################################################################
+class QualityCheckChain:
+    """
+    Uses an LLM to produce { "rating": "...", "reason": "..." } as JSON
+    rating in [Green, Amber, Red]
+    """
+    def __init__(self, llm):
+        self.llm = llm
+        # define a custom prompt
+        template = """
+You are a rating agent that receives:
+- user_input: the user's name + definition
+- candidate_doc: a knowledge base match (with name + definition)
+
+You must return a JSON with exactly two fields: "rating" and "reason".
+"rating" must be one of ["Green","Amber","Red"].
+If you think it's a strong match, rating=Green.
+If partial match, rating=Amber (explain partial reason).
+If no match, rating=Red with reason "No data found" or something.
+
+Output only valid JSON with these two fields, e.g.
+{"rating":"Green","reason":"They match strongly"}
+---
+User input: {user_input}
+Candidate doc: {candidate_doc}
+"""
+        self.prompt = PromptTemplate(
+            input_variables=["user_input", "candidate_doc"],
+            template=template
+        )
+        self.chain = LLMChain(llm=self.llm, prompt=self.prompt)
+
+    def check_quality(self, user_input: str, candidate_doc: str) -> Dict[str, str]:
+        """
+        Returns a dict { "rating": "...", "reason": "..." }.
+        If parsing fails, we default to Red + reason.
+        """
+        try:
+            resp = self.chain.run(
+                user_input=user_input,
+                candidate_doc=candidate_doc
+            )
+            # Attempt to parse JSON
+            resp = resp.strip()
+            # we can do a naive parse
+            start_idx = resp.find("{")
+            end_idx = resp.rfind("}")
+            if start_idx == -1 or end_idx == -1:
+                return {"rating":"Red","reason":"Failed to parse JSON"}
+            json_str = resp[start_idx:end_idx+1]
+            data = json.loads(json_str)
+            rating = data.get("rating","Red")
+            reason = data.get("reason","No reason provided")
+            return {"rating":rating, "reason":reason}
+        except Exception as e:
+            logger.error(f"Error in check_quality: {str(e)}")
+            return {"rating":"Red","reason":"Parsing or chain error."}
+
+###############################################################################
+# AzureChatbot => normal chat + vector store + naive graph + R/A/G approach
 ###############################################################################
 class AzureChatbot:
     def __init__(self, config_file: str, creds_file: str, cert_file: str, csv_path: str):
-        logger.info("Initializing AzureChatbot with chardet + networkx approach.")
+        logger.info("Initializing AzureChatbot with chardet + networkx approach + RAG agent.")
         self.env = OSEnv(config_file, creds_file, cert_file)
 
-        # 1) Chat model
+        # 1) Chat model for normal conversation
         self._setup_chat_model()
 
-        # 2) Normal conversation chain
+        # 2) Conversation chain
         self.memory = ConversationBufferMemory()
         self.conversation = ConversationChain(llm=self.llm, memory=self.memory, verbose=True)
 
-        # 3) Build knowledge base => docs + graph
+        # 3) Knowledge base => docs + graph
         self.kb = KnowledgeBase(csv_path)
         self.graph = self.kb.graph
 
-        # 4) Create vector store from docs
+        # 4) Vector store
         self._setup_vectorstore()
+
+        # 5) QualityCheckChain for rating
+        self.quality_chain = QualityCheckChain(llm=self.llm)
 
         logger.info("AzureChatbot is ready.")
 
@@ -339,6 +402,12 @@ class AzureChatbot:
             logger.error(f"Failed to set up vector store: {str(e)}")
             raise
 
+    def list_env(self):
+        self.env.list_env_vars()
+
+    ###########################################################################
+    # Normal chat
+    ###########################################################################
     def chat(self, message: str) -> str:
         """Normal conversation with memory (no RAG)."""
         if not message.strip():
@@ -349,10 +418,10 @@ class AzureChatbot:
             logger.error(f"Error in chat: {str(e)}")
             return f"An error occurred: {str(e)}"
 
+    ###########################################################################
+    # RAG query => direct vector search (no R/A/G logic)
+    ###########################################################################
     def rag_query(self, query: str, k: int = 3) -> str:
-        """
-        Vector store search for top matches, returning confidence + rating.
-        """
         try:
             results = self.vs.similarity_search_with_score(query, k=k)
             if not results:
@@ -376,68 +445,88 @@ class AzureChatbot:
             logger.error(f"Error in rag_query: {str(e)}")
             return f"An error occurred: {str(e)}"
 
+    ###########################################################################
+    # Graph search => naive substring
+    ###########################################################################
     def graph_search(self, query: str) -> str:
-        """
-        Naive substring search in the graph's nodes for 'query'.
-        """
         results = []
         q_lower = query.lower()
 
-        # check node data for a match
-        for node, data in self.graph.nodes(data=True):
+        for node, data in self.kb.graph.nodes(data=True):
             if q_lower in str(node).lower():
                 node_info = f"Node: {node}, node_type={data.get('node_type','')}, node_id={data.get('node_id','')}"
                 results.append(node_info)
 
         if not results:
             return "No matching nodes found in the graph."
-
         return "\n".join(results)
 
-    def list_env(self):
-        self.env.list_env_vars()
-
     ###########################################################################
-    # JSON processing + test suite
+    # R/A/G logic with QualityCheckChain
     ###########################################################################
-    def vector_search_json(self, query: str, k: int = 3) -> Dict[str, Any]:
+    def rag_quality_check_item(self, name: str, definition: str, top_k: int = 5) -> Dict[str,Any]:
         """
-        Return top vector-store matches in JSON form (confidence, rating, etc.).
+        1) Build user_input from name + definition
+        2) Vector search => up to top_k matches
+        3) For each match in order:
+           - Call QualityCheckChain with user_input + candidate
+           - If rating=Green => done
+           - If rating=Amber => try next match
+           - If rating=Red => stop (no data found)
+        4) Return final JSON with rating, reason, matched doc info
         """
-        results = self.vs.similarity_search_with_score(query, k=k)
-        response = {"query": query, "results": []}
+        user_input = f"{name} {definition}"
+        results = self.vs.similarity_search_with_score(user_input, k=top_k)
         if not results:
-            return response
+            return {
+                "rating":"Red",
+                "reason":"No matches from vector store",
+                "matched_doc":None
+            }
 
         for idx, (doc, score) in enumerate(results, start=1):
-            confidence = max(0.0, min(1.0, 1.0 - score))
-            if confidence >= 0.8:
-                rating = "Green"
-            elif confidence >= 0.5:
-                rating = "Amber"
-            else:
-                rating = "Red"
-            item = {
-                "match_number": idx,
-                "name": doc.metadata.get("name", "Unknown"),
-                "id": doc.metadata.get("id", "No ID"),
-                "confidence": confidence,
-                "rating": rating,
-                "content": doc.page_content
-            }
-            response["results"].append(item)
-        return response
+            # Build candidate doc text
+            candidate_text = f"Name={doc.metadata.get('name','Unknown')}, Def={doc.page_content}"
+            qc_result = self.quality_chain.check_quality(user_input=user_input, candidate_doc=candidate_text)
+
+            rating = qc_result.get("rating","Red")
+            reason = qc_result.get("reason","No reason")
+
+            if rating == "Green":
+                # We finalize
+                return {
+                    "rating":"Green",
+                    "reason":reason,
+                    "matched_doc":{
+                        "name": doc.metadata.get("name","Unknown"),
+                        "id": doc.metadata.get("id","No ID"),
+                        "definition": doc.page_content
+                    }
+                }
+            elif rating == "Amber":
+                # partial match => try next match
+                # but store the reason if we end up with no better match
+                last_amber_reason = reason
+                continue
+            else:  # rating == "Red"
+                # agent says no match
+                return {
+                    "rating":"Red",
+                    "reason":reason,
+                    "matched_doc":None
+                }
+
+        # If we exhausted all matches, let's say last was Amber => no better match
+        return {
+            "rating":"Amber",
+            "reason": last_amber_reason if 'last_amber_reason' in locals() else "No strong match found",
+            "matched_doc":None
+        }
 
 ###############################################################################
 # Test suite
 ###############################################################################
 def run_tests(chatbot: AzureChatbot):
-    """
-    1) Print endpoint
-    2) Sample chat
-    3) Embedding test
-    4) RAG test
-    """
     print("\n=== Running Test Suite ===")
 
     endpoint = chatbot.env.get("AZURE_OPENAI_ENDPOINT", "N/A")
@@ -447,7 +536,6 @@ def run_tests(chatbot: AzureChatbot):
     chat_response = chatbot.chat(sample_chat)
     print(f"\nTest 2: Chat test\nUser: {sample_chat}\nBot: {chat_response}")
 
-    # Embedding test
     from langchain.embeddings.base import Embeddings
     embed_client = EmbeddingClient()
     test_doc = MyDocument(text="Sample text for embedding test", id="test-doc")
@@ -455,22 +543,21 @@ def run_tests(chatbot: AzureChatbot):
     vector_len = len(updated_doc.embedding) if updated_doc.embedding else 0
     print(f"\nTest 3: Embedding test\nDocument text: {test_doc.text}\nEmbedding length: {vector_len}")
 
-    # RAG test
-    sample_rag_query = "rag What is the definition of the first entry in the CSV?"
-    rag_response = chatbot.rag_query(sample_rag_query.replace("rag ", ""))
+    sample_rag_query = "rag phone"
+    rag_response = chatbot.rag_query(sample_rag_query.replace("rag ",""))
     print(f"\nTest 4: RAG test\nQuery: {sample_rag_query}\nRAG Response:\n{rag_response}")
 
     print("\n=== Test Suite Complete ===")
 
 ###############################################################################
-# process input.json
+# Process input.json with R/A/G logic
 ###############################################################################
-def process_input_json(chatbot: AzureChatbot, json_file: str) -> None:
+def process_input_json_with_quality(chatbot: AzureChatbot, json_file: str):
     """
-    1) Load input.json with { "name": "...", "definition": "..." }
-    2) Combine them into a query
-    3) Find top matches => returns JSON
-    4) Print the JSON result
+    If input.json is a single dict => { "name": "...", "definition": "..." }
+    or a list of such dicts => we handle both.
+    For each item, we call rag_quality_check_item => rating, reason, matched_doc
+    Then we print a JSON result.
     """
     if not os.path.isfile(json_file):
         print(f"Input JSON file not found: {json_file}")
@@ -479,11 +566,33 @@ def process_input_json(chatbot: AzureChatbot, json_file: str) -> None:
     with open(json_file, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    query = f"{data.get('name','')} {data.get('definition','')}"
-    results_json = chatbot.vector_search_json(query, k=3)
+    # If 'data' is a list, handle multiple items. If single object, wrap in list.
+    if isinstance(data, dict):
+        data = [data]
+    elif not isinstance(data, list):
+        print("input.json must be an object or a list of objects.")
+        return
 
-    print("\n=== Input JSON Query Results ===")
-    print(json.dumps(results_json, indent=2))
+    final_results = []
+    for item in data:
+        name_val = str(item.get("name",""))
+        def_val = str(item.get("definition",""))
+        # run the R/A/G approach
+        result = chatbot.rag_quality_check_item(name=name_val, definition=def_val, top_k=5)
+        # store
+        final_results.append({
+            "input": {
+                "name": name_val,
+                "definition": def_val
+            },
+            "rating": result["rating"],
+            "reason": result["reason"],
+            "matched_doc": result["matched_doc"]
+        })
+
+    # Print final results as JSON
+    print("\n=== R/A/G Results from input.json ===")
+    print(json.dumps(final_results, indent=2))
 
 ###############################################################################
 # main
@@ -505,7 +614,7 @@ def main():
             print(f"\nMissing required files: {', '.join(missing)}")
             sys.exit(1)
 
-        print("Initializing AzureChatbot (chardet + networkx + test suite + input.json)...")
+        print("Initializing AzureChatbot with R/A/G logic + test suite + input.json handling...")
         chatbot = AzureChatbot(
             config_file=CONFIG_PATH,
             creds_file=CREDS_PATH,
@@ -517,17 +626,18 @@ def main():
         # 1) run test suite
         run_tests(chatbot)
 
-        # 2) process input.json if it exists
+        # 2) process input.json with R/A/G approach if it exists
         if os.path.isfile(INPUT_JSON_PATH):
-            process_input_json(chatbot, INPUT_JSON_PATH)
+            process_input_json_with_quality(chatbot, INPUT_JSON_PATH)
 
         # 3) user loop
         print("\nCommands:\n"
               "- 'quit'/'exit'/'bye': end\n"
               "- 'env': show environment\n"
-              "- 'rag <query>': vector store search\n"
+              "- 'rag <query>': direct vector store search\n"
               "- 'graph <query>': naive graph search\n"
-              "anything else => normal chat\n")
+              "anything else => normal chat\n"
+              "(For R/A/G approach on input.json, put data in input.json and re-run.)\n")
 
         while True:
             user_input = input("\nYou: ").strip()
