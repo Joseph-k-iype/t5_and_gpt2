@@ -1,71 +1,260 @@
-import logging
+import os
+import sys
 import uuid
-from typing import Dict, Any
+import json
+import logging
+import chardet
+import pandas as pd
+from typing import List, Dict, Any
+from pathlib import Path
 
+from dotenv import dotenv_values
+from azure.identity import ClientSecretCredential
+from openai import AzureOpenAI
+from pydantic import BaseModel
+
+# LangChain
 from langchain.chat_models import AzureChatOpenAI
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationChain
-from langchain.vectorstores import Chroma
-from chromadb.config import Settings
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-class AzureChatbot:
-    """
-    Full AzureChatbot class that:
-      1) Loads environment via OSEnv
-      2) Creates an AzureChatOpenAI LLM for normal conversation
-      3) Builds a KnowledgeBase from CSV => docs + graph
-      4) Creates a Chroma vector store for RAG
-      5) Provides normal chat, rag_query, graph_search
-      6) Integrates ISRClassificationChain to classify name + definition
-         => {classification, reason, confidence, rating}
-    """
+###############################################################################
+# 1) OSEnv
+###############################################################################
+class OSEnv:
+    """Environment variable loader for Azure + config, no embeddings needed."""
+    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
+        self.var_list = []
+        self._bulk_set(config_file, print_val=True)
+        logger.info(f"Loaded main configuration from {config_file}")
 
-    def __init__(self, config_file: str, creds_file: str, cert_file: str, csv_path: str,
-                 env_cls, kb_cls, emb_cls, isr_chain_cls):
-        """
-        :param config_file: e.g. "config.env"
-        :param creds_file: e.g. "credentials.env"
-        :param cert_file: e.g. "cacert.pem"
-        :param csv_path: e.g. "knowledgebase.csv"
-        :param env_cls: reference to your OSEnv class
-        :param kb_cls: reference to your KnowledgeBase class
-        :param emb_cls: reference to your AzureOpenAIEmbeddings class
-        :param isr_chain_cls: reference to your ISRClassificationChain class
-        """
-        logger.info("Initializing AzureChatbot with ISR classification capabilities.")
-        # 1) Load environment
-        self.env = env_cls(config_file, creds_file, cert_file)
+        self._bulk_set(creds_file, print_val=False)
+        logger.info(f"Loaded credentials from {creds_file}")
 
-        # 2) Create LLM for normal conversation
+        self._set_certificate_path(certificate_path)
+        logger.info("Certificate path configured")
+
+        if self.get("PROXY_ENABLED","False").lower() == "true":
+            self._set_proxy()
+            logger.info("Proxy configured")
+
+        if self.get("SECURED_ENDPOINTS","False").lower() == "true":
+            logger.info("Securing endpoints")
+            self.token = self._get_azure_token()
+        else:
+            self.token = None
+
+    def _bulk_set(self, dotenvfile: str, print_val: bool):
+        dotenvfile = os.path.abspath(dotenvfile)
+        if not os.path.isfile(dotenvfile):
+            logger.warning(f"No such env file: {dotenvfile}")
+            return
+        logger.info(f"Loading env from {dotenvfile}")
+        temp_dict = dotenv_values(dotenvfile)
+        for k, v in temp_dict.items():
+            self.set(k, v, print_val=print_val)
+
+    def set(self, var_name: str, val: str, print_val: bool=True):
+        os.environ[var_name] = val
+        if var_name not in self.var_list:
+            self.var_list.append(var_name)
+        if print_val:
+            logger.info(f"Set {var_name}={val}")
+
+    def get(self, var_name: str, default: str=None) -> str:
+        return os.environ.get(var_name, default)
+
+    def _set_certificate_path(self, certificate_path: str):
+        certificate_path = os.path.abspath(certificate_path)
+        if not os.path.isfile(certificate_path):
+            logger.warning(f"Certificate file missing: {certificate_path}")
+            return
+        self.set("REQUESTS_CA_BUNDLE", certificate_path)
+        self.set("SSL_CERT_FILE", certificate_path)
+        self.set("CURL_CA_BUNDLE", certificate_path)
+
+    def _set_proxy(self):
+        ad_username = self.get("AD_USERNAME")
+        ad_password = self.get("AD_USER_PW")
+        proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
+        if not all([ad_username, ad_password, proxy_domain]):
+            logger.warning("Missing proxy credentials, skipping proxy setup.")
+            return
+        proxy_url = f"http://{ad_username}:{ad_password}@{proxy_domain}"
+        self.set("HTTP_PROXY", proxy_url, print_val=False)
+        self.set("HTTPS_PROXY", proxy_url, print_val=False)
+
+    def _get_azure_token(self) -> str:
+        try:
+            credential = ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID",""),
+                client_id=self.get("AZURE_CLIENT_ID",""),
+                client_secret=self.get("AZURE_CLIENT_SECRET","")
+            )
+            token = credential.get_token("https://cognitiveservices.azure.com/.default")
+            self.set("AZURE_TOKEN", token.token, print_val=False)
+            logger.info("Azure token acquired successfully")
+            return token.token
+        except Exception as e:
+            logger.error(f"Failed to get Azure token: {str(e)}")
+            return ""
+
+    def list_env_vars(self):
+        for var in self.var_list:
+            if var in {"AZURE_TOKEN","AD_USER_PW","AZURE_CLIENT_SECRET"}:
+                logger.info(f"{var}: [HIDDEN]")
+            else:
+                logger.info(f"{var}: {os.environ.get(var,'')}")
+
+###############################################################################
+# 2) ISRClassificationChain
+###############################################################################
+class ISRClassificationChain:
+    """
+    Classify data into an ISR classification level, returning JSON:
+    {
+      "classification": "...",
+      "reason": "...",
+      "confidence": 0.0,
+      "rating": "Green"/"Amber"/"Red"
+    }
+    """
+    def __init__(self, llm):
+        self.llm = llm
+
+        template = """
+You are an ISR classification agent. You receive a data item with:
+Name + Definition
+
+You must classify it into an ISR classification level (like "Top Secret","Secret","Confidential","Unclassified", etc.)
+Then produce valid JSON with EXACTLY these fields:
+{
+  "classification": "...",
+  "reason": "...",
+  "confidence": 0.0,
+  "rating": "Green"/"Amber"/"Red"
+}
+
+No extra text outside the JSON. Example:
+{
+  "classification": "Secret",
+  "reason": "Because it meets secret data criteria",
+  "confidence": 0.85,
+  "rating": "Green"
+}
+
+User input: {user_input}
+"""
+        self.prompt = PromptTemplate(
+            input_variables=["user_input"],
+            template=template
+        )
+        self.chain = LLMChain(llm=self.llm, prompt=self.prompt)
+
+    def _normalize_keys(self, data: dict) -> dict:
+        new_data = {}
+        for k,v in data.items():
+            new_k = k.replace('"','').replace("'","").replace('\n','').replace('\r','').strip()
+            new_data[new_k] = v
+        return new_data
+
+    def classify(self, user_input: str) -> dict:
+        """
+        Returns { classification, reason, confidence, rating } or fallback.
+        """
+        try:
+            resp = self.chain.run(user_input=user_input).strip()
+
+            # 1) direct parse
+            try:
+                data = json.loads(resp)
+                data = self._normalize_keys(data)
+                classification = str(data.get("classification","Unknown"))
+                reason = str(data.get("reason","No reason"))
+                confidence = float(data.get("confidence",0.0))
+                rating = str(data.get("rating","Red"))
+                return {
+                    "classification": classification,
+                    "reason": reason,
+                    "confidence": confidence,
+                    "rating": rating
+                }
+            except:
+                pass
+
+            # 2) substring parse
+            start_idx = resp.find("{")
+            end_idx = resp.rfind("}")
+            if start_idx == -1 or end_idx == -1:
+                return {
+                    "classification":"Unknown",
+                    "reason":"Failed to parse JSON (no braces)",
+                    "confidence":0.0,
+                    "rating":"Red"
+                }
+            json_str = resp[start_idx:end_idx+1]
+            try:
+                data = json.loads(json_str)
+                data = self._normalize_keys(data)
+                classification = str(data.get("classification","Unknown"))
+                reason = str(data.get("reason","No reason"))
+                confidence = float(data.get("confidence",0.0))
+                rating = str(data.get("rating","Red"))
+                return {
+                    "classification": classification,
+                    "reason": reason,
+                    "confidence": confidence,
+                    "rating": rating
+                }
+            except:
+                return {
+                    "classification":"Unknown",
+                    "reason":"Failed to parse JSON substring",
+                    "confidence":0.0,
+                    "rating":"Red"
+                }
+
+        except Exception as e:
+            logger.error(f"Error in classify: {str(e)}")
+            return {
+                "classification":"Unknown",
+                "reason":"Parsing or chain error",
+                "confidence":0.0,
+                "rating":"Red"
+            }
+
+###############################################################################
+# 3) MinimalAzureChatbot: purely classification, no embeddings needed
+###############################################################################
+class MinimalAzureChatbot:
+    """
+    - Loads environment
+    - Creates an LLM (AzureChatOpenAI)
+    - Has an ISRClassificationChain for classifying data
+    - Also can do normal conversation if you like
+    """
+    def __init__(self, config_file: str, creds_file: str, cert_file: str):
+        logger.info("Initializing MinimalAzureChatbot for classification.")
+        self.env = OSEnv(config_file, creds_file, cert_file)
         self._setup_llm()
 
-        # 3) Conversation memory
+        # Optional conversation memory if you want chat
         self.memory = ConversationBufferMemory()
         self.conversation = ConversationChain(llm=self.llm, memory=self.memory, verbose=True)
 
-        # 4) Build knowledge base => docs + graph
-        self.kb = kb_cls(csv_path)
-        self.graph = self.kb.graph
-
-        # 5) Create vector store (Chroma) using your AzureOpenAIEmbeddings
-        self._setup_vectorstore(emb_cls)
-
-        # 6) Create an ISRClassificationChain instance
-        self.isr_chain = isr_chain_cls(llm=self.llm)
-
-        logger.info("AzureChatbot initialization complete.")
+        # The chain for ISR classification
+        self.isr_chain = ISRClassificationChain(llm=self.llm)
+        logger.info("MinimalAzureChatbot init complete.")
 
     def _setup_llm(self):
-        """Create an AzureChatOpenAI model from environment variables."""
-        from langchain.chat_models import AzureChatOpenAI
-
-        model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
-        temperature = float(self.env.get("MODEL_TEMPERATURE", "0.7"))
-        max_tokens = int(self.env.get("MAX_TOKENS", "800"))
-        api_version = self.env.get("API_VERSION", "2023-05-15")
-        azure_endpoint = self.env.get("AZURE_OPENAI_ENDPOINT", "")
+        model_name = self.env.get("MODEL_NAME","gpt-4o-mini")
+        temperature = float(self.env.get("MODEL_TEMPERATURE","0.7"))
+        max_tokens = int(self.env.get("MAX_TOKENS","800"))
+        api_version = self.env.get("API_VERSION","2023-05-15")
+        azure_endpoint = self.env.get("AZURE_OPENAI_ENDPOINT","")
         azure_ad_token = self.env.token
 
         try:
@@ -77,49 +266,16 @@ class AzureChatbot:
                 azure_endpoint=azure_endpoint,
                 azure_ad_token=azure_ad_token
             )
-            logger.info("LLM (AzureChatOpenAI) initialized successfully.")
+            logger.info("LLM initialized successfully.")
         except Exception as e:
-            logger.error(f"Failed to initialize LLM: {str(e)}")
-            raise
-
-    def _setup_vectorstore(self, emb_cls):
-        """Create a Chroma vector store with AzureOpenAIEmbeddings (cosine by default)."""
-        from chromadb.config import Settings
-
-        azure_embeddings_model = self.env.get("EMBEDDINGS_MODEL", "text-embedding-3-large")
-        azure_api_version = self.env.get("EMBEDDINGS_API_VERSION", "2023-05-15")
-
-        embedding = emb_cls(
-            azure_api_version=azure_api_version,
-            embeddings_model=azure_embeddings_model
-        )
-        # Cosine similarity by default
-        chroma_settings = Settings(
-            anonymized_telemetry=False,
-            persist_directory="chromadb-data"
-            # distance_metric="cosine" if you want to be explicit
-        )
-        try:
-            self.vs = Chroma.from_documents(
-                documents=self.kb.docs,
-                embedding=embedding,
-                collection_name="kb_collection",
-                client_settings=chroma_settings
-            )
-            logger.info("Chroma vector store created successfully (cosine similarity).")
-        except Exception as e:
-            logger.error(f"Failed to set up vector store: {str(e)}")
+            logger.error(f"Failed to init LLM: {str(e)}")
             raise
 
     def list_env(self):
-        """List environment variables from OSEnv."""
         self.env.list_env_vars()
 
-    ###########################################################################
-    # Normal Chat
-    ###########################################################################
     def chat(self, message: str) -> str:
-        """Basic conversation with memory."""
+        """Optional normal conversation."""
         if not message.strip():
             return "Please provide a non-empty message."
         try:
@@ -128,68 +284,68 @@ class AzureChatbot:
             logger.error(f"Error in chat: {str(e)}")
             return f"An error occurred: {str(e)}"
 
-    ###########################################################################
-    # RAG query => direct vector search
-    ###########################################################################
-    def rag_query(self, query: str, k: int = 3) -> str:
-        """Perform a direct vector store search, returning matches with confidence + rating."""
-        try:
-            results = self.vs.similarity_search_with_score(query, k=k)
-            if not results:
-                return "No relevant matches found."
-
-            lines = []
-            for idx, (doc, score) in enumerate(results, start=1):
-                confidence = max(0.0, min(1.0, 1.0 - score))
-                if confidence >= 0.8:
-                    rating = "Green"
-                elif confidence >= 0.5:
-                    rating = "Amber"
-                else:
-                    rating = "Red"
-                reason = f"Confidence={confidence:.2f}, rating={rating}, definition={doc.page_content}"
-                lines.append(
-                    f"Match #{idx}\n"
-                    f"Name: {doc.metadata.get('name','Unknown')}\n"
-                    f"ID: {doc.metadata.get('id','No ID')}\n"
-                    f"Confidence: {confidence:.2f}\n"
-                    f"Rating: {rating}\n"
-                    f"Reason: {reason}\n"
-                )
-            return "\n".join(lines)
-        except Exception as e:
-            logger.error(f"Error in rag_query: {str(e)}")
-            return f"An error occurred: {str(e)}"
-
-    ###########################################################################
-    # Graph search => naive substring
-    ###########################################################################
-    def graph_search(self, query: str) -> str:
-        """Naive substring match in the knowledge base's networkx graph."""
-        results = []
-        q_lower = query.lower()
-        for node, data in self.kb.graph.nodes(data=True):
-            if q_lower in str(node).lower():
-                node_info = f"Node: {node}, node_type={data.get('node_type','')}, node_id={data.get('node_id','')}"
-                results.append(node_info)
-
-        if not results:
-            return "No matching nodes found in the graph."
-        return "\n".join(results)
-
-    ###########################################################################
-    # ISR Classification
-    ###########################################################################
-    def classify_isr_item(self, name: str, definition: str) -> Dict[str, Any]:
+    def classify_isr_item(self, name: str, definition: str) -> dict:
         """
-        Calls ISRClassificationChain on the given name + definition.
-        Returns a dict with:
-          {
-            "classification": "...",
-            "reason": "...",
-            "confidence": float,
-            "rating": "Green"/"Amber"/"Red"
-          }
+        Call the classification chain with name+definition, returns
+        { classification, reason, confidence, rating }.
         """
         user_input = f"Name: {name}\nDefinition: {definition}"
-        return self.isr_chain.classify_isr_data(user_input)
+        return self.isr_chain.classify(user_input)
+
+###############################################################################
+# 4) Main logic => read CSV with name+definition => classify
+###############################################################################
+def main():
+    # 1) Basic checks
+    if len(sys.argv) < 4:
+        print(f"Usage: python {os.path.basename(__file__)} <config_file> <creds_file> <cert_file> [csv_path]")
+        sys.exit(1)
+
+    config_file = sys.argv[1]
+    creds_file = sys.argv[2]
+    cert_file  = sys.argv[3]
+    csv_path   = sys.argv[4] if len(sys.argv) > 4 else "knowledgebase.csv"
+
+    # 2) Init the chatbot
+    chatbot = MinimalAzureChatbot(config_file, creds_file, cert_file)
+
+    # 3) read CSV with chardet => classification
+    if not os.path.isfile(csv_path):
+        print(f"CSV not found: {csv_path}")
+        sys.exit(1)
+
+    # detect encoding
+    with open(csv_path,"rb") as f:
+        rawdata = f.read(100000)
+    detect_result = chardet.detect(rawdata)
+    encoding = detect_result["encoding"] or "utf-8"
+    print(f"Detected encoding: {encoding}")
+
+    df = pd.read_csv(csv_path, encoding=encoding, keep_default_na=False)
+    if "name" not in df.columns or "definition" not in df.columns:
+        print("CSV must have columns: name, definition")
+        sys.exit(1)
+    if "id" not in df.columns:
+        df["id"] = [str(uuid.uuid4()) for _ in range(len(df))]
+
+    # 4) For each row => classify
+    results = []
+    for idx, row in df.iterrows():
+        name_val = str(row["name"])
+        def_val = str(row["definition"])
+        item_id = str(row["id"])
+
+        classification_dict = chatbot.classify_isr_item(name_val, def_val)
+        classification_dict["id"] = item_id
+        classification_dict["name"] = name_val
+        classification_dict["definition"] = def_val
+
+        results.append(classification_dict)
+
+    # 5) Print final results
+    print("\n=== Classification Results ===")
+    for r in results:
+        print(json.dumps(r, indent=2))
+
+if __name__ == "__main__":
+    main()
