@@ -1,3 +1,341 @@
+import os
+import sys
+import uuid
+import json
+import logging
+from typing import Optional, Any, Dict, List, Union, Tuple
+from pathlib import Path
+import re
+from pydantic import BaseModel, ValidationError, field_validator, model_validator
+from langchain.schema import BaseOutputParser
+
+# Enhanced RegexResult with testing validation
+class RegexResult(BaseModel):
+    name: str
+    regex: str
+    reason: str
+    confidence: int
+    status: str
+    positive_tests: List[Tuple[bool, str]] = []
+    negative_tests: List[Tuple[bool, str]] = []
+    syntax_valid: bool = False
+    optimization_suggestions: List[str] = []
+
+    @field_validator('confidence')
+    def validate_confidence(cls, value):
+        if not 0 <= value <= 100:
+            raise ValueError('Confidence must be 0-100')
+        return value
+
+    @field_validator('status')
+    def validate_status(cls, value):
+        if value not in ('RED', 'AMBER', 'GREEN'):
+            raise ValueError('Invalid status')
+        return value
+
+    @field_validator('regex')
+    def validate_regex(cls, value):
+        try:
+            re.compile(value)
+        except re.error as e:
+            raise ValueError(f'Invalid regex: {str(e)}')
+        return value
+
+    @model_validator(mode='after')
+    def validate_tests(self):
+        passed_positive = sum(result for result, _ in self.positive_tests)
+        passed_negative = sum(not result for result, _ in self.negative_tests)
+        
+        total_tests = len(self.positive_tests) + len(self.negative_tests)
+        success_rate = (passed_positive + passed_negative) / total_tests if total_tests else 0
+        
+        # Adjust confidence based on test performance
+        if total_tests > 0:
+            self.confidence = min(100, max(0, int(self.confidence * 0.7 + success_rate * 100 * 0.3)))
+        
+        return self
+
+class RegexOptimizer:
+    """Post-processes regex patterns to improve efficiency and correctness"""
+    
+    @staticmethod
+    def optimize(pattern: str) -> str:
+        optimizations = [
+            (r'\(\?P<\w+>', '(?:'),  # Convert named groups to non-capturing
+            (r'\(\?P=\w+\)', ''),     # Remove backreferences
+            (r'\s+', ''),             # Remove whitespace outside character classes
+            (r'(\\[a-z]){2,}', lambda m: f'(?:{m.group(0)}+)'),  # Quantifier consolidation
+            (r'(\\b|\\B){2,}', ''),   # Remove redundant word boundaries
+        ]
+        
+        try:
+            compiled = re.compile(pattern)
+            original = pattern
+            for regex, replacement in optimizations:
+                pattern = re.sub(regex, replacement, pattern)
+            
+            # Validate optimization didn't break the pattern
+            re.compile(pattern)
+            return pattern
+        except re.error:
+            return original
+
+class RegexTester:
+    """Validates regex patterns against test cases"""
+    
+    @staticmethod
+    def test_pattern(pattern: str, positive_examples: List[str], 
+                    negative_examples: List[str]) -> Tuple[List[Tuple[bool, str]], List[Tuple[bool, str]]]:
+        try:
+            compiled = re.compile(pattern)
+        except re.error:
+            return [], []
+
+        positive_results = []
+        for example in positive_examples:
+            match = compiled.search(example)
+            positive_results.append((bool(match), example))
+
+        negative_results = []
+        for example in negative_examples:
+            match = compiled.search(example)
+            negative_results.append((not bool(match), example))
+
+        return positive_results, negative_results
+
+class RegexOutputParser(BaseOutputParser):
+    """Robust parser with multiple fallback strategies"""
+    
+    def parse(self, text: str) -> dict:
+        parsing_strategies = [
+            self._parse_standard_format,
+            self._parse_markdown_format,
+            self._parse_line_by_line
+        ]
+        
+        for strategy in parsing_strategies:
+            result = strategy(text)
+            if result['status'] != 'RED':
+                return result
+        return self._create_error_result("All parsing strategies failed")
+
+    def _parse_standard_format(self, text: str) -> dict:
+        patterns = [
+            r"Regex:\s*(?P<regex>.+?)\s*Reason:\s*(?P<reason>.+?)\s*Confidence:\s*(?P<confidence>\d+).*?Status:\s*(?P<status>RED|AMBER|GREEN)",
+            r"Pattern:\s*(?P<regex>.+?)\s*Explanation:\s*(?P<reason>.+?)\s*Confidence Level:\s*(?P<confidence>\d+).*?Status:\s*(?P<status>RED|AMBER|GREEN)",
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+            if match:
+                return self._process_match(match)
+        return self._create_error_result("Standard format not found")
+
+    def _parse_markdown_format(self, text: str) -> dict:
+        try:
+            sections = {}
+            current_key = None
+            for line in text.split('\n'):
+                if line.startswith('**'):
+                    key = line.strip('** :').lower()
+                    sections[key] = []
+                    current_key = key
+                elif current_key:
+                    sections[current_key].append(line.strip())
+            
+            if all(k in sections for k in ['regex', 'reason', 'confidence', 'status']):
+                return {
+                    "regex": ' '.join(sections['regex']),
+                    "reason": ' '.join(sections['reason']),
+                    "confidence": int(''.join(filter(str.isdigit, ' '.join(sections['confidence'])))),
+                    "status": sections['status'][0].upper()
+                }
+        except Exception:
+            pass
+        return self._create_error_result("Markdown parsing failed")
+
+    def _parse_line_by_line(self, text: str) -> dict:
+        result = {}
+        for line in text.split('\n'):
+            if ':' in line:
+                key, value = line.split(':', 1)
+                key = key.strip().lower()
+                value = value.strip()
+                if key in ['regex', 'pattern']:
+                    result['regex'] = value
+                elif key == 'reason':
+                    result['reason'] = value
+                elif key == 'confidence':
+                    result['confidence'] = int(value) if value.isdigit() else 0
+                elif key == 'status':
+                    result['status'] = value.upper()
+        if all(k in result for k in ['regex', 'reason', 'confidence', 'status']):
+            return result
+        return self._create_error_result("Line-by-line parsing failed")
+
+    def _process_match(self, match: re.Match) -> dict:
+        try:
+            return {
+                "regex": match.group('regex').strip(),
+                "reason": match.group('reason').strip(),
+                "confidence": min(100, max(0, int(match.group('confidence')))),
+                "status": match.group('status').upper()
+            }
+        except Exception as e:
+            return self._create_error_result(f"Match processing error: {str(e)}")
+
+    def _create_error_result(self, message: str) -> dict:
+        return {
+            "regex": "",
+            "reason": message,
+            "confidence": 0,
+            "status": "RED"
+        }
+
+class TermAnalyzer:
+    def __init__(self, chatbot: AzureChatbot):
+        self.chatbot = chatbot
+        self.parser = RegexOutputParser()
+        self.prompt_template = self._create_enhanced_prompt()
+        self.chain = LLMChain(
+            llm=self.chatbot.llm,
+            prompt=self.prompt_template,
+            output_parser=self.parser
+        )
+
+    def _create_enhanced_prompt(self) -> PromptTemplate:
+        template = """**Task:** Create a comprehensive regex pattern for detecting '{name}' in unstructured text.
+
+**Term Details:**
+- Primary Name: {name}
+- Definition: {definition}
+- Related Terms: {related_terms}
+- Positive Examples: {positive_examples}
+- Negative Examples: {negative_examples}
+
+**Regex Requirements:**
+1. Must match all case variants (use (?i) flag)
+2. Handle common separators: [-_/\\s]*
+3. Account for optional plurals/suffixes
+4. Include common abbreviations/acronyms
+5. Prevent false positives using word boundaries
+6. Allow for number variations (e.g., IDs, codes)
+7. Consider possible OCR errors (e.g., 0/O, 1/l)
+
+**Development Strategy:**
+1. Start with base term variations
+2. Add contextual modifiers
+3. Include validation components
+4. Optimize for performance
+
+**Response Format:**
+```markdown
+**Regex:** <pattern>
+**Reason:** <justification>
+**Confidence:** <0-100>
+**Status:** <RED|AMBER|GREEN>
+Example:
+Regex: (?i)\b(?:c (?:ounter )?[- ]?(?:party |pt)(?:ies |y)?\b(?:[-/\s](?:id |code|num|#)?\s\d+)?\b
+Reason: Matches base term, separators, plurals, and common ID formats
+Confidence: 90
+Status: GREEN
+"""
+
+    return PromptTemplate(
+        input_variables=["name", "definition", "related_terms", "positive_examples", "negative_examples"],
+        template=template
+    )
+
+def analyze_single_term(self, term: dict) -> RegexResult:
+    try:
+        # Prepare test cases
+        positive_examples = term.get("positive_examples", [])
+        negative_examples = term.get("negative_examples", [])
+        
+        # Generate initial regex
+        response = self.chain.invoke({
+            "name": term["name"],
+            "definition": term.get("definition", ""),
+            "related_terms": ", ".join(term.get("related_terms", [])),
+            "positive_examples": "\n- ".join(positive_examples),
+            "negative_examples": "\n- ".join(negative_examples)
+        })
+        
+        # Parse and validate
+        parsed = response if isinstance(response, dict) else self.parser.parse(str(response))
+        parsed["name"] = term["name"]
+        
+        # Post-process regex
+        optimized_regex = RegexOptimizer.optimize(parsed["regex"])
+        if optimized_regex != parsed["regex"]:
+            parsed["optimization_suggestions"] = ["Applied basic optimizations"]
+            parsed["regex"] = optimized_regex
+
+        # Run test cases
+        positive_results, negative_results = RegexTester.test_pattern(
+            parsed["regex"],
+            positive_examples,
+            negative_examples
+        )
+        
+        return RegexResult(
+            **parsed,
+            positive_tests=positive_results,
+            negative_tests=negative_results,
+            syntax_valid=True
+        )
+        
+    except Exception as e:
+        return RegexResult(
+            name=term.get("name", ""),
+            regex="",
+            reason=f"Error: {str(e)}",
+            confidence=0,
+            status="RED",
+            syntax_valid=False
+        )
+
+# Rest of the class remains similar with updated error handling
+_________________________________________________
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 class RegexOutputParser(BaseOutputParser):
     def parse(self, text: str) -> dict:
         try:
