@@ -3,6 +3,672 @@ import sys
 import uuid
 import json
 import logging
+import re
+from typing import Optional, Any, Dict, List, Union, Tuple
+from pathlib import Path
+from dotenv import dotenv_values
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider, ClientSecretCredential
+from openai import AzureOpenAI
+from pydantic import BaseModel, ValidationError, field_validator, model_validator
+from langchain.chat_models import AzureChatOpenAI
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationChain, LLMChain
+from langchain.prompts import PromptTemplate
+from langchain.schema import BaseOutputParser
+from collections import namedtuple
+
+# Optional: if using LangGraph for workflow orchestration
+try:
+    from langgraph.graph import END, StateGraph
+    LANGGRAPH_AVAILABLE = True
+except ImportError:
+    LANGGRAPH_AVAILABLE = False
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
+# Global Constants
+ENV_DIR = "env"
+CONFIG_PATH = os.path.join(ENV_DIR, "config.env")
+CREDS_PATH = os.path.join(ENV_DIR, "credentials.env")
+CERT_PATH = os.path.join(ENV_DIR, "cacert.pem")
+
+Triple = namedtuple("Triple", ["subject", "predicate", "object"])
+
+## Utility functions
+def is_file_readable(filepath: str) -> bool:
+    """Check if a file is readable."""
+    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
+        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
+    return True
+
+def str_to_bool(s: str) -> bool:
+    """Convert a string to a boolean."""
+    if s == 'True':
+        return True
+    elif s == 'False':
+        return False
+    else:
+        raise ValueError(f"Invalid boolean value: {s}")
+
+## OSEnv class for environment configuration
+class OSEnv:
+    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
+        self.var_list = []
+        self.bulk_set(config_file, True)
+        self.bulk_set(creds_file, False)
+        self.set_certificate_path(certificate_path)
+        if str_to_bool(self.get("PROXY_ENABLED", "False")):
+            self.set_proxy()
+        
+        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
+            self.token = self.get_azure_token()
+        else:
+            self.token = None
+
+    def _get_credential(self):
+        if str_to_bool(self.get("USE_MANAGED_IDENTITY", "False")):
+            return DefaultAzureCredential()
+        else:
+            return ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID"),
+                client_id=self.get("AZURE_CLIENT_ID"),
+                client_secret=self.get("AZURE_CLIENT_SECRET")
+            )
+
+    def set_certificate_path(self, path: str):
+        try:
+            if not os.path.isabs(path):
+                path = os.path.abspath(path)
+            if not is_file_readable(path):
+                raise FileNotFoundError(f"The file '{path}' does not exist or is not readable")
+            self.set("REQUESTS_CA_BUNDLE", path)
+            self.set("SSL_CERT_FILE", path)
+            self.set("CURL_CA_BUNDLE", path)
+        except Exception as e:
+            logger.error(f"Error setting certificate path: {e}")
+            raise
+
+    def bulk_set(self, dotenvfile: str, print_val: bool = False) -> None:
+        try:
+            if not os.path.isabs(dotenvfile):
+                dotenvfile = os.path.abspath(dotenvfile)
+            # If file is not directly readable, use dotenv_values to load variables
+            if not os.path.isfile(dotenvfile):
+                temp_dict = dotenv_values(dotenvfile)
+                for key, value in temp_dict.items():
+                    self.set(key, value, print_val)
+                del temp_dict
+            else:
+                temp_dict = dotenv_values(dotenvfile)
+                for key, value in temp_dict.items():
+                    self.set(key, value, print_val)
+        except Exception as e:
+            logger.error(f"Error loading environment variables from {dotenvfile}: {e}")
+            raise
+
+    def set(self, key: str, value: str, print_val: bool = False) -> None:
+        try:
+            os.environ[key] = value
+            if key not in self.var_list:
+                self.var_list.append(key)
+            if print_val:
+                logger.info(f"{key}: {value}")
+        except Exception as e:
+            logger.error(f"Error setting environment variable {key}: {e}")
+            raise
+
+    def get(self, key: str, default: Optional[str] = None) -> str:
+        try:
+            return os.environ.get(key, default)
+        except Exception as e:
+            logger.error(f"Error getting environment variable {key}: {e}")
+            raise
+
+    def set_proxy(self) -> None:
+        try:
+            ad_username = self.get("AD_USERNAME")
+            ad_password = self.get("AD_USER_PW")
+            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
+            if not all([ad_username, ad_password, proxy_domain]):
+                raise ValueError("Proxy settings are incomplete")
+            proxy_url = f"https://{ad_username}:{ad_password}@{proxy_domain}"
+            self.set("HTTP_PROXY", proxy_url, print_val=False)
+            self.set("HTTPS_PROXY", proxy_url, print_val=False)
+            no_proxy_domains = [
+                'cognitiveservices.azure.com',
+                'search.windows.net',
+                'openai.azure.com',
+                'core.windows.net',
+                'azurewebsites.net'
+            ]
+            self.set("NO_PROXY", ",".join(no_proxy_domains), print_val=False)
+        except Exception as e:
+            logger.error(f"Error setting proxy: {e}")
+            raise
+
+    def get_azure_token(self) -> str:
+        try:
+            credential = ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID"),
+                client_id=self.get("AZURE_CLIENT_ID"),
+                client_secret=self.get("AZURE_CLIENT_SECRET")
+            )
+            token = credential.get_token("https://cognitiveservices.azure.com/.default")
+            self.set("AZURE_TOKEN", token.token, print_val=False)
+            logger.info("Azure token set")
+            return token.token
+        except Exception as e:
+            logger.error(f"Error retrieving Azure token: {e}")
+            return None
+
+    def list_env_vars(self) -> None:
+        for var in self.var_list:
+            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET'}:
+                logger.info(f"{var}: [REDACTED]")
+            else:
+                logger.info(f"{var}: {os.getenv(var)}")
+
+## Embedding related classes
+class MyDocument(BaseModel):
+    id: str = ""
+    text: str = ""
+    embedding: List[float] = []
+    metadata: Dict[str, Any] = {}
+
+class EmbeddingClient:
+    def __init__(self, azure_api_version: str = "2023-05-15", embeddings_model: str = "text-embedding-3-large"):
+        self.azure_api_version = azure_api_version
+        self.embeddings_model = embeddings_model
+        self.direct_azure_client = self._get_direct_azure_client()
+
+    def _get_direct_azure_client(self):
+        token_provider = get_bearer_token_provider(
+            DefaultAzureCredential(),
+            "https://cognitiveservices.azure.com/.default"
+        )
+        return AzureOpenAI(token_provider, self.azure_api_version)
+
+    def generate_embeddings(self, doc: MyDocument) -> MyDocument:
+        try:
+            response = self.direct_azure_client.embeddings.create(
+                model=self.embeddings_model,
+                input=doc.text
+            ).data[0].embedding
+            doc.embedding = response
+            return doc
+        except Exception as e:
+            logger.error(f"Error generating embeddings: {e}")
+            return doc
+
+## AzureChatbot components
+class AzureChatbot:
+    def __init__(self, config_file: str, creds_file: str, cert_file: str):
+        self.env = OSEnv(config_file, creds_file, cert_file)
+        self._setup_chat_model()
+        self.memory = ConversationBufferMemory()
+        self.conversation = ConversationChain(llm=self.llm, memory=self.memory, verbose=True)
+
+    def _setup_chat_model(self):
+        try:
+            token_provider = get_bearer_token_provider(
+                self.env._get_credential(),
+                "https://cognitiveservices.azure.com/.default"
+            )
+            model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
+            temperature = float(self.env.get("TEMPERATURE", "0.7"))
+            max_tokens = int(self.env.get("MAX_TOKENS", "800"))
+            api_version = self.env.get("API_VERSION", "2023-05-15")
+            azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
+            azure_ad_token_provider = token_provider
+            self.llm = AzureChatOpenAI(
+                model_name=model_name,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                api_version=api_version,
+                azure_endpoint=azure_endpoint,
+                azure_ad_token_provider=azure_ad_token_provider
+            )
+        except Exception as e:
+            logger.error(f"Error setting up chatbot: {e}")
+            raise
+
+## Enhanced RegexResult with testing and optimization details
+class RegexResult(BaseModel):
+    name: str
+    regex: str
+    reason: str
+    confidence: int
+    status: str
+    positive_tests: List[Tuple[bool, str]] = []
+    negative_tests: List[Tuple[bool, str]] = []
+    syntax_valid: bool = False
+    optimization_suggestions: List[str] = []
+
+    @field_validator('confidence')
+    def validate_confidence(cls, value):
+        if not 0 <= value <= 100:
+            raise ValueError('Confidence must be between 0 and 100')
+        return value
+
+    @field_validator('status')
+    def validate_status(cls, value):
+        if value not in ('RED', 'AMBER', 'GREEN'):
+            raise ValueError('Invalid status')
+        return value
+
+    @field_validator('regex')
+    def validate_regex(cls, value):
+        try:
+            re.compile(value)
+        except re.error as e:
+            raise ValueError(f'Invalid regex: {str(e)}')
+        return value
+
+    @model_validator(mode='after')
+    def validate_tests(self):
+        passed_positive = sum(result for result, _ in self.positive_tests)
+        passed_negative = sum(not result for result, _ in self.negative_tests)
+        total_tests = len(self.positive_tests) + len(self.negative_tests)
+        success_rate = (passed_positive + passed_negative) / total_tests if total_tests else 0
+
+        # Adjust confidence based on test performance (70% original confidence, 30% test success)
+        if total_tests > 0:
+            self.confidence = min(100, max(0, int(self.confidence * 0.7 + success_rate * 100 * 0.3)))
+        return self
+
+## Regex Optimizer: post-process regex patterns
+class RegexOptimizer:
+    """Post-processes regex patterns to improve efficiency and correctness"""
+    
+    @staticmethod
+    def optimize(pattern: str) -> str:
+        optimizations = [
+            (r'\(\?P<\w+>', '(?:'),  # Convert named groups to non-capturing
+            (r'\(\?P=\w+\)', ''),     # Remove backreferences
+            (r'\s+', ''),             # Remove extra whitespace
+            (r'(\\[a-z]){2,}', lambda m: f'(?:{m.group(0)}+)'),  # Consolidate repeated escapes
+            (r'(\\b|\\B){2,}', ''),   # Remove redundant word boundaries
+        ]
+        try:
+            original = pattern
+            for regex, replacement in optimizations:
+                pattern = re.sub(regex, replacement, pattern)
+            # Validate that the optimized pattern is still valid
+            re.compile(pattern)
+            return pattern
+        except re.error:
+            return original
+
+## Regex Tester: run test cases against the pattern
+class RegexTester:
+    """Validates regex patterns against test cases"""
+    
+    @staticmethod
+    def test_pattern(pattern: str, positive_examples: List[str], 
+                     negative_examples: List[str]) -> Tuple[List[Tuple[bool, str]], List[Tuple[bool, str]]]:
+        try:
+            compiled = re.compile(pattern)
+        except re.error:
+            return [], []
+        positive_results = []
+        for example in positive_examples:
+            match = compiled.search(example)
+            positive_results.append((bool(match), example))
+        negative_results = []
+        for example in negative_examples:
+            match = compiled.search(example)
+            negative_results.append((not bool(match), example))
+        return positive_results, negative_results
+
+## Enhanced RegexOutputParser with multiple parsing strategies
+class RegexOutputParser(BaseOutputParser):
+    """Robust parser with multiple fallback strategies"""
+    
+    def parse(self, text: str) -> dict:
+        parsing_strategies = [
+            self._parse_standard_format,
+            self._parse_markdown_format,
+            self._parse_line_by_line
+        ]
+        for strategy in parsing_strategies:
+            result = strategy(text)
+            if result.get('status', 'RED') != 'RED':
+                return result
+        return self._create_error_result("All parsing strategies failed")
+
+    def _parse_standard_format(self, text: str) -> dict:
+        patterns = [
+            r"Regex:\s*(?P<regex>.+?)\s*Reason:\s*(?P<reason>.+?)\s*Confidence:\s*(?P<confidence>\d+).*?Status:\s*(?P<status>RED|AMBER|GREEN)",
+            r"Pattern:\s*(?P<regex>.+?)\s*Explanation:\s*(?P<reason>.+?)\s*Confidence Level:\s*(?P<confidence>\d+).*?Status:\s*(?P<status>RED|AMBER|GREEN)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+            if match:
+                return self._process_match(match)
+        return self._create_error_result("Standard format not found")
+
+    def _parse_markdown_format(self, text: str) -> dict:
+        try:
+            sections = {}
+            current_key = None
+            for line in text.split('\n'):
+                if line.startswith('**'):
+                    key = line.strip('** :').lower()
+                    sections[key] = []
+                    current_key = key
+                elif current_key:
+                    sections[current_key].append(line.strip())
+            if all(k in sections for k in ['regex', 'reason', 'confidence', 'status']):
+                return {
+                    "regex": ' '.join(sections['regex']),
+                    "reason": ' '.join(sections['reason']),
+                    "confidence": int(''.join(filter(str.isdigit, ' '.join(sections['confidence'])))),
+                    "status": sections['status'][0].upper()
+                }
+        except Exception:
+            pass
+        return self._create_error_result("Markdown parsing failed")
+
+    def _parse_line_by_line(self, text: str) -> dict:
+        result = {}
+        for line in text.split('\n'):
+            if ':' in line:
+                key, value = line.split(':', 1)
+                key = key.strip().lower()
+                value = value.strip()
+                if key in ['regex', 'pattern']:
+                    result['regex'] = value
+                elif key == 'reason':
+                    result['reason'] = value
+                elif key == 'confidence':
+                    result['confidence'] = int(value) if value.isdigit() else 0
+                elif key == 'status':
+                    result['status'] = value.upper()
+        if all(k in result for k in ['regex', 'reason', 'confidence', 'status']):
+            return result
+        return self._create_error_result("Line-by-line parsing failed")
+
+    def _process_match(self, match: re.Match) -> dict:
+        try:
+            return {
+                "regex": match.group('regex').strip(),
+                "reason": match.group('reason').strip(),
+                "confidence": min(100, max(0, int(match.group('confidence')))),
+                "status": match.group('status').upper()
+            }
+        except Exception as e:
+            return self._create_error_result(f"Match processing error: {str(e)}")
+
+    def _create_error_result(self, message: str) -> dict:
+        return {
+            "regex": "",
+            "reason": message,
+            "confidence": 0,
+            "status": "RED"
+        }
+
+## Enhanced TermAnalyzer using the updated components
+class TermAnalyzer:
+    def __init__(self, chatbot: AzureChatbot):
+        self.chatbot = chatbot
+        self.parser = RegexOutputParser()
+        self.prompt_template = self._create_enhanced_prompt()
+        self.chain = LLMChain(
+            llm=self.chatbot.llm,
+            prompt=self.prompt_template,
+            output_parser=self.parser
+        )
+
+    def _create_enhanced_prompt(self) -> PromptTemplate:
+        template = """**Task:** Create a comprehensive regex pattern for detecting '{name}' in unstructured text.
+
+**Term Details:**
+- Primary Name: {name}
+- Definition: {definition}
+- Related Terms: {related_terms}
+- Positive Examples: {positive_examples}
+- Negative Examples: {negative_examples}
+
+**Regex Requirements:**
+1. Must match all case variants (use (?i) flag)
+2. Handle common separators: [-_/\\s]*
+3. Account for optional plurals/suffixes
+4. Include common abbreviations/acronyms
+5. Prevent false positives using word boundaries
+6. Allow for number variations (e.g., IDs, codes)
+7. Consider possible OCR errors (e.g., 0/O, 1/l)
+
+**Development Strategy:**
+1. Start with base term variations
+2. Add contextual modifiers
+3. Include validation components
+4. Optimize for performance
+
+**Response Format:**
+```markdown
+**Regex:** <pattern>
+**Reason:** <justification>
+**Confidence:** <0-100>
+**Status:** <RED|AMBER|GREEN>
+**Regex:** (?i)\\b(?:counter[- _]?part(?:y|ies)|cp)\\b(?:[-_/\\s]*(?:id|code))?\\b
+**Reason:** Matches the base term with variations and optional identifier suffixes.
+**Confidence:** 90
+**Status:** GREEN
+```"""
+        return PromptTemplate(
+            input_variables=["name", "definition", "related_terms", "positive_examples", "negative_examples"],
+            template=template
+        )
+
+    def analyze_single_term(self, term: dict) -> RegexResult:
+        try:
+            # Prepare test cases
+            positive_examples = term.get("positive_examples", [])
+            negative_examples = term.get("negative_examples", [])
+            
+            # Generate initial regex pattern via LLM
+            response = self.chain.invoke({
+                "name": term["name"],
+                "definition": term.get("definition", ""),
+                "related_terms": ", ".join(term.get("related_terms", [])),
+                "positive_examples": "\n- ".join(positive_examples),
+                "negative_examples": "\n- ".join(negative_examples)
+            })
+            
+            # Parse response (if not already a dict)
+            parsed = response if isinstance(response, dict) else self.parser.parse(str(response))
+            parsed["name"] = term["name"]
+            
+            # Post-process: Optimize the regex pattern
+            optimized_regex = RegexOptimizer.optimize(parsed["regex"])
+            if optimized_regex != parsed["regex"]:
+                parsed["optimization_suggestions"] = ["Applied basic optimizations"]
+                parsed["regex"] = optimized_regex
+
+            # Run test cases against the regex
+            positive_results, negative_results = RegexTester.test_pattern(
+                parsed["regex"],
+                positive_examples,
+                negative_examples
+            )
+            
+            return RegexResult(
+                **parsed,
+                positive_tests=positive_results,
+                negative_tests=negative_results,
+                syntax_valid=True
+            )
+            
+        except Exception as e:
+            return RegexResult(
+                name=term.get("name", ""),
+                regex="",
+                reason=f"Error: {str(e)}",
+                confidence=0,
+                status="RED",
+                syntax_valid=False
+            )
+    
+    def analyze_terms(self, input_path: str) -> dict:
+        try:
+            with open(input_path) as f:
+                terms = json.load(f)
+            if not isinstance(terms, list):
+                terms = [terms]
+            results = []
+            for term in terms:
+                result = self.analyze_single_term(term)
+                results.append(result.dict())
+            return self._create_final_result(results)
+        except Exception as e:
+            return {
+                "results": [],
+                "summary": {
+                    "total_terms": 0,
+                    "red_status": 0,
+                    "amber_status": 0,
+                    "green_status": 0,
+                    "average_confidence": 0
+                }
+            }
+    
+    def _create_final_result(self, results: List[dict]) -> dict:
+        status_counts = {"RED": 0, "AMBER": 0, "GREEN": 0}
+        total_confidence = 0
+        for result in results:
+            status = result.get("status", "RED")
+            status_counts[status] += 1
+            total_confidence += result.get("confidence", 0)
+        average_confidence = total_confidence // len(results) if results else 0
+        return {
+            "results": results,
+            "summary": {
+                "total_terms": len(results),
+                "red_status": status_counts["RED"],
+                "amber_status": status_counts["AMBER"],
+                "green_status": status_counts["GREEN"],
+                "average_confidence": average_confidence
+            }
+        }
+
+## AnalysisWorkflow using LangGraph (if available)
+if LANGGRAPH_AVAILABLE:
+    class AnalysisWorkflow:
+        def __init__(self, analyzer: TermAnalyzer):
+            self.analyzer = analyzer
+            self.workflow = StateGraph(dict)
+            
+            # Define workflow nodes
+            self.workflow.add_node("validate_input", self.validate_input)
+            self.workflow.add_node("process_terms", self.process_terms)
+            self.workflow.add_node("finalize_output", self.finalize_output)
+            
+            # Set up the workflow edges
+            self.workflow.set_entry_point("validate_input")
+            self.workflow.add_edge("validate_input", "process_terms")
+            self.workflow.add_edge("process_terms", "finalize_output")
+            self.workflow.add_edge("finalize_output", END)
+
+        def validate_input(self, state: dict) -> dict:
+            if not Path(state["input_path"]).exists():
+                raise ValueError("Input file does not exist")
+            return state
+
+        def process_terms(self, state: dict) -> dict:
+            analysis_result = self.analyzer.analyze_terms(state["input_path"])
+            state["result"] = analysis_result
+            return state
+
+        def finalize_output(self, state: dict) -> dict:
+            if isinstance(state.get("result"), dict) and "results" in state["result"]:
+                logger.info(f"Processed {len(state['result']['results'])} terms")
+            return state
+
+        def run(self, input_path: str) -> dict:
+            config = {"input_path": input_path}
+            compiled_graph = self.workflow.compile()
+            final_state = compiled_graph.invoke(config)
+            return final_state["result"]
+
+## Application class tying everything together
+class Application:
+    def __init__(self):
+        self.env = OSEnv(CONFIG_PATH, CREDS_PATH, CERT_PATH)
+        self.chatbot = AzureChatbot(CONFIG_PATH, CREDS_PATH, CERT_PATH)
+        self.analyzer = TermAnalyzer(self.chatbot)
+        if LANGGRAPH_AVAILABLE:
+            self.workflow = AnalysisWorkflow(self.analyzer)
+        else:
+            self.workflow = None
+
+    def run_analysis(self, input_path: str) -> dict:
+        if self.workflow:
+            return self.workflow.run(input_path)
+        return self.analyzer.analyze_terms(input_path)
+
+## Main function
+if __name__ == "__main__":
+    try:
+        app = Application()
+        # Provide the path to your input JSON file (adjust if necessary)
+        result = app.run_analysis("input.json")
+        
+        # Print the results in JSON format and also write to output.json
+        print(json.dumps(result, indent=2))
+        with open("output.json", "w") as f:
+            json.dump(result, f, indent=2)
+            
+        logger.info("Analysis completed successfully")
+    except Exception as e:
+        logger.error(f"Analysis failed: {e}")
+        sys.exit(1)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import os
+import sys
+import uuid
+import json
+import logging
 from typing import Optional, Any, Dict, List, Union, Tuple
 from pathlib import Path
 import re
