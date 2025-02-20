@@ -1,3 +1,268 @@
+from typing import List, Dict, Optional, TypedDict
+from pydantic import BaseModel, Field
+import re
+import json
+from langgraph.graph import StateGraph, END
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
+
+# Extended Pydantic Models
+class RelatedTerm(BaseModel):
+    name: str = Field(..., description="Related term name")
+    definition: str = Field(..., description="Related term definition")
+    example: str = Field(..., description="Example usage of related term")
+
+class RegexRequest(BaseModel):
+    name: str
+    definition: str
+    related_terms: List[RelatedTerm] = Field(default_factory=list)
+
+class RegexOutput(BaseModel):
+    name: str
+    definition: str
+    regex: str
+    reason: str
+    confidence_score: float
+    validation_passes: List[str]
+    validation_failures: List[str]
+
+class State(TypedDict):
+    name: str
+    definition: str
+    related_terms: List[RelatedTerm]
+    synonyms: List[str]
+    regex_candidates: List[str]
+    best_regex: Optional[str]
+    validation_results: List[Dict]
+    iteration: int
+    reason: Optional[str]
+    confidence_score: Optional[float]
+
+class RegexGenerator:
+    def __init__(self, llm, max_retries=3):
+        self.llm = llm
+        self.max_retries = max_retries
+        self.workflow = self._build_workflow()
+
+    def _build_workflow(self):
+        workflow = StateGraph(State)
+        
+        workflow.add_node("extract_context", self.extract_context)
+        workflow.add_node("generate_candidates", self.generate_regex_candidates)
+        workflow.add_node("validate_regex", self.validate_regex)
+        workflow.add_node("select_best", self.select_best_regex)
+        
+        workflow.add_edge("extract_context", "generate_candidates")
+        workflow.add_edge("generate_candidates", "validate_regex")
+        workflow.add_edge("validate_regex", "select_best")
+        
+        # Add feedback loop for regeneration
+        workflow.add_conditional_edges(
+            "select_best",
+            self.should_retry,
+            {True: "generate_candidates", False: END}
+        )
+        
+        workflow.set_entry_point("extract_context")
+        return workflow.compile()
+
+    def extract_context(self, state: State) -> State:
+        """Extract synonyms and related terms using multiple strategies"""
+        main_term = state["name"]
+        related_terms = [rt.name for rt in state["related_terms"]]
+        
+        # 1. Extract from provided related terms
+        state["synonyms"] = related_terms
+        
+        # 2. Add linguistic variations
+        state["synonyms"] += [
+            main_term.lower(),
+            main_term.upper(),
+            main_term.replace("-", ""),
+            main_term.replace("_", ""),
+        ]
+        
+        # 3. Add examples from related terms
+        for rt in state["related_terms"]:
+            if rt.example not in state["synonyms"]:
+                state["synonyms"].append(rt.example)
+        
+        return state
+
+    def generate_regex_candidates(self, state: State) -> State:
+        """Generate multiple regex candidates using LLM"""
+        prompt = ChatPromptTemplate.from_template("""
+        Generate 3 different regex patterns that strictly match:
+        - Primary term: {name} ({definition})
+        - Must include: {synonyms}
+        - Related terms: {related_terms}
+
+        Consider:
+        - Case variations
+        - Special characters
+        - Word boundaries
+        - Common misspellings
+
+        Output JSON with key 'patterns' containing the regex list
+        """)
+        
+        chain = prompt | self.llm | JsonOutputParser()
+        response = chain.invoke({
+            "name": state["name"],
+            "definition": state["definition"],
+            "synonyms": state["synonyms"],
+            "related_terms": [rt.name for rt in state["related_terms"]]
+        })
+        
+        state["regex_candidates"] = response.get("patterns", [])
+        return state
+
+    def validate_regex(self, state: State) -> State:
+        """Validate regex candidates using multiple criteria"""
+        validation_results = []
+        
+        for pattern in state["regex_candidates"]:
+            validations = {
+                "syntax_valid": False,
+                "matches_main_term": False,
+                "matches_synonyms": 0,
+                "matches_related_terms": 0,
+                "false_positives": 0
+            }
+            
+            try:
+                # 1. Syntax check
+                re.compile(pattern)
+                validations["syntax_valid"] = True
+                
+                # 2. Match coverage tests
+                regex = re.compile(pattern, re.IGNORECASE)
+                validations["matches_main_term"] = bool(regex.fullmatch(state["name"]))
+                
+                # 3. Synonym coverage
+                matches = [s for s in state["synonyms"] if regex.fullmatch(s)]
+                validations["matches_synonyms"] = len(matches)/len(state["synonyms"])
+                
+                # 4. Related term coverage
+                related_matches = [rt.name for rt in state["related_terms"]
+                                  if regex.fullmatch(rt.name)]
+                validations["matches_related_terms"] = len(related_matches)/len(state["related_terms"])
+                
+                # 5. False positive check using examples
+                false_positives = [rt.example for rt in state["related_terms"]
+                                  if not regex.fullmatch(rt.example)]
+                validations["false_positives"] = len(false_positives)
+                
+            except re.error as e:
+                validations["error"] = str(e)
+            
+            validation_results.append({
+                "pattern": pattern,
+                "validations": validations,
+                "score": self._calculate_validation_score(validations)
+            })
+        
+        state["validation_results"] = validation_results
+        return state
+
+    def _calculate_validation_score(self, validations: Dict) -> float:
+        """Calculate composite validation score"""
+        weights = {
+            "syntax_valid": 0.3,
+            "matches_main_term": 0.2,
+            "matches_synonyms": 0.25,
+            "matches_related_terms": 0.15,
+            "false_positives": -0.1
+        }
+        
+        score = 0
+        score += weights["syntax_valid"] * validations["syntax_valid"]
+        score += weights["matches_main_term"] * validations["matches_main_term"]
+        score += weights["matches_synonyms"] * validations["matches_synonyms"]
+        score += weights["matches_related_terms"] * validations["matches_related_terms"]
+        score += weights["false_positives"] * validations["false_positives"]
+        
+        return max(0, min(1, score))
+
+    def select_best_regex(self, state: State) -> State:
+        """Select best regex based on validation scores"""
+        best = max(
+            state["validation_results"],
+            key=lambda x: x["score"],
+            default=None
+        )
+        
+        if best and best["score"] >= 0.7:
+            state["best_regex"] = best["pattern"]
+            state["confidence_score"] = best["score"]
+            state["reason"] = self._generate_reason(best["validations"])
+        else:
+            state["best_regex"] = None
+        
+        state["iteration"] = state.get("iteration", 0) + 1
+        return state
+
+    def should_retry(self, state: State) -> bool:
+        """Determine if regeneration is needed"""
+        return (
+            state["best_regex"] is None and 
+            state["iteration"] < self.max_retries
+        )
+
+    def _generate_reason(self, validations: Dict) -> str:
+        """Generate human-readable validation reason"""
+        reasons = []
+        if validations["matches_main_term"]:
+            reasons.append("matches main term exactly")
+        if validations["matches_synonyms"] >= 0.8:
+            reasons.append("covers most synonyms")
+        if validations["matches_related_terms"] >= 0.5:
+            reasons.append("includes related terms")
+        if validations["false_positives"] == 0:
+            reasons.append("no false positives detected")
+        
+        return ", ".join(reasons) if reasons else "partial match with some issues"
+
+    def process_request(self, request: Dict) -> RegexOutput:
+        # Initialize state
+        state = {
+            "name": request["name"],
+            "definition": request["definition"],
+            "related_terms": [
+                RelatedTerm(**rt) for rt in request["related_terms"]
+            ],
+            "iteration": 0
+        }
+        
+        # Execute workflow
+        final_state = self.workflow.invoke(state)
+        
+        return RegexOutput(
+            name=final_state["name"],
+            definition=final_state["definition"],
+            regex=final_state.get("best_regex", ""),
+            reason=final_state.get("reason", "Generation failed after retries"),
+            confidence_score=final_state.get("confidence_score", 0.0),
+            validation_passes=self._get_validation_passes(final_state),
+            validation_failures=self._get_validation_failures(final_state)
+        )
+
+    def _get_validation_passes(self, state: State) -> List[str]:
+        return [v for v in state.get("validation_results", []) 
+               if v["score"] >= 0.7]
+
+    def _get_validation_failures(self, state: State) -> List[str]:
+        return [v for v in state.get("validation_results", []) 
+               if v["score"] < 0.7]
+
+
+
+
+
+
+
+
+
 import json
 
 def main():
