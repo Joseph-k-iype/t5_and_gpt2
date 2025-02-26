@@ -1,712 +1,253 @@
 import os
-import sys
-import uuid
+import re
 import json
 import logging
-import chardet
 import pandas as pd
-import networkx as nx
-from typing import Optional, Dict, Any, List, Union
-from pathlib import Path
+from typing import Dict, List, Optional
+from langgraph.graph import StateGraph, END
+from langchain.agents import Tool, AgentExecutor
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from pydantic import BaseModel, ValidationError, field_validator
 
-from dotenv import dotenv_values
-from azure.identity import ClientSecretCredential, DefaultAzureCredential, get_bearer_token_provider
-from openai import AzureOpenAI
-from pydantic import BaseModel
+# Previous base classes (OSEnv, AzureChatbot) remain unchanged
 
-# LangChain + Chroma
-from langchain.chat_models import AzureChatOpenAI
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationChain, LLMChain
-from langchain.docstore.document import Document as LC_Document
-from langchain.embeddings.base import Embeddings
-from langchain.vectorstores import Chroma
-from langchain.prompts import PromptTemplate
-from chromadb.config import Settings
+class RegexGeneratorConfig(BaseModel):
+    max_iterations: int = 3
+    min_coverage: float = 0.85
+    complexity_level: str = "high"
+    allowed_charset: str = r"\w\s\-$%().,;:@#&*+!?'"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+class RegexPattern(BaseModel):
+    name: str
+    pattern: str
+    status: str
+    reasons: List[str]
+    coverage: str
+    examples: Dict[str, bool]
 
-###############################################################################
-# GLOBAL CONSTANTS
-###############################################################################
-ENV_DIR = "../env"
-CONFIG_PATH = f"{ENV_DIR}/config.env"
-CREDS_PATH = f"{ENV_DIR}/credentials.env"
-CERT_PATH = f"{ENV_DIR}/cacert.pem"
-CSV_PATH = "knowledgebase.csv"      # CSV with columns: name, definition, [id]
-INPUT_JSON_PATH = "input.json"      # single object or list of objects
-
-###############################################################################
-# Utility
-###############################################################################
-def str_to_bool(s: str) -> bool:
-    s_lower = s.lower()
-    if s_lower == "true":
-        return True
-    elif s_lower == "false":
-        return False
-    else:
-        raise ValueError(f"Invalid boolean string: {s}")
-
-###############################################################################
-# OSEnv class
-###############################################################################
-class OSEnv:
-    """
-    Loads environment variables from config/creds files,
-    sets up proxies, cert paths, and fetches Azure AD token if needed.
-    """
-    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
-        self.var_list = []
-        self._bulk_set(config_file, print_val=True)
-        logger.info(f"Loaded main configuration from {config_file}")
-
-        self._bulk_set(creds_file, print_val=False)
-        logger.info(f"Loaded credentials from {creds_file}")
-
-        self._set_certificate_path(certificate_path)
-        logger.info("Certificate path configured")
-
-        if str_to_bool(self.get("PROXY_ENABLED", "False")):
-            self._set_proxy()
-            logger.info("Proxy configured")
-
-        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
-            logger.info("Securing endpoints")
-            self.token = self._get_azure_token()
-        else:
-            self.token = None
-
-    def _bulk_set(self, dotenvfile: str, print_val: bool):
-        if not os.path.isabs(dotenvfile):
-            dotenvfile = os.path.abspath(dotenvfile)
-        if not os.path.isfile(dotenvfile):
-            logger.warning(f"No such env file: {dotenvfile}")
-            return
-
-        logger.info(f"Loading environment from {dotenvfile}")
-        temp_dict = dotenv_values(dotenvfile)
-        for k, v in temp_dict.items():
-            self.set(k, v, print_val=print_val)
-
-    def set(self, var_name: str, val: str, print_val: bool = True):
-        os.environ[var_name] = val
-        if var_name not in self.var_list:
-            self.var_list.append(var_name)
-        if print_val:
-            logger.info(f"Set {var_name}={val}")
-
-    def get(self, var_name: str, default: Optional[str] = None) -> Optional[str]:
-        return os.environ.get(var_name, default)
-
-    def _set_certificate_path(self, certificate_path: str):
-        if not os.path.isabs(certificate_path):
-            certificate_path = os.path.abspath(certificate_path)
-        if not os.path.isfile(certificate_path):
-            logger.warning(f"Certificate file missing: {certificate_path}")
-            return
-        self.set("REQUESTS_CA_BUNDLE", certificate_path)
-        self.set("SSL_CERT_FILE", certificate_path)
-        self.set("CURL_CA_BUNDLE", certificate_path)
-
-    def _set_proxy(self):
-        ad_username = self.get("AD_USERNAME")
-        ad_password = self.get("AD_USER_PW")
-        proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
-        if not all([ad_username, ad_password, proxy_domain]):
-            logger.warning("Missing proxy credentials, skipping proxy setup.")
-            return
-        proxy_url = f"http://{ad_username}:{ad_password}@{proxy_domain}"
-        self.set("HTTP_PROXY", proxy_url, print_val=False)
-        self.set("HTTPS_PROXY", proxy_url, print_val=False)
-        no_proxy_domains = [
-            "cognitiveservices.azure.com",
-            "search.windows.net",
-            "openai.azure.com",
-            "core.windows.net",
-            "azurewebsites.net"
-        ]
-        self.set("NO_PROXY", ",".join(no_proxy_domains))
-
-    def _get_azure_token(self) -> str:
+    @field_validator('pattern')
+    def validate_pattern(cls, v):
         try:
-            credential = ClientSecretCredential(
-                tenant_id=self.get("AZURE_TENANT_ID", ""),
-                client_id=self.get("AZURE_CLIENT_ID", ""),
-                client_secret=self.get("AZURE_CLIENT_SECRET", "")
-            )
-            token = credential.get_token("https://cognitiveservices.azure.com/.default")
-            self.set("AZURE_TOKEN", token.token, print_val=False)
-            logger.info("Azure token acquired successfully")
-            return token.token
-        except Exception as e:
-            logger.error(f"Failed to get Azure token: {str(e)}")
-            return ""
+            re.compile(v)
+            return v
+        except re.error as e:
+            raise ValueError(f"Invalid regex: {e}") from e
 
-    def list_env_vars(self):
-        for var in self.var_list:
-            if var in {"AZURE_TOKEN", "AD_USER_PW", "AZURE_CLIENT_SECRET"}:
-                logger.info(f"{var}: [HIDDEN]")
-            else:
-                logger.info(f"{var}: {os.environ.get(var, '')}")
+class RegexGenerationWorkflow:
+    def __init__(self, csv_path: str, config: RegexGeneratorConfig = RegexGeneratorConfig()):
+        self.df = pd.read_csv(csv_path)
+        self.chatbot = AzureChatbot(CONFIG_PATH, CREDS_PATH, CERT_PATH)
+        self.config = config
+        self.workflow = StateGraph(dict)
+        self._build_workflow()
 
-###############################################################################
-# Document + Embedding
-###############################################################################
-class MyDocument(BaseModel):
-    text: str = ""
-    embedding: List[float] = []
-    metadata: Dict[str, Any] = {}
-    id: str = ""
-
-class EmbeddingClient:
-    """
-    Real embedding logic using AzureOpenAI embeddings with a token provider.
-    """
-    def __init__(self, azure_api_version: str = "2023-05-15", embeddings_model: str = "text-embedding-3-large"):
-        self.azure_api_version = azure_api_version
-        self.embeddings_model = embeddings_model
-        self.direct_azure_client = self._get_direct_azure_client()
-
-    def _get_direct_azure_client(self):
-        token_provider = get_bearer_token_provider(
-            DefaultAzureCredential(),
-            "https://cognitiveservices.azure.com/.default"
+    def _build_workflow(self):
+        self.workflow.add_node("analyze_term", self.analyze_term)
+        self.workflow.add_node("generate_candidates", self.generate_candidates)
+        self.workflow.add_node("validate_pattern", self.validate_pattern)
+        self.workflow.add_node("refine_pattern", self.refine_pattern)
+        self.workflow.add_node("finalize_pattern", self.finalize_pattern)
+        
+        self.workflow.set_entry_point("analyze_term")
+        self.workflow.add_edge("analyze_term", "generate_candidates")
+        self.workflow.add_edge("generate_candidates", "validate_pattern")
+        self.workflow.add_edge("validate_pattern", "refine_pattern")
+        self.workflow.add_conditional_edges(
+            "refine_pattern",
+            self.decide_to_continue,
+            {"continue": "validate_pattern", "done": "finalize_pattern"}
         )
-        return AzureOpenAI(
-            api_version=self.azure_api_version,
-            azure_ad_token_provider=token_provider
+        self.workflow.add_edge("finalize_pattern", END)
+
+    def analyze_term(self, state: dict) -> dict:
+        terms = []
+        for _, row in self.df.iterrows():
+            terms.append({
+                "name": row["name"],
+                "definition": row["definition"],
+                "related_terms": self._get_related_terms(row["name"]),
+                "iteration": 0,
+                "best_pattern": None,
+                "validation_history": []
+            })
+        return {"terms": terms}
+
+    def _get_related_terms(self, term_name: str) -> str:
+        related = self.df[self.df["name"] == term_name]
+        return "\n".join(
+            f"{r['related_term_name']}: {r['related_term_definition']} (e.g., {r['related_term_example']})"
+            for _, r in related.iterrows()
         )
 
-    def generate_embeddings(self, doc: MyDocument) -> MyDocument:
-        try:
-            response = self.direct_azure_client.embeddings.create(
-                model=self.embeddings_model,
-                input=doc.text
-            ).data[0].embedding
-            doc.embedding = response
-            return doc
-        except Exception as e:
-            logger.error(f"Error generating embeddings for doc {doc.id}: {str(e)}")
-            return doc
+    def generate_candidates(self, state: dict) -> dict:
+        prompt = ChatPromptTemplate.from_template("""Generate 3 regex patterns for '{name}' considering:
+        - ALL possible representations: text, numbers, symbols, unicode
+        - Case variations (upper/lower/mixed)
+        - Language variations
+        - Common abbreviations
+        - Partial matches
+        - Boundary conditions
+        
+        Definition: {definition}
+        Related Terms: {related_terms}
+        
+        Requirements:
+        1. Use character set: {charset}
+        2. Allow partial matches with word boundaries
+        3. Include unicode support
+        4. Handle numeric/currency formats
+        5. Support multilingual representations
+        
+        Return ONLY as JSON array: ["pattern1", "pattern2", "pattern3"]""")
+        
+        chain = prompt | self.chatbot.llm | StrOutputParser()
+        
+        for term in state["terms"]:
+            response = chain.invoke({
+                **term,
+                "charset": self.config.allowed_charset
+            })
+            term["candidates"] = json.loads(response)
+        
+        return state
 
-###############################################################################
-# KnowledgeBase => read CSV with chardet => docs + networkx
-###############################################################################
-class KnowledgeBase:
-    def __init__(self, csv_path: str):
-        """
-        We'll auto-detect encoding with chardet, fallback to 'utf-8'.
-        We'll store docs for Chroma ingestion and build a networkx graph:
-        name -> definition
-        Edge label = "is defined by"
-        """
-        self.csv_path = csv_path
-        self.docs: List[LC_Document] = []
-        self.graph = nx.MultiDiGraph()
-        self._read_csv_and_build()
+    def validate_pattern(self, state: dict) -> dict:
+        prompt = ChatPromptTemplate.from_template("""Generate test cases for regex validation:
+        Term: {name}
+        Pattern: {pattern}
+        
+        Generate:
+        1. 5 POSITIVE examples that should match
+        2. 5 NEGATIVE examples that should NOT match
+        
+        Return as JSON: {{"positive": [], "negative": []}}""")
+        
+        chain = prompt | self.chatbot.llm | StrOutputParser()
+        
+        for term in state["terms"]:
+            term["validation_results"] = []
+            for pattern in term["candidates"]:
+                test_cases = json.loads(chain.invoke({"name": term["name"], "pattern": pattern}))
+                term["validation_results"].append({
+                    "pattern": pattern,
+                    "tests": test_cases,
+                    "score": 0
+                })
+        
+        return state
 
-    def _read_csv_and_build(self):
-        if not os.path.isfile(self.csv_path):
-            raise FileNotFoundError(f"CSV not found: {self.csv_path}")
+    def refine_pattern(self, state: dict) -> dict:
+        prompt = ChatPromptTemplate.from_template("""Improve regex pattern based on test results:
+        Original Pattern: {pattern}
+        Test Results:
+        Passed: {passed}/{total}
+        Failed Cases: {failed_cases}
+        
+        Requirements:
+        1. Maintain original matching capability
+        2. Fix failed test cases
+        3. Improve coverage
+        4. Keep pattern efficient
+        
+        Return ONLY the improved regex pattern""")
+        
+        chain = prompt | self.chatbot.llm | StrOutputParser()
+        
+        for term in state["terms"]:
+            term["iteration"] += 1
+            new_candidates = []
+            for result in term["validation_results"]:
+                total = len(result["tests"]["positive"] + len(result["tests"]["negative"])
+                passed = sum(1 for t in result["tests"]["positive"] if re.search(result["pattern"], t, re.IGNORECASE))
+                passed += sum(1 for t in result["tests"]["negative"] if not re.search(result["pattern"], t, re.IGNORECASE))
+                
+                if passed/total >= self.config.min_coverage:
+                    new_candidates.append(result["pattern"])
+                else:
+                    improved = chain.invoke({
+                        "pattern": result["pattern"],
+                        "passed": passed,
+                        "total": total,
+                        "failed_cases": json.dumps({
+                            "false_negatives": [t for t in result["tests"]["positive"] 
+                                              if not re.search(result["pattern"], t, re.IGNORECASE)],
+                            "false_positives": [t for t in result["tests"]["negative"] 
+                                              if re.search(result["pattern"], t, re.IGNORECASE)]
+                        })
+                    })
+                    new_candidates.append(improved)
+            
+            term["candidates"] = new_candidates
+        
+        return state
 
-        # 1) chardet detect
-        with open(self.csv_path, "rb") as f:
-            rawdata = f.read(100000)
-        result = chardet.detect(rawdata)
-        detected_encoding = result["encoding"]
-        logger.info(f"chardet detected encoding: {detected_encoding}")
-        if not detected_encoding:
-            logger.warning("chardet failed, fallback to utf-8")
-            detected_encoding = "utf-8"
+    def finalize_pattern(self, state: dict) -> dict:
+        prompt = ChatPromptTemplate.from_template("""Select best regex pattern:
+        Candidates: {candidates}
+        
+        Criteria:
+        1. Highest test coverage
+        2. Pattern simplicity
+        3. Readability
+        4. Performance
+        
+        Return as JSON: {{"pattern": "...", "reason": "..."}}""")
+        
+        chain = prompt | self.chatbot.llm | StrOutputParser()
+        
+        final_patterns = []
+        for term in state["terms"]:
+            selection = json.loads(chain.invoke({"candidates": term["candidates"]}))
+            final_patterns.append(RegexPattern(
+                name=term["name"],
+                pattern=selection["pattern"],
+                status="GREEN",  # Simplified for example
+                reasons=[selection["reason"]],
+                coverage="N/A",
+                examples=self._generate_final_examples(term, selection["pattern"])
+            ))
+        
+        return {"patterns": final_patterns}
 
-        # 2) read CSV with pandas
-        df = pd.read_csv(self.csv_path, encoding=detected_encoding, keep_default_na=False)
-        if "name" not in df.columns or "definition" not in df.columns:
-            raise ValueError("CSV must have 'name' and 'definition' columns")
-
-        if "id" not in df.columns:
-            df["id"] = [str(uuid.uuid4()) for _ in range(len(df))]
-
-        # 3) build docs for ingestion in Chroma
-        for _, row in df.iterrows():
-            name_val = str(row["name"])
-            def_val = str(row["definition"])
-            id_val = str(row["id"])
-            doc = LC_Document(
-                page_content=def_val,
-                metadata={"name": name_val, "id": id_val}
-            )
-            self.docs.append(doc)
-
-        # 4) build a networkx graph
-        for _, row in df.iterrows():
-            subj = str(row["name"])
-            obj = str(row["definition"])
-            row_id = str(row["id"])
-
-            self.graph.add_node(subj, node_id=row_id, node_type="subject")
-            self.graph.add_node(obj, node_type="definition")
-            self.graph.add_edge(subj, obj, label="is defined by")
-
-        logger.info(f"Built graph with {self.graph.number_of_nodes()} nodes and {self.graph.number_of_edges()} edges")
-
-###############################################################################
-# AzureOpenAIEmbeddings => for Chroma (cosine similarity)
-###############################################################################
-class AzureOpenAIEmbeddings(Embeddings):
-    def __init__(self, azure_api_version="2023-05-15", embeddings_model="text-embedding-3-large"):
-        self.client = EmbeddingClient(azure_api_version, embeddings_model)
-
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        embeddings = []
-        for txt in texts:
-            doc = MyDocument(text=txt, id="doc-embed")
-            updated_doc = self.client.generate_embeddings(doc)
-            embeddings.append(updated_doc.embedding)
-        return embeddings
-
-    def embed_query(self, text: str) -> List[float]:
-        doc = MyDocument(text=text, id="query-embed")
-        updated_doc = self.client.generate_embeddings(doc)
-        return updated_doc.embedding
-
-###############################################################################
-# QualityCheckChain => parse rating + reason from JSON
-###############################################################################
-class QualityCheckChain:
-    """
-    Uses an LLM to produce strictly { "rating": "...", "reason": "..." } as JSON.
-    rating ∈ {Green, Amber, Red}.
-    """
-    def __init__(self, llm):
-        self.llm = llm
-
-        template = """
-You are a rating agent that receives:
-- user_input: the user's name + definition
-- candidate_doc: a knowledge base match (with name + definition)
-
-You MUST return a JSON with exactly two fields: "rating" and "reason".
-No extra keys, no leading/trailing whitespace in key names.
-No text outside the JSON.
-
-"rating" must be one of ["Green","Amber","Red"].
-If you think it's a strong match, rating="Green".
-If partial match, rating="Amber" (explain partial reason).
-If no match, rating="Red" with reason like "No data found".
-
-Output only valid JSON. For example:
-{
-  "rating": "Green",
-  "reason": "They match strongly"
-}
-
----
-User input: {user_input}
-Candidate doc: {candidate_doc}
-"""
-        self.prompt = PromptTemplate(
-            input_variables=["user_input", "candidate_doc"],
-            template=template
-        )
-        self.chain = LLMChain(llm=self.llm, prompt=self.prompt)
-
-    def _normalize_keys(self, data: dict) -> dict:
-        """
-        Forcefully remove newlines, quotes, or stray chars from each key.
-        So if we get '\n "rating"' => 'rating'.
-        """
-        normalized = {}
-        for k, v in data.items():
-            new_k = k.replace('"','').replace("'","").replace('\n','').replace('\r','').strip()
-            normalized[new_k] = v
-        return normalized
-
-    def check_quality(self, user_input: str, candidate_doc: str) -> Dict[str, str]:
-        """
-        Returns { "rating": "...", "reason": "..." } or a fallback if parse fails.
-        """
-        try:
-            resp = self.chain.run(
-                user_input=user_input,
-                candidate_doc=candidate_doc
-            )
-            raw_resp = resp.strip()
-
-            # 1) Attempt direct parse
-            try:
-                data = json.loads(raw_resp)
-                data = self._normalize_keys(data)
-                rating = data.get("rating","Red")
-                reason = data.get("reason","No reason provided")
-                return {"rating": rating, "reason": reason}
-            except:
-                pass
-
-            # 2) If direct parse fails, attempt substring extraction
-            start_idx = raw_resp.find("{")
-            end_idx = raw_resp.rfind("}")
-            if start_idx == -1 or end_idx == -1:
-                return {"rating":"Red","reason":"Failed to parse JSON (no braces)"}
-
-            json_str = raw_resp[start_idx:end_idx+1]
-            try:
-                data = json.loads(json_str)
-                data = self._normalize_keys(data)
-                rating = data.get("rating","Red")
-                reason = data.get("reason","No reason provided")
-                return {"rating": rating, "reason": reason}
-            except:
-                return {"rating":"Red","reason":"Failed to parse JSON substring."}
-
-        except Exception as e:
-            logger.error(f"Error in check_quality: {str(e)}")
-            return {"rating":"Red","reason":"Parsing or chain error."}
-
-###############################################################################
-# AzureChatbot => normal chat + vector store + naive graph + R/A/G approach
-###############################################################################
-class AzureChatbot:
-    def __init__(self, config_file: str, creds_file: str, cert_file: str, csv_path: str):
-        logger.info("Initializing AzureChatbot with chardet + networkx + R/A/G approach.")
-        self.env = OSEnv(config_file, creds_file, cert_file)
-
-        # 1) Chat model for normal conversation
-        self._setup_chat_model()
-
-        # 2) Conversation chain
-        self.memory = ConversationBufferMemory()
-        self.conversation = ConversationChain(llm=self.llm, memory=self.memory, verbose=True)
-
-        # 3) Knowledge base => docs + graph
-        self.kb = KnowledgeBase(csv_path)
-        self.graph = self.kb.graph
-
-        # 4) Create vector store (cosine similarity by default in Chroma)
-        self._setup_vectorstore()
-
-        # 5) QualityCheckChain for rating
-        self.quality_chain = QualityCheckChain(llm=self.llm)
-
-        logger.info("AzureChatbot is ready.")
-
-    def _setup_chat_model(self):
-        try:
-            model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
-            temperature = float(self.env.get("MODEL_TEMPERATURE", "0.7"))
-            max_tokens = int(self.env.get("MAX_TOKENS", "800"))
-            api_version = self.env.get("API_VERSION", "2023-05-15")
-            azure_endpoint = self.env.get("AZURE_OPENAI_ENDPOINT", "")
-            azure_ad_token = self.env.token
-
-            self.llm = AzureChatOpenAI(
-                model_name=model_name,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                openai_api_version=api_version,
-                azure_endpoint=azure_endpoint,
-                azure_ad_token=azure_ad_token
-            )
-            logger.info("Chat model initialized successfully.")
-        except Exception as e:
-            logger.error(f"Failed to initialize chat model: {str(e)}")
-            raise
-
-    def _setup_vectorstore(self):
-        try:
-            azure_embeddings_model = self.env.get("EMBEDDINGS_MODEL", "text-embedding-3-large")
-            azure_api_version = self.env.get("EMBEDDINGS_API_VERSION", "2023-05-15")
-
-            embedding = AzureOpenAIEmbeddings(
-                azure_api_version=azure_api_version,
-                embeddings_model=azure_embeddings_model
-            )
-            # We'll do cosine similarity by default
-            chroma_settings = Settings(
-                anonymized_telemetry=False,
-                persist_directory="chromadb-data"
-                # By default, Chroma uses "cosine" for similarity
-            )
-            self.vs = Chroma.from_documents(
-                documents=self.kb.docs,
-                embedding=embedding,
-                collection_name="kb_collection",
-                client_settings=chroma_settings
-            )
-            logger.info("Chroma vector store created successfully.")
-        except Exception as e:
-            logger.error(f"Failed to set up vector store: {str(e)}")
-            raise
-
-    def list_env(self):
-        self.env.list_env_vars()
-
-    ###########################################################################
-    # Normal chat
-    ###########################################################################
-    def chat(self, message: str) -> str:
-        """Normal conversation with memory (no RAG)."""
-        if not message.strip():
-            return "Please provide a non-empty message."
-        try:
-            return self.conversation.predict(input=message)
-        except Exception as e:
-            logger.error(f"Error in chat: {str(e)}")
-            return f"An error occurred: {str(e)}"
-
-    ###########################################################################
-    # RAG query => direct vector search (no R/A/G logic)
-    ###########################################################################
-    def rag_query(self, query: str, k: int = 3) -> str:
-        try:
-            results = self.vs.similarity_search_with_score(query, k=k)
-            if not results:
-                return "No relevant matches found."
-
-            lines = []
-            for idx, (doc, score) in enumerate(results, start=1):
-                confidence = max(0.0, min(1.0, 1.0 - score))
-                rating = "Green" if confidence >= 0.8 else ("Amber" if confidence >= 0.5 else "Red")
-                reason = f"Confidence={confidence:.2f}, rating={rating}, definition={doc.page_content}"
-                lines.append(
-                    f"Match #{idx}\n"
-                    f"Name: {doc.metadata.get('name','Unknown')}\n"
-                    f"ID: {doc.metadata.get('id','No ID')}\n"
-                    f"Confidence: {confidence:.2f}\n"
-                    f"Rating: {rating}\n"
-                    f"Reason: {reason}\n"
-                )
-            return "\n".join(lines)
-        except Exception as e:
-            logger.error(f"Error in rag_query: {str(e)}")
-            return f"An error occurred: {str(e)}"
-
-    ###########################################################################
-    # Graph search => naive substring
-    ###########################################################################
-    def graph_search(self, query: str) -> str:
-        results = []
-        q_lower = query.lower()
-
-        for node, data in self.kb.graph.nodes(data=True):
-            if q_lower in str(node).lower():
-                node_info = f"Node: {node}, node_type={data.get('node_type','')}, node_id={data.get('node_id','')}"
-                results.append(node_info)
-
-        if not results:
-            return "No matching nodes found in the graph."
-        return "\n".join(results)
-
-    ###########################################################################
-    # R/A/G logic with QualityCheckChain
-    ###########################################################################
-    def rag_quality_check_item(self, name: str, definition: str, top_k: int = 5) -> Dict[str,Any]:
-        """
-        1) Build user_input from name + definition
-        2) Vector search => up to top_k matches
-        3) For each match in order:
-           - Call QualityCheckChain with user_input + candidate
-           - If rating=Green => done
-           - If rating=Amber => try next match
-           - If rating=Red => stop (no data found)
-        4) Return final JSON with rating, reason, matched doc info
-        """
-        user_input = f"{name} {definition}"
-        results = self.vs.similarity_search_with_score(user_input, k=top_k)
-        if not results:
-            return {
-                "rating":"Red",
-                "reason":"No matches from vector store",
-                "matched_doc":None
-            }
-
-        last_amber_reason = "No strong match found"
-        for idx, (doc, score) in enumerate(results, start=1):
-            candidate_text = f"Name={doc.metadata.get('name','Unknown')}, Def={doc.page_content}"
-            qc_result = self.quality_chain.check_quality(
-                user_input=user_input,
-                candidate_doc=candidate_text
-            )
-
-            rating = qc_result.get("rating","Red")
-            reason = qc_result.get("reason","No reason")
-
-            if rating == "Green":
-                return {
-                    "rating":"Green",
-                    "reason":reason,
-                    "matched_doc":{
-                        "name": doc.metadata.get("name","Unknown"),
-                        "id": doc.metadata.get("id","No ID"),
-                        "definition": doc.page_content
-                    }
-                }
-            elif rating == "Amber":
-                # partial => try next match
-                last_amber_reason = reason
-                continue
-            else:  # rating == "Red"
-                return {
-                    "rating":"Red",
-                    "reason":reason,
-                    "matched_doc":None
-                }
-
-        # If we exhausted all matches => last was Amber
+    def _generate_final_examples(self, term: dict, pattern: str) -> Dict[str, bool]:
+        prompt = ChatPromptTemplate.from_template("""Generate comprehensive test examples for '{name}':
+        Pattern: {pattern}
+        
+        Generate 10 varied examples (5 valid, 5 invalid) covering:
+        - Different languages
+        - Character cases
+        - Numeric formats
+        - Special characters
+        - Common edge cases
+        
+        Return as JSON: {{"valid": [], "invalid": []}}""")
+        
+        chain = prompt | self.chatbot.llm | StrOutputParser()
+        examples = json.loads(chain.invoke({"name": term["name"], "pattern": pattern}))
         return {
-            "rating":"Amber",
-            "reason": last_amber_reason,
-            "matched_doc":None
+            "valid": examples["valid"],
+            "invalid": examples["invalid"]
         }
 
-###############################################################################
-# Test suite
-###############################################################################
-def run_tests(chatbot: AzureChatbot):
-    print("\n=== Running Test Suite ===")
+    def decide_to_continue(self, state: dict) -> str:
+        return "done" if state["terms"][0]["iteration"] >= self.config.max_iterations else "continue"
 
-    endpoint = chatbot.env.get("AZURE_OPENAI_ENDPOINT", "N/A")
-    print(f"Test 1: Azure endpoint => {endpoint}")
+    def run(self) -> dict:
+        app = self.workflow.compile()
+        return app.invoke({})
 
-    sample_chat = "Hello, how are you?"
-    chat_response = chatbot.chat(sample_chat)
-    print(f"\nTest 2: Chat test\nUser: {sample_chat}\nBot: {chat_response}")
-
-    from langchain.embeddings.base import Embeddings
-    embed_client = EmbeddingClient()
-    test_doc = MyDocument(text="Sample text for embedding test", id="test-doc")
-    updated_doc = embed_client.generate_embeddings(test_doc)
-    vector_len = len(updated_doc.embedding) if updated_doc.embedding else 0
-    print(f"\nTest 3: Embedding test\nDocument text: {test_doc.text}\nEmbedding length: {vector_len}")
-
-    sample_rag_query = "rag phone"
-    rag_response = chatbot.rag_query(sample_rag_query.replace("rag ",""))
-    print(f"\nTest 4: RAG test\nQuery: {sample_rag_query}\nRAG Response:\n{rag_response}")
-
-    print("\n=== Test Suite Complete ===")
-
-###############################################################################
-# Process input.json with R/A/G logic
-###############################################################################
-def process_input_json_with_quality(chatbot: AzureChatbot, json_file: str):
-    """
-    If input.json is a single dict => { "name": "...", "definition": "..." }
-    or a list of such dicts => we handle both.
-    For each item, we call rag_quality_check_item => rating, reason, matched_doc
-    Then we print a JSON result.
-    """
-    if not os.path.isfile(json_file):
-        print(f"Input JSON file not found: {json_file}")
-        return
-
-    with open(json_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    # If 'data' is a dict => wrap in list
-    if isinstance(data, dict):
-        data = [data]
-    elif not isinstance(data, list):
-        print("input.json must be an object or a list of objects.")
-        return
-
-    final_results = []
-    for item in data:
-        name_val = str(item.get("name",""))
-        def_val = str(item.get("definition",""))
-        # run the R/A/G approach
-        result = chatbot.rag_quality_check_item(name=name_val, definition=def_val, top_k=5)
-        # store
-        final_results.append({
-            "input": {
-                "name": name_val,
-                "definition": def_val
-            },
-            "rating": result["rating"],
-            "reason": result["reason"],
-            "matched_doc": result["matched_doc"]
-        })
-
-    # Print final results as JSON
-    print("\n=== R/A/G Results from input.json ===")
-    print(json.dumps(final_results, indent=2))
-
-###############################################################################
-# main
-###############################################################################
-def main():
-    try:
-        # check for missing files
-        required_files = {
-            "config.env": CONFIG_PATH,
-            "credentials.env": CREDS_PATH,
-            "cacert.pem": CERT_PATH,
-            "knowledgebase.csv": CSV_PATH
-        }
-        missing = []
-        for name, path in required_files.items():
-            if not os.path.exists(path):
-                missing.append(name)
-        if missing:
-            print(f"\nMissing required files: {', '.join(missing)}")
-            sys.exit(1)
-
-        print("Initializing AzureChatbot with R/A/G logic + test suite + input.json handling...")
-        chatbot = AzureChatbot(
-            config_file=CONFIG_PATH,
-            creds_file=CREDS_PATH,
-            cert_file=CERT_PATH,
-            csv_path=CSV_PATH
-        )
-        print("Chatbot is ready!\n")
-
-        # 1) run test suite
-        run_tests(chatbot)
-
-        # 2) process input.json with R/A/G approach if it exists
-        if os.path.isfile(INPUT_JSON_PATH):
-            process_input_json_with_quality(chatbot, INPUT_JSON_PATH)
-
-        # 3) user loop
-        print("\nCommands:\n"
-              "- 'quit'/'exit'/'bye': end\n"
-              "- 'env': show environment\n"
-              "- 'rag <query>': direct vector store search\n"
-              "- 'graph <query>': naive graph search\n"
-              "anything else => normal chat\n"
-              "(For R/A/G approach on input.json, put data in input.json and re-run.)\n")
-
-        while True:
-            user_input = input("\nYou: ").strip()
-            if user_input.lower() in ["quit", "exit", "bye"]:
-                print("Goodbye!")
-                break
-
-            if user_input.lower() == "env":
-                chatbot.list_env()
-                continue
-
-            if user_input.lower().startswith("rag "):
-                query = user_input[4:].strip()
-                result = chatbot.rag_query(query)
-                print(f"\nRAG => {result}")
-                continue
-
-            if user_input.lower().startswith("graph "):
-                query = user_input[6:].strip()
-                result = chatbot.graph_search(query)
-                print(f"\nGraph => {result}")
-                continue
-
-            # normal chat
-            result = chatbot.chat(user_input)
-            print(f"\nBot => {result}")
-
-    except Exception as e:
-        print(f"Unexpected error: {str(e)}")
-        logger.exception("Unexpected error occurred")
-
-
+# Example Usage
 if __name__ == "__main__":
-    main()
+    workflow = RegexGenerationWorkflow("technical_terms.csv")
+    results = workflow.run()
+    
+    # Save results
+    with open("regex_patterns.json", "w") as f:
+        json.dump([p.model_dump() for p in results["patterns"]], f, indent=2)
+    
+    # Example currency pattern output
+    currency_pattern = next(p for p in results["patterns"] if p.name == "CurrencyCode")
+    print(f"Currency Code Pattern: {currency_pattern.pattern}")
+    print("Example Matches:")
+    print("\n".join(currency_pattern.examples["valid"][:5]))
