@@ -1,253 +1,713 @@
 import os
-import re
+import sys
+import uuid
 import json
 import logging
+import chardet
 import pandas as pd
-from typing import Dict, List, Optional
-from langgraph.graph import StateGraph, END
-from langchain.agents import Tool, AgentExecutor
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+import networkx as nx
+import numpy as np
+import re
+import csv
+from typing import Optional, Any, Dict, List, Union, Set
+from pathlib import Path
+from dotenv import dotenv_values
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider, ClientSecretCredential
+from openai import AzureOpenAI
+from pydantic import BaseModel
+from langchain.chat_models import AzureChatOpenAI
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationChain, LLMChain
+from langchain.docstore import Document as LC_DOCUMENT
+from langchain.embeddings.base import Embeddings
+from langchain.vectorstores import Chroma
+from langchain.prompts import PromptTemplate
+from chromadb.config import Settings
+from chromadb.utils import embedding_functions
+from collections import namedtuple
 from pydantic import BaseModel, ValidationError, field_validator
 
-# Previous base classes (OSEnv, AzureChatbot) remain unchanged
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
 
-class RegexGeneratorConfig(BaseModel):
-    max_iterations: int = 3
-    min_coverage: float = 0.85
-    complexity_level: str = "high"
-    allowed_charset: str = r"\w\s\-$%().,;:@#&*+!?'"
+ENV_DIR = "env"
+CONFIG_PATH = f"{ENV_DIR}/config.env"
+CREDS_PATH = f"{ENV_DIR}/credentials.env"
+CERT_PATH = f"{ENV_DIR}/cacert.pem"
+
+Triple = namedtuple("Triple", ["subject", "predicate", "object"])
+
+## utility functions
+def is_file_readable(filepath: str)->bool:
+    """Check if a file is readable."""
+    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
+        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
+    return True
+
+def str_to_bool(s: str)->bool:
+    """Convert a string to a boolean."""
+    if s== 'True':
+        return True
+    elif s== 'False':
+        return False
+    else:
+        raise ValueError(f"Invalid boolean value: {s}")
+
+## OSEnv class
+
+class OSEnv:
+    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
+        self.var_list = []
+        self.bulk_set(config_file, True)
+        self.bulk_set(creds_file, False)
+        self.set_certificate_path(certificate_path)
+        if str_to_bool(self.get("PROXY_ENABLED", "False")):
+            self.set_proxy()
+        
+        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
+            self.token = self.get_azure_token()
+            self.credential = self._get_credential()
+        else:
+            self.token = None
+            self.credential = self._get_credential()
+        
+    def _get_credential(self):
+        if str_to_bool(self.get("USE_MANAGED_IDENTITY", "False")):
+            return DefaultAzureCredential()
+        else:
+            return ClientSecretCredential(tenant_id=self.get("AZURE_TENANT_ID"), client_id=self.get("AZURE_CLIENT_ID"), client_secret=self.get("AZURE_CLIENT_SECRET"))
+    
+    def set_certificate_path(self, path: str):
+        try:
+            if not os.path.isabs(path):
+                path = os.path.abspath(path)
+            if not is_file_readable(path):
+                raise FileNotFoundError(f"The file '{path}' does not exist or is not readable")
+            
+            self.set("REQUESTS_CA_BUNDLE", path)
+            self.set("SSL_CERT_FILE", path)
+            self.set("CURL_CA_BUNDLE", path)
+        except Exception as e:
+            logger.error(f"Error setting certificate path: {e}")
+            raise
+    
+    def bulk_set(self, dotenvfile: str, print_val: bool = False)->None:
+        try:
+            if not os.path.isabs(dotenvfile):
+                dotenvfile = os.path.abspath(dotenvfile)
+            if not is_file_readable(dotenvfile):
+                raise FileNotFoundError(f"The file '{dotenvfile}' does not exist or is not readable")
+            temp_dict = dotenv_values(dotenvfile)
+            for key, value in temp_dict.items():
+                self.set(key, value, print_val)
+            del temp_dict
+        except Exception as e:
+            logger.error(f"Error loading environment variables from {dotenvfile}: {e}")
+            raise
+    
+    def set(self, key: str, value: str, print_val: bool = False)->None:
+        try:
+            os.environ[key] = value
+            if key not in self.var_list:
+                self.var_list.append(key)
+            if print_val:
+                logger.info(f"{key}: {value}")
+        except Exception as e:
+            logger.error(f"Error setting environment variable {key}: {e}")
+            raise
+    
+    def get(self, key: str, default: Optional[str] = None)->str:
+        try:
+            return os.environ.get(key, default)
+        except Exception as e:
+            logger.error(f"Error getting environment variable {key}: {e}")
+            raise
+    
+    def set_proxy(self) -> None:
+        try:
+            ad_username = self.get("AD_USERNAME")
+            ad_password = self.get("AD_USER_PW")
+            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
+            if not all([ad_username, ad_password, proxy_domain]):
+                raise ValueError("Proxy settings are incomplete")
+            proxy_url = f"https://{ad_username}:{ad_password}@{proxy_domain}"
+            self.set("HTTP_PROXY", proxy_url, print_val=False)
+            self.set("HTTPS_PROXY", proxy_url, print_val=False)
+            no_proxy_domains = [
+                'cognitiveservices.azure.com',
+                'search.windows.net',
+                'openai.azure.com',
+                'core.windows.net',
+                'azurewebsites.net'
+            ]
+            self.set("NO_PROXY", ",".join(no_proxy_domains), print_val=False)
+        except Exception as e:
+            logger.error(f"Error setting proxy: {e}")
+            raise
+    
+    def get_azure_token(self) -> str:
+        try:
+            credential = ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID"),
+                client_id=self.get("AZURE_CLIENT_ID"),
+                client_secret=self.get("AZURE_CLIENT_SECRET")
+            )
+            token = credential.get_token("https://cognitiveservices.azure.com/.default")
+            self.set("AZURE_TOKEN", token.token, print_val=False)
+            logger.info("Azure token set")
+            return token.token
+        except Exception as e:
+            logger.error(f"Error retrieving Azure token: {e}")
+            return None
+    
+    def list_env_vars(self)->None:
+        for var in self.var_list:
+            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET'}:
+                logger.info(f"{var}: [REDACTED]")
+            else:
+                logger.info(f"{var}: {os.getenv(var)}")
+
+
+## embedding class + Document class
+
+class MyDocument(BaseModel):
+    id: str = ""
+    text: str = ""
+    embedding: List[float] = []
+    metadata: Dict[str, Any] = {}
+
+class EmbeddingClient:
+    def __init__(self, azure_api_version: str = "2023-05-15", embeddings_model: str = "text-embedding-3-large"):
+        self.azure_api_version = azure_api_version
+        self.embeddings_model = embeddings_model
+        self.direct_azure_client = self._get_direct_azure_client()
+    
+    def _get_direct_azure_client(self):
+        token_provider = get_bearer_token_provider(
+            DefaultAzureCredential(),
+            "https://cognitiveservices.azure.com/.default"
+        )
+        return AzureOpenAI(token_provider, self.azure_api_version)
+    
+    def generate_embeddings(self, doc: MyDocument)->MyDocument:
+        try:
+            response = self.direct_azure_client.embeddings.create(
+                model=self.embeddings_model,
+                input=doc.text
+            ).data[0].embedding
+            doc.embedding = response
+            return doc
+        except Exception as e:
+            logger.error(f"Error generating embeddings: {e}")
+            return doc
+
+## CSV Parsing and Regex Generation Components
+
+class CSVParser:
+    """Parse CSV files and extract data for regex generation."""
+    
+    def __init__(self, file_path: str, encoding: str = None):
+        self.file_path = file_path
+        self.encoding = encoding or self._detect_encoding(file_path)
+        self.data = None
+    
+    def _detect_encoding(self, file_path: str) -> str:
+        """Detect the encoding of a file."""
+        try:
+            with open(file_path, 'rb') as f:
+                result = chardet.detect(f.read())
+            return result['encoding'] or 'utf-8'
+        except Exception as e:
+            logger.error(f"Error detecting file encoding: {e}")
+            return 'utf-8'
+    
+    def parse(self) -> pd.DataFrame:
+        """Parse the CSV file and return a pandas DataFrame."""
+        try:
+            self.data = pd.read_csv(self.file_path, encoding=self.encoding)
+            # Validate expected columns
+            required_columns = ['name', 'definition', 'related_term_name', 
+                               'related_term_definition', 'related_term_example']
+            
+            # Check if all required columns exist (case insensitive)
+            df_columns_lower = [col.lower() for col in self.data.columns]
+            missing_columns = [col for col in required_columns 
+                              if not any(col == c or col.replace('_', ' ') == c 
+                                        for c in df_columns_lower)]
+            
+            if missing_columns:
+                logger.warning(f"Missing columns: {missing_columns}")
+                # Try to map existing columns to required ones
+                self._map_columns()
+            
+            # Clean and prepare data
+            self.data = self._clean_data()
+            return self.data
+        except Exception as e:
+            logger.error(f"Error parsing CSV file: {e}")
+            raise
+    
+    def _map_columns(self):
+        """Try to map existing columns to required ones."""
+        column_mappings = {
+            'name': ['name', 'term', 'term name', 'terminology'],
+            'definition': ['definition', 'desc', 'description', 'meaning'],
+            'related_term_name': ['related term', 'related name', 'related term name'],
+            'related_term_definition': ['related definition', 'related term definition', 'related desc'],
+            'related_term_example': ['related example', 'related term example', 'example']
+        }
+        
+        # Create a new DataFrame with standardized column names
+        new_data = pd.DataFrame()
+        
+        for standard_name, possible_names in column_mappings.items():
+            found = False
+            for col in self.data.columns:
+                if col.lower() in possible_names or col.lower().replace(' ', '_') in possible_names:
+                    new_data[standard_name] = self.data[col]
+                    found = True
+                    break
+            
+            if not found:
+                # Create empty column if not found
+                new_data[standard_name] = ""
+                logger.warning(f"Column '{standard_name}' not found, created empty column")
+        
+        self.data = new_data
+    
+    def _clean_data(self) -> pd.DataFrame:
+        """Clean and prepare data for regex generation."""
+        # Fill NaN values with empty strings
+        self.data = self.data.fillna("")
+        
+        # Strip whitespace from text fields
+        for col in self.data.columns:
+            if self.data[col].dtype == 'object':
+                self.data[col] = self.data[col].str.strip()
+        
+        return self.data
+
 
 class RegexPattern(BaseModel):
-    name: str
+    """Model for storing regex patterns."""
+    term_name: str
     pattern: str
-    status: str
-    reasons: List[str]
-    coverage: str
-    examples: Dict[str, bool]
+    source_terms: List[str] = []
+    complexity: int = 0  # Measure of pattern complexity
+    examples: List[str] = []  # Example matches
 
-    @field_validator('pattern')
-    def validate_pattern(cls, v):
-        try:
-            re.compile(v)
-            return v
-        except re.error as e:
-            raise ValueError(f"Invalid regex: {e}") from e
 
-class RegexGenerationWorkflow:
-    def __init__(self, csv_path: str, config: RegexGeneratorConfig = RegexGeneratorConfig()):
-        self.df = pd.read_csv(csv_path)
-        self.chatbot = AzureChatbot(CONFIG_PATH, CREDS_PATH, CERT_PATH)
-        self.config = config
-        self.workflow = StateGraph(dict)
-        self._build_workflow()
-
-    def _build_workflow(self):
-        self.workflow.add_node("analyze_term", self.analyze_term)
-        self.workflow.add_node("generate_candidates", self.generate_candidates)
-        self.workflow.add_node("validate_pattern", self.validate_pattern)
-        self.workflow.add_node("refine_pattern", self.refine_pattern)
-        self.workflow.add_node("finalize_pattern", self.finalize_pattern)
+class RegexGenerator:
+    """Generate robust regex patterns based on input terms and definitions."""
+    
+    def __init__(self, data: pd.DataFrame):
+        self.data = data
+        self.patterns = []
+        self.stop_words = set(['a', 'an', 'the', 'and', 'or', 'but', 'of', 'to', 'in', 'on', 'at', 'by', 'for'])
+    
+    def generate_patterns(self) -> List[RegexPattern]:
+        """Generate regex patterns for all terms in the data."""
+        for _, row in self.data.iterrows():
+            try:
+                pattern = self._create_pattern_for_term(row)
+                self.patterns.append(pattern)
+            except Exception as e:
+                logger.error(f"Error generating pattern for {row.get('name', 'unknown term')}: {e}")
         
-        self.workflow.set_entry_point("analyze_term")
-        self.workflow.add_edge("analyze_term", "generate_candidates")
-        self.workflow.add_edge("generate_candidates", "validate_pattern")
-        self.workflow.add_edge("validate_pattern", "refine_pattern")
-        self.workflow.add_conditional_edges(
-            "refine_pattern",
-            self.decide_to_continue,
-            {"continue": "validate_pattern", "done": "finalize_pattern"}
-        )
-        self.workflow.add_edge("finalize_pattern", END)
-
-    def analyze_term(self, state: dict) -> dict:
-        terms = []
-        for _, row in self.df.iterrows():
-            terms.append({
-                "name": row["name"],
-                "definition": row["definition"],
-                "related_terms": self._get_related_terms(row["name"]),
-                "iteration": 0,
-                "best_pattern": None,
-                "validation_history": []
-            })
-        return {"terms": terms}
-
-    def _get_related_terms(self, term_name: str) -> str:
-        related = self.df[self.df["name"] == term_name]
-        return "\n".join(
-            f"{r['related_term_name']}: {r['related_term_definition']} (e.g., {r['related_term_example']})"
-            for _, r in related.iterrows()
-        )
-
-    def generate_candidates(self, state: dict) -> dict:
-        prompt = ChatPromptTemplate.from_template("""Generate 3 regex patterns for '{name}' considering:
-        - ALL possible representations: text, numbers, symbols, unicode
-        - Case variations (upper/lower/mixed)
-        - Language variations
-        - Common abbreviations
-        - Partial matches
-        - Boundary conditions
+        # Merge similar patterns to avoid redundancy
+        self._merge_similar_patterns()
         
-        Definition: {definition}
-        Related Terms: {related_terms}
+        return self.patterns
+    
+    def _create_pattern_for_term(self, row: pd.Series) -> RegexPattern:
+        """Create a regex pattern for a specific term."""
+        term_name = row.get('name', '')
+        definition = row.get('definition', '')
+        related_term = row.get('related_term_name', '')
+        related_def = row.get('related_term_definition', '')
+        example = row.get('related_term_example', '')
         
-        Requirements:
-        1. Use character set: {charset}
-        2. Allow partial matches with word boundaries
-        3. Include unicode support
-        4. Handle numeric/currency formats
-        5. Support multilingual representations
+        if not term_name:
+            raise ValueError("Term name is required")
         
-        Return ONLY as JSON array: ["pattern1", "pattern2", "pattern3"]""")
+        # Extract key tokens from the name and definition
+        name_tokens = self._extract_tokens(term_name)
+        def_tokens = self._extract_tokens(definition)
+        related_tokens = self._extract_tokens(related_term)
         
-        chain = prompt | self.chatbot.llm | StrOutputParser()
+        # Combine tokens, prioritizing those from the name
+        all_tokens = set(name_tokens)
+        all_tokens.update(def_tokens)
+        all_tokens.update(related_tokens)
         
-        for term in state["terms"]:
-            response = chain.invoke({
-                **term,
-                "charset": self.config.allowed_charset
-            })
-            term["candidates"] = json.loads(response)
+        # Remove common words and very short tokens
+        filtered_tokens = [t for t in all_tokens if t.lower() not in self.stop_words and len(t) > 2]
         
-        return state
-
-    def validate_pattern(self, state: dict) -> dict:
-        prompt = ChatPromptTemplate.from_template("""Generate test cases for regex validation:
-        Term: {name}
-        Pattern: {pattern}
-        
-        Generate:
-        1. 5 POSITIVE examples that should match
-        2. 5 NEGATIVE examples that should NOT match
-        
-        Return as JSON: {{"positive": [], "negative": []}}""")
-        
-        chain = prompt | self.chatbot.llm | StrOutputParser()
-        
-        for term in state["terms"]:
-            term["validation_results"] = []
-            for pattern in term["candidates"]:
-                test_cases = json.loads(chain.invoke({"name": term["name"], "pattern": pattern}))
-                term["validation_results"].append({
-                    "pattern": pattern,
-                    "tests": test_cases,
-                    "score": 0
-                })
-        
-        return state
-
-    def refine_pattern(self, state: dict) -> dict:
-        prompt = ChatPromptTemplate.from_template("""Improve regex pattern based on test results:
-        Original Pattern: {pattern}
-        Test Results:
-        Passed: {passed}/{total}
-        Failed Cases: {failed_cases}
-        
-        Requirements:
-        1. Maintain original matching capability
-        2. Fix failed test cases
-        3. Improve coverage
-        4. Keep pattern efficient
-        
-        Return ONLY the improved regex pattern""")
-        
-        chain = prompt | self.chatbot.llm | StrOutputParser()
-        
-        for term in state["terms"]:
-            term["iteration"] += 1
-            new_candidates = []
-            for result in term["validation_results"]:
-                total = len(result["tests"]["positive"] + len(result["tests"]["negative"])
-                passed = sum(1 for t in result["tests"]["positive"] if re.search(result["pattern"], t, re.IGNORECASE))
-                passed += sum(1 for t in result["tests"]["negative"] if not re.search(result["pattern"], t, re.IGNORECASE))
-                
-                if passed/total >= self.config.min_coverage:
-                    new_candidates.append(result["pattern"])
-                else:
-                    improved = chain.invoke({
-                        "pattern": result["pattern"],
-                        "passed": passed,
-                        "total": total,
-                        "failed_cases": json.dumps({
-                            "false_negatives": [t for t in result["tests"]["positive"] 
-                                              if not re.search(result["pattern"], t, re.IGNORECASE)],
-                            "false_positives": [t for t in result["tests"]["negative"] 
-                                              if re.search(result["pattern"], t, re.IGNORECASE)]
-                        })
-                    })
-                    new_candidates.append(improved)
+        # Create pattern based on tokens
+        if filtered_tokens:
+            # Basic pattern using term variations and key tokens
+            variations = self._generate_variations(term_name)
+            token_pattern = '|'.join(re.escape(t) for t in filtered_tokens)
             
-            term["candidates"] = new_candidates
+            # Create the pattern with word boundaries for more precise matching
+            pattern_str = r'(?i)(?:\b(?:' + '|'.join(variations) + r')\b|\b(?:' + token_pattern + r')\b)'
+            
+            # Add example matches
+            examples = [term_name]
+            if example:
+                examples.append(example)
+            
+            return RegexPattern(
+                term_name=term_name,
+                pattern=pattern_str,
+                source_terms=[term_name, related_term],
+                complexity=len(filtered_tokens),
+                examples=examples
+            )
+        else:
+            # Fallback to simple pattern based on the term name
+            pattern_str = r'(?i)\b' + re.escape(term_name) + r'\b'
+            return RegexPattern(
+                term_name=term_name,
+                pattern=pattern_str,
+                source_terms=[term_name],
+                complexity=1,
+                examples=[term_name]
+            )
+    
+    def _extract_tokens(self, text: str) -> List[str]:
+        """Extract meaningful tokens from text."""
+        if not text:
+            return []
         
-        return state
+        # Split by whitespace and punctuation
+        raw_tokens = re.findall(r'\b\w+\b', text)
+        
+        # Remove duplicates and short tokens
+        return [t for t in raw_tokens if len(t) > 2]
+    
+    def _generate_variations(self, term: str) -> List[str]:
+        """Generate variations of a term for more flexible matching."""
+        variations = [term]
+        
+        # Add lowercase version
+        variations.append(term.lower())
+        
+        # Add version without spaces
+        if ' ' in term:
+            variations.append(term.replace(' ', ''))
+        
+        # Add version with dashes instead of spaces
+        if ' ' in term:
+            variations.append(term.replace(' ', '-'))
+        
+        # Add plural form for singular nouns (simple heuristic)
+        if not term.endswith('s') and not term.endswith('data'):
+            variations.append(term + 's')
+        
+        return variations
+    
+    def _merge_similar_patterns(self):
+        """Merge similar patterns to reduce redundancy."""
+        if len(self.patterns) <= 1:
+            return
+        
+        # Sort patterns by complexity (descending)
+        sorted_patterns = sorted(self.patterns, key=lambda p: p.complexity, reverse=True)
+        merged_patterns = [sorted_patterns[0]]
+        
+        for i in range(1, len(sorted_patterns)):
+            current = sorted_patterns[i]
+            should_merge = False
+            
+            for mp in merged_patterns:
+                # Check if current pattern is similar to an existing merged pattern
+                if self._are_patterns_similar(current, mp):
+                    # Update the merged pattern to include the current one
+                    mp.source_terms.extend(current.source_terms)
+                    mp.examples.extend(current.examples)
+                    mp.source_terms = list(set(mp.source_terms))  # Remove duplicates
+                    mp.examples = list(set(mp.examples))  # Remove duplicates
+                    should_merge = True
+                    break
+            
+            if not should_merge:
+                merged_patterns.append(current)
+        
+        self.patterns = merged_patterns
+    
+    def _are_patterns_similar(self, p1: RegexPattern, p2: RegexPattern) -> bool:
+        """Check if two patterns are similar enough to be merged."""
+        # Check if the term names are similar
+        name1 = p1.term_name.lower()
+        name2 = p2.term_name.lower()
+        
+        # Exact match or one is substring of the other
+        if name1 == name2 or name1 in name2 or name2 in name1:
+            return True
+        
+        # Check for significant overlap in source terms
+        p1_sources = set(s.lower() for s in p1.source_terms if s)
+        p2_sources = set(s.lower() for s in p2.source_terms if s)
+        
+        if p1_sources and p2_sources:
+            # Calculate Jaccard similarity
+            intersection = len(p1_sources.intersection(p2_sources))
+            union = len(p1_sources.union(p2_sources))
+            
+            if union > 0 and intersection / union > 0.5:
+                return True
+        
+        return False
+    
+    def export_patterns_csv(self, output_path: str):
+        """Export the generated patterns to a CSV file."""
+        try:
+            with open(output_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                # Write header
+                writer.writerow(['term_name', 'pattern', 'source_terms', 'complexity', 'examples'])
+                
+                # Write data
+                for p in self.patterns:
+                    writer.writerow([
+                        p.term_name,
+                        p.pattern,
+                        '|'.join(p.source_terms),
+                        p.complexity,
+                        '|'.join(p.examples)
+                    ])
+            
+            logger.info(f"Patterns exported to {output_path}")
+        except Exception as e:
+            logger.error(f"Error exporting patterns to CSV: {e}")
+            raise
 
-    def finalize_pattern(self, state: dict) -> dict:
-        prompt = ChatPromptTemplate.from_template("""Select best regex pattern:
-        Candidates: {candidates}
-        
-        Criteria:
-        1. Highest test coverage
-        2. Pattern simplicity
-        3. Readability
-        4. Performance
-        
-        Return as JSON: {{"pattern": "...", "reason": "..."}}""")
-        
-        chain = prompt | self.chatbot.llm | StrOutputParser()
-        
-        final_patterns = []
-        for term in state["terms"]:
-            selection = json.loads(chain.invoke({"candidates": term["candidates"]}))
-            final_patterns.append(RegexPattern(
-                name=term["name"],
-                pattern=selection["pattern"],
-                status="GREEN",  # Simplified for example
-                reasons=[selection["reason"]],
-                coverage="N/A",
-                examples=self._generate_final_examples(term, selection["pattern"])
-            ))
-        
-        return {"patterns": final_patterns}
 
-    def _generate_final_examples(self, term: dict, pattern: str) -> Dict[str, bool]:
-        prompt = ChatPromptTemplate.from_template("""Generate comprehensive test examples for '{name}':
-        Pattern: {pattern}
+class PatternTester:
+    """Test regex patterns against sample data."""
+    
+    def __init__(self, patterns: List[RegexPattern]):
+        self.patterns = patterns
+        self.compiled_patterns = {}
+        self._compile_patterns()
+    
+    def _compile_patterns(self):
+        """Compile regex patterns for faster matching."""
+        for p in self.patterns:
+            try:
+                self.compiled_patterns[p.term_name] = re.compile(p.pattern)
+            except Exception as e:
+                logger.error(f"Error compiling pattern '{p.pattern}' for '{p.term_name}': {e}")
+    
+    def test_pattern(self, pattern_name: str, test_text: str) -> bool:
+        """Test if a specific pattern matches a given text."""
+        if pattern_name not in self.compiled_patterns:
+            logger.warning(f"Pattern '{pattern_name}' not found")
+            return False
         
-        Generate 10 varied examples (5 valid, 5 invalid) covering:
-        - Different languages
-        - Character cases
-        - Numeric formats
-        - Special characters
-        - Common edge cases
+        return bool(self.compiled_patterns[pattern_name].search(test_text))
+    
+    def classify_text(self, text: str) -> List[str]:
+        """Classify text based on all available patterns."""
+        matches = []
+        for name, pattern in self.compiled_patterns.items():
+            if pattern.search(text):
+                matches.append(name)
         
-        Return as JSON: {{"valid": [], "invalid": []}}""")
+        return matches
+    
+    def batch_test(self, test_data: List[Dict[str, str]]) -> Dict[str, List[str]]:
+        """Run batch testing on multiple test cases."""
+        results = {}
         
-        chain = prompt | self.chatbot.llm | StrOutputParser()
-        examples = json.loads(chain.invoke({"name": term["name"], "pattern": pattern}))
-        return {
-            "valid": examples["valid"],
-            "invalid": examples["invalid"]
-        }
+        for test_case in test_data:
+            text = test_case.get('text', '')
+            expected = test_case.get('expected', [])
+            
+            if not text:
+                continue
+            
+            matches = self.classify_text(text)
+            results[text] = {
+                'matches': matches,
+                'expected': expected,
+                'correct': set(matches) == set(expected)
+            }
+        
+        return results
 
-    def decide_to_continue(self, state: dict) -> str:
-        return "done" if state["terms"][0]["iteration"] >= self.config.max_iterations else "continue"
 
-    def run(self) -> dict:
-        app = self.workflow.compile()
-        return app.invoke({})
+## Main application class
 
-# Example Usage
+class RegexApp:
+    """Main application for generating and testing regex patterns."""
+    
+    def __init__(self, config_file=CONFIG_PATH, creds_file=CREDS_PATH, cert_file=CERT_PATH):
+        self.env = OSEnv(config_file, creds_file, cert_file)
+        self.embedding_client = None
+        self.llm_client = None
+        
+        # Initialize embedding client if needed
+        if str_to_bool(self.env.get("USE_EMBEDDINGS", "False")):
+            self.embedding_client = EmbeddingClient(
+                azure_api_version=self.env.get("API_VERSION", "2023-05-15"),
+                embeddings_model=self.env.get("EMBEDDINGS_MODEL", "text-embedding-3-large")
+            )
+        
+        # Initialize LLM client if needed
+        if str_to_bool(self.env.get("USE_LLM", "False")):
+            self._setup_llm_client()
+    
+    def _setup_llm_client(self):
+        """Set up LLM client for enhanced pattern generation."""
+        try:
+            token_provider = get_bearer_token_provider(
+                self.env.credential,
+                "https://cognitiveservices.azure.com/.default"
+            )
+            
+            model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
+            azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
+            api_version = self.env.get("API_VERSION", "2023-05-15")
+            
+            self.llm_client = AzureOpenAI(
+                azure_ad_token_provider=token_provider,
+                azure_endpoint=azure_endpoint,
+                api_version=api_version
+            )
+        except Exception as e:
+            logger.error(f"Error setting up LLM client: {e}")
+            self.llm_client = None
+    
+    def generate_regex_from_csv(self, csv_file: str, output_file: str = "regex_patterns.csv"):
+        """Generate regex patterns from CSV file."""
+        try:
+            # Parse CSV
+            logger.info(f"Parsing CSV file: {csv_file}")
+            parser = CSVParser(csv_file)
+            data = parser.parse()
+            
+            # Generate patterns
+            logger.info("Generating regex patterns")
+            generator = RegexGenerator(data)
+            patterns = generator.generate_patterns()
+            
+            # Export patterns
+            logger.info(f"Exporting {len(patterns)} patterns to {output_file}")
+            generator.export_patterns_csv(output_file)
+            
+            return patterns
+        except Exception as e:
+            logger.error(f"Error generating regex patterns: {e}")
+            raise
+    
+    def test_patterns(self, patterns: List[RegexPattern], test_data: Union[str, List[Dict[str, str]]]):
+        """Test patterns against test data."""
+        try:
+            tester = PatternTester(patterns)
+            
+            # If test_data is a string, assume it's a file path
+            if isinstance(test_data, str):
+                # Load test data from CSV or other format
+                test_df = pd.read_csv(test_data)
+                test_cases = test_df.to_dict('records')
+            else:
+                test_cases = test_data
+            
+            # Run tests
+            results = tester.batch_test(test_cases)
+            
+            # Print summary
+            correct = sum(1 for r in results.values() if r['correct'])
+            total = len(results)
+            logger.info(f"Test results: {correct}/{total} correct ({correct/total*100:.2f}%)")
+            
+            return results
+        except Exception as e:
+            logger.error(f"Error testing patterns: {e}")
+            raise
+    
+    def enhance_patterns_with_llm(self, patterns: List[RegexPattern]) -> List[RegexPattern]:
+        """Use LLM to enhance regex patterns for better matching."""
+        if not self.llm_client:
+            logger.warning("LLM client not initialized, skipping pattern enhancement")
+            return patterns
+        
+        enhanced_patterns = []
+        
+        for pattern in patterns:
+            try:
+                # Create prompt for LLM
+                prompt = f"""
+                Generate a robust regex pattern to match the following term and its variations:
+                
+                Term: {pattern.term_name}
+                Definition: {', '.join(pattern.source_terms)}
+                Examples: {', '.join(pattern.examples)}
+                
+                The pattern should be:
+                1. Generic enough to match different variations of the term
+                2. Precise enough to avoid false positives
+                3. Case insensitive
+                4. Include word boundaries for full word matching
+                
+                Return ONLY the regex pattern, nothing else.
+                """
+                
+                # Get response from LLM
+                response = self.llm_client.completions.create(
+                    model=self.env.get("MODEL_NAME", "gpt-4o-mini"),
+                    prompt=prompt,
+                    max_tokens=100,
+                    temperature=0.2
+                )
+                
+                # Extract pattern from response
+                enhanced_pattern = response.choices[0].text.strip()
+                
+                # Validate pattern
+                re.compile(enhanced_pattern)  # Will raise error if invalid
+                
+                # Update pattern
+                pattern.pattern = enhanced_pattern
+                enhanced_patterns.append(pattern)
+            except Exception as e:
+                logger.error(f"Error enhancing pattern for {pattern.term_name}: {e}")
+                enhanced_patterns.append(pattern)  # Keep original pattern
+        
+        return enhanced_patterns
+
+
+# Example usage
+def main():
+    """Main function to demonstrate usage."""
+    try:
+        # Initialize app
+        app = RegexApp()
+        
+        # Get input and output files from command line or use defaults
+        input_file = sys.argv[1] if len(sys.argv) > 1 else "input_terms.csv"
+        output_file = sys.argv[2] if len(sys.argv) > 2 else "regex_patterns.csv"
+        
+        # Generate patterns
+        patterns = app.generate_regex_from_csv(input_file, output_file)
+        
+        # Optional: test patterns if test data is provided
+        if len(sys.argv) > 3:
+            test_file = sys.argv[3]
+            app.test_patterns(patterns, test_file)
+        
+        logger.info(f"Generated {len(patterns)} regex patterns.")
+        
+        # Print sample patterns
+        logger.info("Sample patterns:")
+        for p in patterns[:5]:  # Show first 5 patterns
+            logger.info(f"{p.term_name}: {p.pattern}")
+        
+    except Exception as e:
+        logger.error(f"Error in main function: {e}")
+        sys.exit(1)
+
 if __name__ == "__main__":
-    workflow = RegexGenerationWorkflow("technical_terms.csv")
-    results = workflow.run()
-    
-    # Save results
-    with open("regex_patterns.json", "w") as f:
-        json.dump([p.model_dump() for p in results["patterns"]], f, indent=2)
-    
-    # Example currency pattern output
-    currency_pattern = next(p for p in results["patterns"] if p.name == "CurrencyCode")
-    print(f"Currency Code Pattern: {currency_pattern.pattern}")
-    print("Example Matches:")
-    print("\n".join(currency_pattern.examples["valid"][:5]))
+    main()
