@@ -1,0 +1,737 @@
+import os
+import sys
+import uuid
+import json
+import logging
+import chardet
+import pandas as pd
+import networkx as nx
+import numpy as np
+from typing import Optional, Any, Dict, List, Union, Callable, TypeVar, Tuple
+from pathlib import Path
+from dotenv import dotenv_values
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider, ClientSecretCredential
+from openai import AzureOpenAI
+from pydantic import BaseModel
+from langchain.chat_models import AzureChatOpenAI
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationChain, LLMChain
+from langchain.docstore import Document as LC_DOCUMENT
+from langchain.embeddings.base import Embeddings
+from langchain.vectorstores import Chroma
+from langchain.prompts import PromptTemplate
+from chromadb.config import Settings
+from chromadb.utils import embedding_functions
+from collections import namedtuple
+import re
+from pydantic import BaseModel, ValidationError, field_validator
+
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
+ENV_DIR = "env"
+CONFIG_PATH = f"{ENV_DIR}/config.env"
+CREDS_PATH = f"{ENV_DIR}/credentials.env"
+CERT_PATH = f"{ENV_DIR}/cacert.pem"
+
+Triple = namedtuple("Triple", ["subject", "predicate", "object"])
+
+## utility functions
+def is_file_readable(filepath: str)->bool:
+    """Check if a file is readable."""
+    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
+        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
+    return True
+
+def str_to_bool(s: str)->bool:
+    """Convert a string to a boolean."""
+    if s== 'True':
+        return True
+    elif s== 'False':
+        return False
+    else:
+        raise ValueError(f"Invalid boolean value: {s}")
+
+## OSEnv class
+
+class OSEnv:
+    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
+        self.var_list = []
+        self.bulk_set(config_file, True)
+        self.bulk_set(creds_file, False)
+        self.set_certificate_path(certificate_path)
+        if str_to_bool(self.get("PROXY_ENABLED", "False")):
+            self.set_proxy()
+        
+        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
+            self.token = self.get_azure_token()
+        else:
+            self.token = None
+        
+    def _get_credential(self):
+        if str_to_bool(self.get("USE_MANAGED_IDENTITY", "False")):
+            return DefaultAzureCredential()
+        else:
+            return ClientSecretCredential(tenant_id=self.get("AZURE_TENANT_ID"), client_id=self.get("AZURE_CLIENT_ID"), client_secret=self.get("AZURE_CLIENT_SECRET"))
+    
+    def set_certificate_path(self, path: str):
+        try:
+            if not os.path.isabs(path):
+                path = os.path.abspath(path)
+            if not is_file_readable(path):
+                raise FileNotFoundError(f"The file '{path}' does not exist or is not readable")
+            
+            self.set("REQUESTS_CA_BUNDLE", path)
+            self.set("SSL_CERT_FILE", path)
+            self.set("CURL_CA_BUNDLE", path)
+        except Exception as e:
+            logger.error(f"Error setting certificate path: {e}")
+            raise
+    
+    def bulk_set(self, dotenvfile: str, print_val: bool = False)->None:
+        try:
+            if not os.path.isabs(dotenvfile):
+                dotenvfile = os.path.abspath(dotenvfile)
+            if not is_file_readable(dotenvfile):
+                temp_dict = dotenv_values(dotenvfile)
+                for key, value in temp_dict.items():
+                    self.set(key, value, print_val)
+                del temp_dict
+        except Exception as e:
+            logger.error(f"Error loading environment variables from {dotenvfile}: {e}")
+            raise
+    
+    def set(self, key: str, value: str, print_val: bool = False)->None:
+        try:
+            os.environ[key] = value
+            if key not in self.var_list:  # Fixed: var_name -> key
+                self.var_list.append(key)  # Fixed: var_name -> key
+            if print_val:
+                logger.info(f"{key}: {value}")
+        except Exception as e:
+            logger.error(f"Error setting environment variable {key}: {e}")
+            raise
+    
+    def get(self, key: str, default: Optional[str] = None)->str:
+        try:
+            return os.environ.get(key, default)
+        except Exception as e:
+            logger.error(f"Error getting environment variable {key}: {e}")
+            raise
+    
+    def set_proxy(self) -> None:
+        try:
+            ad_username = self.get("AD_USERNAME")
+            ad_password = self.get("AD_USER_PW")
+            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
+            if not all([ad_username, ad_password, proxy_domain]):
+                raise ValueError("Proxy settings are incomplete")
+            proxy_url = f"https://{ad_username}:{ad_password}@{proxy_domain}"
+            self.set("HTTP_PROXY", proxy_url, print_val=False)
+            self.set("HTTPS_PROXY", proxy_url, print_val=False)
+            no_proxy_domains = [
+                'cognitiveservices.azure.com',
+                'search.windows.net',
+                'openai.azure.com',
+                'core.windows.net',
+                'azurewebsites.net'
+            ]
+            self.set("NO_PROXY", ",".join(no_proxy_domains), print_val=False)
+        except Exception as e:
+            logger.error(f"Error setting proxy: {e}")
+            raise
+    
+    def get_azure_token(self) -> str:
+        try:
+            credential = ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID"),
+                client_id=self.get("AZURE_CLIENT_ID"),
+                client_secret=self.get("AZURE_CLIENT_SECRET")
+            )
+            token = credential.get_token("https://cognitiveservices.azure.com/.default")
+            self.set("AZURE_TOKEN", token.token, print_val=False)
+            logger.info("Azure token set")
+            return token.token
+        except Exception as e:
+            logger.error(f"Error retrieving Azure token: {e}")
+            return None
+    
+    def list_env_vars(self)->None:
+        for var in self.var_list:
+            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET'}:
+                logger.info(f"{var}: [REDACTED]")
+            else:
+                logger.info(f"{var}: {os.getenv(var)}")
+
+
+## embedding class + Document class
+
+class MyDocument(BaseModel):
+    id: str = ""
+    text: str = ""
+    embedding: List[float] = []
+    metadata: Dict[str, Any] = {}
+
+class EmbeddingClient:
+    def __init__(self, azure_api_version: str = "2023-05-15", embeddings_model: str = "text-embedding-3-large"):
+        self.azure_api_version = azure_api_version
+        self.embeddings_model = embeddings_model
+        self.direct_azure_client = self._get_direct_azure_client()
+    
+    def _get_direct_azure_client(self):
+        token_provider = get_bearer_token_provider(
+            DefaultAzureCredential(),
+            "https://cognitiveservices.azure.com/.default"
+        )
+        return AzureOpenAI(token_provider, self.azure_api_version)
+    
+    def generate_embeddings(self, doc: MyDocument)->MyDocument:
+        try:
+            response = self.direct_azure_client.embeddings.create(
+                model=self.embeddings_model,
+                input=doc.text
+            ).data[0].embedding
+            doc.embedding = response
+            return doc
+        except Exception as e:
+            logger.error(f"Error generating embeddings: {e}")
+            return doc
+
+## LangChain components
+## AzureChatbot components
+
+class AzureChatbot:
+    def __init__(self, config_file=str, creds_file=str, cert_file=str):
+        self.env = OSEnv(config_file, creds_file, cert_file)
+        self._setup_chat_model()
+        self.memory = ConversationBufferMemory()
+        self.conversation = ConversationChain(llm=self.llm, memory=self.memory, verbose=True)
+    
+    def _setup_chat_model(self):
+        try:
+            token_provider = get_bearer_token_provider(
+                self.env._get_credential(),  # Fixed: self.env.credential -> self.env._get_credential()
+                "https://cognitiveservices.azure.com/.default"
+            )
+            model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
+            temperature = float(self.env.get("TEMPERATURE", "0.7"))
+            max_tokens = int(self.env.get("MAX_TOKENS", "800"))
+            api_version = self.env.get("API_VERSION", "2023-05-15")
+            azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
+            azure_ad_token_provider = token_provider
+            self.llm = AzureChatOpenAI(
+                model_name=model_name,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                api_version=api_version,
+                azure_endpoint=azure_endpoint,
+                azure_ad_token_provider=azure_ad_token_provider
+            )
+        except Exception as e:
+            logger.error(f"Error setting up chatbot: {e}")
+            raise
+
+##############################################
+# NEW CODE BELOW FOR REGEX GENERATOR WORKFLOW
+##############################################
+
+# Import necessary LangGraph components
+from langgraph.graph import StateGraph, END
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.runnables import RunnablePassthrough
+import csv
+import io
+
+# Define schemas for data flow
+class DataItem(BaseModel):
+    name: str
+    definition: str = ""
+    related_term_name: str = ""
+    related_term_definition: str = ""
+    related_term_example: str = ""
+    
+class ResearchResult(BaseModel):
+    name: str
+    possible_values: List[str]
+    value_descriptions: Dict[str, str] = {}
+    examples: List[str] = []
+    notes: str = ""
+
+class RegexGeneration(BaseModel):
+    name: str
+    possible_values: List[str]
+    regex: str
+    explanation: str = ""
+    
+class ValidationResult(BaseModel):
+    name: str
+    regex: str
+    is_valid: bool
+    issues: List[str] = []
+    corrected_regex: Optional[str] = None
+    
+class EvaluationResult(BaseModel):
+    name: str
+    regex: str
+    status: str  # RED, AMBER, GREEN
+    reason: str
+    suggestions: List[str] = []
+
+class WorkflowState(BaseModel):
+    input_data: DataItem
+    research_result: Optional[ResearchResult] = None
+    regex_generation: Optional[RegexGeneration] = None
+    validation_result: Optional[ValidationResult] = None
+    evaluation_result: Optional[EvaluationResult] = None
+    final_output: Optional[str] = None
+
+# Agent implementation templates
+class ResearcherAgent:
+    def __init__(self, llm):
+        self.llm = llm
+        self.prompt_template = PromptTemplate(
+            template="""You are a field researcher expert. Your task is to understand a field name and its metadata, 
+            then generate all possible values that could be represented by this field.
+            
+            For example:
+            - If the field is "age", possible values might include integers, ranges, years, months, etc.
+            - If the field is "currency", possible values might include currency codes (USD, EUR), symbols ($, €), etc.
+            
+            Field information:
+            - Name: {name}
+            - Definition: {definition}
+            - Related term name: {related_term_name}
+            - Related term definition: {related_term_definition}
+            - Related term example: {related_term_example}
+            
+            Generate a comprehensive list of all possible values and formats for this field.
+            Be exhaustive in your analysis but focus on actual data values, not descriptive terms.
+            
+            Your response format should be:
+            POSSIBLE VALUES:
+            - [list value types one per line]
+            
+            EXAMPLES:
+            - [list concrete examples one per line]
+            
+            NOTES:
+            [Any special considerations or edge cases]
+            """,
+            input_variables=["name", "definition", "related_term_name", "related_term_definition", "related_term_example"]
+        )
+        
+    def process(self, state: WorkflowState) -> WorkflowState:
+        try:
+            data = state.input_data
+            prompt = self.prompt_template.format(
+                name=data.name,
+                definition=data.definition,
+                related_term_name=data.related_term_name,
+                related_term_definition=data.related_term_definition,
+                related_term_example=data.related_term_example
+            )
+            
+            response = self.llm(prompt)
+            response_text = response if isinstance(response, str) else response.content
+            
+            # Parse the response
+            possible_values = []
+            examples = []
+            notes = ""
+            
+            current_section = None
+            for line in response_text.split('\n'):
+                line = line.strip()
+                if line.startswith('POSSIBLE VALUES:'):
+                    current_section = 'values'
+                elif line.startswith('EXAMPLES:'):
+                    current_section = 'examples'
+                elif line.startswith('NOTES:'):
+                    current_section = 'notes'
+                elif line and line.startswith('-') and current_section == 'values':
+                    possible_values.append(line[1:].strip())
+                elif line and line.startswith('-') and current_section == 'examples':
+                    examples.append(line[1:].strip())
+                elif line and current_section == 'notes':
+                    notes += line + ' '
+            
+            # Create research result
+            state.research_result = ResearchResult(
+                name=data.name,
+                possible_values=possible_values,
+                examples=examples,
+                notes=notes.strip()
+            )
+            
+            return state
+        
+        except Exception as e:
+            logger.error(f"Error in ResearcherAgent: {e}")
+            raise
+
+class RegexGeneratorAgent:
+    def __init__(self, llm):
+        self.llm = llm
+        self.prompt_template = PromptTemplate(
+            template="""You are a regex engineering expert. Your task is to create a technically sound, reusable regex pattern
+            that matches all possible values for a given field without being descriptive.
+            
+            Field name: {name}
+            
+            Possible values:
+            {possible_values}
+            
+            Examples:
+            {examples}
+            
+            Additional notes:
+            {notes}
+            
+            Create a single regex pattern that can match all these possible values. Follow these guidelines:
+            1. The regex should NOT contain the field name itself (e.g., for "age", don't include "age" in the regex)
+            2. Focus on matching data patterns, not descriptive words
+            3. Balance specificity and flexibility
+            4. Use exact match as a fallback method
+            5. Add capture groups where appropriate
+            6. Account for edge cases
+            7. Make the regex as readable and maintainable as possible
+            
+            Your response format should be:
+            REGEX: [your regex pattern]
+            
+            EXPLANATION:
+            [Detailed explanation of how the regex works and covers all possible values]
+            """,
+            input_variables=["name", "possible_values", "examples", "notes"]
+        )
+        
+    def process(self, state: WorkflowState) -> WorkflowState:
+        try:
+            research = state.research_result
+            
+            possible_values_str = "\n".join([f"- {val}" for val in research.possible_values])
+            examples_str = "\n".join([f"- {ex}" for ex in research.examples])
+            
+            prompt = self.prompt_template.format(
+                name=research.name,
+                possible_values=possible_values_str,
+                examples=examples_str,
+                notes=research.notes
+            )
+            
+            response = self.llm(prompt)
+            response_text = response if isinstance(response, str) else response.content
+            
+            # Parse the response
+            regex_pattern = ""
+            explanation = ""
+            
+            in_explanation = False
+            for line in response_text.split('\n'):
+                line = line.strip()
+                if line.startswith('REGEX:'):
+                    regex_pattern = line[6:].strip()
+                elif line.startswith('EXPLANATION:'):
+                    in_explanation = True
+                elif in_explanation:
+                    explanation += line + ' '
+            
+            # Create regex generation result
+            state.regex_generation = RegexGeneration(
+                name=research.name,
+                possible_values=research.possible_values,
+                regex=regex_pattern,
+                explanation=explanation.strip()
+            )
+            
+            return state
+        
+        except Exception as e:
+            logger.error(f"Error in RegexGeneratorAgent: {e}")
+            raise
+
+class ValidatorAgent:
+    def __init__(self, llm):
+        self.llm = llm
+        self.prompt_template = PromptTemplate(
+            template="""You are a regex validation expert. Your task is to verify that a given regex pattern is syntactically correct
+            and will work as expected.
+            
+            Field name: {name}
+            Regex pattern: {regex}
+            
+            Please analyze this regex for:
+            1. Syntactical correctness
+            2. Potential errors or issues
+            3. Edge cases that might not be handled properly
+            4. Efficiency and performance considerations
+            
+            Your response format should be:
+            VALID: [Yes/No]
+            
+            ISSUES:
+            - [List any issues found, one per line. If none, state "None found"]
+            
+            CORRECTED REGEX: [If there are issues, provide a corrected version. Otherwise, write "N/A"]
+            """,
+            input_variables=["name", "regex"]
+        )
+        
+    def process(self, state: WorkflowState) -> WorkflowState:
+        try:
+            regex_gen = state.regex_generation
+            
+            prompt = self.prompt_template.format(
+                name=regex_gen.name,
+                regex=regex_gen.regex
+            )
+            
+            response = self.llm(prompt)
+            response_text = response if isinstance(response, str) else response.content
+            
+            # Parse the response
+            is_valid = False
+            issues = []
+            corrected_regex = None
+            
+            for line in response_text.split('\n'):
+                line = line.strip()
+                if line.startswith('VALID:'):
+                    is_valid = line[6:].strip().lower() == 'yes'
+                elif line.startswith('ISSUES:'):
+                    continue
+                elif line.startswith('-') and 'none found' not in line.lower():
+                    issues.append(line[1:].strip())
+                elif line.startswith('CORRECTED REGEX:'):
+                    corrected = line[16:].strip()
+                    if corrected != "N/A":
+                        corrected_regex = corrected
+            
+            # Create validation result
+            state.validation_result = ValidationResult(
+                name=regex_gen.name,
+                regex=corrected_regex if corrected_regex else regex_gen.regex,
+                is_valid=is_valid,
+                issues=issues,
+                corrected_regex=corrected_regex
+            )
+            
+            return state
+        
+        except Exception as e:
+            logger.error(f"Error in ValidatorAgent: {e}")
+            raise
+
+class EvaluatorAgent:
+    def __init__(self, llm):
+        self.llm = llm
+        self.prompt_template = PromptTemplate(
+            template="""You are a data quality evaluator. Your task is to assess the overall quality and effectiveness of a regex
+            pattern for a given field.
+            
+            Field name: {name}
+            Field definition: {definition}
+            Possible values: {possible_values}
+            Regex pattern: {regex}
+            Validation issues: {issues}
+            
+            Assign a status of RED, AMBER, or GREEN based on these criteria:
+            - GREEN: The regex is valid, covers all possible values, and has no significant issues.
+            - AMBER: The regex has minor issues or edge cases that might not be fully covered, but it's generally functional.
+            - RED: The regex has major issues, doesn't cover important cases, or is syntactically incorrect.
+            
+            Your response format should be:
+            STATUS: [RED/AMBER/GREEN]
+            
+            REASON:
+            [Explain why you assigned this status]
+            
+            SUGGESTIONS:
+            - [List any suggestions for improvement, one per line. If none, state "None"]
+            """,
+            input_variables=["name", "definition", "possible_values", "regex", "issues"]
+        )
+        
+    def process(self, state: WorkflowState) -> WorkflowState:
+        try:
+            data = state.input_data
+            research = state.research_result
+            validation = state.validation_result
+            
+            possible_values_str = "\n".join([f"- {val}" for val in research.possible_values])
+            issues_str = "\n".join([f"- {issue}" for issue in validation.issues]) if validation.issues else "None"
+            
+            prompt = self.prompt_template.format(
+                name=data.name,
+                definition=data.definition,
+                possible_values=possible_values_str,
+                regex=validation.regex,
+                issues=issues_str
+            )
+            
+            response = self.llm(prompt)
+            response_text = response if isinstance(response, str) else response.content
+            
+            # Parse the response
+            status = ""
+            reason = ""
+            suggestions = []
+            
+            current_section = None
+            for line in response_text.split('\n'):
+                line = line.strip()
+                if line.startswith('STATUS:'):
+                    status = line[7:].strip()
+                elif line.startswith('REASON:'):
+                    current_section = 'reason'
+                elif line.startswith('SUGGESTIONS:'):
+                    current_section = 'suggestions'
+                elif line and line.startswith('-') and current_section == 'suggestions' and 'none' not in line.lower():
+                    suggestions.append(line[1:].strip())
+                elif line and current_section == 'reason':
+                    reason += line + ' '
+            
+            # Create evaluation result
+            state.evaluation_result = EvaluationResult(
+                name=data.name,
+                regex=validation.regex,
+                status=status,
+                reason=reason.strip(),
+                suggestions=suggestions
+            )
+            
+            # Format final output as CSV or text
+            output = format_output_as_csv(state)
+            state.final_output = output
+            
+            return state
+        
+        except Exception as e:
+            logger.error(f"Error in EvaluatorAgent: {e}")
+            raise
+
+# CSV processing utilities
+def read_csv_file(file_path):
+    """Read a CSV file and return a list of DataItem objects."""
+    try:
+        df = pd.read_csv(file_path)
+        items = []
+        
+        for index, row in df.iterrows():
+            item = DataItem(
+                name=str(row.get('name', '')),
+                definition=str(row.get('definition', '')),
+                related_term_name=str(row.get('related term name', '')),
+                related_term_definition=str(row.get('related term definition', '')),
+                related_term_example=str(row.get('related term example', ''))
+            )
+            items.append(item)
+        
+        return items
+    except Exception as e:
+        logger.error(f"Error reading CSV file: {e}")
+        raise
+
+def format_output_as_csv(state: WorkflowState) -> str:
+    """Format the workflow results as a CSV string."""
+    output = io.StringIO()
+    writer = csv.writer(output)
+    
+    # Write header
+    writer.writerow(['Name', 'Definition', 'Possible Values', 'Regex Pattern', 'Status', 'Reason'])
+    
+    # Write data
+    data = state.input_data
+    research = state.research_result
+    validation = state.validation_result
+    evaluation = state.evaluation_result
+    
+    possible_values = ', '.join(research.possible_values) if research else ''
+    
+    writer.writerow([
+        data.name,
+        data.definition,
+        possible_values,
+        validation.regex if validation else '',
+        evaluation.status if evaluation else '',
+        evaluation.reason if evaluation else ''
+    ])
+    
+    return output.getvalue()
+
+# Main workflow class
+class RegexGeneratorWorkflow:
+    def __init__(self, config_file=CONFIG_PATH, creds_file=CREDS_PATH, cert_file=CERT_PATH):
+        self.chatbot = AzureChatbot(config_file, creds_file, cert_file)
+        self.llm = self.chatbot.llm
+        
+        # Initialize agents
+        self.researcher = ResearcherAgent(self.llm)
+        self.generator = RegexGeneratorAgent(self.llm)
+        self.validator = ValidatorAgent(self.llm)
+        self.evaluator = EvaluatorAgent(self.llm)
+        
+        # Build the workflow
+        self.build_workflow()
+    
+    def build_workflow(self):
+        workflow = StateGraph(WorkflowState)
+        
+        # Define the nodes
+        workflow.add_node("researcher", self.researcher.process)
+        workflow.add_node("generator", self.generator.process)
+        workflow.add_node("validator", self.validator.process)
+        workflow.add_node("evaluator", self.evaluator.process)
+        
+        # Define the edges
+        workflow.add_edge("researcher", "generator")
+        workflow.add_edge("generator", "validator")
+        workflow.add_edge("validator", "evaluator")
+        workflow.add_edge("evaluator", END)
+        
+        # Set the entry point
+        workflow.set_entry_point("researcher")
+        
+        self.graph = workflow.compile()
+    
+    def process_item(self, item: DataItem) -> str:
+        """Process a single data item through the workflow."""
+        initial_state = WorkflowState(input_data=item)
+        final_state = self.graph.invoke(initial_state)
+        return final_state.final_output
+    
+    def process_csv(self, csv_file_path: str, output_file_path: str):
+        """Process all items in a CSV file and write results to an output file."""
+        items = read_csv_file(csv_file_path)
+        
+        all_outputs = []
+        for item in items:
+            logger.info(f"Processing item: {item.name}")
+            output = self.process_item(item)
+            all_outputs.append(output)
+        
+        # Combine all outputs, keeping only one header
+        combined_output = all_outputs[0]
+        for output in all_outputs[1:]:
+            lines = output.strip().split('\n')
+            if len(lines) > 1:  # Skip header
+                combined_output += '\n' + '\n'.join(lines[1:])
+        
+        # Write to output file
+        with open(output_file_path, 'w', newline='') as f:
+            f.write(combined_output)
+        
+        logger.info(f"Processing complete. Results written to {output_file_path}")
+        return combined_output
+
+# Example usage
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        print("Usage: python regex_generator.py input.csv output.csv")
+        sys.exit(1)
+    
+    input_file = sys.argv[1]
+    output_file = sys.argv[2]
+    
+    workflow = RegexGeneratorWorkflow()
+    workflow.process_csv(input_file, output_file)
