@@ -1,31 +1,302 @@
-# Add these imports at the top
+import os
+import sys
+import uuid
+import json
+import logging
+import chardet
+import pandas as pd
+import networkx as nx
+import numpy as np
+from typing import Optional, Any, Dict, List, Union
+from pathlib import Path
+from dotenv import dotenv_values
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider, ClientSecretCredential
+from openai import AzureOpenAI
+from pydantic import BaseModel
+from langchain.chat_models import AzureChatOpenAI
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationChain, LLMChain
+from langchain.docstore import Document as LC_DOCUMENT
+from langchain.embeddings.base import Embeddings
+from langchain.vectorstores import Chroma
+from langchain.prompts import PromptTemplate
+from chromadb.config import Settings
+from chromadb.utils import embedding_functions
+from collections import namedtuple
+import re
+from pydantic import BaseModel, ValidationError, field_validator
+# Add missing imports
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
+ENV_DIR = "env"
+CONFIG_PATH = f"{ENV_DIR}/config.env"
+CREDS_PATH = f"{ENV_DIR}/credentials.env"
+CERT_PATH = f"{ENV_DIR}/cacert.pem"
+
+Triple = namedtuple("Triple", ["subject", "predicate", "object"])
+
+## utility functions
+def is_file_readable(filepath: str)->bool:
+    """Check if a file is readable."""
+    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
+        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
+    return True
+
+def str_to_bool(s: str)->bool:
+    """Convert a string to a boolean."""
+    if s== 'True':
+        return True
+    elif s== 'False':
+        return False
+    else:
+        raise ValueError(f"Invalid boolean value: {s}")
+
+## OSEnv class
+class OSEnv:
+    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
+        self.var_list = []
+        self.bulk_set(config_file, True)
+        self.bulk_set(creds_file, False)
+        self.set_certificate_path(certificate_path)
+        if str_to_bool(self.get("PROXY_ENABLED", "False")):
+            self.set_proxy()
+        
+        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
+            self.token = self.get_azure_token()
+        else:
+            self.token = None
+        
+    def _get_credential(self):
+        if str_to_bool(self.get("USE_MANAGED_IDENTITY", "False")):
+            return DefaultAzureCredential()
+        else:
+            return ClientSecretCredential(tenant_id=self.get("AZURE_TENANT_ID"), client_id=self.get("AZURE_CLIENT_ID"), client_secret=self.get("AZURE_CLIENT_SECRET"))
+    
+    def set_certificate_path(self, path: str):
+        try:
+            if not os.path.isabs(path):
+                path = os.path.abspath(path)
+            if not is_file_readable(path):
+                raise FileNotFoundError(f"The file '{path}' does not exist or is not readable")
+            
+            self.set("REQUESTS_CA_BUNDLE", path)
+            self.set("SSL_CERT_FILE", path)
+            self.set("CURL_CA_BUNDLE", path)
+        except Exception as e:
+            logger.error(f"Error setting certificate path: {e}")
+            raise
+    
+    def bulk_set(self, dotenvfile: str, print_val: bool = False)->None:
+        try:
+            if not os.path.isabs(dotenvfile):
+                dotenvfile = os.path.abspath(dotenvfile)
+            if not is_file_readable(dotenvfile):
+                temp_dict = dotenv_values(dotenvfile)
+                for key, value in temp_dict.items():
+                    self.set(key, value, print_val)
+                del temp_dict
+        except Exception as e:
+            logger.error(f"Error loading environment variables from {dotenvfile}: {e}")
+            raise
+    
+    def set(self, key: str, value: str, print_val: bool = False)->None:
+        try:
+            os.environ[key] = value
+            # Fix var_name issue - changed to key
+            if key not in self.var_list:
+                self.var_list.append(key)
+            if print_val:
+                logger.info(f"{key}: {value}")
+        except Exception as e:
+            logger.error(f"Error setting environment variable {key}: {e}")
+            raise
+    
+    def get(self, key: str, default: Optional[str] = None)->str:
+        try:
+            return os.environ.get(key, default)
+        except Exception as e:
+            logger.error(f"Error getting environment variable {key}: {e}")
+            raise
+    
+    def set_proxy(self) -> None:
+        try:
+            ad_username = self.get("AD_USERNAME")
+            ad_password = self.get("AD_USER_PW")
+            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
+            if not all([ad_username, ad_password, proxy_domain]):
+                raise ValueError("Proxy settings are incomplete")
+            proxy_url = f"https://{ad_username}:{ad_password}@{proxy_domain}"
+            self.set("HTTP_PROXY", proxy_url, print_val=False)
+            self.set("HTTPS_PROXY", proxy_url, print_val=False)
+            no_proxy_domains = [
+                'cognitiveservices.azure.com',
+                'search.windows.net',
+                'openai.azure.com',
+                'core.windows.net',
+                'azurewebsites.net'
+            ]
+            self.set("NO_PROXY", ",".join(no_proxy_domains), print_val=False)
+        except Exception as e:
+            logger.error(f"Error setting proxy: {e}")
+            raise
+    
+    def get_azure_token(self) -> str:
+        try:
+            credential = ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID"),
+                client_id=self.get("AZURE_CLIENT_ID"),
+                client_secret=self.get("AZURE_CLIENT_SECRET")
+            )
+            token = credential.get_token("https://cognitiveservices.azure.com/.default")
+            self.set("AZURE_TOKEN", token.token, print_val=False)
+            logger.info("Azure token set")
+            return token.token
+        except Exception as e:
+            logger.error(f"Error retrieving Azure token: {e}")
+            return None
+    
+    def list_env_vars(self)->None:
+        for var in self.var_list:
+            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET'}:
+                logger.info(f"{var}: [REDACTED]")
+            else:
+                logger.info(f"{var}: {os.getenv(var)}")
+
+
+## embedding class + Document class
+class MyDocument(BaseModel):
+    id: str = ""
+    text: str = ""
+    embedding: List[float] = []
+    metadata: Dict[str, Any] = {}
+
+class EmbeddingClient:
+    def __init__(self, azure_api_version: str = "2023-05-15", embeddings_model: str = "text-embedding-3-large"):
+        self.azure_api_version = azure_api_version
+        self.embeddings_model = embeddings_model
+        self.direct_azure_client = self._get_direct_azure_client()
+    
+    def _get_direct_azure_client(self):
+        token_provider = get_bearer_token_provider(
+            DefaultAzureCredential(),
+            "https://cognitiveservices.azure.com/.default"
+        )
+        return AzureOpenAI(token_provider=token_provider, api_version=self.azure_api_version)
+    
+    def generate_embeddings(self, doc: MyDocument)->MyDocument:
+        try:
+            response = self.direct_azure_client.embeddings.create(
+                model=self.embeddings_model,
+                input=doc.text
+            ).data[0].embedding
+            doc.embedding = response
+            return doc
+        except Exception as e:
+            logger.error(f"Error generating embeddings: {e}")
+            return doc
+
+## AzureChatbot components
+class AzureChatbot:
+    def __init__(self, config_file=CONFIG_PATH, creds_file=CREDS_PATH, cert_file=CERT_PATH):
+        self.env = OSEnv(config_file, creds_file, cert_file)
+        self._setup_chat_model()
+        self.memory = ConversationBufferMemory()
+        self.conversation = ConversationChain(llm=self.llm, memory=self.memory, verbose=True)
+    
+    def _setup_chat_model(self):
+        try:
+            # Create credential first
+            credential = self._get_credential()
+            token_provider = get_bearer_token_provider(
+                credential,
+                "https://cognitiveservices.azure.com/.default"
+            )
+            model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
+            temperature = float(self.env.get("TEMPERATURE", "0.7"))
+            max_tokens = int(self.env.get("MAX_TOKENS", "800"))
+            api_version = self.env.get("API_VERSION", "2023-05-15")
+            azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
+            azure_ad_token_provider = token_provider
+            self.llm = AzureChatOpenAI(
+                model_name=model_name,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                api_version=api_version,
+                azure_endpoint=azure_endpoint,
+                azure_ad_token_provider=azure_ad_token_provider
+            )
+        except Exception as e:
+            logger.error(f"Error setting up chatbot: {e}")
+            raise
+    
+    def _get_credential(self):
+        if str_to_bool(self.env.get("USE_MANAGED_IDENTITY", "False")):
+            return DefaultAzureCredential()
+        else:
+            return ClientSecretCredential(
+                tenant_id=self.env.get("AZURE_TENANT_ID"),
+                client_id=self.env.get("AZURE_CLIENT_ID"),
+                client_secret=self.env.get("AZURE_CLIENT_SECRET")
+            )
+        
+# First install additional required packages: pypdf, rdflib
+from typing import Tuple, TypedDict
+from langgraph.graph import END, StateGraph
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from rdflib import Graph, Namespace, URIRef, Literal, RDF, RDFS, XSD
+from pypdf import PdfReader
 import tiktoken
 
-# Add Tiktoken configuration class before OSEnv
+# Add these classes to existing code
+class RDFTriple(BaseModel):
+    subject: str
+    predicate: str
+    object: str
+    source_docs: List[str]
+
+class DocumentProcessingState(TypedDict):
+    documents: List[MyDocument]
+    topics: List[str]
+    triples: List[RDFTriple]
+    
+# Fix TiktokenProxyConfig - removed set_http_client
 class TiktokenProxyConfig:
     _configured = False
     
     @classmethod
     def configure(cls):
         if not cls._configured:
-            session = requests.Session()
-            retries = Retry(total=3, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
-            session.mount('https://', HTTPAdapter(max_retries=retries))
+            # Tiktoken doesn't have HTTP client configuration
+            # Instead, just verify we can create an encoding
+            try:
+                tiktoken.get_encoding("cl100k_base")
+                cls._configured = True
+                logger.info("Tiktoken configured successfully")
+            except Exception as e:
+                logger.error(f"Error configuring tiktoken: {e}")
+                # Continue without raising - will use fallback length calculation
             
+            # Configure proxy for other HTTP requests if needed
             if os.environ.get("HTTPS_PROXY"):
+                session = requests.Session()
+                retries = Retry(total=3, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
+                session.mount('https://', HTTPAdapter(max_retries=retries))
+                
                 session.proxies = {
                     "http": os.environ.get("HTTPS_PROXY"),
                     "https": os.environ.get("HTTPS_PROXY")
                 }
-            
-            session.verify = os.environ.get("REQUESTS_CA_BUNDLE", True)
-            tiktoken.set_http_client(session)
-            cls._configured = True
+                
+                session.verify = os.environ.get("REQUESTS_CA_BUNDLE", True)
+                
+                # Monkey patch the requests session if needed for other libraries
+                requests.Session = lambda: session
 
-# Update the EmbeddingClient with a wrapper
 class EmbeddingWrapper(Embeddings):
     def __init__(self, embedding_client: EmbeddingClient):
         self.client = embedding_client
@@ -38,7 +309,7 @@ class EmbeddingWrapper(Embeddings):
         embedded_doc = self.client.generate_embeddings(doc)
         return embedded_doc.embedding
 
-# Modified PDFReaderAgent
+
 class PDFReaderAgent:
     def __init__(self, vector_db: Chroma, embedding_client: EmbeddingClient):
         self.vector_db = vector_db
@@ -49,13 +320,14 @@ class PDFReaderAgent:
             length_function=self.tiktoken_len
         )
         TiktokenProxyConfig.configure()
-    
+        
     def tiktoken_len(self, text: str) -> int:
         try:
             enc = tiktoken.get_encoding("cl100k_base")
             return len(enc.encode(text))
         except Exception as e:
             logger.error(f"Tiktoken error: {e}")
+            # Fallback to word count method
             return len(text.split())
 
     def process_pdf(self, file_path: str) -> List[MyDocument]:
@@ -77,25 +349,57 @@ class PDFReaderAgent:
                         )
                         doc = self.embedding_client.generate_embeddings(doc)
                         docs.append(doc)
-            self.vector_db.add(
-                ids=[d.id for d in docs],
-                documents=[d.text for d in docs],
-                metadatas=[d.metadata for d in docs],
-                embeddings=[d.embedding for d in docs]
+            self.vector_db.add_documents(
+                [LC_DOCUMENT(page_content=d.text, metadata=d.metadata) for d in docs]
             )
             return docs
         except Exception as e:
             logger.error(f"Error processing PDF {file_path}: {e}")
             return []
 
-# Updated TopicExtractionAgent
 class TopicExtractionAgent:
+    def __init__(self, chatbot: AzureChatbot, vector_db: Chroma):
+        self.llm = chatbot.llm
+        self.vector_db = vector_db
+        self.topic_prompt = PromptTemplate.from_template(
+            "Extract key ontology-relevant topics from this text. Consider entities, "
+            "concepts, relationships, and domain-specific terms:\n\n{text}\n\n"
+            "Return as comma-separated values:"
+        )
+
+    def extract_topics(self, state: DocumentProcessingState) -> List[str]:
+        try:
+            unique_topics = set()
+            for doc in state["documents"]:
+                chain = LLMChain(llm=self.llm, prompt=self.topic_prompt)
+                result = chain.run(text=doc.text)
+                topics = [t.strip() for t in result.split(",") if t.strip()]
+                unique_topics.update(topics)
+            
+            # Cross-validate topics across documents
+            validated_topics = self._validate_topics(list(unique_topics))
+            return validated_topics
+        except Exception as e:
+            logger.error(f"Error extracting topics: {e}")
+            return []
+
     def _validate_topics(self, topics: List[str]) -> List[str]:
         results = self.vector_db.similarity_search(
             query=", ".join(topics),
             k=5
         )
-        context = "\n".join([d.text for d in results])  # Changed from page_content to text
+        # Fixed to handle different document formats
+        context_texts = []
+        for doc in results:
+            if hasattr(doc, 'page_content'):
+                context_texts.append(doc.page_content)
+            elif hasattr(doc, 'text'):
+                context_texts.append(doc.text)
+            else:
+                # Fallback to string representation
+                context_texts.append(str(doc))
+        
+        context = "\n".join(context_texts)
         
         validation_prompt = f"""Validate and consolidate topics based on context:
         Context: {context}
@@ -107,47 +411,156 @@ class TopicExtractionAgent:
         chain = LLMChain(llm=self.llm, prompt=PromptTemplate.from_template(validation_prompt))
         return [t.strip() for t in chain.run().split(",")]
 
-# Updated workflow setup
+class OntologyCreationAgent:
+    def __init__(self, base_uri: str = "http://example.org/ontology/"):
+        self.base_uri = Namespace(base_uri)
+        self.graph = Graph()
+        self.graph.bind("ex", self.base_uri)
+        self.graph.bind("rdfs", RDFS)
+        
+    def create_ontology(self, topics: List[str], state: DocumentProcessingState) -> Graph:
+        try:
+            # Create classes from topics
+            for topic in topics:
+                class_uri = self.base_uri[topic.replace(" ", "")]
+                self.graph.add((class_uri, RDF.type, RDFS.Class))
+                self.graph.add((class_uri, RDFS.label, Literal(topic, datatype=XSD.string)))
+            
+            # Create triples from extracted relationships
+            for triple in state["triples"]:
+                subj_uri = self.base_uri[triple.subject.replace(" ", "")]
+                obj_uri = self.base_uri[triple.object.replace(" ", "")]
+                pred_uri = self.base_uri[triple.predicate.replace(" ", "")]
+                
+                # Add triple
+                self.graph.add((subj_uri, pred_uri, obj_uri))
+                
+                # Add source document provenance
+                for source in triple.source_docs:
+                    source_literal = Literal(source, datatype=XSD.anyURI)
+                    self.graph.add((subj_uri, self.base_uri["hasSource"], source_literal))
+            
+            return self.graph
+        except Exception as e:
+            logger.error(f"Error creating ontology: {e}")
+            return self.graph
+
+class TripleExtractionAgent:
+    def __init__(self, chatbot: AzureChatbot):
+        self.llm = chatbot.llm
+        self.triple_prompt = PromptTemplate.from_template(
+            """Extract relationships from text as subject-predicate-object triples.
+            Text: {text}
+            
+            Return JSON format: {{"triples": [{{"subject": "...", "predicate": "...", "object": "..."}}]}}"""
+        )
+    
+    def extract_triples(self, state: DocumentProcessingState) -> List[RDFTriple]:
+        triples = []
+        try:
+            for doc in state["documents"]:
+                chain = LLMChain(llm=self.llm, prompt=self.triple_prompt)
+                result = chain.run(text=doc.text)
+                json_data = json.loads(result)
+                for triple in json_data.get("triples", []):
+                    triples.append(RDFTriple(
+                        subject=triple["subject"],
+                        predicate=triple["predicate"],
+                        object=triple["object"],
+                        source_docs=[doc.metadata["source"]]
+                    ))
+            return self._merge_duplicate_triples(triples)
+        except Exception as e:
+            logger.error(f"Error extracting triples: {e}")
+            return []
+
+    def _merge_duplicate_triples(self, triples: List[RDFTriple]) -> List[RDFTriple]:
+        merged = {}
+        for t in triples:
+            key = (t.subject, t.predicate, t.object)
+            if key in merged:
+                merged[key].source_docs.extend(t.source_docs)
+                merged[key].source_docs = list(set(merged[key].source_docs))
+            else:
+                merged[key] = t
+        return list(merged.values())
+
+# Initialize components and create workflow
 def setup_workflow(pdf_directory: str) -> StateGraph:
+    # Initialize core components
     env = OSEnv(CONFIG_PATH, CREDS_PATH, CERT_PATH)
     embedding_client = EmbeddingClient()
+    chatbot = AzureChatbot(CONFIG_PATH, CREDS_PATH, CERT_PATH)
     
+    # Initialize ChromaDB
+    embedding_func = EmbeddingWrapper(embedding_client)
     chroma_client = Chroma(
-        embedding_function=EmbeddingWrapper(embedding_client),  # Use wrapper
+        embedding_function=embedding_func,
         persist_directory="./chroma_db",
         client_settings=Settings(anonymized_telemetry=False)
     )
     
-    # Rest of the setup remains the same but update the process_pdfs node:
+    # Create agents
+    pdf_agent = PDFReaderAgent(chroma_client, embedding_client)
+    topic_agent = TopicExtractionAgent(chatbot, chroma_client)
+    triple_agent = TripleExtractionAgent(chatbot)
+    ontology_agent = OntologyCreationAgent()
+    
+    # Define workflow
+    workflow = StateGraph(DocumentProcessingState)
+    
+    # Add nodes with proper error handling
     workflow.add_node("process_pdfs", 
         lambda state: {"documents": [
             doc for f in Path(pdf_directory).glob("*.pdf") 
             for doc in pdf_agent.process_pdf(str(f))
-        ]}
+        ] if Path(pdf_directory).exists() else []}
     )
+    workflow.add_node("extract_topics", lambda state: {"topics": topic_agent.extract_topics(state)})
+    workflow.add_node("extract_triples", lambda state: {"triples": triple_agent.extract_triples(state)})
+    workflow.add_node("generate_ontology", lambda state: {"ontology": ontology_agent.create_ontology(state["topics"], state)})
+    
+    # Define edges
+    workflow.set_entry_point("process_pdfs")
+    workflow.add_edge("process_pdfs", "extract_topics")
+    workflow.add_edge("extract_topics", "extract_triples")
+    workflow.add_edge("extract_triples", "generate_ontology")
+    workflow.add_edge("generate_ontology", END)
+    
+    return workflow
 
-# Updated main execution
+# Main execution
 if __name__ == "__main__":
-    # Initialize environment first
-    env = OSEnv(CONFIG_PATH, CREDS_PATH, CERT_PATH)
-    TiktokenProxyConfig.configure()
-    
-    pdf_dir = "./pdf_documents"
-    workflow = setup_workflow(pdf_dir)
-    app = workflow.compile()
-    
-    # Initialize all state keys
-    final_state = app.invoke({
-        "documents": [],
-        "topics": [],
-        "triples": [],
-        "ontology": None
-    })
-    
-    # Safe access with get()
-    ontology_graph = final_state.get("ontology", Graph())
-    if isinstance(ontology_graph, Graph) and len(ontology_graph) > 0:
-        ontology_graph.serialize(destination="ontology.owl", format="xml")
-        logger.info("Ontology generated and saved to ontology.owl")
-    else:
-        logger.error("Failed to generate ontology")
+    try:
+        # Initialize environment first
+        env = OSEnv(CONFIG_PATH, CREDS_PATH, CERT_PATH)
+        # No explicit TiktokenProxyConfig.configure() needed here
+        
+        pdf_dir = "./pdf_documents"
+        # Check if directory exists, create if not
+        if not os.path.exists(pdf_dir):
+            os.makedirs(pdf_dir)
+            logger.info(f"Created directory {pdf_dir}")
+        
+        workflow = setup_workflow(pdf_dir)
+        app = workflow.compile()
+        
+        # Initialize all state keys
+        final_state = app.invoke({
+            "documents": [],
+            "topics": [],
+            "triples": [],
+            "ontology": None
+        })
+        
+        # Safe access with get()
+        ontology_graph = final_state.get("ontology", Graph())
+        if isinstance(ontology_graph, Graph) and len(ontology_graph) > 0:
+            ontology_graph.serialize(destination="ontology.owl", format="xml")
+            logger.info("Ontology generated and saved to ontology.owl")
+        else:
+            logger.error("Failed to generate ontology")
+    except Exception as e:
+        logger.error(f"Error in main execution: {e}")
+        import traceback
+        traceback.print_exc()
