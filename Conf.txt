@@ -1,1213 +1,153 @@
-import os
-import re
-import json
-import logging
-import pandas as pd
-from typing import Dict, List, Optional, Any, Tuple, Union
-from langgraph.graph import StateGraph, END
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from pydantic import BaseModel, ValidationError, Field, field_validator
-import traceback
-from tqdm import tqdm
+# Add these imports at the top
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import tiktoken
 
-# Import base code classes
-# Note: These classes are in the first document and should not be changed
-from dotenv import dotenv_values
-
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# Environment paths (from the base code)
-ENV_DIR = "env"
-CONFIG_PATH = f"{ENV_DIR}/config.env"
-CREDS_PATH = f"{ENV_DIR}/credentials.env"
-CERT_PATH = f"{ENV_DIR}/cacert.pem"
-
-class RegexGeneratorConfig(BaseModel):
-    """Configuration for the regex generator"""
-    max_iterations: int = 3
-    min_coverage: float = 0.85
-    complexity_level: str = "extreme"  # Options: "basic", "standard", "high", "extreme"
-    allowed_charset: str = r"\w\s\-$%().,;:@#&*+!?'[]{}^|<>=/\"\\~`"
-    use_lookarounds: bool = True
-    use_backreferences: bool = True
-    use_unicode_properties: bool = True
-    optimize_for_performance: bool = False  # When True, prefers simpler patterns that are faster to execute
-
-class TestCase(BaseModel):
-    """Test case for regex validation"""
-    text: str
-    should_match: bool
-    reason: str = ""
-
-class PatternResult(BaseModel):
-    """Results for a pattern's validation"""
-    pattern: str
-    tests: Dict[str, List[Dict[str, Any]]] = {"positive": [], "negative": []}
-    score: float = 0.0
-    failures: Dict[str, List[str]] = {"false_positives": [], "false_negatives": []}
-
-class TermData(BaseModel):
-    """Data for a technical term"""
-    name: str
-    definition: str
-    related_terms: List[Dict[str, str]] = []
-    iteration: int = 0
-    candidates: List[str] = []
-    validation_results: List[PatternResult] = []
-    best_pattern: Optional[str] = None
-
-class RegexPattern(BaseModel):
-    """Final regex pattern output"""
-    name: str
-    pattern: str
-    status: str = "GREEN"
-    reasons: List[str] = []
-    coverage: str = "N/A"
-    examples: Dict[str, List[str]] = {"valid": [], "invalid": []}
-
-    @field_validator('pattern')
-    def validate_pattern(cls, v):
-        try:
-            re.compile(v)
-            return v
-        except re.error as e:
-            raise ValueError(f"Invalid regex: {e}")
-            
-    def to_dict(self) -> dict:
-        """Convert to dictionary with proper escaping for JSON serialization"""
-        data = self.model_dump()
-        # Ensure regex pattern is properly escaped for JSON
-        data["pattern"] = data["pattern"].replace("\\", "\\\\")
-        return data
-
-class WorkflowState(BaseModel):
-    """State for the regex generation workflow"""
-    terms: List[TermData] = []
-    current_term_index: int = 0
-    final_patterns: List[RegexPattern] = []
-    config: RegexGeneratorConfig = RegexGeneratorConfig()
-
-class RegexGenerationWorkflow:
-    """Workflow for generating robust regex patterns for technical terms"""
+# Add Tiktoken configuration class before OSEnv
+class TiktokenProxyConfig:
+    _configured = False
     
-    def __init__(self, csv_path: str, config: RegexGeneratorConfig = RegexGeneratorConfig(), mock_mode: bool = False):
-        """Initialize the workflow with a CSV file containing technical terms"""
-        self.csv_path = csv_path
-        self.config = config
-        self.mock_mode = mock_mode
-        
-        # Initialize the chatbot or use a mock if specified
-        if mock_mode:
-            print("Running in MOCK MODE - using simple responses instead of Azure Chatbot")
-            self.chatbot = self._create_mock_chatbot()
-        else:
-            try:
-                self.chatbot = AzureChatbot(CONFIG_PATH, CREDS_PATH, CERT_PATH)
-                print("Successfully initialized Azure Chatbot")
-            except Exception as e:
-                logger.error(f"Error initializing Azure Chatbot: {e}")
-                print("ERROR: Failed to initialize Azure Chatbot, falling back to mock mode")
-                self.mock_mode = True
-                self.chatbot = self._create_mock_chatbot()
-                
-        self.workflow = self._build_workflow()
-        
-    def _create_mock_chatbot(self):
-        """Create a simple mock chatbot for testing without Azure dependencies"""
-        
-        class MockLLM:
-            def invoke(self, prompt):
-                # Extract the term name from the prompt for customized responses
-                term_name = ""
-                if isinstance(prompt, dict) and "name" in prompt:
-                    term_name = prompt["name"]
-                
-                # Generate mock regex patterns
-                if "create 3 robust patterns" in str(prompt):
-                    return json.dumps([
-                        f"(?i)\\b{re.escape(term_name)}\\b",
-                        f"(?i)\\b{re.escape(term_name)}s?\\b",
-                        f"(?i)\\b(the\\s+)?{re.escape(term_name)}\\b"
-                    ])
-                
-                # Generate mock test cases
-                elif "test cases" in str(prompt):
-                    return json.dumps({
-                        "positive": [
-                            {"text": term_name, "should_match": True, "reason": "exact match"},
-                            {"text": term_name.upper(), "should_match": True, "reason": "uppercase"},
-                            {"text": f"The {term_name}", "should_match": True, "reason": "with article"}
-                        ],
-                        "negative": [
-                            {"text": "unrelated", "should_match": False, "reason": "unrelated term"},
-                            {"text": "not relevant", "should_match": False, "reason": "different concept"}
-                        ]
-                    })
-                
-                # Generate mock examples
-                elif "examples" in str(prompt):
-                    return json.dumps({
-                        "valid": [term_name, term_name.upper(), f"The {term_name}"],
-                        "invalid": ["unrelated", "different concept"]
-                    })
-                
-                # Default mock response
-                else:
-                    return json.dumps({"response": "mock response"})
-        
-        class MockChatbot:
-            def __init__(self):
-                self.llm = MockLLM()
-        
-        return MockChatbot()
-    
-    def _load_csv(self) -> pd.DataFrame:
-        """Load and validate the CSV file"""
-        try:
-            df = pd.read_csv(self.csv_path)
-            required_columns = ["name", "definition"]
+    @classmethod
+    def configure(cls):
+        if not cls._configured:
+            session = requests.Session()
+            retries = Retry(total=3, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
+            session.mount('https://', HTTPAdapter(max_retries=retries))
             
-            # Check for required columns
-            missing = [col for col in required_columns if col not in df.columns]
-            if missing:
-                raise ValueError(f"CSV is missing required columns: {', '.join(missing)}")
-            
-            return df
-        except Exception as e:
-            logger.error(f"Error loading CSV: {e}")
-            raise
-    
-    def _get_related_terms(self, term_name: str, df: pd.DataFrame) -> List[Dict[str, str]]:
-        """Extract related terms for a given term name"""
-        related_terms = []
-        
-        # Filter rows for the current term
-        term_rows = df[df["name"] == term_name]
-        
-        # Extract related terms if available
-        for _, row in term_rows.iterrows():
-            if "related_term_name" in df.columns and "related_term_definition" in df.columns:
-                if pd.notna(row["related_term_name"]) and pd.notna(row["related_term_definition"]):
-                    example = row.get("related_term_example", "") if "related_term_example" in df.columns else ""
-                    related_terms.append({
-                        "name": row["related_term_name"],
-                        "definition": row["related_term_definition"],
-                        "example": example if pd.notna(example) else ""
-                    })
-        
-        return related_terms
-    
-    def _build_workflow(self) -> Any:
-        """Build the LangGraph workflow for regex generation"""
-        # Create workflow
-        workflow = StateGraph(WorkflowState)
-        
-        # Add nodes
-        workflow.add_node("analyze_terms", self.analyze_terms)
-        workflow.add_node("generate_candidates", self.generate_candidates)
-        workflow.add_node("validate_patterns", self.validate_patterns)
-        workflow.add_node("refine_patterns", self.refine_patterns)
-        workflow.add_node("select_best_pattern", self.select_best_pattern)
-        workflow.add_node("finalize_pattern", self.finalize_pattern)
-        
-        # Set entry point
-        workflow.set_entry_point("analyze_terms")
-        
-        # Add edges
-        workflow.add_edge("analyze_terms", "generate_candidates")
-        workflow.add_edge("generate_candidates", "validate_patterns")
-        workflow.add_edge("validate_patterns", "refine_patterns")
-        
-        # Add conditional edges
-        workflow.add_conditional_edges(
-            "refine_patterns",
-            self.should_continue_refining,
-            {
-                "continue": "validate_patterns",
-                "select": "select_best_pattern",
-                "next_term": "analyze_terms"
-            }
-        )
-        
-        workflow.add_edge("select_best_pattern", "finalize_pattern")
-        
-        workflow.add_conditional_edges(
-            "finalize_pattern",
-            self.check_completion,
-            {
-                "complete": END,
-                "next_term": "analyze_terms"
-            }
-        )
-        
-        # Return compiled workflow with state map visible for debugging
-        return workflow.compile()
-    
-    def analyze_terms(self, state: WorkflowState) -> WorkflowState:
-        """Analyze terms from the CSV file"""
-        # Load CSV if this is the first run
-        if not state.terms:
-            df = self._load_csv()
-            unique_terms = df["name"].unique()
-            
-            print(f"Loading {len(unique_terms)} terms from CSV...")
-            for term_name in tqdm(unique_terms, desc="Loading Terms"):
-                term_rows = df[df["name"] == term_name]
-                definition = term_rows["definition"].iloc[0] if not term_rows.empty else ""
-                
-                related_terms = self._get_related_terms(term_name, df)
-                
-                state.terms.append(TermData(
-                    name=term_name,
-                    definition=definition,
-                    related_terms=related_terms
-                ))
-            
-            logger.info(f"Loaded {len(state.terms)} unique terms from CSV")
-        
-        # Check if we've processed all terms
-        if state.current_term_index >= len(state.terms):
-            return state
-        
-        # Reset current term's data for a new iteration
-        current_term = state.terms[state.current_term_index]
-        current_term.iteration = 0
-        current_term.candidates = []
-        current_term.validation_results = []
-        current_term.best_pattern = None
-        
-        logger.info(f"Analyzing term: {current_term.name}")
-        print(f"Processing term [{state.current_term_index+1}/{len(state.terms)}]: {current_term.name}")
-        return state
-    
-    def generate_candidates(self, state: WorkflowState) -> WorkflowState:
-        """Generate regex pattern candidates for the current term"""
-        # Ensure re module is imported
-        import re
-
-        if state.current_term_index >= len(state.terms):
-            return state
-    
-        current_term = state.terms[state.current_term_index]
-        
-        # Construct prompt for pattern generation
-        related_terms_formatted = "\n".join([
-            f"- {rt['name']}: {rt['definition']} (Example: {rt['example']})"
-            for rt in current_term.related_terms
-        ])
-        
-        # Define regex complexity requirements based on config
-        complexity_requirements = ""
-        if state.config.complexity_level == "extreme":
-            complexity_requirements = """
-            Create powerful regex patterns with:
-            - Word boundaries and case insensitivity
-            - Character classes and alternations
-            - Optional parts and quantifiers
-            - Some lookaheads/lookbehinds when necessary
-            - Unicode character support
-
-            Aim for powerful matching while maintaining reliability.
-            """
-        elif state.config.complexity_level == "high":
-            complexity_requirements = """
-            Create advanced regex patterns with:
-            - Lookaheads and lookbehinds where appropriate
-            - Capturing groups and backreferences
-            - Unicode character properties where needed
-            - Non-capturing groups
-            - Varied quantifiers (lazy and greedy)
-            
-            Balance power with reasonable complexity.
-            """
-        else:
-            complexity_requirements = """
-            Create effective regex patterns with:
-            - Capturing groups where needed
-            - Character classes and ranges
-            - Word boundaries and anchors
-            - Basic quantifiers
-            
-            Focus on readability and maintainability.
-            """
-        
-        lookaround_instruction = "Use lookaheads and lookbehinds for specific contextual matching when needed." if state.config.use_lookarounds else "Avoid lookaheads and lookbehinds unless absolutely necessary."
-        backreference_instruction = "Use backreferences for pattern repetition when appropriate." if state.config.use_backreferences else "Avoid backreferences for better performance."
-        unicode_instruction = "Incorporate Unicode support where needed." if state.config.use_unicode_properties else "Use basic ASCII character classes for better compatibility."
-        
-        prompt = ChatPromptTemplate.from_template("""
-    Create 3 robust regex patterns to identify values related to: "{name}"
-    
-    Definition: {definition}
-    
-    Related Terms:
-    {related_terms}
-    
-    {complexity_requirements}
-    
-    Technical Requirements:
-    1. Generate patterns that can match a variety of related values
-    2. Handle case variations (upper/lower/mixed)
-    3. Support partial matches with appropriate word boundaries
-    4. Include handling for abbreviations and common variations
-    5. {lookaround_instruction}
-    6. {backreference_instruction}
-    7. {unicode_instruction}
-    
-    Return your response ONLY as a JSON array with 3 regex patterns:
-    ["pattern1", "pattern2", "pattern3"]
-    
-    IMPORTANT: 
-    - Escape all backslashes properly in JSON (use double backslashes \\\\)
-    - Ensure patterns are properly enclosed in quotes
-    - Avoid trailing commas in the array
-    """)
-
-    chain = prompt | self.chatbot.llm | StrOutputParser()
-
-    try:
-        print(f"  • Generating regex patterns for: {current_term.name}")
-        
-        # Invoke LLM to generate patterns
-        response = chain.invoke({
-            "name": current_term.name,
-            "definition": current_term.definition,
-            "related_terms": related_terms_formatted if related_terms_formatted else "No related terms available.",
-            "complexity_requirements": complexity_requirements,
-            "lookaround_instruction": lookaround_instruction,
-            "backreference_instruction": backreference_instruction,
-            "unicode_instruction": unicode_instruction
-        })
-        
-        # Clean and validate the response
-        cleaned_response = response.strip()
-        logger.debug(f"Raw LLM response: {cleaned_response}")
-        
-        # Initialize variables for JSON handling
-        patterns = []
-        cleaned_response_fixed = None  # Explicit initialization
-        json_error = None
-
-        # First attempt: Try parsing original response
-        try:
-            patterns = json.loads(cleaned_response)
-            if not isinstance(patterns, list):
-                raise ValueError("Top-level structure is not a list")
-        except (json.JSONDecodeError, ValueError) as e:
-            json_error = e
-            logger.warning(f"Initial JSON parse failed: {str(e)}")
-
-            # Second attempt: Fix common issues and try again
-            try:
-                # Fix 1: Handle unterminated arrays
-                if not cleaned_response.endswith(']'):
-                    cleaned_response += ']'
-                
-                # Fix 2: Escape backslashes
-                cleaned_response_fixed = cleaned_response.replace('\\', '\\\\')
-                
-                # Fix 3: Remove trailing commas
-                cleaned_response_fixed = re.sub(r',(\s*)]', r'\1]', cleaned_response_fixed)
-                
-                patterns = json.loads(cleaned_response_fixed)
-                logger.info("Successfully parsed after fixes")
-            except Exception as fix_error:
-                logger.error(f"Secondary parse failed: {str(fix_error)}")
-                logger.error(f"Original response: {cleaned_response[:200]}...")
-                if cleaned_response_fixed:
-                    logger.error(f"Fixed response: {cleaned_response_fixed[:200]}...")
-
-                # Final fallback: Create default patterns
-                logger.warning("Using default patterns as fallback")
-                patterns = [
-                    rf"(?i)\b{re.escape(current_term.name)}\b",
-                    rf"(?i)\b{re.escape(current_term.name)}s?\b",
-                    rf"(?i)\b{re.escape(current_term.name)}(?:s|es|ing|ed)?\b"
-                ]
-
-        # Validate patterns
-        valid_patterns = []
-        for pattern in patterns:
-            if not isinstance(pattern, str):
-                logger.warning(f"Skipping non-string pattern: {pattern}")
-                continue
-            
-            try:
-                # Check for common regex issues
-                temp_pattern = pattern
-                
-                # Fix lookaround assertions
-                if ("?<!" in temp_pattern or "?<=" in temp_pattern) and \
-                    temp_pattern.count('(') != temp_pattern.count(')'):
-                    logger.warning(f"Fixing unbalanced parentheses in: {temp_pattern[:50]}...")
-                    temp_pattern += ')' * (temp_pattern.count('(') - temp_pattern.count(')'))
-
-                # Compile to validate
-                re.compile(temp_pattern)
-                valid_patterns.append(temp_pattern)
-            except re.error as e:
-                logger.warning(f"Invalid pattern removed: {pattern[:50]}... - Error: {str(e)}")
-
-        # Ensure we have at least one pattern
-        if not valid_patterns:
-            logger.warning("All patterns invalid, using basic fallback")
-            valid_patterns = [rf"(?i)\b{re.escape(current_term.name)}\b"]
-
-        current_term.candidates = valid_patterns
-        logger.info(f"Generated {len(valid_patterns)} valid patterns")
-        print(f"  ✓ Generated {len(valid_patterns)} patterns")
-
-        # Print sample patterns
-        for idx, pattern in enumerate(valid_patterns[:3]):
-            print(f"    Pattern {idx+1}: {pattern[:80]}{'...' if len(pattern) > 80 else ''}")
-
-    except Exception as e:
-        logger.error(f"Critical error in generate_candidates: {str(e)}")
-        logger.error(traceback.format_exc())
-        # Ensure we always have at least one pattern
-        current_term.candidates = [rf"(?i)\b{re.escape(current_term.name)}\b"]
-        print(f"  ⚠ Using fallback pattern due to error: {current_term.candidates[0]}")
-
-    return state
-    
-    def validate_patterns(self, state: WorkflowState) -> WorkflowState:
-        """Validate the regex patterns against test cases"""
-        # Ensure re module is imported in this scope
-        import re
-        
-        if state.current_term_index >= len(state.terms):
-            return state
-        
-        current_term = state.terms[state.current_term_index]
-        
-        if not current_term.candidates:
-            return state
-        
-        # Construct prompt for test case generation
-        related_terms_formatted = "\n".join([
-            f"- {rt['name']}: {rt['definition']} (Example: {rt['example']})"
-            for rt in current_term.related_terms
-        ])
-        
-        # Simplified test case generation prompt
-        prompt = ChatPromptTemplate.from_template("""
-        Generate test cases to validate regex patterns for the term: "{name}"
-        
-        Definition: {definition}
-        
-        Related Terms:
-        {related_terms}
-        
-        Please generate:
-        1. 10 POSITIVE examples (should match)
-        2. 5 NEGATIVE examples (should NOT match)
-        
-        Include various examples covering:
-        - Different capitalizations
-        - Common abbreviations
-        - Related terms
-        - Typical usage scenarios
-        
-        For each test case, provide:
-        - The text string
-        - Whether it should match (true/false)
-        - Brief explanation of why
-        
-        Return in this format:
-        {{
-          "positive": [
-            {{"text": "example string", "should_match": true, "reason": "explanation"}}
-          ],
-          "negative": [
-            {{"text": "example string", "should_match": false, "reason": "explanation"}}
-          ]
-        }}
-        """)
-        
-        chain = prompt | self.chatbot.llm | StrOutputParser()
-        
-        try:
-            print(f"  • Validating patterns with test cases")
-            
-            # Generate test cases
-            response = chain.invoke({
-                "name": current_term.name,
-                "definition": current_term.definition,
-                "related_terms": related_terms_formatted if related_terms_formatted else "No related terms available."
-            })
-            
-            # Clean and validate the response
-            cleaned_response = response.strip()
-            
-            # Debug logging
-            logger.debug(f"Raw test case response: {cleaned_response[:500]}...")
-            
-            # Handle common JSON formatting issues
-            if not cleaned_response.startswith('{'):
-                # Try to find a JSON object in the response
-                json_match = re.search(r'\{.*\}', cleaned_response, re.DOTALL)
-                if json_match:
-                    cleaned_response = json_match.group(0)
-                    logger.info(f"Extracted JSON object from response")
-                else:
-                    logger.error(f"Response does not contain a JSON object: {cleaned_response[:100]}...")
-                    raise ValueError("Invalid JSON format for test cases")
-            
-            # Try to parse the JSON
-            try:
-                test_cases = json.loads(cleaned_response)
-                
-                # Validate structure
-                if not isinstance(test_cases, dict):
-                    raise ValueError(f"Expected a dict, got: {type(test_cases)}")
-                
-                if "positive" not in test_cases or "negative" not in test_cases:
-                    raise ValueError(f"Missing required keys (positive/negative) in test cases")
-                
-                if not isinstance(test_cases["positive"], list) or not isinstance(test_cases["negative"], list):
-                    raise ValueError(f"Expected lists for positive/negative test cases")
-                
-                # Ensure test cases have required format
-                for i, case in enumerate(test_cases["positive"]):
-                    if not isinstance(case, dict) or "text" not in case:
-                        test_cases["positive"][i] = {"text": str(case), "should_match": True, "reason": "auto-converted"}
-                
-                for i, case in enumerate(test_cases["negative"]):
-                    if not isinstance(case, dict) or "text" not in case:
-                        test_cases["negative"][i] = {"text": str(case), "should_match": False, "reason": "auto-converted"}
-                
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON decode error for test cases: {e}")
-                logger.error(f"Response was: {cleaned_response[:500]}...")
-                
-                # Create default test cases
-                test_cases = {
-                    "positive": [
-                        {"text": current_term.name, "should_match": True, "reason": "exact match"},
-                        {"text": current_term.name.upper(), "should_match": True, "reason": "upper case"},
-                        {"text": current_term.name.lower(), "should_match": True, "reason": "lower case"},
-                        {"text": f"The {current_term.name} is important", "should_match": True, "reason": "in context"}
-                    ],
-                    "negative": [
-                        {"text": "unrelated term", "should_match": False, "reason": "unrelated"},
-                        {"text": "completely different", "should_match": False, "reason": "different concept"}
-                    ]
-                }
-                logger.warning(f"Using default test cases due to JSON error")
-            
-            # Validate each pattern against the test cases
-            validation_results = []
-            
-            for pattern in current_term.candidates:
-                result = PatternResult(pattern=pattern)
-                result.tests = test_cases
-                
-                # Count test cases
-                num_positives = len(test_cases["positive"])
-                num_negatives = len(test_cases["negative"])
-                
-                print(f"    ◦ Testing pattern: {pattern[:50]}{'...' if len(pattern) > 50 else ''}")
-                
-                try:
-                    compiled_pattern = re.compile(pattern, re.IGNORECASE | re.UNICODE)
-                    
-                    # Validate positives
-                    false_negatives = 0
-                    for test in test_cases["positive"]:
-                        if not isinstance(test, dict) or "text" not in test:
-                            continue
-                            
-                        try:
-                            matches = bool(compiled_pattern.search(test["text"]))
-                            if not matches:
-                                result.failures["false_negatives"].append(test["text"])
-                                false_negatives += 1
-                        except Exception as e:
-                            logger.warning(f"Error testing positive case '{test['text']}': {e}")
-                    
-                    # Validate negatives
-                    false_positives = 0
-                    for test in test_cases["negative"]:
-                        if not isinstance(test, dict) or "text" not in test:
-                            continue
-                            
-                        try:
-                            matches = bool(compiled_pattern.search(test["text"]))
-                            if matches:
-                                result.failures["false_positives"].append(test["text"])
-                                false_positives += 1
-                        except Exception as e:
-                            logger.warning(f"Error testing negative case '{test['text']}': {e}")
-                    
-                    # Calculate score
-                    total_tests = num_positives + num_negatives
-                    passed = total_tests - false_negatives - false_positives
-                    result.score = passed / total_tests if total_tests > 0 else 0
-                    
-                except re.error as e:
-                    logger.error(f"Error compiling pattern '{pattern}': {e}")
-                    result.score = 0
-                
-                validation_results.append(result)
-                print(f"      Score: {result.score:.2f} ({passed}/{total_tests} tests passed)")
-                
-                # Print some failures for debugging
-                if result.failures["false_negatives"]:
-                    print(f"      False negatives (first 3): {', '.join(result.failures['false_negatives'][:3])}")
-                if result.failures["false_positives"]:
-                    print(f"      False positives (first 3): {', '.join(result.failures['false_positives'][:3])}")
-            
-            # Sort results by score (highest first)
-            validation_results.sort(key=lambda x: x.score, reverse=True)
-            current_term.validation_results = validation_results
-            
-            # Log results
-            logger.info(f"Validated {len(current_term.candidates)} patterns for {current_term.name}")
-            for i, result in enumerate(validation_results):
-                logger.info(f"Pattern {i+1}: {result.pattern} (Score: {result.score:.2f})")
-            
-            if validation_results:
-                best_score = validation_results[0].score
-                print(f"    ✓ Best pattern score: {best_score:.2f}")
-            else:
-                print(f"    ⚠ No pattern validation results available")
-        
-        except Exception as e:
-            logger.error(f"Error validating patterns: {str(e)}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            
-            # Create minimal validation results
-            for pattern in current_term.candidates:
-                current_term.validation_results.append(PatternResult(
-                    pattern=pattern, 
-                    score=0.5,  # Default score
-                    tests={"positive": [], "negative": []}
-                ))
-            
-            print(f"    ⚠ Error during validation, using default scores")
-        
-        return state
-    
-    def refine_patterns(self, state: WorkflowState) -> WorkflowState:
-        """Refine regex patterns based on validation results"""
-        # Ensure re module is imported in this scope
-        import re
-        
-        if state.current_term_index >= len(state.terms):
-            return state
-        
-        current_term = state.terms[state.current_term_index]
-        current_term.iteration += 1
-        
-        if not current_term.validation_results:
-            return state
-        
-        # Skip refinement if max iterations reached or we have good patterns
-        if current_term.iteration >= state.config.max_iterations:
-            logger.info(f"Max iterations ({state.config.max_iterations}) reached for {current_term.name}")
-            return state
-        
-        best_score = max([r.score for r in current_term.validation_results], default=0)
-        if best_score >= state.config.min_coverage:
-            logger.info(f"Achieved minimum coverage for {current_term.name} (Score: {best_score:.2f})")
-            return state
-        
-        # Identify patterns needing improvement
-        patterns_to_refine = [r for r in current_term.validation_results if r.score < state.config.min_coverage]
-        
-        if not patterns_to_refine:
-            return state
-        
-        # Construct prompt for pattern refinement
-        prompt = ChatPromptTemplate.from_template("""
-        Refine this regex pattern to improve its accuracy:
-        
-        Original Pattern: {pattern}
-        
-        Testing Results:
-        - Score: {score}
-        - False Negatives (should match but didn't): {false_negatives}
-        - False Positives (shouldn't match but did): {false_positives}
-        
-        Requirements:
-        1. Fix the pattern to correctly handle failed cases
-        2. Maintain existing valid matches
-        3. Make the pattern more robust
-        4. Ensure correct word boundaries
-        5. Keep pattern complexity reasonable
-        
-        Return ONLY the improved regex pattern (no explanation):
-        """)
-        
-        chain = prompt | self.chatbot.llm | StrOutputParser()
-        
-        refined_candidates = []
-        
-        for result in patterns_to_refine:
-            try:
-                # Invoke LLM to refine the pattern
-                response = chain.invoke({
-                    "pattern": result.pattern,
-                    "score": f"{result.score:.2f}",
-                    "false_negatives": result.failures["false_negatives"],
-                    "false_positives": result.failures["false_positives"]
-                })
-                
-                # Validate the refined pattern
-                refined = response.strip()
-                try:
-                    re.compile(refined)
-                    refined_candidates.append(refined)
-                    logger.info(f"Refined pattern: {refined}")
-                except re.error:
-                    logger.warning(f"Invalid refined pattern: {refined}")
-            except Exception as e:
-                logger.error(f"Error refining pattern: {str(e)}")
-        
-        # Add new candidates
-        if refined_candidates:
-            current_term.candidates = refined_candidates
-            logger.info(f"Generated {len(refined_candidates)} refined patterns for {current_term.name}")
-        
-        return state
-    
-    def should_continue_refining(self, state: WorkflowState) -> str:
-        """Determine next step based on refinement results"""
-        if state.current_term_index >= len(state.terms):
-            return "next_term"
-        
-        current_term = state.terms[state.current_term_index]
-        
-        # Check if max iterations reached
-        if current_term.iteration >= state.config.max_iterations:
-            return "select"
-        
-        # Check if we have a good score
-        best_score = max([r.score for r in current_term.validation_results], default=0)
-        if best_score >= state.config.min_coverage:
-            return "select"
-        
-        # Continue refining
-        return "continue"
-    
-    def select_best_pattern(self, state: WorkflowState) -> WorkflowState:
-        """Select the best regex pattern from candidates"""
-        if state.current_term_index >= len(state.terms):
-            return state
-        
-        current_term = state.terms[state.current_term_index]
-        
-        if not current_term.validation_results:
-            # Use a default pattern if no validation results
-            current_term.best_pattern = rf"(?i)\b{re.escape(current_term.name)}\b"
-            return state
-        
-        # Select pattern with highest score
-        best_result = max(current_term.validation_results, key=lambda x: x.score)
-        current_term.best_pattern = best_result.pattern
-        
-        logger.info(f"Selected best pattern for {current_term.name}: {current_term.best_pattern} (Score: {best_result.score:.2f})")
-        return state
-    
-    def finalize_pattern(self, state: WorkflowState) -> WorkflowState:
-        """Create the final regex pattern and prepare for next term"""
-        # Ensure re module is imported in this scope
-        import re
-        
-        if state.current_term_index >= len(state.terms):
-            return state
-        
-        current_term = state.terms[state.current_term_index]
-        
-        if not current_term.best_pattern:
-            # Skip this term
-            state.current_term_index += 1
-            return state
-        
-        try:
-            print(f"  • Finalizing pattern for: {current_term.name}")
-            
-            # Generate examples for the pattern
-            prompt = ChatPromptTemplate.from_template("""
-            Generate 5 valid and 5 invalid examples for the regex pattern: {pattern}
-            
-            Term: {name}
-            Definition: {definition}
-            
-            Valid examples should match the pattern.
-            Invalid examples should NOT match the pattern.
-            
-            Return only in this JSON format:
-            {{"valid": ["example1", "example2", ...], "invalid": ["example1", "example2", ...]}}
-            """)
-            
-            chain = prompt | self.chatbot.llm | StrOutputParser()
-            
-            response = chain.invoke({
-                "pattern": current_term.best_pattern,
-                "name": current_term.name,
-                "definition": current_term.definition
-            })
-            
-            # Clean and validate the response
-            cleaned_response = response.strip()
-            
-            # Debug logging
-            logger.debug(f"Raw examples response: {cleaned_response[:500]}...")
-            
-            # Handle common JSON formatting issues
-            if not cleaned_response.startswith('{'):
-                # Try to find a JSON object in the response
-                json_match = re.search(r'\{.*\}', cleaned_response, re.DOTALL)
-                if json_match:
-                    cleaned_response = json_match.group(0)
-                    logger.info(f"Extracted JSON object from examples response")
-                else:
-                    raise ValueError(f"Examples response does not contain a JSON object")
-            
-            # Parse examples
-            try:
-                examples = json.loads(cleaned_response)
-                
-                # Validate structure
-                if not isinstance(examples, dict) or "valid" not in examples or "invalid" not in examples:
-                    raise ValueError("Invalid examples format")
-                
-                # Convert any non-list values to lists
-                if not isinstance(examples["valid"], list):
-                    examples["valid"] = [str(examples["valid"])]
-                
-                if not isinstance(examples["invalid"], list):
-                    examples["invalid"] = [str(examples["invalid"])]
-                
-            except (json.JSONDecodeError, ValueError) as e:
-                logger.error(f"Error parsing examples: {e}")
-                # Use default examples
-                examples = {
-                    "valid": [current_term.name, current_term.name.upper(), f"The {current_term.name} is important"],
-                    "invalid": ["unrelated term", "completely different"]
+            if os.environ.get("HTTPS_PROXY"):
+                session.proxies = {
+                    "http": os.environ.get("HTTPS_PROXY"),
+                    "https": os.environ.get("HTTPS_PROXY")
                 }
             
-            # Find the validation result for the best pattern
-            best_result = next(
-                (r for r in current_term.validation_results if r.pattern == current_term.best_pattern), 
-                None
+            session.verify = os.environ.get("REQUESTS_CA_BUNDLE", True)
+            tiktoken.set_http_client(session)
+            cls._configured = True
+
+# Update the EmbeddingClient with a wrapper
+class EmbeddingWrapper(Embeddings):
+    def __init__(self, embedding_client: EmbeddingClient):
+        self.client = embedding_client
+        
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return [self.embed_query(text) for text in texts]
+    
+    def embed_query(self, text: str) -> List[float]:
+        doc = MyDocument(text=text)
+        embedded_doc = self.client.generate_embeddings(doc)
+        return embedded_doc.embedding
+
+# Modified PDFReaderAgent
+class PDFReaderAgent:
+    def __init__(self, vector_db: Chroma, embedding_client: EmbeddingClient):
+        self.vector_db = vector_db
+        self.embedding_client = embedding_client
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=self.tiktoken_len
+        )
+        TiktokenProxyConfig.configure()
+    
+    def tiktoken_len(self, text: str) -> int:
+        try:
+            enc = tiktoken.get_encoding("cl100k_base")
+            return len(enc.encode(text))
+        except Exception as e:
+            logger.error(f"Tiktoken error: {e}")
+            return len(text.split())
+
+    def process_pdf(self, file_path: str) -> List[MyDocument]:
+        try:
+            docs = []
+            reader = PdfReader(file_path)
+            for page_num, page in enumerate(reader.pages):
+                text = page.extract_text()
+                if text:
+                    chunks = self.text_splitter.split_text(text)
+                    for chunk in chunks:
+                        doc = MyDocument(
+                            id=str(uuid.uuid4()),
+                            text=chunk,
+                            metadata={
+                                "source": file_path,
+                                "page": page_num + 1
+                            }
+                        )
+                        doc = self.embedding_client.generate_embeddings(doc)
+                        docs.append(doc)
+            self.vector_db.add(
+                ids=[d.id for d in docs],
+                documents=[d.text for d in docs],
+                metadatas=[d.metadata for d in docs],
+                embeddings=[d.embedding for d in docs]
             )
-            
-            # Create the final pattern
-            final_pattern = RegexPattern(
-                name=current_term.name,
-                pattern=current_term.best_pattern,
-                status="GREEN" if best_result and best_result.score >= state.config.min_coverage else "YELLOW",
-                reasons=[f"Generated after {current_term.iteration} iterations"],
-                coverage=f"{best_result.score:.2f}" if best_result else "N/A",
-                examples=examples
-            )
-            
-            # Log the generated pattern
-            logger.info(f"Pattern for '{current_term.name}': {final_pattern.pattern}")
-            
-            # Add to final patterns
-            if not hasattr(state, 'final_patterns'):
-                state.final_patterns = []
-                
-            state.final_patterns.append(final_pattern)
-            logger.info(f"Finalized pattern for {current_term.name}")
-            print(f"  ✓ Finalized pattern: {final_pattern.pattern[:50]}{'...' if len(final_pattern.pattern) > 50 else ''}")
-            
+            return docs
         except Exception as e:
-            logger.error(f"Error finalizing pattern: {str(e)}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            
-            # Create a minimal pattern
-            fallback_pattern = current_term.best_pattern or rf"(?i)\b{re.escape(current_term.name)}\b"
-            
-            if not hasattr(state, 'final_patterns'):
-                state.final_patterns = []
-                
-            state.final_patterns.append(RegexPattern(
-                name=current_term.name,
-                pattern=fallback_pattern,
-                status="YELLOW",
-                reasons=["Error during finalization"],
-                coverage="N/A",
-                examples={
-                    "valid": [current_term.name],
-                    "invalid": ["unrelated"]
-                }
-            ))
-            
-            print(f"  ⚠ Error finalizing pattern, using fallback: {fallback_pattern[:50]}{'...' if len(fallback_pattern) > 50 else ''}")
-        
-        # Move to next term
-        state.current_term_index += 1
-        print(f"  • Moving to next term ({state.current_term_index}/{len(state.terms)})")
-        logger.info(f"Moving to next term ({state.current_term_index}/{len(state.terms)})")
-        
-        return state
-    
-    def check_completion(self, state: WorkflowState) -> str:
-        """Check if all terms are processed"""
-        return "complete" if state.current_term_index >= len(state.terms) else "next_term"
-    
-    def run(self) -> List[RegexPattern]:
-        """Run the workflow and return the generated patterns"""
-        # Initialize state
-        state = WorkflowState(config=self.config)
-        
-        try:
-            # Execute workflow
-            final_state = self.workflow.invoke(state)
-            
-            # Debug output of final state
-            logger.debug(f"Final state type: {type(final_state)}")
-            if hasattr(final_state, 'dict'):
-                logger.debug(f"State keys: {final_state.dict().keys()}")
-            elif isinstance(final_state, dict):
-                logger.debug(f"State keys: {final_state.keys()}")
-            else:
-                logger.debug(f"State has no easily accessible keys")
-            
-            # Extract patterns using multiple fallback methods
-            patterns = []
-            
-            # Method 1: Direct attribute access
-            if hasattr(final_state, 'final_patterns'):
-                patterns = final_state.final_patterns
-                logger.info("Retrieved patterns using direct attribute access")
-            
-            # Method 2: Dictionary access
-            elif isinstance(final_state, dict) and 'final_patterns' in final_state:
-                patterns = final_state['final_patterns']
-                logger.info("Retrieved patterns using dictionary access")
-            
-            # Method 3: Nested values attribute
-            elif hasattr(final_state, 'values') and hasattr(final_state.values, 'get'):
-                patterns = final_state.values.get('final_patterns', [])
-                logger.info("Retrieved patterns using values.get access")
-            
-            # Method 4: Try to reconstruct from state data
-            elif hasattr(final_state, 'terms'):
-                # Reconstruct from term data
-                logger.info("Attempting to reconstruct patterns from term data")
-                for term in final_state.terms:
-                    if term.best_pattern:
-                        patterns.append(RegexPattern(
-                            name=term.name,
-                            pattern=term.best_pattern,
-                            status="YELLOW",
-                            reasons=["Reconstructed from term data"],
-                            coverage="N/A",
-                            examples={"valid": [term.name], "invalid": ["unrelated"]}
-                        ))
-            
-            # Method 5: Last resort fallback
-            if not patterns:
-                logger.warning("Could not extract patterns from state, creating minimal fallbacks")
-                
-                # If we have terms in the state, create patterns from them
-                if hasattr(final_state, 'terms') and final_state.terms:
-                    for term in final_state.terms:
-                        patterns.append(RegexPattern(
-                            name=term.name,
-                            pattern=rf"(?i)\b{re.escape(term.name)}\b",
-                            status="RED",
-                            reasons=["Fallback pattern created"],
-                            coverage="N/A"
-                        ))
-                # Otherwise try to load the CSV and create minimal patterns
-                else:
-                    try:
-                        df = pd.read_csv(self.csv_path)
-                        for term_name in df["name"].unique():
-                            patterns.append(RegexPattern(
-                                name=term_name,
-                                pattern=rf"(?i)\b{re.escape(term_name)}\b",
-                                status="RED",
-                                reasons=["Emergency fallback pattern"],
-                                coverage="N/A"
-                            ))
-                    except Exception as csv_error:
-                        logger.error(f"Error creating fallback patterns from CSV: {csv_error}")
-            
-            print(f"Workflow completed. Generated {len(patterns)} patterns.")
-            return patterns
-            
-        except Exception as e:
-            logger.error(f"Error executing workflow: {str(e)}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            print("Error executing workflow. Creating fallback patterns instead.")
-            
-            # Emergency fallback: create basic patterns from CSV
-            try:
-                patterns = []
-                df = pd.read_csv(self.csv_path)
-                
-                print("Creating fallback patterns for all terms...")
-                for term_name in df["name"].unique():
-                    patterns.append(RegexPattern(
-                        name=term_name,
-                        pattern=rf"(?i)\b{re.escape(term_name)}\b",
-                        status="RED",
-                        reasons=["Created after workflow error"],
-                        coverage="N/A",
-                        examples={"valid": [term_name], "invalid": ["unrelated"]}
-                    ))
-                
-                return patterns
-            except Exception as fallback_error:
-                logger.error(f"Error creating fallback patterns: {fallback_error}")
-                return []
+            logger.error(f"Error processing PDF {file_path}: {e}")
+            return []
 
-def save_patterns(patterns: List[RegexPattern], output_path: str = "regex_patterns.json") -> None:
-    """Save patterns to a JSON file"""
-    try:
-        with open(output_path, "w") as f:
-            # Convert to dict before serializing
-            patterns_dict = []
-            for p in patterns:
-                # Use the to_dict method for proper JSON escaping
-                patterns_dict.append(p.to_dict())
-            
-            json.dump(patterns_dict, f, indent=2)
-        logger.info(f"Saved {len(patterns)} patterns to {output_path}")
-        print(f"✓ Successfully saved {len(patterns)} patterns to {output_path}")
-    except Exception as e:
-        logger.error(f"Error saving patterns: {str(e)}")
-        print(f"✗ Failed to save patterns: {str(e)}")
-
-# Main execution function
-def generate_regex_patterns(csv_path: str, output_path: str = "regex_patterns.json", 
-                           complexity_level: str = "extreme", optimize_for_performance: bool = False,
-                           mock_mode: bool = False, debug: bool = False) -> None:
-    """Generate regex patterns from a CSV file of technical terms
-    
-    Args:
-        csv_path: Path to the CSV file with technical terms
-        output_path: Path to save the generated patterns as JSON
-        complexity_level: Level of regex complexity - one of "basic", "standard", "high", "extreme"
-        optimize_for_performance: If True, generates simpler patterns that execute faster
-        mock_mode: If True, uses mock responses instead of Azure OpenAI
-        debug: If True, enables debug logging
-    """
-    
-    # Set up logging level based on debug flag
-    if debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-        print("Debug mode enabled - verbose logging active")
-    
-    try:
-        print("\n=== Technical Term Regex Pattern Generator ===\n")
-        print("Starting regex pattern generation...")
-        
-        # Configure regex generator
-        config = RegexGeneratorConfig(
-            max_iterations=3,
-            min_coverage=0.85,
-            complexity_level=complexity_level,
-            optimize_for_performance=optimize_for_performance,
-            use_lookarounds=complexity_level in ["high", "extreme"],
-            use_backreferences=complexity_level in ["high", "extreme"],
-            use_unicode_properties=True
+# Updated TopicExtractionAgent
+class TopicExtractionAgent:
+    def _validate_topics(self, topics: List[str]) -> List[str]:
+        results = self.vector_db.similarity_search(
+            query=", ".join(topics),
+            k=5
         )
+        context = "\n".join([d.text for d in results])  # Changed from page_content to text
         
-        # Print configuration
-        print(f"Configuration:")
-        print(f"  • Complexity level: {complexity_level}")
-        print(f"  • Performance optimization: {'Enabled' if optimize_for_performance else 'Disabled'}")
-        print(f"  • Advanced features: {'Enabled' if complexity_level in ['high', 'extreme'] else 'Limited'}")
+        validation_prompt = f"""Validate and consolidate topics based on context:
+        Context: {context}
+        Proposed Topics: {topics}
         
-        # Validate CSV file
-        if not os.path.exists(csv_path):
-            raise FileNotFoundError(f"CSV file not found: {csv_path}")
+        Remove duplicates, merge similar terms, and keep only relevant topics.
+        Return cleaned comma-separated values:"""
         
-        # Load CSV to get total number of terms for progress bar
-        try:
-            df = pd.read_csv(csv_path)
-            if "name" not in df.columns:
-                raise ValueError("CSV must contain a 'name' column")
-            if "definition" not in df.columns:
-                raise ValueError("CSV must contain a 'definition' column")
-                
-            total_terms = len(df["name"].unique())
-            print(f"Found {total_terms} unique technical terms to process")
-        except Exception as csv_error:
-            print(f"Error loading CSV: {csv_error}")
-            raise
-        
-        # Create and run workflow
-        print(f"Initializing workflow{' in mock mode' if mock_mode else ' with Azure OpenAI'}...")
-        workflow = RegexGenerationWorkflow(csv_path, config, mock_mode=mock_mode)
-        
-        print("Generating patterns...")
-        patterns = workflow.run()
-        
-        # Save results
-        if patterns:
-            save_patterns(patterns, output_path)
-            
-            # Print summary with tqdm formatting
-            print(f"\nGenerated {len(patterns)} regex patterns:")
-            for pattern in tqdm(patterns, desc="Pattern Summary"):
-                print(f"- {pattern.name}: {pattern.pattern}")
-                print(f"  Coverage: {pattern.coverage}")
-                print(f"  Status: {pattern.status}")
-                print()
-                
-            print(f"\nAll patterns have been saved to: {output_path}")
-            print("\nExample usage in Python:")
-            print("```python")
-            print("import re")
-            print("import json")
-            print("")
-            print(f"# Load patterns from {output_path}")
-            print(f"with open('{output_path}', 'r') as f:")
-            print("    patterns = json.load(f)")
-            print("")
-            print("# Use patterns for classification")
-            print("def classify_column(column_name):")
-            print("    matched_terms = []")
-            print("    for p in patterns:")
-            print("        # Note: Don't forget to add re.IGNORECASE when using the patterns")
-            print("        if re.search(p['pattern'], column_name, re.IGNORECASE | re.UNICODE):")
-            print("            matched_terms.append(p['name'])")
-            print("    return matched_terms")
-            print("```")
-        else:
-            print("No patterns were generated. Check the logs for errors.")
-            
-    except Exception as e:
-        logger.error(f"Error generating patterns: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        print(f"\n❌ Error: {str(e)}")
-        print("Try running with --debug for more detailed error information.")
+        chain = LLMChain(llm=self.llm, prompt=PromptTemplate.from_template(validation_prompt))
+        return [t.strip() for t in chain.run().split(",")]
 
-# Command-line execution
-if __name__ == "__main__":
-    import argparse
+# Updated workflow setup
+def setup_workflow(pdf_directory: str) -> StateGraph:
+    env = OSEnv(CONFIG_PATH, CREDS_PATH, CERT_PATH)
+    embedding_client = EmbeddingClient()
     
-    parser = argparse.ArgumentParser(description="Generate robust regex patterns for technical terms")
-    parser.add_argument("csv_path", help="Path to the CSV file with technical terms")
-    parser.add_argument("--output", "-o", default="regex_patterns.json", help="Path to output JSON file")
-    parser.add_argument("--complexity", "-c", default="extreme", 
-                        choices=["basic", "standard", "high", "extreme"],
-                        help="Level of regex complexity (default: extreme)")
-    parser.add_argument("--optimize", action="store_true", 
-                        help="Optimize patterns for performance (simpler patterns that execute faster)")
-    parser.add_argument("--mock", action="store_true", help="Run in mock mode without Azure dependencies")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    
-    args = parser.parse_args()
-    
-    # Ensure the argument name matches the parameter name in the function definition
-    generate_regex_patterns(
-        csv_path=args.csv_path, 
-        output_path=args.output,
-        complexity_level=args.complexity,  # Use complexity_level to match the function definition
-        optimize_for_performance=args.optimize,
-        mock_mode=args.mock,
-        debug=args.debug
+    chroma_client = Chroma(
+        embedding_function=EmbeddingWrapper(embedding_client),  # Use wrapper
+        persist_directory="./chroma_db",
+        client_settings=Settings(anonymized_telemetry=False)
     )
+    
+    # Rest of the setup remains the same but update the process_pdfs node:
+    workflow.add_node("process_pdfs", 
+        lambda state: {"documents": [
+            doc for f in Path(pdf_directory).glob("*.pdf") 
+            for doc in pdf_agent.process_pdf(str(f))
+        ]}
+    )
+
+# Updated main execution
+if __name__ == "__main__":
+    # Initialize environment first
+    env = OSEnv(CONFIG_PATH, CREDS_PATH, CERT_PATH)
+    TiktokenProxyConfig.configure()
+    
+    pdf_dir = "./pdf_documents"
+    workflow = setup_workflow(pdf_dir)
+    app = workflow.compile()
+    
+    # Initialize all state keys
+    final_state = app.invoke({
+        "documents": [],
+        "topics": [],
+        "triples": [],
+        "ontology": None
+    })
+    
+    # Safe access with get()
+    ontology_graph = final_state.get("ontology", Graph())
+    if isinstance(ontology_graph, Graph) and len(ontology_graph) > 0:
+        ontology_graph.serialize(destination="ontology.owl", format="xml")
+        logger.info("Ontology generated and saved to ontology.owl")
+    else:
+        logger.error("Failed to generate ontology")
