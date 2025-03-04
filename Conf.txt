@@ -3,86 +3,161 @@ import sys
 import uuid
 import json
 import logging
+import re
 import chardet
 import requests
+from datetime import datetime
 from requests.adapters import HTTPAdapter, Retry
-from typing import Optional, Any, Dict, List, Union
+from typing import Optional, Any, Dict, List, Union, Tuple
 from pathlib import Path
 from dotenv import dotenv_values
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider, ClientSecretCredential
 from openai import AzureOpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from langchain.chat_models import AzureChatOpenAI
+from langchain.schema.output_parser import StrOutputParser
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import LLMChain
 from langchain.embeddings.base import Embeddings
 from langchain.vectorstores import Chroma
-from langchain.prompts import PromptTemplate
+from langchain.prompts import PromptTemplate, ChatPromptTemplate
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from chromadb.config import Settings
 from collections import namedtuple
-from rdflib import Graph, Namespace, URIRef, Literal, RDF, RDFS, XSD
+from rdflib import Graph, Namespace, URIRef, Literal, RDF, RDFS, XSD, OWL
 from pypdf import PdfReader
 from langgraph.graph import StateGraph, END
 
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("ontology_generation.log")
+    ]
+)
 logger = logging.getLogger(__name__)
 
+# Constants
 ENV_DIR = "env"
 CONFIG_PATH = f"{ENV_DIR}/config.env"
 CREDS_PATH = f"{ENV_DIR}/credentials.env"
 CERT_PATH = f"{ENV_DIR}/cacert.pem"
+CHROMA_DIR = "./chroma_db"
+OUTPUT_DIR = "./output"
 
-Triple = namedtuple("Triple", ["subject", "predicate", "object"])
+# Define the Triple structure
+Triple = namedtuple("Triple", ["subject", "predicate", "object", "source_docs"])
 
 # Utility functions
 def is_file_readable(filepath: str) -> bool:
     """Check if a file is readable."""
     if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
-        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
+        return False
     return True
 
 def str_to_bool(s: str) -> bool:
     """Convert a string to a boolean."""
-    if s == 'True':
-        return True
-    elif s == 'False':
-        return False
-    else:
-        raise ValueError(f"Invalid boolean value: {s}")
+    return s.lower() in ('true', 'yes', '1', 't', 'y')
 
-# OSEnv class
+def create_default_files():
+    """Create default configuration files if they don't exist."""
+    os.makedirs(ENV_DIR, exist_ok=True)
+    
+    if not os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, 'w') as f:
+            f.write("""
+# Azure OpenAI Configuration
+AZURE_ENDPOINT=https://your-endpoint.openai.azure.com/
+API_VERSION=2023-05-15
+MODEL_NAME=gpt-4
+EMBEDDINGS_MODEL=text-embedding-3-large
+
+# Proxy Settings
+PROXY_ENABLED=False
+HTTPS_PROXY_DOMAIN=proxy.example.com:8080
+SECURED_ENDPOINTS=False
+
+# Application Settings
+USE_MANAGED_IDENTITY=False
+            """.strip())
+    
+    if not os.path.exists(CREDS_PATH):
+        with open(CREDS_PATH, 'w') as f:
+            f.write("""
+# Azure Credentials
+AZURE_TENANT_ID=your-tenant-id
+AZURE_CLIENT_ID=your-client-id
+AZURE_CLIENT_SECRET=your-client-secret
+
+# Proxy Credentials (if needed)
+AD_USERNAME=your-username
+AD_USER_PW=your-password
+            """.strip())
+
+# Enhanced OSEnv class
 class OSEnv:
     def __init__(self, config_file: str, creds_file: str, certificate_path: str):
+        """Initialize the environment with config, credentials, and certificates."""
+        logger.info("[CHAIN OF THOUGHT] Initializing environment variables")
         self.var_list = []
+        
+        # Create default files if they don't exist
+        create_default_files()
+        
+        # Load configurations
         self.bulk_set(config_file, True)
         self.bulk_set(creds_file, False)
-        self.set_certificate_path(certificate_path)
+        
+        # Set certificate path if it exists
+        if os.path.exists(certificate_path) and is_file_readable(certificate_path):
+            self.set_certificate_path(certificate_path)
+            logger.info(f"[CHAIN OF THOUGHT] Loaded certificate from {certificate_path}")
+        else:
+            logger.warning(f"[CHAIN OF THOUGHT] Certificate file not found or not readable: {certificate_path}")
+        
+        # Configure proxy if enabled
         if str_to_bool(self.get("PROXY_ENABLED", "False")):
+            logger.info("[CHAIN OF THOUGHT] Proxy is enabled, configuring proxy settings")
             self.set_proxy()
         
+        # Get Azure token if secured endpoints
         if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
+            logger.info("[CHAIN OF THOUGHT] Setting up Azure token for secured endpoints")
             self.token = self.get_azure_token()
         else:
             self.token = None
 
-    def _get_credential(self):
+    def _get_credential(self) -> Union[DefaultAzureCredential, ClientSecretCredential]:
+        """Get the appropriate Azure credential based on configuration."""
         if str_to_bool(self.get("USE_MANAGED_IDENTITY", "False")):
+            logger.info("[CHAIN OF THOUGHT] Using managed identity for Azure authentication")
             return DefaultAzureCredential()
         else:
+            logger.info("[CHAIN OF THOUGHT] Using client secret for Azure authentication")
+            tenant_id = self.get("AZURE_TENANT_ID")
+            client_id = self.get("AZURE_CLIENT_ID")
+            client_secret = self.get("AZURE_CLIENT_SECRET")
+            
+            if not all([tenant_id, client_id, client_secret]):
+                logger.warning("[CHAIN OF THOUGHT] Missing Azure credentials, authentication may fail")
+                
             return ClientSecretCredential(
-                tenant_id=self.get("AZURE_TENANT_ID"),
-                client_id=self.get("AZURE_CLIENT_ID"),
-                client_secret=self.get("AZURE_CLIENT_SECRET")
+                tenant_id=tenant_id,
+                client_id=client_id,
+                client_secret=client_secret
             )
 
-    def set_certificate_path(self, path: str):
+    def set_certificate_path(self, path: str) -> None:
+        """Set the certificate path for secure connections."""
         try:
             if not os.path.isabs(path):
                 path = os.path.abspath(path)
             if not is_file_readable(path):
                 raise FileNotFoundError(f"The file '{path}' does not exist or is not readable")
             
+            logger.info(f"[CHAIN OF THOUGHT] Setting certificate paths to {path}")
             self.set("REQUESTS_CA_BUNDLE", path)
             self.set("SSL_CERT_FILE", path)
             self.set("CURL_CA_BUNDLE", path)
@@ -91,19 +166,25 @@ class OSEnv:
             raise
 
     def bulk_set(self, dotenvfile: str, print_val: bool = False) -> None:
+        """Load environment variables from a .env file."""
         try:
             if not os.path.isabs(dotenvfile):
                 dotenvfile = os.path.abspath(dotenvfile)
-            if not is_file_readable(dotenvfile):
+                
+            if os.path.exists(dotenvfile) and is_file_readable(dotenvfile):
+                logger.info(f"[CHAIN OF THOUGHT] Loading environment variables from {dotenvfile}")
                 temp_dict = dotenv_values(dotenvfile)
                 for key, value in temp_dict.items():
                     self.set(key, value, print_val)
                 del temp_dict
+            else:
+                logger.warning(f"[CHAIN OF THOUGHT] Environment file not found or not readable: {dotenvfile}")
         except Exception as e:
             logger.error(f"Error loading environment variables from {dotenvfile}: {e}")
             raise
 
     def set(self, key: str, value: str, print_val: bool = False) -> None:
+        """Set an environment variable."""
         try:
             os.environ[key] = value
             if key not in self.var_list:
@@ -115,6 +196,7 @@ class OSEnv:
             raise
 
     def get(self, key: str, default: Optional[str] = None) -> str:
+        """Get an environment variable with a default value."""
         try:
             return os.environ.get(key, default)
         except Exception as e:
@@ -122,15 +204,22 @@ class OSEnv:
             raise
 
     def set_proxy(self) -> None:
+        """Configure proxy settings from environment variables."""
         try:
             ad_username = self.get("AD_USERNAME")
             ad_password = self.get("AD_USER_PW")
             proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
+            
             if not all([ad_username, ad_password, proxy_domain]):
-                raise ValueError("Proxy settings are incomplete")
+                logger.warning("[CHAIN OF THOUGHT] Proxy is enabled but settings are incomplete")
+                return
+                
+            logger.info("[CHAIN OF THOUGHT] Configuring proxy with authentication")
             proxy_url = f"https://{ad_username}:{ad_password}@{proxy_domain}"
             self.set("HTTP_PROXY", proxy_url, print_val=False)
             self.set("HTTPS_PROXY", proxy_url, print_val=False)
+            
+            # Configure no_proxy for Azure services
             no_proxy_domains = [
                 'cognitiveservices.azure.com',
                 'search.windows.net',
@@ -139,303 +228,1280 @@ class OSEnv:
                 'azurewebsites.net'
             ]
             self.set("NO_PROXY", ",".join(no_proxy_domains), print_val=False)
+            logger.info("[CHAIN OF THOUGHT] Added Azure domains to NO_PROXY")
         except Exception as e:
             logger.error(f"Error setting proxy: {e}")
             raise
 
-    def get_azure_token(self) -> str:
+    def get_azure_token(self) -> Optional[str]:
+        """Get an Azure authentication token."""
         try:
-            credential = ClientSecretCredential(
-                tenant_id=self.get("AZURE_TENANT_ID"),
-                client_id=self.get("AZURE_CLIENT_ID"),
-                client_secret=self.get("AZURE_CLIENT_SECRET")
-            )
+            logger.info("[CHAIN OF THOUGHT] Acquiring Azure authentication token")
+            credential = self._get_credential()
             token = credential.get_token("https://cognitiveservices.azure.com/.default")
-            self.set("AZURE_TOKEN", token.token, print_val=False)
-            logger.info("Azure token set")
-            return token.token
+            
+            if token and token.token:
+                self.set("AZURE_TOKEN", token.token, print_val=False)
+                logger.info("[CHAIN OF THOUGHT] Successfully acquired Azure token")
+                return token.token
+            else:
+                logger.error("[CHAIN OF THOUGHT] Failed to acquire valid Azure token")
+                return None
         except Exception as e:
             logger.error(f"Error retrieving Azure token: {e}")
             return None
 
 # Document and Embedding classes
 class MyDocument(BaseModel):
-    id: str = ""
+    """Document class for storing text, embeddings, and metadata."""
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     text: str = ""
     embedding: List[float] = []
-    metadata: Dict[str, Any] = {}
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 class EmbeddingClient:
-    def __init__(self, azure_api_version: str = "2023-05-15", embeddings_model: str = "text-embedding-3-large"):
-        self.azure_api_version = azure_api_version
-        self.embeddings_model = embeddings_model
+    """Client for generating embeddings using Azure OpenAI."""
+    def __init__(self, azure_api_version: str = "", embeddings_model: str = ""):
+        self.azure_api_version = azure_api_version or os.getenv("API_VERSION", "2023-05-15")
+        self.embeddings_model = embeddings_model or os.getenv("EMBEDDINGS_MODEL", "text-embedding-3-large")
+        logger.info(f"[CHAIN OF THOUGHT] Initializing embedding client with model: {self.embeddings_model}")
         self.direct_azure_client = self._get_direct_azure_client()
 
-    def _get_direct_azure_client(self):
-        token_provider = get_bearer_token_provider(
-            DefaultAzureCredential(),
-            "https://cognitiveservices.azure.com/.default"
-        )
-        return AzureOpenAI(
-            azure_endpoint=os.getenv("AZURE_ENDPOINT"),
-            api_version=self.azure_api_version,
-            azure_ad_token_provider=token_provider
-        )
+    def _get_direct_azure_client(self) -> AzureOpenAI:
+        """Get an Azure OpenAI client for embeddings."""
+        try:
+            logger.info("[CHAIN OF THOUGHT] Setting up Azure OpenAI client for embeddings")
+            token_provider = get_bearer_token_provider(
+                DefaultAzureCredential(),
+                "https://cognitiveservices.azure.com/.default"
+            )
+            
+            endpoint = os.getenv("AZURE_ENDPOINT")
+            if not endpoint:
+                logger.warning("[CHAIN OF THOUGHT] AZURE_ENDPOINT not set, embeddings will fail")
+                
+            return AzureOpenAI(
+                azure_endpoint=endpoint,
+                api_version=self.azure_api_version,
+                azure_ad_token_provider=token_provider
+            )
+        except Exception as e:
+            logger.error(f"Error creating Azure OpenAI client: {e}")
+            raise
 
     def generate_embeddings(self, doc: MyDocument) -> MyDocument:
+        """Generate embeddings for a document."""
         try:
+            logger.info(f"[CHAIN OF THOUGHT] Generating embeddings for document: {doc.id}")
+            
+            if not doc.text:
+                logger.warning(f"[CHAIN OF THOUGHT] Empty text for document {doc.id}, skipping embeddings")
+                return doc
+                
             response = self.direct_azure_client.embeddings.create(
                 model=self.embeddings_model,
                 input=doc.text
             ).data[0].embedding
+            
             doc.embedding = response
+            logger.info(f"[CHAIN OF THOUGHT] Successfully generated embedding with dimension: {len(response)}")
             return doc
         except Exception as e:
             logger.error(f"Error generating embeddings: {e}")
+            # Return the original document without embeddings as fallback
             return doc
 
+    def generate_batch_embeddings(self, docs: List[MyDocument], batch_size: int = 10) -> List[MyDocument]:
+        """Generate embeddings for a batch of documents."""
+        try:
+            logger.info(f"[CHAIN OF THOUGHT] Generating batch embeddings for {len(docs)} documents")
+            
+            # Process in batches to avoid rate limits
+            processed_docs = []
+            for i in range(0, len(docs), batch_size):
+                batch = docs[i:i+batch_size]
+                logger.info(f"[CHAIN OF THOUGHT] Processing batch {i//batch_size + 1}/{len(docs)//batch_size + 1}")
+                
+                for doc in batch:
+                    processed_docs.append(self.generate_embeddings(doc))
+                
+            return processed_docs
+        except Exception as e:
+            logger.error(f"Error in batch embedding generation: {e}")
+            return docs
+
 class EmbeddingWrapper(Embeddings):
+    """Langchain compatible embedding wrapper for the EmbeddingClient."""
     def __init__(self, embedding_client: EmbeddingClient):
         self.client = embedding_client
         
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        return [self.embed_query(text) for text in texts]
+        """Embed a list of documents."""
+        try:
+            logger.info(f"[CHAIN OF THOUGHT] Embedding {len(texts)} documents")
+            docs = [MyDocument(text=text) for text in texts]
+            embedded_docs = self.client.generate_batch_embeddings(docs)
+            return [doc.embedding for doc in embedded_docs]
+        except Exception as e:
+            logger.error(f"Error in embed_documents: {e}")
+            # Return empty embeddings as fallback
+            return [[0.0] for _ in texts]
     
     def embed_query(self, text: str) -> List[float]:
-        doc = MyDocument(text=text)
-        embedded_doc = self.client.generate_embeddings(doc)
-        return embedded_doc.embedding
+        """Embed a single query."""
+        try:
+            logger.info("[CHAIN OF THOUGHT] Embedding query text")
+            doc = MyDocument(text=text)
+            embedded_doc = self.client.generate_embeddings(doc)
+            return embedded_doc.embedding
+        except Exception as e:
+            logger.error(f"Error in embed_query: {e}")
+            # Return empty embedding as fallback
+            return [0.0]
 
-# Agents
+# Enhanced PDF Reader Agent
 class PDFReaderAgent:
+    """Agent for reading PDF documents and storing them in a vector database."""
     def __init__(self, vector_db: Chroma, embedding_client: EmbeddingClient):
         self.vector_db = vector_db
         self.embedding_client = embedding_client
+        
+        # Use sophisticated chunking for better semantic boundaries
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=4000,  # Character count based chunking
-            chunk_overlap=800,
-            length_function=len  # Simple character count
+            chunk_size=2000,         # Smaller chunks for better semantic coherence
+            chunk_overlap=400,       # Significant overlap to maintain context
+            length_function=len,
+            separators=["\n\n", "\n", ".", "!", "?", ";", ":", ",", " ", ""]  # More nuanced splits
         )
+        
+        logger.info(f"[CHAIN OF THOUGHT] Initialized PDF Reader Agent with chunk size {self.text_splitter.chunk_size} and overlap {self.text_splitter.chunk_overlap}")
+
+    def _extract_metadata(self, reader: PdfReader, file_path: str) -> Dict[str, Any]:
+        """Extract document metadata from PDF file."""
+        try:
+            logger.info(f"[CHAIN OF THOUGHT] Extracting metadata from {file_path}")
+            
+            metadata = {
+                "source": file_path,
+                "filename": Path(file_path).name,
+                "title": Path(file_path).stem,
+                "num_pages": len(reader.pages),
+                "extraction_time": datetime.now().isoformat()
+            }
+            
+            # Try to extract PDF document info if available
+            if reader.metadata:
+                for key in reader.metadata:
+                    if reader.metadata[key]:
+                        clean_key = key.lower().replace('/', '_')
+                        metadata[clean_key] = str(reader.metadata[key])
+                        
+            logger.info(f"[CHAIN OF THOUGHT] Extracted metadata: {json.dumps(metadata, indent=2)}")
+            return metadata
+        except Exception as e:
+            logger.error(f"Error extracting PDF metadata: {e}")
+            return {
+                "source": file_path,
+                "filename": Path(file_path).name,
+                "error": str(e)
+            }
 
     def process_pdf(self, file_path: str) -> List[MyDocument]:
+        """Process a PDF file with chain-of-thought reasoning."""
         try:
             docs = []
+            logger.info(f"[CHAIN OF THOUGHT] Processing PDF: {file_path}")
+            
+            # Verify file exists and is readable
+            if not os.path.exists(file_path) or not is_file_readable(file_path):
+                logger.error(f"[CHAIN OF THOUGHT] File does not exist or is not readable: {file_path}")
+                return []
+            
+            # Read the PDF
             reader = PdfReader(file_path)
+            num_pages = len(reader.pages)
+            logger.info(f"[CHAIN OF THOUGHT] PDF has {num_pages} pages")
+            
+            # Extract document metadata
+            doc_metadata = self._extract_metadata(reader, file_path)
+            
+            # Extract and process text from each page
+            all_text = ""
             for page_num, page in enumerate(reader.pages):
+                logger.info(f"[CHAIN OF THOUGHT] Extracting text from page {page_num + 1}/{num_pages}")
                 text = page.extract_text()
                 if text:
-                    chunks = self.text_splitter.split_text(text)
-                    for chunk in chunks:
-                        doc = MyDocument(
-                            id=str(uuid.uuid4()),
-                            text=chunk,
-                            metadata={
-                                "source": file_path,
-                                "page": page_num + 1
-                            }
-                        )
-                        doc = self.embedding_client.generate_embeddings(doc)
-                        docs.append(doc)
-            self.vector_db.add(
-                ids=[d.id for d in docs],
-                documents=[d.text for d in docs],
-                metadatas=[d.metadata for d in docs],
-                embeddings=[d.embedding for d in docs]
-            )
+                    # Add page marker for later reference
+                    all_text += f"\n\n--- Page {page_num + 1} ---\n\n{text}"
+                else:
+                    logger.warning(f"[CHAIN OF THOUGHT] No text extracted from page {page_num + 1}")
+            
+            # Log text extraction statistics
+            logger.info(f"[CHAIN OF THOUGHT] Total extracted text length: {len(all_text)} characters")
+            
+            if not all_text.strip():
+                logger.warning(f"[CHAIN OF THOUGHT] No text content extracted from: {file_path}")
+                return []
+            
+            # Create chunks that respect semantic boundaries
+            logger.info(f"[CHAIN OF THOUGHT] Applying semantic chunking with size {self.text_splitter.chunk_size} and overlap {self.text_splitter.chunk_overlap}")
+            chunks = self.text_splitter.split_text(all_text)
+            logger.info(f"[CHAIN OF THOUGHT] Created {len(chunks)} chunks from document")
+            
+            # Process each chunk
+            for i, chunk in enumerate(chunks):
+                # Create a unique ID that encodes the document and chunk position
+                doc_id = f"{Path(file_path).stem}_{i+1}_{uuid.uuid4()}"
+                
+                # Create chunk-specific metadata
+                chunk_metadata = doc_metadata.copy()
+                chunk_metadata["chunk_id"] = i + 1
+                chunk_metadata["chunk_total"] = len(chunks)
+                
+                # Extract page references from chunk
+                page_refs = []
+                for p in range(1, num_pages + 1):
+                    if f"--- Page {p} ---" in chunk:
+                        page_refs.append(p)
+                
+                chunk_metadata["pages"] = page_refs
+                logger.info(f"[CHAIN OF THOUGHT] Chunk {i+1}/{len(chunks)} refers to pages: {page_refs}")
+                
+                # Create document object
+                doc = MyDocument(
+                    id=doc_id,
+                    text=chunk,
+                    metadata=chunk_metadata
+                )
+                
+                # Generate embeddings
+                doc = self.embedding_client.generate_embeddings(doc)
+                docs.append(doc)
+            
+            # Add to vector DB in a batch if we have documents
+            if docs:
+                logger.info(f"[CHAIN OF THOUGHT] Adding {len(docs)} document chunks to vector database")
+                
+                self.vector_db.add(
+                    ids=[d.id for d in docs],
+                    documents=[d.text for d in docs],
+                    metadatas=[d.metadata for d in docs],
+                    embeddings=[d.embedding for d in docs]
+                )
+                logger.info(f"[CHAIN OF THOUGHT] Successfully added chunks to vector database")
+            
+            logger.info(f"[CHAIN OF THOUGHT] Completed processing PDF: {file_path}")
             return docs
         except Exception as e:
             logger.error(f"Error processing PDF {file_path}: {e}")
             return []
 
+# Enhanced Topic Extraction Agent
 class TopicExtractionAgent:
+    """Agent for extracting ontology-relevant topics from documents."""
     def __init__(self, llm: AzureChatOpenAI, vector_db: Chroma):
         self.llm = llm
         self.vector_db = vector_db
+        
+        # Enhanced prompt with detailed instructions for topic extraction
         self.topic_prompt = PromptTemplate.from_template(
-            "Extract key ontology-relevant topics from this text. Consider entities, "
-            "concepts, relationships, and domain-specific terms:\n\n{text}\n\n"
-            "Return as comma-separated values:"
+            """You are an expert ontology engineer analyzing documents to extract key topics.
+            
+            # Task
+            Extract ontology-relevant topics from the text below. Consider:
+            1. Named entities (people, organizations, products, locations)
+            2. Domain concepts and terminology
+            3. Important categories and classifications
+            4. Properties or attributes of entities
+            5. Potential relationships between concepts
+            
+            # Text to analyze
+            {text}
+            
+            # Chain of Thought
+            First, identify all possible topics mentioned in the text.
+            Then, categorize these into entities, concepts, properties, and relationships.
+            Next, standardize terminology and merge similar concepts.
+            Finally, select the most relevant terms for the ontology.
+            
+            # Output Format
+            Return as a JSON object with the following structure:
+            {{
+                "reasoning": "your step by step analysis",
+                "topics": [
+                    {{
+                        "term": "standardized term",
+                        "type": "entity|concept|property|relationship",
+                        "definition": "brief definition based on context"
+                    }}
+                ]
+            }}
+            """
         )
+        
+        # Consolidation prompt for merging topics across documents
+        self.consolidation_prompt = PromptTemplate.from_template(
+            """You are an expert ontology engineer consolidating topics extracted from multiple documents.
+            
+            # Task
+            Review the list of extracted topics below and create a consolidated, non-redundant set of topics
+            for creating an ontology.
+            
+            # Topics from documents
+            {topics_json}
+            
+            # Chain of Thought
+            First, identify duplicate topics with different names or spellings.
+            Then, merge related concepts into hierarchical structures where appropriate.
+            Next, standardize terminology across all topics.
+            Finally, organize topics into a coherent set for ontology creation.
+            
+            # Output Format
+            Return as a JSON object with the following structure:
+            {{
+                "reasoning": "your step by step consolidation process",
+                "consolidated_topics": [
+                    {{
+                        "term": "standardized term",
+                        "type": "entity|concept|property|relationship",
+                        "definition": "consolidated definition",
+                        "related_terms": ["list", "of", "related", "terms"],
+                        "source_terms": ["original", "extracted", "terms"]
+                    }}
+                ]
+            }}
+            """
+        )
+        
+        logger.info("[CHAIN OF THOUGHT] Initialized Topic Extraction Agent with enhanced prompts")
 
-    def extract_topics(self, state: dict) -> List[str]:
+    def extract_topics(self, state: dict) -> dict:
+        """Extract topics from documents with chain-of-thought reasoning."""
         try:
-            unique_topics = set()
-            for doc in state["documents"]:
+            documents = state.get("documents", [])
+            logger.info(f"[CHAIN OF THOUGHT] Beginning topic extraction from {len(documents)} documents")
+            
+            all_doc_topics = []
+            
+            # Process each document
+            for i, doc in enumerate(documents):
+                logger.info(f"[CHAIN OF THOUGHT] Extracting topics from document chunk {i+1}/{len(documents)}")
+                logger.info(f"[CHAIN OF THOUGHT] Document ID: {doc.id}, Source: {doc.metadata.get('source', 'unknown')}")
+                
+                # Extract topics using LLM
                 chain = LLMChain(llm=self.llm, prompt=self.topic_prompt)
                 result = chain.run(text=doc.text)
-                topics = [t.strip() for t in result.split(",") if t.strip()]
-                unique_topics.update(topics)
+                
+                try:
+                    # Parse the JSON response
+                    topics_data = json.loads(result)
+                    
+                    # Log the reasoning process
+                    logger.info(f"[CHAIN OF THOUGHT] LLM reasoning: {topics_data.get('reasoning', 'No reasoning provided')}")
+                    
+                    # Add document reference to each topic
+                    for topic in topics_data.get("topics", []):
+                        topic["document_id"] = doc.id
+                        topic["source"] = doc.metadata.get("source", "unknown")
+                    
+                    all_doc_topics.extend(topics_data.get("topics", []))
+                    logger.info(f"[CHAIN OF THOUGHT] Extracted {len(topics_data.get('topics', []))} topics from this document")
+                    
+                except json.JSONDecodeError:
+                    logger.error(f"Failed to parse LLM response as JSON: {result}")
+                    # Try to extract a simple list if JSON parsing fails
+                    topics = [t.strip() for t in result.split(",") if t.strip()]
+                    for topic in topics:
+                        all_doc_topics.append({
+                            "term": topic,
+                            "type": "unknown",
+                            "definition": "",
+                            "document_id": doc.id,
+                            "source": doc.metadata.get("source", "unknown")
+                        })
             
-            validated_topics = self._validate_topics(list(unique_topics))
-            return validated_topics
+            logger.info(f"[CHAIN OF THOUGHT] Extracted a total of {len(all_doc_topics)} topics across all documents")
+            
+            # Consolidate topics
+            logger.info("[CHAIN OF THOUGHT] Beginning topic consolidation process")
+            consolidated_topics = self._consolidate_topics(all_doc_topics)
+            
+            return {
+                "extracted_topics": all_doc_topics,
+                "consolidated_topics": consolidated_topics
+            }
         except Exception as e:
-            logger.error(f"Error extracting topics: {e}")
-            return []
+            logger.error(f"Error in topic extraction: {e}")
+            return {"extracted_topics": [], "consolidated_topics": []}
 
-    def _validate_topics(self, topics: List[str]) -> List[str]:
-        results = self.vector_db.similarity_search(
-            query=", ".join(topics),
-            k=5
+    def _consolidate_topics(self, topics: List[Dict]) -> List[Dict]:
+        """Consolidate topics with chain-of-thought reasoning."""
+        try:
+            if not topics:
+                logger.warning("[CHAIN OF THOUGHT] No topics to consolidate")
+                return []
+                
+            logger.info(f"[CHAIN OF THOUGHT] Consolidating {len(topics)} extracted topics")
+            
+            # Convert topics to JSON for the prompt
+            topics_json = json.dumps(topics, indent=2)
+            
+            # Run consolidation with LLM
+            chain = LLMChain(llm=self.llm, prompt=self.consolidation_prompt)
+            result = chain.run(topics_json=topics_json)
+            
+            try:
+                consolidated_data = json.loads(result)
+                
+                # Log the reasoning process
+                logger.info(f"[CHAIN OF THOUGHT] Consolidation reasoning: {consolidated_data.get('reasoning', 'No reasoning provided')}")
+                logger.info(f"[CHAIN OF THOUGHT] Consolidated {len(topics)} topics into {len(consolidated_data.get('consolidated_topics', []))} unique topics")
+                
+                return consolidated_data.get("consolidated_topics", [])
+            except json.JSONDecodeError:
+                logger.error(f"Failed to parse consolidation response as JSON: {result}")
+                return topics
+        except Exception as e:
+            logger.error(f"Error in topic consolidation: {e}")
+            return topics
+
+# Enhanced Triple Extraction Agent
+class TripleExtractionAgent:
+    """Agent for extracting RDF triples (subject-predicate-object) from documents."""
+    def __init__(self, llm: AzureChatOpenAI, vector_db: Chroma):
+        self.llm = llm
+        self.vector_db = vector_db
+        
+        # Enhanced prompt for better triple extraction
+        self.triple_prompt = PromptTemplate.from_template(
+            """You are an expert knowledge graph engineer extracting subject-predicate-object triples from text.
+            
+            # Task
+            Identify all meaningful relationships from the following text and represent them as RDF-style triples.
+            
+            # Text to analyze
+            {text}
+            
+            # Context
+            Consider these ontology topics that have been identified in the document corpus:
+            {topics}
+            
+            # Chain of Thought
+            First, identify all entities and concepts in the text.
+            Then, determine relationships between these entities.
+            Next, formulate each relationship as a Subject-Predicate-Object triple.
+            Finally, ensure predicates are standardized and represent meaningful relationships.
+            
+            # Output Format
+            Return as a JSON object with the following structure:
+            {{
+                "reasoning": "your step by step triple extraction process",
+                "triples": [
+                    {{
+                        "subject": "entity or concept as subject",
+                        "predicate": "relationship type (use camelCase for multi-word predicates)",
+                        "object": "entity or concept as object",
+                        "confidence": 0.85,  // confidence score between 0 and 1
+                        "text_evidence": "text excerpt supporting this triple"
+                    }}
+                ]
+            }}
+            """
         )
-        context = "\n".join([d.text for d in results])
         
-        validation_prompt = f"""Validate and consolidate topics based on context:
-        Context: {context}
-        Proposed Topics: {topics}
+        # Validation prompt for quality control
+        self.validation_prompt = PromptTemplate.from_template(
+            """You are an expert knowledge graph engineer validating extracted triples for an ontology.
+            
+            # Task
+            Review the following triples extracted from documents and validate their quality for inclusion
+            in an OWL ontology.
+            
+            # Extracted Triples
+            {triples_json}
+            
+            # Chain of Thought
+            For each triple:
+            1. Check if the subject and object are clear, specific entities or concepts
+            2. Verify that the predicate is a meaningful relationship type
+            3. Evaluate whether the triple represents ontological knowledge (vs factual data)
+            4. Look for inconsistencies or contradictions between triples
+            5. Consider if predicates need standardization or alignment with common ontology patterns
+            
+            # Output Format
+            Return as a JSON object with the following structure:
+            {{
+                "reasoning": "your validation reasoning process",
+                "validated_triples": [
+                    {{
+                        "subject": "validated subject",
+                        "predicate": "validated predicate",
+                        "object": "validated object",
+                        "confidence": 0.85,
+                        "quality_score": 0.90,  // 0-1 score of triple quality for ontology
+                        "issues": ["list", "of", "any", "issues"],
+                        "source_docs": ["list", "of", "document", "ids"]
+                    }}
+                ]
+            }}
+            """
+        )
         
-        Remove duplicates, merge similar terms, and keep only relevant topics.
-        Return cleaned comma-separated values:"""
-        
-        chain = LLMChain(llm=self.llm, prompt=PromptTemplate.from_template(validation_prompt))
-        return [t.strip() for t in chain.run().split(",")]
+        logger.info("[CHAIN OF THOUGHT] Initialized Triple Extraction Agent with enhanced prompts")
+    
+    def extract_triples(self, state: dict) -> dict:
+        """Extract triples from documents with chain-of-thought reasoning."""
+        try:
+            documents = state.get("documents", [])
+            logger.info(f"[CHAIN OF THOUGHT] Beginning triple extraction from {len(documents)} documents")
+            
+            # Get consolidated topics as context
+            topics = state.get("consolidated_topics", [])
+            topics_str = ", ".join([t.get("term", "") for t in topics])
+            logger.info(f"[CHAIN OF THOUGHT] Using {len(topics)} consolidated topics as context for triple extraction")
+            
+            all_triples = []
+            
+            # Process each document
+            for i, doc in enumerate(documents):
+                logger.info(f"[CHAIN OF THOUGHT] Extracting triples from document chunk {i+1}/{len(documents)}")
+                logger.info(f"[CHAIN OF THOUGHT] Document ID: {doc.id}, Source: {doc.metadata.get('source', 'unknown')}")
+                
+                # Extract triples using LLM
+                chain = LLMChain(llm=self.llm, prompt=self.triple_prompt)
+                result = chain.run(text=doc.text, topics=topics_str)
+                
+                try:
+                    # Parse the JSON response
+                    triples_data = json.loads(result)
+                    
+                    # Log the reasoning process
+                    logger.info(f"[CHAIN OF THOUGHT] Triple extraction reasoning: {triples_data.get('reasoning', 'No reasoning provided')}")
+                    
+                    # Add document reference to each triple
+                    for triple in triples_data.get("triples", []):
+                        triple["document_id"] = doc.id
+                        triple["source"] = doc.metadata.get("source", "unknown")
+                        triple["source_docs"] = [doc.id]
+                    
+                    all_triples.extend(triples_data.get("triples", []))
+                    logger.info(f"[CHAIN OF THOUGHT] Extracted {len(triples_data.get('triples', []))} triples from this document")
+                    
+                except json.JSONDecodeError:
+                    logger.error(f"Failed to parse LLM response as JSON: {result}")
+            
+            logger.info(f"[CHAIN OF THOUGHT] Extracted a total of {len(all_triples)} triples across all documents")
+            
+            # Merge duplicate triples
+            merged_triples = self._merge_duplicate_triples(all_triples)
+            logger.info(f"[CHAIN OF THOUGHT] Merged into {len(merged_triples)} unique triples")
+            
+            # Validate triples
+            validated_triples = self._validate_triples(merged_triples)
+            logger.info(f"[CHAIN OF THOUGHT] Validated {len(validated_triples)} triples for ontology creation")
+            
+            return {
+                "extracted_triples": all_triples,
+                "merged_triples": merged_triples,
+                "validated_triples": validated_triples
+            }
+        except Exception as e:
+            logger.error(f"Error in triple extraction: {e}")
+            return {"extracted_triples": [], "merged_triples": [], "validated_triples": []}
 
+    def _merge_duplicate_triples(self, triples: List[Dict]) -> List[Dict]:
+        """Merge duplicate triples with chain-of-thought reasoning."""
+        try:
+            if not triples:
+                return []
+                
+            logger.info(f"[CHAIN OF THOUGHT] Merging {len(triples)} triples to eliminate duplicates")
+            
+            merged = {}
+            for t in triples:
+                # Create a key for each unique triple relationship
+                key = (
+                    t.get("subject", "").lower(), 
+                    t.get("predicate", "").lower(), 
+                    t.get("object", "").lower()
+                )
+                
+                if key in merged:
+                    # Combine source documents
+                    merged[key]["source_docs"].extend(t.get("source_docs", []))
+                    merged[key]["source_docs"] = list(set(merged[key]["source_docs"]))
+                    
+                    # Average the confidence scores
+                    if "confidence" in t and "confidence" in merged[key]:
+                        merged[key]["confidence"] = (merged[key]["confidence"] + t["confidence"]) / 2
+                    
+                    # Keep the most detailed evidence
+                    if "text_evidence" in t and len(t.get("text_evidence", "")) > len(merged[key].get("text_evidence", "")):
+                        merged[key]["text_evidence"] = t["text_evidence"]
+                else:
+                    merged[key] = t.copy()
+            
+            return list(merged.values())
+        except Exception as e:
+            logger.error(f"Error in merging triples: {e}")
+            return triples
+
+    def _validate_triples(self, triples: List[Dict]) -> List[Dict]:
+        """Validate triples with chain-of-thought reasoning."""
+        try:
+            if not triples:
+                return []
+                
+            logger.info(f"[CHAIN OF THOUGHT] Validating {len(triples)} triples for ontology quality")
+            
+            # Convert triples to JSON for the prompt
+            triples_json = json.dumps(triples, indent=2)
+            
+            # Run validation with LLM
+            chain = LLMChain(llm=self.llm, prompt=self.validation_prompt)
+            result = chain.run(triples_json=triples_json)
+            
+            try:
+                validation_data = json.loads(result)
+                
+                # Log the reasoning process
+                logger.info(f"[CHAIN OF THOUGHT] Validation reasoning: {validation_data.get('reasoning', 'No reasoning provided')}")
+                
+                return validation_data.get("validated_triples", triples)
+            except json.JSONDecodeError:
+                logger.error(f"Failed to parse validation response as JSON: {result}")
+                return triples
+        except Exception as e:
+            logger.error(f"Error in triple validation: {e}")
+            return triples
+
+# Enhanced Ontology Creation Agent
 class OntologyCreationAgent:
-    def __init__(self, base_uri: str = "http://example.org/ontology/"):
+    """Agent for creating OWL ontology from extracted topics and triples."""
+    def __init__(self, llm: AzureChatOpenAI, base_uri: str = "http://example.org/ontology/"):
+        self.llm = llm
         self.base_uri = Namespace(base_uri)
         self.graph = Graph()
-        self.graph.bind("ex", self.base_uri)
-        self.graph.bind("rdfs", RDFS)
         
-    def create_ontology(self, topics: List[str], state: dict) -> Graph:
+        # Standard prefixes for semantic web
+        self.graph.bind("ex", self.base_uri)
+        self.graph.bind("rdf", RDF)
+        self.graph.bind("rdfs", RDFS)
+        self.graph.bind("owl", OWL)
+        self.graph.bind("xsd", XSD)
+        self.graph.bind("dcterms", URIRef("http://purl.org/dc/terms/"))
+        self.graph.bind("skos", URIRef("http://www.w3.org/2004/02/skos/core#"))
+        self.graph.bind("dc", URIRef("http://purl.org/dc/elements/1.1/"))
+        
+        # Enhanced ontology design prompt
+        self.ontology_design_prompt = PromptTemplate.from_template(
+            """You are an expert knowledge engineer designing an OWL ontology structure.
+            
+            # Task
+            Design an OWL ontology structure based on the topics and triples extracted from documents.
+            
+            # Topics
+            {topics_json}
+            
+            # Triples
+            {triples_json}
+            
+            # Chain of Thought
+            First, categorize topics into classes, properties, and individuals.
+            Then, organize classes into a hierarchy with subClassOf relationships.
+            Next, design object properties to represent relationships between classes.
+            Then, design data properties to represent attributes of classes.
+            Finally, identify potential restrictions and axioms to apply to the ontology.
+            
+            # Output Format
+            Return as a JSON object with the following structure:
+            {{
+                "reasoning": "your design rationale and decisions",
+                "ontology_design": {{
+                    "classes": [
+                        {{
+                            "class_id": "ClassId",
+                            "label": "Human-readable label",
+                            "description": "Class description",
+                            "parent_class": "ParentClassId or null",
+                            "source_topics": ["topic1", "topic2"]
+                        }}
+                    ],
+                    "object_properties": [
+                        {{
+                            "property_id": "propertyId",
+                            "label": "Human-readable label",
+                            "description": "Property description",
+                            "domain": "DomainClassId",
+                            "range": "RangeClassId",
+                            "source_triples": ["subject-predicate-object"]
+                        }}
+                    ],
+                    "data_properties": [
+                        {{
+                            "property_id": "propertyId",
+                            "label": "Human-readable label",
+                            "description": "Property description",
+                            "domain": "DomainClassId",
+                            "range": "xsd:datatype",
+                            "source_topics": ["topic1", "topic2"]
+                        }}
+                    ]
+                }}
+            }}
+            """
+        )
+        
+        logger.info("[CHAIN OF THOUGHT] Initialized Ontology Creation Agent with enhanced OWL structure")
+
+    def design_ontology(self, topics: List[Dict], triples: List[Dict]) -> Dict:
+        """Design the ontology structure with chain-of-thought reasoning."""
         try:
-            # Create classes from topics
-            for topic in topics:
-                class_uri = self.base_uri[topic.replace(" ", "")]
-                self.graph.add((class_uri, RDF.type, RDFS.Class))
-                self.graph.add((class_uri, RDFS.label, Literal(topic, datatype=XSD.string)))
+            logger.info("[CHAIN OF THOUGHT] Designing ontology structure from topics and triples")
             
-            # Create triples from extracted relationships
-            for triple in state["triples"]:
-                subj_uri = self.base_uri[triple.subject.replace(" ", "")]
-                obj_uri = self.base_uri[triple.object.replace(" ", "")]
-                pred_uri = self.base_uri[triple.predicate.replace(" ", "")]
-                
-                self.graph.add((subj_uri, pred_uri, obj_uri))
-                
-                # Add source document provenance
-                for source in triple.source_docs:
-                    source_literal = Literal(source, datatype=XSD.anyURI)
-                    self.graph.add((subj_uri, self.base_uri["hasSource"], source_literal))
+            # Convert inputs to JSON for the prompt
+            topics_json = json.dumps(topics, indent=2)
+            triples_json = json.dumps(triples, indent=2)
             
-            return self.graph
+            # Run ontology design with LLM
+            chain = LLMChain(llm=self.llm, prompt=self.ontology_design_prompt)
+            result = chain.run(topics_json=topics_json, triples_json=triples_json)
+            
+            try:
+                design_data = json.loads(result)
+                
+                # Log the reasoning process
+                logger.info(f"[CHAIN OF THOUGHT] Ontology design reasoning: {design_data.get('reasoning', 'No reasoning provided')}")
+                logger.info(f"[CHAIN OF THOUGHT] Design includes {len(design_data.get('ontology_design', {}).get('classes', []))} classes, " +
+                           f"{len(design_data.get('ontology_design', {}).get('object_properties', []))} object properties, " +
+                           f"{len(design_data.get('ontology_design', {}).get('data_properties', []))} data properties")
+                
+                return design_data.get("ontology_design", {})
+            except json.JSONDecodeError:
+                logger.error(f"Failed to parse ontology design response as JSON: {result}")
+                return {}
+        except Exception as e:
+            logger.error(f"Error in ontology design: {e}")
+            return {}
+
+    def _safe_uri(self, text: str) -> str:
+        """Convert text to safe URI format."""
+        # Replace spaces and special characters
+        safe = re.sub(r'[^a-zA-Z0-9]', '_', text)
+        # Ensure it starts with a letter (required for valid URIs)
+        if safe and not safe[0].isalpha():
+            safe = 'x_' + safe
+        # Convert to CamelCase for classes or camelCase for properties
+        return safe
+
+    def create_ontology(self, state: dict) -> dict:
+        """Create the OWL ontology with chain-of-thought reasoning."""
+        try:
+            topics = state.get("consolidated_topics", [])
+            triples = state.get("validated_triples", [])
+            
+            logger.info(f"[CHAIN OF THOUGHT] Creating OWL ontology from {len(topics)} topics and {len(triples)} triples")
+            
+            # Design the ontology structure
+            design = self.design_ontology(topics, triples)
+            
+            # Initialize the ontology
+            self._initialize_ontology()
+            
+            # Create classes
+            self._create_classes(design.get("classes", []))
+            
+            # Create object properties
+            self._create_object_properties(design.get("object_properties", []))
+            
+            # Create data properties
+            self._create_data_properties(design.get("data_properties", []))
+            
+            # Add triples from extracted relationships
+            self._add_relationship_triples(triples)
+            
+            # Add source document references
+            self._add_source_references(triples)
+            
+            logger.info(f"[CHAIN OF THOUGHT] Ontology creation complete with {len(self.graph)} triples")
+            
+            return {
+                "ontology": self.graph,
+                "design": design
+            }
         except Exception as e:
             logger.error(f"Error creating ontology: {e}")
-            return self.graph
-
-class TripleExtractionAgent:
-    def __init__(self, llm: AzureChatOpenAI):
-        self.llm = llm
-        self.triple_prompt = PromptTemplate.from_template(
-            """Extract relationships from text as subject-predicate-object triples.
-            Text: {text}
-            
-            Return JSON format: {{"triples": [{{"subject": "...", "predicate": "...", "object": "..."}}]}}"""
-        )
+            return {"ontology": self.graph, "design": {}}
     
-    def extract_triples(self, state: dict) -> list:
-        triples = []
+    def _initialize_ontology(self):
+        """Initialize the OWL ontology with metadata."""
         try:
-            for doc in state["documents"]:
-                chain = LLMChain(llm=self.llm, prompt=self.triple_prompt)
-                result = chain.run(text=doc.text)
-                json_data = json.loads(result)
-                for triple in json_data.get("triples", []):
-                    triples.append({
-                        "subject": triple["subject"],
-                        "predicate": triple["predicate"],
-                        "object": triple["object"],
-                        "source_docs": [doc.metadata["source"]]
-                    })
-            return self._merge_duplicate_triples(triples)
+            logger.info("[CHAIN OF THOUGHT] Initializing OWL ontology with metadata")
+            
+            # Define ontology URI
+            ontology_uri = URIRef(str(self.base_uri))
+            
+            # Add ontology declaration
+            self.graph.add((ontology_uri, RDF.type, OWL.Ontology))
+            
+            # Add ontology metadata
+            self.graph.add((ontology_uri, RDFS.label, Literal("Document-based Domain Ontology", lang="en")))
+            self.graph.add((ontology_uri, RDFS.comment, Literal("Ontology automatically generated from document analysis", lang="en")))
+            self.graph.add((ontology_uri, URIRef("http://purl.org/dc/terms/created"), Literal(datetime.now().isoformat(), datatype=XSD.dateTime)))
+            
+            logger.info("[CHAIN OF THOUGHT] Added ontology declaration and metadata")
         except Exception as e:
-            logger.error(f"Error extracting triples: {e}")
-            return []
+            logger.error(f"Error initializing ontology: {e}")
+    
+    def _create_classes(self, classes: List[Dict]):
+        """Create OWL classes with chain-of-thought reasoning."""
+        try:
+            logger.info(f"[CHAIN OF THOUGHT] Creating {len(classes)} OWL classes")
+            
+            # Track class URIs for parent-child relationships
+            class_uris = {}
+            
+            # First pass: Create all classes
+            for cls in classes:
+                class_id = cls.get("class_id", "")
+                if not class_id:
+                    continue
+                    
+                # Create safe URI for class
+                safe_id = self._safe_uri(class_id)
+                class_uri = self.base_uri[safe_id]
+                
+                # Store in our mapping
+                class_uris[class_id] = class_uri
+                
+                # Add class declaration
+                self.graph.add((class_uri, RDF.type, OWL.Class))
+                
+                # Add labels and comments
+                label = cls.get("label", class_id)
+                self.graph.add((class_uri, RDFS.label, Literal(label, lang="en")))
+                
+                if "description" in cls and cls["description"]:
+                    self.graph.add((class_uri, RDFS.comment, Literal(cls["description"], lang="en")))
+                
+                # Add source topic references
+                for topic in cls.get("source_topics", []):
+                    self.graph.add((class_uri, URIRef("http://purl.org/dc/terms/source"), Literal(topic)))
+                    
+                logger.info(f"[CHAIN OF THOUGHT] Created class: {class_id}")
+            
+            # Second pass: Set up class hierarchy
+            for cls in classes:
+                class_id = cls.get("class_id", "")
+                parent_id = cls.get("parent_class")
+                
+                if not class_id or not parent_id or parent_id not in class_uris:
+                    continue
+                
+                # Add subClassOf relationship
+                self.graph.add((class_uris[class_id], RDFS.subClassOf, class_uris[parent_id]))
+                logger.info(f"[CHAIN OF THOUGHT] Added subclass relationship: {class_id} subClassOf {parent_id}")
+                
+            logger.info(f"[CHAIN OF THOUGHT] Completed creating {len(class_uris)} OWL classes with hierarchy")
+            return class_uris
+        except Exception as e:
+            logger.error(f"Error creating classes: {e}")
+            return {}
+    
+    def _create_object_properties(self, properties: List[Dict]):
+        """Create OWL object properties with chain-of-thought reasoning."""
+        try:
+            logger.info(f"[CHAIN OF THOUGHT] Creating {len(properties)} OWL object properties")
+            
+            for prop in properties:
+                prop_id = prop.get("property_id", "")
+                if not prop_id:
+                    continue
+                
+                # Create safe URI for property
+                safe_id = self._safe_uri(prop_id)
+                prop_uri = self.base_uri[safe_id]
+                
+                # Add property declaration
+                self.graph.add((prop_uri, RDF.type, OWL.ObjectProperty))
+                
+                # Add labels and comments
+                label = prop.get("label", prop_id)
+                self.graph.add((prop_uri, RDFS.label, Literal(label, lang="en")))
+                
+                if "description" in prop and prop["description"]:
+                    self.graph.add((prop_uri, RDFS.comment, Literal(prop["description"], lang="en")))
+                
+                # Add domain and range if specified
+                if "domain" in prop and prop["domain"]:
+                    domain_uri = self.base_uri[self._safe_uri(prop["domain"])]
+                    self.graph.add((prop_uri, RDFS.domain, domain_uri))
+                
+                if "range" in prop and prop["range"]:
+                    range_uri = self.base_uri[self._safe_uri(prop["range"])]
+                    self.graph.add((prop_uri, RDFS.range, range_uri))
+                
+                # Add source triple references
+                for triple in prop.get("source_triples", []):
+                    self.graph.add((prop_uri, URIRef("http://purl.org/dc/terms/source"), Literal(triple)))
+                
+                logger.info(f"[CHAIN OF THOUGHT] Created object property: {prop_id}")
+                
+            logger.info(f"[CHAIN OF THOUGHT] Completed creating OWL object properties")
+        except Exception as e:
+            logger.error(f"Error creating object properties: {e}")
+    
+    def _create_data_properties(self, properties: List[Dict]):
+        """Create OWL data properties with chain-of-thought reasoning."""
+        try:
+            logger.info(f"[CHAIN OF THOUGHT] Creating {len(properties)} OWL data properties")
+            
+            for prop in properties:
+                prop_id = prop.get("property_id", "")
+                if not prop_id:
+                    continue
+                
+                # Create safe URI for property
+                safe_id = self._safe_uri(prop_id)
+                prop_uri = self.base_uri[safe_id]
+                
+                # Add property declaration
+                self.graph.add((prop_uri, RDF.type, OWL.DatatypeProperty))
+                
+                # Add labels and comments
+                label = prop.get("label", prop_id)
+                self.graph.add((prop_uri, RDFS.label, Literal(label, lang="en")))
+                
+                if "description" in prop and prop["description"]:
+                    self.graph.add((prop_uri, RDFS.comment, Literal(prop["description"], lang="en")))
+                
+                # Add domain and range if specified
+                if "domain" in prop and prop["domain"]:
+                    domain_uri = self.base_uri[self._safe_uri(prop["domain"])]
+                    self.graph.add((prop_uri, RDFS.domain, domain_uri))
+                
+                if "range" in prop and prop["range"]:
+                    # Handle XSD datatypes
+                    if prop["range"].startswith("xsd:"):
+                        datatype = prop["range"].replace("xsd:", "")
+                        range_uri = getattr(XSD, datatype, XSD.string)
+                    else:
+                        range_uri = self.base_uri[self._safe_uri(prop["range"])]
+                    self.graph.add((prop_uri, RDFS.range, range_uri))
+                
+                # Add source topic references
+                for topic in prop.get("source_topics", []):
+                    self.graph.add((prop_uri, URIRef("http://purl.org/dc/terms/source"), Literal(topic)))
+                
+                logger.info(f"[CHAIN OF THOUGHT] Created data property: {prop_id}")
+                
+            logger.info(f"[CHAIN OF THOUGHT] Completed creating OWL data properties")
+        except Exception as e:
+            logger.error(f"Error creating data properties: {e}")
+    
+    def _add_relationship_triples(self, triples: List[Dict]):
+        """Add relationship triples from extracted data with chain-of-thought reasoning."""
+        try:
+            logger.info(f"[CHAIN OF THOUGHT] Adding {len(triples)} relationship triples to ontology")
+            
+            for triple in triples:
+                subject = triple.get("subject", "")
+                predicate = triple.get("predicate", "")
+                obj = triple.get("object", "")
+                
+                if not all([subject, predicate, obj]):
+                    continue
+                
+                # Create safe URIs
+                subj_uri = self.base_uri[self._safe_uri(subject)]
+                pred_uri = self.base_uri[self._safe_uri(predicate)]
+                obj_uri = self.base_uri[self._safe_uri(obj)]
+                
+                # Add the triple
+                self.graph.add((subj_uri, pred_uri, obj_uri))
+                
+                # Add confidence information if available
+                if "confidence" in triple:
+                    confidence_uri = URIRef("http://purl.org/dc/terms/confidence")
+                    confidence_value = Literal(triple["confidence"], datatype=XSD.decimal)
+                    
+                    # Create a blank node to hold metadata about the triple
+                    b_node = URIRef(f"{str(subj_uri)}_{str(pred_uri)}_{str(obj_uri)}_metadata")
+                    self.graph.add((b_node, RDF.type, RDF.Statement))
+                    self.graph.add((b_node, RDF.subject, subj_uri))
+                    self.graph.add((b_node, RDF.predicate, pred_uri))
+                    self.graph.add((b_node, RDF.object, obj_uri))
+                    self.graph.add((b_node, confidence_uri, confidence_value))
+                
+                logger.info(f"[CHAIN OF THOUGHT] Added triple: {subject} - {predicate} - {obj}")
+                
+            logger.info(f"[CHAIN OF THOUGHT] Completed adding relationship triples")
+        except Exception as e:
+            logger.error(f"Error adding relationship triples: {e}")
+    
+    def _add_source_references(self, triples: List[Dict]):
+        """Add source document references with chain-of-thought reasoning."""
+        try:
+            logger.info("[CHAIN OF THOUGHT] Adding source document references to ontology")
+            
+            for triple in triples:
+                subject = triple.get("subject", "")
+                sources = triple.get("source_docs", [])
+                
+                if not subject or not sources:
+                    continue
+                
+                # Create safe URI for subject
+                subj_uri = self.base_uri[self._safe_uri(subject)]
+                
+                # Add source document references
+                for source in sources:
+                    source_uri = URIRef("http://purl.org/dc/terms/source")
+                    source_literal = Literal(source, datatype=XSD.anyURI)
+                    self.graph.add((subj_uri, source_uri, source_literal))
+                
+                logger.info(f"[CHAIN OF THOUGHT] Added {len(sources)} source references for {subject}")
+                
+            logger.info("[CHAIN OF THOUGHT] Completed adding source document references")
+        except Exception as e:
+            logger.error(f"Error adding source references: {e}")
 
-    def _merge_duplicate_triples(self, triples: list) -> list:
-        merged = {}
-        for t in triples:
-            key = (t["subject"], t["predicate"], t["object"])
-            if key in merged:
-                merged[key]["source_docs"].extend(t["source_docs"])
-                merged[key]["source_docs"] = list(set(merged[key]["source_docs"]))
-            else:
-                merged[key] = t
-        return list(merged.values())
+    def serialize_ontology(self, output_path: str = "ontology.owl", format: str = "xml") -> bool:
+        """Serialize the ontology to a file with chain-of-thought reasoning."""
+        try:
+            logger.info(f"[CHAIN OF THOUGHT] Serializing ontology to {output_path} in {format} format")
+            
+            # Create output directory if it doesn't exist
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+            
+            # Serialize the graph
+            self.graph.serialize(destination=output_path, format=format)
+            logger.info(f"[CHAIN OF THOUGHT] Successfully serialized ontology to {output_path}")
+            
+            # Also save as Turtle format for easier human reading
+            turtle_path = output_path.replace(".owl", ".ttl").replace(".xml", ".ttl")
+            self.graph.serialize(destination=turtle_path, format="turtle")
+            logger.info(f"[CHAIN OF THOUGHT] Also saved human-readable version to {turtle_path}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error serializing ontology: {e}")
+            return False
 
-# Workflow setup
+# Enhanced workflow setup
 def setup_workflow(pdf_directory: str) -> StateGraph:
-    env = OSEnv(CONFIG_PATH, CREDS_PATH, CERT_PATH)
-    embedding_client = EmbeddingClient()
-    
-    # Initialize ChromaDB
-    chroma_client = Chroma(
-        embedding_function=EmbeddingWrapper(embedding_client),
-        persist_directory="./chroma_db",
-        client_settings=Settings(anonymized_telemetry=False)
-    )
-    
-    # Initialize LLM
-    llm = AzureChatOpenAI(
-        openai_api_version=os.getenv("API_VERSION"),
-        azure_deployment=os.getenv("MODEL_NAME"),
-        temperature=0.7
-    )
-    
-    # Create agents
-    pdf_agent = PDFReaderAgent(chroma_client, embedding_client)
-    topic_agent = TopicExtractionAgent(llm, chroma_client)
-    triple_agent = TripleExtractionAgent(llm)
-    ontology_agent = OntologyCreationAgent()
-    
-    # Define workflow
-    workflow = StateGraph(state_spec=dict)
-    workflow.add_node("process_pdfs", lambda state: {
-        "documents": [doc for f in Path(pdf_directory).glob("*.pdf") 
-                     for doc in pdf_agent.process_pdf(str(f))]
-    })
-    workflow.add_node("extract_topics", lambda state: {
-        "topics": topic_agent.extract_topics(state)
-    })
-    workflow.add_node("extract_triples", lambda state: {
-        "triples": triple_agent.extract_triples(state)
-    })
-    workflow.add_node("generate_ontology", lambda state: {
-        "ontology": ontology_agent.create_ontology(state["topics"], state)
-    })
-    
-    workflow.set_entry_point("process_pdfs")
-    workflow.add_edge("process_pdfs", "extract_topics")
-    workflow.add_edge("extract_topics", "extract_triples")
-    workflow.add_edge("extract_triples", "generate_ontology")
-    workflow.add_edge("generate_ontology", END)
-    
-    return workflow
-
-# Main execution
-if __name__ == "__main__":
+    """Set up the workflow for ontology generation from PDF documents."""
     try:
+        logger.info("[CHAIN OF THOUGHT] Setting up workflow for ontology generation")
+        
+        # Initialize environment
         env = OSEnv(CONFIG_PATH, CREDS_PATH, CERT_PATH)
-        pdf_dir = "./pdf_documents"
+        logger.info("[CHAIN OF THOUGHT] Environment initialized")
         
-        if not Path(pdf_dir).exists():
-            raise FileNotFoundError(f"PDF directory {pdf_dir} not found")
+        # Create output directory
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
         
-        workflow = setup_workflow(pdf_dir)
-        app = workflow.compile()
+        # Initialize embedding client
+        embedding_client = EmbeddingClient()
+        logger.info("[CHAIN OF THOUGHT] Embedding client initialized")
         
-        final_state = app.invoke({
-            "documents": [],
-            "topics": [],
-            "triples": [],
-            "ontology": None
+        # Initialize vector database
+        logger.info(f"[CHAIN OF THOUGHT] Initializing ChromaDB with persistence directory: {CHROMA_DIR}")
+        chroma_client = Chroma(
+            embedding_function=EmbeddingWrapper(embedding_client),
+            persist_directory=CHROMA_DIR,
+            client_settings=Settings(anonymized_telemetry=False)
+        )
+        
+        # Initialize LLM with appropriate settings
+        logger.info("[CHAIN OF THOUGHT] Initializing Azure OpenAI LLM")
+        llm = AzureChatOpenAI(
+            openai_api_version=os.getenv("API_VERSION", "2023-05-15"),
+            azure_deployment=os.getenv("MODEL_NAME", "gpt-4"),
+            temperature=0.2,  # Lower temperature for more consistent ontology creation
+            max_tokens=4000,  # Ensure enough tokens for detailed reasoning
+            streaming=False
+        )
+        
+        # Create agents
+        logger.info("[CHAIN OF THOUGHT] Creating specialized agents")
+        pdf_agent = PDFReaderAgent(chroma_client, embedding_client)
+        topic_agent = TopicExtractionAgent(llm, chroma_client)
+        triple_agent = TripleExtractionAgent(llm, chroma_client)
+        ontology_agent = OntologyCreationAgent(llm)
+        
+        # Define workflow graph
+        logger.info("[CHAIN OF THOUGHT] Defining workflow graph with LangGraph")
+        workflow = StateGraph(state_spec=dict)
+        
+        # Process PDFs node
+        workflow.add_node("process_pdfs", lambda state: {
+            **state,
+            "documents": [doc for f in Path(pdf_directory).glob("*.pdf") 
+                         for doc in pdf_agent.process_pdf(str(f))],
+            "process_status": "completed",
+            "pdf_count": len(list(Path(pdf_directory).glob("*.pdf")))
         })
         
-        ontology_graph = final_state.get("ontology")
-        if ontology_graph:
-            ontology_graph.serialize(destination="ontology.owl", format="xml")
-            logger.info("Ontology generated successfully")
-        else:
-            logger.error("Ontology generation failed")
+        # Extract topics node
+        workflow.add_node("extract_topics", lambda state: {
+            **state,
+            **topic_agent.extract_topics(state),
+            "topic_extraction_status": "completed"
+        })
+        
+        # Extract triples node
+        workflow.add_node("extract_triples", lambda state: {
+            **state,
+            **triple_agent.extract_triples(state),
+            "triple_extraction_status": "completed"
+        })
+        
+        # Generate ontology node
+        workflow.add_node("generate_ontology", lambda state: {
+            **state,
+            **ontology_agent.create_ontology(state),
+            "ontology_status": "generated"
+        })
+        
+        # Save ontology node
+        workflow.add_node("save_ontology", lambda state: {
+            **state,
+            "saved": ontology_agent.serialize_ontology(
+                output_path=f"{OUTPUT_DIR}/ontology.owl",
+                format="xml"
+            ),
+            "output_path": f"{OUTPUT_DIR}/ontology.owl",
+            "status": "completed"
+        })
+        
+        # Set workflow structure
+        logger.info("[CHAIN OF THOUGHT] Setting workflow entry point and edges")
+        workflow.set_entry_point("process_pdfs")
+        workflow.add_edge("process_pdfs", "extract_topics")
+        workflow.add_edge("extract_topics", "extract_triples")
+        workflow.add_edge("extract_triples", "generate_ontology")
+        workflow.add_edge("generate_ontology", "save_ontology")
+        workflow.add_edge("save_ontology", END)
+        
+        logger.info("[CHAIN OF THOUGHT] Workflow setup completed")
+        return workflow
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        logger.error(f"Error setting up workflow: {e}")
+        raise
+
+# Main execution
+def main():
+    try:
+        # Banner
+        print("\n" + "="*80)
+        print(" PDF-BASED ONTOLOGY GENERATOR ".center(80, "="))
+        print("="*80 + "\n")
+        
+        # Create necessary directories
+        os.makedirs(ENV_DIR, exist_ok=True)
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        
+        # Initialize environment
+        env = OSEnv(CONFIG_PATH, CREDS_PATH, CERT_PATH)
+        
+        # Get PDF directory
+        pdf_dir = "./pdf_documents"
+        if len(sys.argv) > 1:
+            pdf_dir = sys.argv[1]
+        
+        logger.info(f"Using PDF directory: {pdf_dir}")
+        
+        # Verify PDF directory exists
+        if not Path(pdf_dir).exists():
+            logger.error(f"PDF directory {pdf_dir} not found")
+            print(f"\nERROR: PDF directory '{pdf_dir}' not found. Please create it and add your PDF files.")
+            sys.exit(1)
+        
+        # Count PDF files
+        pdf_files = list(Path(pdf_dir).glob("*.pdf"))
+        if not pdf_files:
+            logger.error(f"No PDF files found in {pdf_dir}")
+            print(f"\nERROR: No PDF files found in '{pdf_dir}'. Please add PDF files to analyze.")
+            sys.exit(1)
+        
+        print(f"Found {len(pdf_files)} PDF files in '{pdf_dir}':")
+        for pdf in pdf_files:
+            print(f"  - {pdf.name}")
+        print()
+        
+        # Set up and run workflow
+        logger.info("Setting up workflow")
+        print("Setting up ontology generation workflow...")
+        workflow = setup_workflow(pdf_dir)
+        
+        logger.info("Compiling workflow")
+        print("Compiling workflow graph...")
+        app = workflow.compile()
+        
+        logger.info("Running workflow")
+        print("\nRunning ontology generation process (this might take some time)...")
+        print("Step 1: Processing PDF documents...")
+        
+        # Initial state
+        initial_state = {
+            "documents": [],
+            "extracted_topics": [],
+            "consolidated_topics": [],
+            "extracted_triples": [],
+            "merged_triples": [],
+            "validated_triples": [],
+            "ontology": None,
+            "design": {},
+            "status": "starting"
+        }
+        
+        # Execute workflow
+        final_state = app.invoke(initial_state)
+        
+        # Process results
+        if final_state.get("saved", False) and final_state.get("ontology"):
+            output_path = final_state.get("output_path", f"{OUTPUT_DIR}/ontology.owl")
+            
+            print("\n" + "="*80)
+            print(" ONTOLOGY GENERATION SUCCESSFUL ".center(80, "="))
+            print("="*80)
+            print(f"Output files:")
+            print(f"  - OWL/XML: {output_path}")
+            print(f"  - Turtle: {output_path.replace('.owl', '.ttl')}")
+            
+            # Print statistics
+            print("\nStatistics:")
+            print(f"  - PDF Documents: {len(pdf_files)}")
+            print(f"  - Document Chunks: {len(final_state.get('documents', []))}")
+            print(f"  - Consolidated Topics: {len(final_state.get('consolidated_topics', []))}")
+            print(f"  - Validated Triples: {len(final_state.get('validated_triples', []))}")
+            print(f"  - Ontology Triples: {len(final_state.get('ontology', Graph()))}")
+            
+            # Print sample topics
+            topics = final_state.get('consolidated_topics', [])
+            if topics:
+                print("\nSample Topics:")
+                for i, topic in enumerate(topics[:5]):
+                    print(f"  - {topic.get('term', 'Unknown')}: {topic.get('definition', 'No definition')[:60]}...")
+                if len(topics) > 5:
+                    print(f"  - And {len(topics) - 5} more...")
+            
+            logger.info("Ontology generation completed successfully")
+        else:
+            print("\n" + "="*80)
+            print(" ONTOLOGY GENERATION FAILED ".center(80, "="))
+            print("="*80)
+            print("Please check the logs for details on the failure.")
+            logger.error("Ontology generation failed")
+    except FileNotFoundError as e:
+        logger.error(f"File not found: {e}")
+        print(f"\nERROR: {e}")
         sys.exit(1)
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        print(f"\nERROR: An unexpected error occurred: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
