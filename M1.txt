@@ -1,65 +1,1186 @@
-from datetime import datetime, timedelta
+import os
+import sys
+import uuid
+import json
+import logging
+import pandas as pd
+import networkx as nx
+import numpy as np
+from typing import Optional, Any, Dict, List, Union, Tuple, Callable
+from pathlib import Path
+from dotenv import dotenv_values
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider, ClientSecretCredential
+from openai import AzureOpenAI
+from pydantic import BaseModel
+from langchain.chat_models import AzureChatOpenAI
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationChain, LLMChain
+from langchain.docstore import Document as LC_DOCUMENT
+from langchain.embeddings.base import Embeddings
+from langchain.vectorstores import Chroma
+from langchain.prompts import PromptTemplate
+from chromadb.config import Settings
+from chromadb.utils import embedding_functions
+from collections import namedtuple
+import re
+from pydantic import BaseModel, ValidationError, field_validator
 
-def get_current_week_monday():
-    """
-    Calculate the date for the Monday of the current week.
-    """
-    today = datetime.today()
-    start_of_week = today - timedelta(days=today.weekday())  # Monday is weekday 0
-    return start_of_week.strftime('%Y-%m-%d')  # Format as 'YYYY-MM-DD'
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
 
-def replace_report_date(slide):
-    """
-    Replace 'Report Date: {Monday Date}' with the actual Monday's date in the template slide.
-    This function ensures that only the specific shape for the report date is targeted.
-    """
-    monday_date = get_current_week_monday()
-    for shape in slide.shapes:
-        if shape.has_text_frame and "Report Date:" in shape.text:
-            for paragraph in shape.text_frame.paragraphs:
-                for run in paragraph.runs:
-                    if "Report Date:" in run.text:
-                        run.text = f"Report Date: {monday_date}"
-                        run.font.size = Pt(12)  # Adjust font size if needed
-                        run.font.bold = True
-def create_report(template_path, output_folder, report_value):
+ENV_DIR = "env"
+CONFIG_PATH = f"{ENV_DIR}/config.env"
+CREDS_PATH = f"{ENV_DIR}/credentials.env"
+CERT_PATH = f"{ENV_DIR}/cacert.pem"
+
+Triple = namedtuple("Triple", ["subject", "predicate", "object"])
+
+## utility functions
+def is_file_readable(filepath: str)->bool:
+    """Check if a file is readable."""
+    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
+        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
+    return True
+
+def str_to_bool(s: str)->bool:
+    """Convert a string to a boolean."""
+    if s== 'True':
+        return True
+    elif s== 'False':
+        return False
+    else:
+        raise ValueError(f"Invalid boolean value: {s}")
+
+## OSEnv class
+
+class OSEnv:
+    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
+        self.var_list = []
+        self.bulk_set(config_file, True)
+        self.bulk_set(creds_file, False)
+        self.set_certificate_path(certificate_path)
+        if str_to_bool(self.get("PROXY_ENABLED", "False")):
+            self.set_proxy()
+        
+        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
+            self.token = self.get_azure_token()
+        else:
+            self.token = None
+        
+    def _get_credential(self):
+        if str_to_bool(self.get("USE_MANAGED_IDENTITY", "False")):
+            return DefaultAzureCredential()
+        else:
+            return ClientSecretCredential(tenant_id=self.get("AZURE_TENANT_ID"), client_id=self.get("AZURE_CLIENT_ID"), client_secret=self.get("AZURE_CLIENT_SECRET"))
+    
+    def set_certificate_path(self, path: str):
+        try:
+            if not os.path.isabs(path):
+                path = os.path.abspath(path)
+            if not is_file_readable(path):
+                raise FileNotFoundError(f"The file '{path}' does not exist or is not readable")
+            
+            self.set("REQUESTS_CA_BUNDLE", path)
+            self.set("SSL_CERT_FILE", path)
+            self.set("CURL_CA_BUNDLE", path)
+        except Exception as e:
+            logger.error(f"Error setting certificate path: {e}")
+            raise
+    
+    def bulk_set(self, dotenvfile: str, print_val: bool = False)->None:
+        try:
+            if not os.path.isabs(dotenvfile):
+                dotenvfile = os.path.abspath(dotenvfile)
+            if not is_file_readable(dotenvfile):
+                temp_dict = dotenv_values(dotenvfile)
+                for key, value in temp_dict.items():
+                    self.set(key, value, print_val)
+                del temp_dict
+        except Exception as e:
+            logger.error(f"Error loading environment variables from {dotenvfile}: {e}")
+            raise
+    
+    def set(self, key: str, value: str, print_val: bool = False)->None:
+        try:
+            os.environ[key] = value
+            if key not in self.var_list:  # Fixed var_name to key
+                self.var_list.append(key)  # Fixed var_name to key
+            if print_val:
+                logger.info(f"{key}: {value}")
+        except Exception as e:
+            logger.error(f"Error setting environment variable {key}: {e}")
+            raise
+    
+    def get(self, key: str, default: Optional[str] = None)->str:
+        try:
+            return os.environ.get(key, default)
+        except Exception as e:
+            logger.error(f"Error getting environment variable {key}: {e}")
+            raise
+    
+    def set_proxy(self) -> None:
+        try:
+            ad_username = self.get("AD_USERNAME")
+            ad_password = self.get("AD_USER_PW")
+            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
+            if not all([ad_username, ad_password, proxy_domain]):
+                raise ValueError("Proxy settings are incomplete")
+            proxy_url = f"https://{ad_username}:{ad_password}@{proxy_domain}"
+            self.set("HTTP_PROXY", proxy_url, print_val=False)
+            self.set("HTTPS_PROXY", proxy_url, print_val=False)
+            no_proxy_domains = [
+                'cognitiveservices.azure.com',
+                'search.windows.net',
+                'openai.azure.com',
+                'core.windows.net',
+                'azurewebsites.net'
+            ]
+            self.set("NO_PROXY", ",".join(no_proxy_domains), print_val=False)
+        except Exception as e:
+            logger.error(f"Error setting proxy: {e}")
+            raise
+    
+    def get_azure_token(self) -> str:
+        try:
+            credential = ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID"),
+                client_id=self.get("AZURE_CLIENT_ID"),
+                client_secret=self.get("AZURE_CLIENT_SECRET")
+            )
+            token = credential.get_token("https://cognitiveservices.azure.com/.default")
+            self.set("AZURE_TOKEN", token.token, print_val=False)
+            logger.info("Azure token set")
+            return token.token
+        except Exception as e:
+            logger.error(f"Error retrieving Azure token: {e}")
+            return None
+    
+    def list_env_vars(self)->None:
+        for var in self.var_list:
+            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET'}:
+                logger.info(f"{var}: [REDACTED]")
+            else:
+                logger.info(f"{var}: {os.getenv(var)}")
+
+
+## embedding class + Document class
+
+class MyDocument(BaseModel):
+    id: str = ""
+    text: str = ""
+    embedding: List[float] = []
+    metadata: Dict[str, Any] = {}
+
+class EmbeddingClient:
+    def __init__(self, azure_api_version: str = "2023-05-15", embeddings_model: str = "text-embedding-3-large"):
+        self.azure_api_version = azure_api_version
+        self.embeddings_model = embeddings_model
+        self.direct_azure_client = self._get_direct_azure_client()
+    
+    def _get_direct_azure_client(self):
+        token_provider = get_bearer_token_provider(
+            DefaultAzureCredential(),
+            "https://cognitiveservices.azure.com/.default"
+        )
+        return AzureOpenAI(token_provider, self.azure_api_version)
+    
+    def generate_embeddings(self, doc: MyDocument)->MyDocument:
+        try:
+            response = self.direct_azure_client.embeddings.create(
+                model=self.embeddings_model,
+                input=doc.text
+            ).data[0].embedding
+            doc.embedding = response
+            return doc
+        except Exception as e:
+            logger.error(f"Error generating embeddings: {e}")
+            return doc
+
+## LangChain components
+## AzureChatbot components
+
+class AzureChatbot:
+    def __init__(self, config_file=CONFIG_PATH, creds_file=CREDS_PATH, cert_file=CERT_PATH):
+        self.env = OSEnv(config_file, creds_file, cert_file)
+        self._setup_chat_model()
+        self.memory = ConversationBufferMemory()
+        self.conversation = ConversationChain(llm=self.llm, memory=self.memory, verbose=True)
+    
+    def _setup_chat_model(self):
+        try:
+            token_provider = get_bearer_token_provider(
+                self.env._get_credential(),  # Fixed method call
+                "https://cognitiveservices.azure.com/.default"
+            )
+            model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
+            temperature = float(self.env.get("TEMPERATURE", "0.7"))
+            max_tokens = int(self.env.get("MAX_TOKENS", "800"))
+            api_version = self.env.get("API_VERSION", "2023-05-15")
+            azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
+            azure_ad_token_provider = token_provider
+            self.llm = AzureChatOpenAI(
+                model_name=model_name,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                api_version=api_version,
+                azure_endpoint=azure_endpoint,
+                azure_ad_token_provider=azure_ad_token_provider
+            )
+        except Exception as e:
+            logger.error(f"Error setting up chatbot: {e}")
+            raise
+
+# Now adding GraphRAG chatbot functionality
+
+# Import necessary dependencies for RDF and LangGraph
+import rdflib
+from rdflib import Graph as RDFGraph, URIRef, Literal, BNode
+from rdflib.namespace import RDF, RDFS, OWL
+from rdflib.plugins.sparql import prepareQuery
+from rdflib.plugins.stores.sparqlstore import SPARQLStore
+
+# LangGraph for agent orchestration
+from langgraph.graph import StateGraph, END
+
+# Additional LangChain components for structured output
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser, PydanticOutputParser
+from langchain_core.pydantic_v1 import BaseModel, Field
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+
+class QueryUnderstanding(BaseModel):
+    """Model for understanding the user's query"""
+    intent: str = Field(description="The main intent of the user's query")
+    entities: List[Dict[str, str]] = Field(description="Key entities mentioned in the query")
+    filters: Optional[List[Dict[str, Any]]] = Field(default=None, description="Any filters or constraints specified")
+    question_type: str = Field(description="The type of question (e.g., 'factual', 'analytical', 'comparative')")
+
+
+class SparqlQuery(BaseModel):
+    """Model for a SPARQL query"""
+    query_id: str
+    original_query: str
+    sparql_query: str
+    is_valid: bool = False
+    error_message: Optional[str] = None
+
+
+class QueryResult(BaseModel):
+    """Model for query results"""
+    query_id: str
+    original_query: str
+    sparql_query: str
+    results: List[Dict[str, Any]]
+    result_count: int
+
+
+class BusinessReport(BaseModel):
+    """Model for the final business report"""
+    query_id: str
+    original_query: str
+    report_text: str
+    insights: Optional[List[str]] = None
+    recommendations: Optional[List[str]] = None
+
+
+class QueryValidation(BaseModel):
+    """Model for query validation results"""
+    is_valid: bool = Field(description="Whether the query is valid")
+    corrected_query: Optional[str] = Field(default=None, description="The corrected query if the original was invalid")
+    explanation: str = Field(description="Explanation of the errors found or why the query is valid")
+
+
+class WorkflowState(BaseModel):
+    """State object for the agent workflow with reasoning traces"""
+    query_id: str
+    original_query: str
+    query_understanding: Optional[Dict[str, Any]] = None
+    understanding_reasoning: Optional[str] = None  # Chain-of-thought reasoning for query understanding
+    sparql_query: Optional[str] = None
+    sparql_generation_reasoning: Optional[str] = None  # Chain-of-thought reasoning for SPARQL generation
+    validation_result: Optional[Dict[str, Any]] = None
+    validation_reasoning: Optional[str] = None  # Chain-of-thought reasoning for validation
+    query_results: Optional[List[Dict[str, Any]]] = None
+    reporting_reasoning: Optional[str] = None  # Chain-of-thought reasoning for report generation
+    final_report: Optional[str] = None
+
+
+class GraphRAGChatbot:
+    def __init__(self, 
+                 config_file=CONFIG_PATH, 
+                 creds_file=CREDS_PATH, 
+                 cert_file=CERT_PATH, 
+                 ontology_path=None):
+        """
+        Initialize the GraphRAG chatbot
+        
+        Args:
+            config_file (str): Path to the config file
+            creds_file (str): Path to the credentials file
+            cert_file (str): Path to the certificate file
+            ontology_path (str, optional): Path to the OWL ontology file. If None, will use the value from
+                                           ONTOLOGY_PATH environment variable or default to "ontology.owl"
+        """
+        # Initialize the base chatbot for Azure OpenAI integration
+        self.base_chatbot = AzureChatbot(config_file, creds_file, cert_file)
+        self.env = self.base_chatbot.env
+        self.llm = self.base_chatbot.llm
+        
+        # Initialize RDF components
+        # Determine the ontology path from parameters or environment variables
+        self.ontology_path = ontology_path or self.env.get("ONTOLOGY_PATH", "ontology.owl")
+        logger.info(f"Using ontology file: {self.ontology_path}")
+        
+        self.ontology_graph = self._load_ontology()
+        self.sparql_endpoint = self._setup_sparql_endpoint()
+        
+        # Initialize conversation memory
+        self.memory = ConversationBufferMemory()
+        
+        # Setup the agent workflow
+        self.agent_workflow = self._setup_agent_workflow()
+    
+    def _load_ontology(self) -> RDFGraph:
+        """Load the ontology from the OWL file"""
+        try:
+            ontology = RDFGraph()
+            ontology.parse(self.ontology_path, format="xml")
+            logger.info(f"Loaded ontology with {len(ontology)} triples")
+            return ontology
+        except Exception as e:
+            logger.error(f"Error loading ontology: {e}")
+            raise
+    
+    def _setup_sparql_endpoint(self) -> SPARQLStore:
+        """Setup connection to the SPARQL endpoint with authorization if needed"""
+        try:
+            endpoint_url = self.env.get("SPARQL_ENDPOINT_URL")
+            if not endpoint_url:
+                raise ValueError("SPARQL endpoint URL not configured in environment variables")
+            
+            # Get authorization configuration
+            auth_enabled = str_to_bool(self.env.get("SPARQL_AUTH_ENABLED", "False"))
+            auth_header_name = self.env.get("SPARQL_AUTH_HEADER", "Authorization")
+            auth_key = self.env.get("SPARQL_AUTH_KEY", "")
+            
+            # Configure the SPARQL store with custom HTTP headers if authentication is enabled
+            http_auth_headers = {}
+            if auth_enabled and auth_key:
+                # Handle different auth formats (Bearer token vs API key)
+                if self.env.get("SPARQL_AUTH_TYPE", "").lower() == "bearer":
+                    http_auth_headers[auth_header_name] = f"Bearer {auth_key}"
+                else:
+                    http_auth_headers[auth_header_name] = auth_key
+                logger.info(f"SPARQL endpoint authorization enabled with header: {auth_header_name}")
+            
+            # Create the SPARQL store with authorization headers
+            store = SPARQLStore(
+                endpoint_url,
+                http_auth=None,  # Not using basic auth - using custom headers instead
+                custom_httpheaders=http_auth_headers
+            )
+            
+            # Test connection
+            test_query = "SELECT ?s WHERE { ?s a ?o } LIMIT 1"
+            results = store.query(test_query)
+            logger.info(f"Successfully connected to SPARQL endpoint: {endpoint_url}")
+            return store
+        except Exception as e:
+            logger.error(f"Error connecting to SPARQL endpoint: {e}")
+            raise
+    
+    def _setup_query_understanding_agent(self):
+        """Create an agent for understanding the user query with chain-of-thought reasoning"""
+        # Define the system prompt with chain-of-thought instructions
+        system_prompt = """You are an expert in understanding user queries about data from knowledge graphs.
+        Your task is to analyze the user's question and break down your understanding using chain-of-thought reasoning.
+        
+        Follow these steps in your analysis:
+        1. First, identify the core question type (e.g., factual lookup, comparative analysis, relationship exploration)
+        2. Next, identify all entities mentioned in the question and their types
+        3. Determine any specific attributes or properties being requested
+        4. Identify any filters, constraints, or conditions (temporal, numerical, categorical)
+        5. Recognize any sorting, grouping, or aggregation requests
+        6. Determine the overall intent of the query
+        
+        For each step, explicitly state your reasoning before drawing conclusions.
+        
+        After your reasoning, provide a structured understanding of the query with the following fields:
+        - intent: The main intent of the user's query
+        - entities: Key entities mentioned in the query
+        - filters: Any filters or constraints specified
+        - question_type: The type of question being asked
+        
+        Your structured output should capture the essence of the query in a way that can be translated to a SPARQL query.
+        """
+        
+        # Create the prompt template
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_prompt),
+            ("human", "{query}")
+        ])
+        
+        # Create the output parser
+        parser = PydanticOutputParser(pydantic_object=QueryUnderstanding)
+        
+        # Create the chain
+        understanding_chain = prompt | self.llm | parser
+        
+        return understanding_chain
+    
+    def _setup_ontology_agent(self):
+        """Create an agent for converting natural language to SPARQL based on the ontology"""
+        # First, create a string representation of the ontology structure
+        ontology_classes = []
+        ontology_properties = []
+        ontology_relationships = []
+        
+        # Extract classes with descriptions and labels
+        for cls in self.ontology_graph.subjects(RDF.type, OWL.Class):
+            if isinstance(cls, URIRef):
+                label = self.ontology_graph.value(cls, RDFS.label)
+                description = self.ontology_graph.value(cls, RDFS.comment)
+                
+                label_str = str(label) if label else cls.split('#')[-1]
+                desc_str = f" - {str(description)}" if description else ""
+                
+                ontology_classes.append(f"Class: {label_str} ({cls}){desc_str}")
+        
+        # Extract datatype properties with domains, ranges, and descriptions
+        for prop in self.ontology_graph.subjects(RDF.type, OWL.DatatypeProperty):
+            if isinstance(prop, URIRef):
+                label = self.ontology_graph.value(prop, RDFS.label)
+                description = self.ontology_graph.value(prop, RDFS.comment)
+                domain = self.ontology_graph.value(prop, RDFS.domain)
+                range_val = self.ontology_graph.value(prop, RDFS.range)
+                
+                label_str = str(label) if label else prop.split('#')[-1]
+                domain_str = domain.split('#')[-1] if domain else "Unspecified"
+                range_str = range_val.split('#')[-1] if range_val else "Unspecified"
+                desc_str = f" - {str(description)}" if description else ""
+                
+                ontology_properties.append(f"DatatypeProperty: {label_str} ({prop}) - Domain: {domain_str}, Range: {range_str}{desc_str}")
+        
+        # Extract object properties with domains, ranges, and descriptions
+        for prop in self.ontology_graph.subjects(RDF.type, OWL.ObjectProperty):
+            if isinstance(prop, URIRef):
+                label = self.ontology_graph.value(prop, RDFS.label)
+                description = self.ontology_graph.value(prop, RDFS.comment)
+                domain = self.ontology_graph.value(prop, RDFS.domain)
+                range_val = self.ontology_graph.value(prop, RDFS.range)
+                
+                label_str = str(label) if label else prop.split('#')[-1]
+                domain_str = domain.split('#')[-1] if domain else "Unspecified"
+                range_str = range_val.split('#')[-1] if range_val else "Unspecified"
+                desc_str = f" - {str(description)}" if description else ""
+                
+                relationship = f"ObjectProperty: {label_str} ({prop}) - Domain: {domain_str}, Range: {range_str}{desc_str}"
+                ontology_properties.append(relationship)
+                ontology_relationships.append(relationship)
+        
+        # Define the system prompt with ontology information and chain of thought instructions
+        system_prompt = f"""You are an expert in Semantic Web technologies, RDF, OWL ontologies, and SPARQL query generation.
+        Your task is to convert a natural language query into a precise, valid SPARQL query by reasoning step-by-step through the mapping process.
+        
+        Here's the ontology structure:
+        
+        CLASSES:
+        {chr(10).join(ontology_classes[:20])}
+        ... and {len(ontology_classes) - 20} more classes
+        
+        PROPERTIES:
+        {chr(10).join(ontology_properties[:20])}
+        ... and {len(ontology_properties) - 20} more properties
+        
+        KEY RELATIONSHIPS:
+        {chr(10).join(ontology_relationships[:15])}
+        ... and {len(ontology_relationships) - 15 if len(ontology_relationships) > 15 else 0} more relationships
+        
+        Follow these chain-of-thought reasoning steps when converting the query understanding to SPARQL:
+        
+        1. IDENTIFY CORE ENTITIES:
+           - Determine the main classes from the ontology that correspond to entities in the query
+           - Map each entity to its corresponding class URI
+        
+        2. IDENTIFY PROPERTIES:
+           - For each attribute or relationship mentioned in the query, identify the corresponding properties
+           - Determine if they are datatype properties or object properties
+           - Map property names to their corresponding property URIs
+        
+        3. CONSTRUCT TRIPLE PATTERNS:
+           - Create the basic triple patterns needed to represent the query
+           - Consider subject-predicate-object patterns for each relationship
+        
+        4. ADD CONSTRAINTS:
+           - Translate filters, conditions, or constraints into SPARQL FILTER clauses
+           - Handle any comparison operators (equals, greater than, less than, etc.)
+        
+        5. DETERMINE QUERY TYPE:
+           - Decide if this should be a SELECT, ASK, CONSTRUCT, or DESCRIBE query
+           - For SELECT queries, identify the specific variables to include in the result
+        
+        6. ADD MODIFIERS:
+           - Add any ORDER BY, GROUP BY, LIMIT, or OFFSET clauses needed
+           - Consider aggregation functions (COUNT, SUM, AVG, etc.) if needed
+        
+        7. FINALIZE PREFIXES:
+           - Add all necessary namespace prefixes based on the URIs used
+
+        8. CHECK FOR COMMON ISSUES:
+           - Verify no typos in property or class URIs
+           - Ensure all variables are properly defined
+           - Confirm proper syntax for FILTER expressions
+        
+        After completing your step-by-step reasoning, provide the full, executable SPARQL query.
+        
+        Use standard prefixes and ensure the query is syntactically correct according to SPARQL 1.1.
+        """
+        
+        # Create the prompt template that shows the query understanding
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_prompt),
+            ("human", "Query Understanding: {query_understanding}\n\nGenerate a SPARQL query to answer this question, showing your chain-of-thought reasoning process.")
+        ])
+        
+        # Create the chain
+        sparql_generation_chain = prompt | self.llm | StrOutputParser()
+        
+        return sparql_generation_chain
+    
+    def _setup_query_validation_agent(self):
+        """Create an agent for validating and fixing SPARQL queries with chain-of-thought reasoning"""
+        # Enhanced system prompt with chain-of-thought instructions
+        system_prompt = """You are an expert in SPARQL query syntax, validation, and optimization with deep knowledge of the SPARQL 1.1 specification.
+        Your task is to validate the provided SPARQL query using chain-of-thought reasoning to identify and fix any issues.
+
+        Follow these reasoning steps when validating the query:
+
+        1. ANALYZE PREFIXES:
+           - Check if all required namespace prefixes are declared
+           - Verify that prefixes are correctly formatted
+           - Ensure each prefix used in the query body is defined
+        
+        2. VALIDATE TRIPLE PATTERNS:
+           - Examine each triple pattern for correct subject-predicate-object structure
+           - Check variable naming conventions (should start with ? or $)
+           - Verify URI formatting (should be enclosed in <> or use defined prefixes)
+           - Ensure literals have appropriate datatype or language tags if needed
+        
+        3. REVIEW QUERY STRUCTURE:
+           - Validate the query structure for the specific query form (SELECT, ASK, CONSTRUCT, DESCRIBE)
+           - Check for required components (e.g., WHERE clause)
+           - Ensure proper nesting of OPTIONAL, UNION, FILTER clauses
+           - Verify matching of opening and closing braces and parentheses
+        
+        4. EXAMINE FILTER EXPRESSIONS:
+           - Validate the syntax of FILTER expressions
+           - Check for correct use of operators (=, !=, <, >, etc.)
+           - Verify proper escaping in strings
+           - Ensure type compatibility in comparisons
+        
+        5. VALIDATE SOLUTION MODIFIERS:
+           - Check syntax of any ORDER BY, GROUP BY, HAVING, LIMIT, or OFFSET clauses
+           - Verify that variables used in these clauses are defined in the query
+           - Ensure aggregation functions have proper syntax
+        
+        6. IDENTIFY SEMANTIC ISSUES:
+           - Check for common logical errors that might produce empty results
+           - Look for redundant patterns
+           - Identify overly complex constructions that could be simplified
+        
+        7. OPTIMIZE IF NEEDED:
+           - Suggest optimizations for better performance
+           - Identify any inefficient patterns that could be rewritten
+        
+        After completing your analysis, provide:
+        
+        1. A determination of whether the query is valid (is_valid: true/false)
+        2. If not valid, a corrected version of the query (corrected_query)
+        3. A clear explanation of any issues found or why the query is valid (explanation)
+        
+        Always consider both syntactic correctness and semantic meaningfulness in your validation.
+        """
+        
+        # Enhanced prompt template that shows the query in formatted code block
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_prompt),
+            ("human", "SPARQL Query to validate:\n\n```sparql\n{sparql_query}\n```\n\nPlease analyze this query thoroughly using the chain-of-thought process.")
+        ])
+        
+        # Create the output parser
+        parser = PydanticOutputParser(pydantic_object=QueryValidation)
+        
+        # Create the chain
+        validation_chain = prompt | self.llm | parser
+        
+        return validation_chain
+    
+    def _setup_reporting_agent(self):
+        """Create an agent for generating business-friendly reports from query results with chain-of-thought reasoning"""
+        system_prompt = """You are an expert in data analysis, knowledge graph interpretation, and business communication.
+        Your task is to create a clear, concise, and business-friendly report based on the results of a SPARQL query through careful chain-of-thought reasoning.
+        
+        Follow these analytical steps when generating your report:
+        
+        1. UNDERSTAND THE QUESTION CONTEXT:
+           - Review the original question to understand what the user was seeking
+           - Identify the key business metrics or relationships they wanted to know about
+           - Consider any implicit needs or context not directly stated in the question
+        
+        2. ANALYZE THE QUERY RESULTS:
+           - Examine all returned data systematically
+           - Identify patterns, trends, outliers, or anomalies
+           - Note the completeness of results (any missing data or null values?)
+           - Verify the data makes logical sense based on domain knowledge
+        
+        3. EXTRACT KEY INSIGHTS:
+           - Determine the most important findings that directly answer the question
+           - Identify secondary insights that provide additional value
+           - Note any unexpected findings that might be of interest
+           - Consider the business implications of these insights
+        
+        4. STRUCTURE YOUR REPORT:
+           - Start with a clear, direct answer to the original question
+           - Present key findings in order of importance
+           - Group related information logically
+           - Use appropriate formatting (lists, sections) for readability
+        
+        5. TRANSLATE TECHNICAL DETAILS:
+           - Convert technical terminology into business language
+           - Explain complex relationships in simple terms
+           - Provide context for any metrics or measurements
+           - Use analogies or comparisons when helpful
+        
+        6. FORMULATE RECOMMENDATIONS (IF APPROPRIATE):
+           - Consider what actions could be taken based on these insights
+           - Suggest potential next steps or further analyses
+           - Frame recommendations in terms of business impact
+        
+        The final report should be:
+        - Accessible to non-technical stakeholders
+        - Free of query language or technical jargon
+        - Precise and accurate regarding the data
+        - Well-structured with clear sections
+        - Concise yet comprehensive
+        - Action-oriented where appropriate
+        
+        After completing your analysis, provide a polished business report that someone could present to executives or include in a business document.
+        """
+        
+        # Create the prompt template with added query details for context
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_prompt),
+            ("human", """
+            Original Question: {original_query}
+            
+            Query Results:
+            {query_results}
+            
+            SPARQL Query Used:
+            {sparql_query}
+            
+            Please generate a business-friendly report that answers the original question based on these results. 
+            Show your analytical thinking as you interpret the data and formulate your response.
+            """)
+        ])
+        
+        # Create the chain
+        reporting_chain = prompt | self.llm | StrOutputParser()
+        
+        return reporting_chain
+    
+    def _execute_sparql_query(self, query: str) -> List[Dict[str, Any]]:
+        """Execute a SPARQL query against the endpoint and return results"""
+        try:
+            # Create a graph connected to the SPARQL endpoint
+            g = RDFGraph(store=self.sparql_endpoint)
+            
+            # Execute the query
+            results = g.query(query)
+            
+            # Process results into a dictionary format
+            processed_results = []
+            for row in results:
+                row_dict = {}
+                for var_name, var_value in zip(results.vars, row):
+                    if isinstance(var_value, URIRef):
+                        # Get label if available
+                        label = self.ontology_graph.value(var_value, RDFS.label)
+                        if label:
+                            row_dict[var_name.n3()] = {"uri": str(var_value), "label": str(label)}
+                        else:
+                            row_dict[var_name.n3()] = {"uri": str(var_value)}
+                    elif isinstance(var_value, Literal):
+                        row_dict[var_name.n3()] = {"value": str(var_value), "datatype": var_value.datatype.n3() if var_value.datatype else None}
+                    else:
+                        row_dict[var_name.n3()] = {"value": str(var_value)}
+                processed_results.append(row_dict)
+            
+            return processed_results
+        except Exception as e:
+            logger.error(f"Error executing SPARQL query: {e}")
+            return [{"error": str(e)}]
+    
+    def _setup_agent_workflow(self):
+        """Create the multi-agent workflow using LangGraph"""
+        # Initialize the agents
+        query_understanding_agent = self._setup_query_understanding_agent()
+        ontology_agent = self._setup_ontology_agent()
+        validation_agent = self._setup_query_validation_agent()
+        reporting_agent = self._setup_reporting_agent()
+        
+        # Define workflow nodes as functions with reasoning capture
+        def understand_query(state: Dict[str, Any]) -> Dict[str, Any]:
+            """Node for understanding the user query with chain-of-thought reasoning"""
+            # Get the structured output and reasoning
+            query_understanding_input = {"query": state["original_query"]}
+            
+            # Capture the full response for the reasoning trace
+            understanding_response = self.llm.invoke(
+                f"User query: {state['original_query']}\n\nAnalyze this query step by step, identifying the intent, entities, filters, and question type."
+            )
+            understanding_reasoning = understanding_response.content
+            
+            # Get the structured output
+            query_understanding = query_understanding_agent.invoke(query_understanding_input)
+            
+            return {
+                "query_understanding": query_understanding,
+                "understanding_reasoning": understanding_reasoning
+            }
+        
+        def generate_sparql(state: Dict[str, Any]) -> Dict[str, Any]:
+            """Node for generating a SPARQL query with chain-of-thought reasoning"""
+            # Get both the SPARQL query and the reasoning behind it
+            sparql_generation_input = {
+                "query_understanding": json.dumps(state["query_understanding"])
+            }
+            
+            # Capture the full reasoning process
+            sparql_generation_response = self.llm.invoke(
+                f"Query Understanding: {json.dumps(state['query_understanding'])}\n\n" +
+                "Based on this understanding and the ontology, generate a SPARQL query step by step."
+            )
+            sparql_generation_reasoning = sparql_generation_response.content
+            
+            # Get the actual SPARQL query
+            sparql_query = ontology_agent.invoke(sparql_generation_input)
+            
+            # Extract just the SPARQL query from the reasoning if needed
+            cleaned_sparql = self._extract_sparql_from_reasoning(sparql_query)
+            
+            return {
+                "sparql_query": cleaned_sparql,
+                "sparql_generation_reasoning": sparql_generation_reasoning
+            }
+        
+        def validate_query(state: Dict[str, Any]) -> Dict[str, Any]:
+            """Node for validating the SPARQL query with chain-of-thought reasoning"""
+            # Capture the validation reasoning process
+            validation_response = self.llm.invoke(
+                f"SPARQL Query to validate:\n\n```sparql\n{state['sparql_query']}\n```\n\n" +
+                "Validate this SPARQL query step by step, checking for syntax errors, logical issues, and potential optimizations."
+            )
+            validation_reasoning = validation_response.content
+            
+            # Get the structured validation result
+            validation_result = validation_agent.invoke({
+                "sparql_query": state["sparql_query"]
+            })
+            
+            return {
+                "validation_result": validation_result,
+                "validation_reasoning": validation_reasoning
+            }
+        
+        def fix_query(state: Dict[str, Any]) -> Dict[str, Any]:
+            """Node for fixing an invalid SPARQL query"""
+            # Use the corrected query from validation
+            return {"sparql_query": state["validation_result"]["corrected_query"]}
+        
+        def execute_query(state: Dict[str, Any]) -> Dict[str, Any]:
+            """Node for executing the SPARQL query"""
+            # Log the query execution
+            logger.info(f"Executing SPARQL query: {state['sparql_query']}")
+            
+            # Execute the query and get results
+            query_results = self._execute_sparql_query(state["sparql_query"])
+            
+            # Log the number of results
+            logger.info(f"Query returned {len(query_results)} results")
+            
+            return {"query_results": query_results}
+        
+        def generate_report(state: Dict[str, Any]) -> Dict[str, Any]:
+            """Node for generating the final report with chain-of-thought reasoning"""
+            # Capture the reporting reasoning process
+            reporting_response = self.llm.invoke(
+                f"Original Question: {state['original_query']}\n\n" +
+                f"Query Results: {json.dumps(state['query_results'])}\n\n" +
+                "Analyze these results step by step and create a business-friendly report."
+            )
+            reporting_reasoning = reporting_response.content
+            
+            # Generate the actual report
+            final_report = reporting_agent.invoke({
+                "original_query": state["original_query"],
+                "query_results": json.dumps(state["query_results"]),
+                "sparql_query": state["sparql_query"]
+            })
+            
+            return {
+                "final_report": final_report,
+                "reporting_reasoning": reporting_reasoning
+            }
+    
+    def _extract_sparql_from_reasoning(self, text: str) -> str:
+        """Helper method to extract the SPARQL query from a reasoning text"""
+        # Try to find a SPARQL query enclosed in triple backticks with sparql language marker
+        sparql_blocks = re.findall(r"```sparql\n(.*?)\n```", text, re.DOTALL)
+        if sparql_blocks:
+            return sparql_blocks[0].strip()
+        
+        # Try to find any code block that might contain SPARQL
+        code_blocks = re.findall(r"```(.*?)```", text, re.DOTALL)
+        if code_blocks:
+            for block in code_blocks:
+                # Check if block looks like SPARQL (contains SELECT/ASK/CONSTRUCT/DESCRIBE and WHERE)
+                if re.search(r"(SELECT|ASK|CONSTRUCT|DESCRIBE).*?WHERE", block, re.DOTALL | re.IGNORECASE):
+                    return block.strip()
+        
+        # If no clear SPARQL blocks found, look for patterns that suggest a SPARQL query
+        potential_query = re.search(r"(PREFIX.*?|SELECT.*?WHERE.*?\{.*?\})", text, re.DOTALL | re.IGNORECASE)
+        if potential_query:
+            return potential_query.group(0).strip()
+        
+        # If all else fails, return the original text but log a warning
+        logger.warning("Could not extract clean SPARQL query from reasoning text")
+        return text
+        
+        # Define the router for conditional branching
+        def validation_router(state: Dict[str, Any]) -> str:
+            """Route based on query validation results"""
+            if state["validation_result"]["is_valid"]:
+                return "execute_query"
+            else:
+                return "fix_query"
+        
+        # Create the graph
+        workflow = StateGraph(WorkflowState)
+        
+        # Add nodes to the graph
+        workflow.add_node("understand_query", understand_query)
+        workflow.add_node("generate_sparql", generate_sparql)
+        workflow.add_node("validate_query", validate_query)
+        workflow.add_node("fix_query", fix_query)
+        workflow.add_node("execute_query", execute_query)
+        workflow.add_node("generate_report", generate_report)
+        
+        # Add edges to create the workflow
+        workflow.add_edge("understand_query", "generate_sparql")
+        workflow.add_edge("generate_sparql", "validate_query")
+        workflow.add_conditional_edges(
+            "validate_query",
+            validation_router,
+            {
+                "execute_query": "execute_query",
+                "fix_query": "fix_query"
+            }
+        )
+        workflow.add_edge("fix_query", "validate_query")  # Loop back for revalidation
+        workflow.add_edge("execute_query", "generate_report")
+        workflow.add_edge("generate_report", END)
+        
+        # Set the entry point
+        workflow.set_entry_point("understand_query")
+        
+        # Compile the workflow
+        return workflow.compile()
+    
+    def ask(self, query: str) -> str:
+        """Process a user query through the entire workflow and return the final report"""
+        query_id = str(uuid.uuid4())
+        
+        # Initialize the workflow state
+        initial_state = {
+            "query_id": query_id,
+            "original_query": query
+        }
+        
+        # Execute the workflow
+        try:
+            logger.info(f"Processing query: {query}")
+            final_state = self.agent_workflow.invoke(initial_state)
+            
+            # Store the conversation in memory
+            self.memory.save_context(
+                {"input": query},
+                {"output": final_state["final_report"]}
+            )
+            
+            return final_state["final_report"]
+        except Exception as e:
+            logger.error(f"Error processing query: {e}")
+            return f"Sorry, I encountered an error while processing your query: {str(e)}"
+
+# FastAPI implementation for API access
+from fastapi import FastAPI, HTTPException, Depends, Security, status
+from fastapi.security import APIKeyHeader
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel as FastAPIBaseModel
+import uvicorn
+from typing import Dict, Any, List, Optional
+
+# Request and response models
+class ChatRequest(FastAPIBaseModel):
+    query: str
+    conversation_id: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+class ChatResponse(FastAPIBaseModel):
+    query_id: str
+    original_query: str
+    response: str
+    metadata: Optional[Dict[str, Any]] = None
+
+class HealthResponse(FastAPIBaseModel):
+    status: str
+    version: str
+
+# Global chatbot instance
+_chatbot_instance = None
+
+def get_chatbot():
+    """Singleton pattern to get or create the chatbot instance"""
+    global _chatbot_instance
+    if _chatbot_instance is None:
+        _chatbot_instance = GraphRAGChatbot()
+    return _chatbot_instance
+
+# API Key security
+API_KEY_NAME = "X-API-Key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+async def get_api_key(api_key: str = Security(api_key_header)):
+    """Validate API key if enabled"""
+    # Get from environment if API key security is enabled
+    if os.environ.get("API_KEY_ENABLED", "False").lower() == "true":
+        correct_api_key = os.environ.get("API_KEY", "")
+        if not correct_api_key or api_key != correct_api_key:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid API Key",
+            )
+    return api_key
+
+# Create FastAPI app
+app = FastAPI(
+    title="GraphRAG Chatbot API",
+    description="API for querying knowledge graphs using natural language",
+    version="1.0.0"
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Modify this in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "ok", "version": "1.0.0"}
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest, api_key: str = Depends(get_api_key)):
+    """Process a chat request"""
     try:
-        prs = Presentation(template_path)
-        file_name = get_last_part_of_url(report_value)
-        report_folder = os.path.join(output_folder, file_name)
-        os.makedirs(report_folder, exist_ok=True)
-
-        # Generate data
-        df = generate_main_data(report_value, report_folder)
-        df_slide9 = generate_slide9_data(report_value, report_folder)
-        df_slide_11 = generate_slide11_data(report_value, report_folder)
-
-        if df.empty:
-            print(f"No data returned for report URL: {report_value}. Skipping...")
-            return
-
-        report_name = df['Report Name'].iloc[0] if 'Report Name' in df.columns else "Unknown Report"
-        replace_report_name_in_all_sliders(prs, report_name)
-
-        # Replace Report Date on all slides BEFORE modifying slide tables
-        for slide in prs.slides:
-            replace_report_date(slide)
-
-        # Populate slides with data
-        if len(prs.slides) > 4:
-            populate_slide_6(prs, prs.slides[4], df)
-        if len(prs.slides) > 5:
-            csv_data = []
-            populate_slide_8(prs, prs.slides[5], df, csv_data)
-            save_csv(csv_data, report_folder)
-        if len(prs.slides) > 6:
-            populate_slide_9(prs, prs.slides[6], df_slide9)
-        if len(prs.slides) > 8:
-            populate_slide_11(prs, prs.slides[8], df_slide_11)
-
-        pptx_path = os.path.join(report_folder, f"{file_name}.pptx")
-        prs.save(pptx_path)
-        print(f"PowerPoint saved as {pptx_path}")
-
+        chatbot = get_chatbot()
+        response = chatbot.ask(request.query)
+        
+        # Get query_id from memory or generate a new one
+        query_id = str(uuid.uuid4())
+        
+        return {
+            "query_id": query_id,
+            "original_query": request.query,
+            "response": response,
+            "metadata": request.metadata
+        }
     except Exception as e:
-        print(f"Error processing report URL {report_value}: {e}")
+        logger.error(f"Error processing chat request: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error processing request: {str(e)}"
+        )
+
+@app.post("/query_with_details", response_model=Dict[str, Any])
+async def query_with_details(request: ChatRequest, api_key: str = Depends(get_api_key)):
+    """Process a query and return detailed workflow information with reasoning traces"""
+    try:
+        chatbot = get_chatbot()
+        
+        # Initialize the workflow with tracking enabled
+        query_id = str(uuid.uuid4())
+        
+        # Initialize the workflow state
+        initial_state = {
+            "query_id": query_id,
+            "original_query": request.query
+        }
+        
+        # Execute the workflow and capture intermediate states with reasoning
+        final_state = chatbot.agent_workflow.invoke(initial_state)
+        
+        # Return the full workflow details including all reasoning traces
+        return {
+            "query_id": query_id,
+            "original_query": request.query,
+            # Query understanding with reasoning
+            "query_understanding": final_state.get("query_understanding"),
+            "understanding_reasoning": final_state.get("understanding_reasoning"),
+            # SPARQL generation with reasoning
+            "sparql_query": final_state.get("sparql_query"),
+            "sparql_generation_reasoning": final_state.get("sparql_generation_reasoning"),
+            # Query validation with reasoning
+            "validation_result": final_state.get("validation_result"),
+            "validation_reasoning": final_state.get("validation_reasoning"),
+            # Query results
+            "query_results": final_state.get("query_results"),
+            # Report generation with reasoning
+            "reporting_reasoning": final_state.get("reporting_reasoning"),
+            "final_report": final_state.get("final_report"),
+            # Additional metadata
+            "metadata": request.metadata
+        }
+    except Exception as e:
+        logger.error(f"Error processing detailed query: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error processing request: {str(e)}"
+        )
+
+@app.post("/reasoning_only", response_model=Dict[str, Any])
+async def get_reasoning_only(request: ChatRequest, api_key: str = Depends(get_api_key)):
+    """Process a query and return only the chain-of-thought reasoning for each step"""
+    try:
+        chatbot = get_chatbot()
+        
+        # Initialize the workflow
+        query_id = str(uuid.uuid4())
+        initial_state = {
+            "query_id": query_id,
+            "original_query": request.query
+        }
+        
+        # Execute the workflow
+        final_state = chatbot.agent_workflow.invoke(initial_state)
+        
+        # Return only the reasoning traces
+        return {
+            "query_id": query_id,
+            "original_query": request.query,
+            "understanding_reasoning": final_state.get("understanding_reasoning"),
+            "sparql_generation_reasoning": final_state.get("sparql_generation_reasoning"),
+            "validation_reasoning": final_state.get("validation_reasoning"),
+            "reporting_reasoning": final_state.get("reporting_reasoning"),
+            "metadata": request.metadata
+        }
+    except Exception as e:
+        logger.error(f"Error processing reasoning query: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error processing request: {str(e)}"
+        )
+
+# Command-line interface function
+def cli():
+    """Command-line interface for the GraphRAG chatbot"""
+    try:
+        # Initialize the chatbot
+        chatbot = get_chatbot()
+        
+        # Interactive loop
+        print("GraphRAG Chatbot initialized. Type 'exit' to quit.")
+        while True:
+            user_query = input("\nEnter your question: ")
+            if user_query.lower() in ["exit", "quit", "bye"]:
+                print("Goodbye!")
+                break
+                
+            # Process query
+            response = chatbot.ask(user_query)
+            print("\nResponse:")
+            print(response)
+            
+    except Exception as e:
+        logger.error(f"Error in CLI function: {e}")
+        raise
+
+# API server function
+def serve_api(host="0.0.0.0", port=8000):
+    """Start the API server"""
+    uvicorn.run(app, host=host, port=port)
+
+# Main function that can start either the CLI or API server
+def main():
+    """Main function to start either the CLI or API server based on arguments"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="GraphRAG Chatbot")
+    parser.add_argument("--api", action="store_true", help="Start the API server")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="API server host")
+    parser.add_argument("--port", type=int, default=8000, help="API server port")
+    parser.add_argument("--ontology", type=str, help="Path to the OWL ontology file")
+    parser.add_argument("--config", type=str, help="Path to the config file")
+    parser.add_argument("--creds", type=str, help="Path to the credentials file")
+    parser.add_argument("--cert", type=str, help="Path to the certificate file")
+    parser.add_argument("--sparql-endpoint", type=str, help="URL of the SPARQL endpoint")
+    parser.add_argument("--sparql-auth-key", type=str, help="Authorization key for the SPARQL endpoint")
+    parser.add_argument("--sparql-auth-header", type=str, default="Authorization", 
+                        help="Name of the authorization header for the SPARQL endpoint")
+    parser.add_argument("--sparql-auth-type", type=str, choices=["bearer", "apikey"], default="apikey",
+                        help="Type of authorization for the SPARQL endpoint")
+    
+    args = parser.parse_args()
+    
+    # Set environment variables from command line arguments if provided
+    if args.sparql_endpoint:
+        os.environ["SPARQL_ENDPOINT_URL"] = args.sparql_endpoint
+    
+    if args.sparql_auth_key:
+        os.environ["SPARQL_AUTH_ENABLED"] = "True"
+        os.environ["SPARQL_AUTH_KEY"] = args.sparql_auth_key
+        os.environ["SPARQL_AUTH_HEADER"] = args.sparql_auth_header
+        os.environ["SPARQL_AUTH_TYPE"] = args.sparql_auth_type
+    
+    if args.ontology:
+        os.environ["ONTOLOGY_PATH"] = args.ontology
+    
+    # Determine file paths
+    config_path = args.config or CONFIG_PATH
+    creds_path = args.creds or CREDS_PATH
+    cert_path = args.cert or CERT_PATH
+    ontology_path = args.ontology
+    
+    # Initialize the global chatbot instance with the provided paths
+    global _chatbot_instance
+    _chatbot_instance = GraphRAGChatbot(
+        config_file=config_path,
+        creds_file=creds_path,
+        cert_file=cert_path,
+        ontology_path=ontology_path
+    )
+    
+    if args.api:
+        print(f"Starting API server on {args.host}:{args.port}")
+        serve_api(host=args.host, port=args.port)
+    else:
+        cli()
+
+if __name__ == "__main__":
+    main()
