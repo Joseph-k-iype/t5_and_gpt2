@@ -1,3 +1,608 @@
+class SemanticColumnMatcher:
+    def __init__(self, config_file=CONFIG_PATH, creds_file=CREDS_PATH, cert_file=CERT_PATH, 
+                 matching_strategies=None, strategy_weights=None, nltk_path=None):
+        self.env = OSEnv(config_file, creds_file, cert_file)
+        
+        # Initialize custom NLTK path if provided
+        if nltk_path:
+            logger.info(f"Using provided NLTK path: {nltk_path}")
+            # Update environment variables for NLTK
+            if os.path.exists(nltk_path):
+                os.environ['NLTK_DATA'] = nltk_path
+                logger.info(f"Set NLTK_DATA environment variable to: {nltk_path}")
+                
+            # Initialize NLTK resources
+            try:
+                nltk.download('wordnet', quiet=True, download_dir=nltk_path)
+                nltk.download('punkt', quiet=True, download_dir=nltk_path)
+                nltk.download('stopwords', quiet=True, download_dir=nltk_path)
+            except Exception as e:
+                logger.warning(f"Error downloading NLTK resources: {e}")
+        
+        # Initialize hybrid matcher with specified strategies or defaults
+        if matching_strategies is None:
+            matching_strategies = [
+                MatchingStrategy.SEMANTIC,     # 0.4 weight by default
+                MatchingStrategy.LINGUISTIC,   # 0.3 weight by default
+                MatchingStrategy.FUZZY,        # 0.2 weight by default
+                MatchingStrategy.JARO_WINKLER  # 0.1 weight by default
+            ]
+            
+        # Default weights that favor semantic and linguistic approaches
+        if strategy_weights is None:
+            strategy_weights = {
+                MatchingStrategy.SEMANTIC: 0.4,
+                MatchingStrategy.LINGUISTIC: 0.3,
+                MatchingStrategy.FUZZY: 0.2,
+                MatchingStrategy.JARO_WINKLER: 0.1
+            }
+        
+        self.hybrid_matcher = HybridMatcher(
+            strategies=matching_strategies,
+            weights=strategy_weights
+        )
+        
+        # Setup other components
+        self.setup_components()
+        
+    def _get_credential(self):
+        """Get Azure credential based on environment settings"""
+        if str_to_bool(self.env.get("USE_MANAGED_IDENTITY", "False")):
+            return DefaultAzureCredential()
+        else:
+            return ClientSecretCredential(
+                tenant_id=self.env.get("AZURE_TENANT_ID"), 
+                client_id=self.env.get("AZURE_CLIENT_ID"), 
+                client_secret=self.env.get("AZURE_CLIENT_SECRET")
+            )
+    
+    def setup_components(self):
+        """Initialize all components needed for semantic matching"""
+        # Set up Azure Chat LLM
+        model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
+        temperature = float(self.env.get("TEMPERATURE", "0.7"))
+        max_tokens = int(self.env.get("MAX_TOKENS", "800"))
+        api_version = self.env.get("API_VERSION", "2023-05-15")
+        azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
+        
+        # Get token provider
+        token_provider = get_bearer_token_provider(
+            self._get_credential(),
+            "https://cognitiveservices.azure.com/.default"
+        )
+        
+        self.llm = AzureChatOpenAI(
+            model_name=model_name,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            api_version=api_version,
+            azure_endpoint=azure_endpoint,
+            azure_ad_token_provider=token_provider
+        )
+        
+        # Set up Pydantic output parser
+        self.parser = PydanticOutputParser(pydantic_object=MatchingResult)
+        
+        # Initialize job tracking for async processing
+        self.jobs = {}
+            
+    def detect_file_encoding(self, file_path: str):
+        """Detect the encoding of a file using chardet with multiple fallbacks"""
+        # Read a sample of the file to detect encoding
+        with open(file_path, 'rb') as f:
+            # Read up to 1MB for encoding detection
+            raw_data = f.read(1024 * 1024)
+        
+        # Detect encoding using chardet
+        result = chardet.detect(raw_data)
+        encoding = result['encoding']
+        confidence = result['confidence']
+        
+        logger.info(f"chardet detected {encoding} with {confidence:.2f} confidence for {file_path}")
+        
+        # If detection failed or has low confidence, try common encodings
+        if encoding is None or confidence < 0.7:
+            fallback_encodings = ['utf-8', 'latin1', 'iso-8859-1', 'cp1252', 'utf-16']
+            
+            for enc in fallback_encodings:
+                try:
+                    # Try reading a few lines with this encoding
+                    with open(file_path, 'r', encoding=enc) as f:
+                        f.readline()  # Just read the header
+                        f.readline()  # And one data line
+                    
+                    logger.info(f"Fallback to {enc} encoding successful for {file_path}")
+                    return enc
+                except UnicodeDecodeError:
+                    continue
+            
+            # If all fallbacks fail, use a replacement strategy with utf-8
+            logger.warning(f"All encoding detection failed for {file_path}, using utf-8 with replacement")
+            return 'utf-8'
+        
+        return encoding
+        
+    def load_csv_data(self, source_csv_path: str, target_csv_path: str):
+        """Load the two CSV files and prepare them for processing with automatic encoding detection"""
+        try:
+            # Detect encoding for source CSV
+            source_encoding = self.detect_file_encoding(source_csv_path)
+            logger.info(f"Detected encoding for source CSV: {source_encoding}")
+            
+            # Load source CSV (with id, appname, colname) using detected encoding
+            self.source_df = pd.read_csv(source_csv_path, encoding=source_encoding)
+            logger.info(f"Loaded source CSV with {len(self.source_df)} rows")
+            
+            # Detect encoding for target CSV
+            target_encoding = self.detect_file_encoding(target_csv_path)
+            logger.info(f"Detected encoding for target CSV: {target_encoding}")
+            
+            # Load target CSV (with name and definition) using detected encoding
+            self.target_df = pd.read_csv(target_csv_path, encoding=target_encoding)
+            logger.info(f"Loaded target CSV with {len(self.target_df)} rows")
+            
+            # Verify required columns exist
+            if not all(col in self.source_df.columns for col in ['id', 'appname', 'colname']):
+                raise ValueError("Source CSV missing required columns: id, appname, colname")
+                
+            if not all(col in self.target_df.columns for col in ['name', 'definition']):
+                raise ValueError("Target CSV missing required columns: name, definition")
+                
+            # Clean data
+            self.source_df['colname'] = self.source_df['colname'].str.strip()
+            self.target_df['name'] = self.target_df['name'].str.strip()
+            self.target_df['definition'] = self.target_df['definition'].fillna('').str.strip()
+            
+            # Create enriched target data for better matching
+            self.target_df['text_for_embedding'] = self.target_df.apply(
+                lambda row: f"Column name: {row['name']}. Definition: {row['definition']}", 
+                axis=1
+            )
+            
+            # Add NLP features
+            logger.info("Generating NLP features for target columns...")
+            self.target_df['nlp_features'] = self.target_df['name'].apply(NLPHelper.extract_column_features)
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error loading CSV data: {e}")
+            raise
+    
+    def setup_vector_store(self):
+        """Set up ChromaDB vector store with your existing EmbeddingClient and MyDocument classes"""
+        try:
+            # Initialize the embedding client
+            embedding_client = EmbeddingClient(
+                azure_api_version=self.env.get("API_VERSION", "2023-05-15"),
+                embeddings_model=self.env.get("EMBEDDINGS_MODEL", "text-embedding-3-large")
+            )
+            
+            # Create in-memory Chroma settings
+            chroma_settings = Settings(
+                anonymized_telemetry=False,
+                allow_reset=True
+            )
+            
+            # Create ChromaDB client
+            chroma_client = chromadb.Client(settings=chroma_settings)
+            
+            # Create collection name with a unique identifier
+            collection_name = f"column_matcher_{uuid.uuid4().hex[:8]}"
+            
+            # Create collection
+            collection = chroma_client.create_collection(name=collection_name)
+            
+            # Create documents for each target column using MyDocument
+            documents = []
+            
+            logger.info(f"Creating documents and generating embeddings for {len(self.target_df)} target columns")
+            
+            for i, row in self.target_df.iterrows():
+                doc_id = f"doc_{i}"
+                doc_text = f"Column name: {row['name']}. Definition: {row['definition']}"
+                doc_metadata = {
+                    'name': row['name'],
+                    'definition': row['definition']
+                }
+                
+                # Create MyDocument instance
+                doc = MyDocument(
+                    id=doc_id,
+                    text=doc_text,
+                    metadata=doc_metadata
+                )
+                
+                # Generate embeddings using EmbeddingClient
+                doc_with_embedding = embedding_client.generate_embeddings(doc)
+                documents.append(doc_with_embedding)
+            
+            # Process documents in batches to add to ChromaDB
+            batch_size = 100
+            for i in range(0, len(documents), batch_size):
+                batch_docs = documents[i:i+batch_size]
+                
+                # Prepare data for batch insertion
+                batch_ids = [doc.id for doc in batch_docs]
+                batch_embeddings = [doc.embedding for doc in batch_docs]
+                batch_texts = [doc.text for doc in batch_docs]
+                batch_metadatas = [doc.metadata for doc in batch_docs]
+                
+                # Add documents to ChromaDB collection
+                collection.add(
+                    ids=batch_ids,
+                    embeddings=batch_embeddings,
+                    documents=batch_texts,
+                    metadatas=batch_metadatas
+                )
+                
+                logger.info(f"Added batch of {len(batch_docs)} documents to ChromaDB")
+            
+            # Store ChromaDB collection and client for later use
+            self.chroma_collection = collection
+            self.chroma_client = chroma_client
+            
+            # Create a custom ChromaDB retriever
+            class CustomChromaRetriever(BaseRetriever):
+                """Custom retriever that works with ChromaDB using EmbeddingClient"""
+                
+                def __init__(self, collection, embedding_client, k=8):
+                    super().__init__()
+                    self.collection = collection
+                    self.embedding_client = embedding_client
+                    self.k = k
+                
+                def _get_relevant_documents(self, query, **kwargs):
+                    # Create a document for the query
+                    query_doc = MyDocument(
+                        id="query",
+                        text=query
+                    )
+                    
+                    # Generate embedding for the query
+                    query_doc_with_embedding = self.embedding_client.generate_embeddings(query_doc)
+                    
+                    # Query the collection
+                    results = self.collection.query(
+                        query_embeddings=[query_doc_with_embedding.embedding],
+                        n_results=self.k,
+                        include=["documents", "metadatas", "distances"]
+                    )
+                    
+                    # Convert to Document format
+                    documents = []
+                    if results["ids"] and len(results["ids"][0]) > 0:
+                        for i in range(len(results["ids"][0])):
+                            doc = Document(
+                                page_content=results["documents"][0][i],
+                                metadata=results["metadatas"][0][i]
+                            )
+                            documents.append(doc)
+                    
+                    return documents
+                
+                def get_retrieved_docs_with_scores(self, query, k=None):
+                    if k is not None:
+                        self.k = k
+                    
+                    # Create a document for the query
+                    query_doc = MyDocument(
+                        id="query",
+                        text=query
+                    )
+                    
+                    # Generate embedding for the query
+                    query_doc_with_embedding = self.embedding_client.generate_embeddings(query_doc)
+                    
+                    # Query the collection
+                    results = self.collection.query(
+                        query_embeddings=[query_doc_with_embedding.embedding],
+                        n_results=self.k,
+                        include=["documents", "metadatas", "distances"]
+                    )
+                    
+                    # Convert to Document format with scores
+                    documents_with_scores = []
+                    if results["ids"] and len(results["ids"][0]) > 0:
+                        for i in range(len(results["ids"][0])):
+                            doc = Document(
+                                page_content=results["documents"][0][i],
+                                metadata=results["metadatas"][0][i]
+                            )
+                            # Convert distance to similarity score
+                            distance = results["distances"][0][i]
+                            similarity = 1.0 - min(1.0, distance)
+                            documents_with_scores.append((doc, similarity, {}))
+                    
+                    return documents_with_scores
+            
+            # Create the retriever
+            self.retriever = CustomChromaRetriever(
+                collection=collection,
+                embedding_client=embedding_client,
+                k=8
+            )
+            
+            # Save the embedding client for later use
+            self.embedding_client = embedding_client
+            
+            logger.info(f"ChromaDB vector store created with {len(documents)} documents")
+            return True
+        except Exception as e:
+            logger.error(f"Error setting up vector store: {e}")
+            raise
+    
+    def enhance_retrieval(self, source_column, source_app, k=8):
+        """Enhance vector retrieval with hybrid matching strategies"""
+        # Get initial candidates from ChromaDB retriever
+        query = f"Column name: {source_column} from application: {source_app}"
+        
+        # Use the retriever to get documents with scores
+        initial_docs_with_scores = self.retriever.get_retrieved_docs_with_scores(query, k*2)
+        
+        # If TF-IDF vectorizer not fit yet, fit on all column names
+        if not self.hybrid_matcher.tfidf_fit and len(initial_docs_with_scores) > 0:
+            all_column_names = [doc.metadata['name'] for doc, _, _ in initial_docs_with_scores]
+            self.hybrid_matcher.fit_tfidf(all_column_names)
+        
+        # Calculate hybrid similarity scores for each candidate
+        scores = []
+        for doc, chroma_score, _ in initial_docs_with_scores:
+            target_name = doc.metadata['name']
+            definition = doc.metadata.get('definition', '')
+            
+            # Calculate hybrid similarity using multiple strategies
+            hybrid_results = self.hybrid_matcher.compute_similarity(
+                source_column, 
+                target_name
+            )
+            
+            # Extract ensemble score and blend with ChromaDB score
+            combined_score = 0.7 * hybrid_results['ensemble'] + 0.3 * chroma_score
+            
+            # Also compute similarity between source column and definition
+            # if definition is available
+            if definition:
+                definition_sim = self.hybrid_matcher.compute_similarity(
+                    source_column, 
+                    definition
+                )
+                
+                # Blend name similarity with definition similarity
+                final_score = 0.7 * combined_score + 0.3 * definition_sim['ensemble']
+            else:
+                final_score = combined_score
+                
+            # Store document, score, and detailed results
+            scores.append((doc, final_score, hybrid_results))
+        
+        # Sort by combined score and take top k
+        scores.sort(key=lambda x: x[1], reverse=True)
+        top_docs = [item[0] for item in scores[:k]]
+        
+        # Return the documents with their scores
+        return top_docs, scores[:k]
+    
+    def create_rag_chain(self):
+        """Create the RAG prompt chain for semantic matching"""
+        # Define the semantic matching prompt template with format instructions
+        template = """You are a semantic column matching expert. You need to find the most semantically similar matches 
+between a source column name and potential target columns.
+
+SOURCE COLUMN: {source_column}
+SOURCE APPLICATION: {source_app}
+
+POTENTIAL MATCHES:
+{retrieved_documents}
+
+INSTRUCTIONS:
+1. Carefully analyze the semantic meaning of the source column name.
+2. Consider the application context: {source_app}
+3. Evaluate each potential match based on:
+   - Semantic similarity to the source column name
+   - How well the definition aligns with the likely purpose of the source column
+   - Common database naming conventions and abbreviations
+4. Think step-by-step to determine each match's relevance.
+5. For each match, provide:
+   - A confidence score between 0.0 and 1.0
+   - A detailed justification
+   - If the match isn't ideal, suggest a better name and explain why
+6. Rank the top 4 matches in order of confidence score.
+
+{format_instructions}
+"""
+        
+        # Format instructions for Pydantic output
+        format_instructions = self.parser.get_format_instructions()
+        
+        # Format the retrieved documents for the prompt
+        def format_docs(docs_with_scores):
+            result = []
+            for i, (doc, combined_score, similarity_details) in enumerate(docs_with_scores):
+                name = doc.metadata['name']
+                definition = doc.metadata.get('definition', '')
+                
+                # Format similarity metrics
+                sim_text = f"Similarity Score: {combined_score:.3f}"
+                
+                entry = f"MATCH {i+1}:\nName: {name}\nDefinition: {definition}\n{sim_text}\n"
+                result.append(entry)
+            
+            return "\n".join(result)
+        
+        # Create the RAG chain
+        self.rag_chain = (
+            {
+                "source_column": itemgetter("source_column"),
+                "source_app": itemgetter("source_app"),
+                "retrieved_documents": itemgetter("docs_with_scores") | format_docs,
+                "format_instructions": lambda _: format_instructions
+            }
+            | ChatPromptTemplate.from_template(template)
+            | self.llm
+            | self.parser
+        )
+        
+        logger.info("RAG chain created for semantic matching")
+        return True
+
+    def setup_agent_graph(self):
+        """Create a LangGraph workflow for agent-based selection"""
+        
+        # Define state
+        class AgentState(BaseModel):
+            source_column: str
+            source_app: str
+            source_id: str
+            retrieved_docs: List[Document] = []
+            docs_with_scores: List[Tuple[Document, float, Dict]] = []
+            matching_result: Optional[MatchingResult] = None
+            
+        # Define the retrieval node
+        def retrieve_and_analyze(state):
+            # Enhanced retrieval using ChromaDB and hybrid matching
+            docs, docs_with_scores = self.enhance_retrieval(
+                state.source_column, 
+                state.source_app
+            )
+            
+            return {
+                "retrieved_docs": docs,
+                "docs_with_scores": docs_with_scores
+            }
+        
+        # Define the reasoning and selection node
+        def reason_and_select(state):
+            # Use the RAG chain to analyze and select matches
+            matching_result = self.rag_chain.invoke({
+                "source_column": state.source_column,
+                "source_app": state.source_app,
+                "docs_with_scores": state.docs_with_scores
+            })
+            
+            return {"matching_result": matching_result}
+        
+        # Build the graph
+        workflow = StateGraph(AgentState)
+        
+        # Add nodes
+        workflow.add_node("retrieve_and_analyze", retrieve_and_analyze)
+        workflow.add_node("reason_and_select", reason_and_select)
+        
+        # Add edges
+        workflow.add_edge("retrieve_and_analyze", "reason_and_select")
+        workflow.add_edge("reason_and_select", END)
+        
+        # Set entry point
+        workflow.set_entry_point("retrieve_and_analyze")
+        
+        # Compile the graph
+        self.agent_graph = workflow.compile()
+        
+        logger.info("Agent graph created for column matching")
+        return True
+    
+    def match_columns(self):
+        """Process all source columns and find their semantic matches"""
+        try:
+            results = []
+            
+            for _, row in self.source_df.iterrows():
+                source_id = row['id']
+                source_app = row['appname']
+                source_column = row['colname']
+                
+                logger.info(f"Processing column: {source_column} from app: {source_app}")
+                
+                # Execute the agent graph
+                final_state = self.agent_graph.invoke({
+                    "source_column": source_column,
+                    "source_app": source_app,
+                    "source_id": source_id
+                })
+                
+                # Store results
+                result = {
+                    "source_id": source_id,
+                    "source_app": source_app,
+                    "source_column": source_column,
+                    "matching_result": final_state.matching_result
+                }
+                
+                results.append(result)
+                
+            self.matching_results = results
+            logger.info(f"Completed matching for {len(results)} source columns")
+            return results
+        except Exception as e:
+            logger.error(f"Error during column matching: {e}")
+            raise
+    
+    def format_results(self):
+        """Format the matching results into a pandas DataFrame"""
+        formatted_results = []
+        
+        for result in self.matching_results:
+            source_id = result["source_id"]
+            source_app = result["source_app"]
+            source_column = result["source_column"]
+            matching_result = result["matching_result"]
+            
+            for i, match in enumerate(matching_result.matches):
+                formatted_results.append({
+                    "source_id": source_id,
+                    "source_app": source_app,
+                    "source_column": source_column,
+                    "target_column": match.name,
+                    "rank": i + 1,
+                    "score": match.score,
+                    "justification": match.justification,
+                    "suggested_name": match.suggested_name if match.suggested_name else "",
+                    "suggested_name_reason": match.suggested_name_reason if match.suggested_name_reason else ""
+                })
+        
+        return pd.DataFrame(formatted_results)
+    
+    def save_results(self, output_path: str):
+        """Save the matching results to a CSV file"""
+        results_df = self.format_results()
+        results_df.to_csv(output_path, index=False)
+        logger.info(f"Results saved to {output_path}")
+        return True
+    
+    def run_full_pipeline(self, source_csv_path: str, target_csv_path: str, output_path: str):
+        """Run the complete semantic column matching pipeline"""
+        try:
+            logger.info("Starting semantic column matching pipeline")
+            
+            # Step 1: Load CSV data
+            self.load_csv_data(source_csv_path, target_csv_path)
+            
+            # Step 2: Set up vector store with EmbeddingClient and MyDocument
+            self.setup_vector_store()
+            
+            # Step 3: Create RAG chain
+            self.create_rag_chain()
+            
+            # Step 4: Set up agent graph
+            self.setup_agent_graph()
+            
+            # Step 5: Run matching process
+            self.match_columns()
+            
+            # Step 6: Save results
+            self.save_results(output_path)
+            
+            logger.info("Pipeline completed successfully")
+            return self.format_results()
+        except Exception as e:
+            logger.error(f"Error in pipeline: {e}")
+            raise
+
+
+
+
+
+
 def setup_vector_store(self):
     """Set up ChromaDB vector store with manual embedding to avoid version compatibility issues"""
     try:
