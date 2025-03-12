@@ -1,3 +1,204 @@
+class SemanticColumnMatcher:
+    def __init__(self, config_file=CONFIG_PATH, creds_file=CREDS_PATH, cert_file=CERT_PATH, 
+                 matching_strategies=None, strategy_weights=None, nltk_path=None):
+        # Initialize OSEnv with all necessary environment variables and proxy settings
+        self.env = OSEnv(config_file, creds_file, cert_file)
+        
+        # Initialize custom NLTK path if provided
+        if nltk_path:
+            logger.info(f"Using provided NLTK path: {nltk_path}")
+            # Update environment variables for NLTK
+            if os.path.exists(nltk_path):
+                os.environ['NLTK_DATA'] = nltk_path
+                logger.info(f"Set NLTK_DATA environment variable to: {nltk_path}")
+                
+            # Initialize NLTK resources
+            try:
+                nltk.download('wordnet', quiet=True, download_dir=nltk_path)
+                nltk.download('punkt', quiet=True, download_dir=nltk_path)
+                nltk.download('stopwords', quiet=True, download_dir=nltk_path)
+            except Exception as e:
+                logger.warning(f"Error downloading NLTK resources: {e}")
+        
+        # Initialize hybrid matcher with specified strategies or defaults
+        if matching_strategies is None:
+            matching_strategies = [
+                MatchingStrategy.SEMANTIC,     # 0.4 weight by default
+                MatchingStrategy.LINGUISTIC,   # 0.3 weight by default
+                MatchingStrategy.FUZZY,        # 0.2 weight by default
+                MatchingStrategy.JARO_WINKLER  # 0.1 weight by default
+            ]
+            
+        # Default weights that favor semantic and linguistic approaches
+        if strategy_weights is None:
+            strategy_weights = {
+                MatchingStrategy.SEMANTIC: 0.4,
+                MatchingStrategy.LINGUISTIC: 0.3,
+                MatchingStrategy.FUZZY: 0.2,
+                MatchingStrategy.JARO_WINKLER: 0.1
+            }
+        
+        self.hybrid_matcher = HybridMatcher(
+            strategies=matching_strategies,
+            weights=strategy_weights
+        )
+        
+        # Setup Azure Chat LLM using OSEnv for credentials and proxy
+        self.setup_llm()
+        
+        # Initialize parser
+        self.parser = PydanticOutputParser(pydantic_object=MatchingResult)
+            
+    def setup_llm(self):
+        """Initialize LLM using OSEnv to handle credentials and proxy"""
+        # Set up Azure Chat LLM
+        model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
+        temperature = float(self.env.get("TEMPERATURE", "0.7"))
+        max_tokens = int(self.env.get("MAX_TOKENS", "800"))
+        api_version = self.env.get("API_VERSION", "2023-05-15")
+        azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
+        
+        # Use OSEnv's credential method to properly handle proxy settings
+        token_provider = get_bearer_token_provider(
+            self.env._get_credential(),  # Use OSEnv's credential method
+            "https://cognitiveservices.azure.com/.default"
+        )
+        
+        # Create LLM with token provider that includes proper proxy settings
+        self.llm = AzureChatOpenAI(
+            model_name=model_name,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            api_version=api_version,
+            azure_endpoint=azure_endpoint,
+            azure_ad_token_provider=token_provider
+        )
+        
+        logger.info(f"Initialized Azure OpenAI LLM with model: {model_name}")
+
+    def setup_vector_store(self, persist_directory="./chroma_db", collection_name="column_matcher"):
+        """
+        Set up ChromaDB vector store with persistence and incremental updates.
+        Uses EmbeddingClient for embedding generation.
+        """
+        try:
+            # Initialize the embedding client from our custom class
+            # This will use the proper token provider with proxy settings
+            embedding_client = EmbeddingClient(
+                azure_api_version=self.env.get("API_VERSION", "2023-05-15"),
+                embeddings_model=self.env.get("EMBEDDINGS_MODEL", "text-embedding-3-large")
+            )
+            
+            # Create a persistent ChromaDB client
+            chroma_settings = Settings(
+                anonymized_telemetry=False,
+                allow_reset=True,
+                persist_directory=persist_directory  # Set persistence directory
+            )
+            
+            # Create ChromaDB client with persistence
+            logger.info(f"Creating persistent ChromaDB client at {persist_directory}")
+            chroma_client = chromadb.PersistentClient(path=persist_directory)
+            
+            # Try to get existing collection or create a new one
+            try:
+                # Attempt to get existing collection
+                collection = chroma_client.get_collection(name=collection_name)
+                logger.info(f"Using existing ChromaDB collection '{collection_name}' with {collection.count()} documents")
+                
+                # Get existing IDs to determine what needs to be updated
+                existing_ids = set()
+                if collection.count() > 0:
+                    # Get all existing IDs in batches to avoid memory issues
+                    batch_size = 1000
+                    for i in range(0, collection.count(), batch_size):
+                        batch_results = collection.get(limit=batch_size, offset=i, include=["metadatas"])
+                        for metadata in batch_results["metadatas"]:
+                            if "name" in metadata:
+                                existing_ids.add(metadata["name"])
+                
+                logger.info(f"Found {len(existing_ids)} existing entries in collection")
+                
+            except Exception as e:
+                # Collection doesn't exist, create a new one
+                logger.info(f"Creating new ChromaDB collection '{collection_name}'")
+                collection = chroma_client.create_collection(name=collection_name)
+                existing_ids = set()
+            
+            # Find entries that need to be added (new or updated)
+            new_entries = []
+            for i, row in self.target_df.iterrows():
+                # Skip if already in the collection
+                if row['name'] in existing_ids:
+                    continue
+                    
+                new_entries.append(row)
+            
+            # Process new entries in batches
+            if new_entries:
+                logger.info(f"Found {len(new_entries)} new entries to add to ChromaDB")
+                
+                documents = []
+                
+                # Create documents for each new target column using MyDocument
+                for i, row in enumerate(new_entries):
+                    doc_id = f"doc_{uuid.uuid4().hex}"  # Use UUID to avoid collisions
+                    doc_text = f"Column name: {row['name']}. Definition: {row['definition']}"
+                    doc_metadata = {
+                        'name': row['name'],
+                        'definition': row['definition']
+                    }
+                    
+                    # Create MyDocument instance - this is from the user's existing class
+                    doc = MyDocument(
+                        id=doc_id,
+                        text=doc_text,
+                        metadata=doc_metadata
+                    )
+                    
+                    # Generate embeddings using EmbeddingClient - this is from the user's existing class
+                    doc_with_embedding = embedding_client.generate_embeddings(doc)
+                    documents.append(doc_with_embedding)
+                
+                # Process documents in batches to add to ChromaDB
+                batch_size = 100
+                for i in range(0, len(documents), batch_size):
+                    batch_docs = documents[i:i+batch_size]
+                    
+                    # Prepare data for batch insertion
+                    batch_ids = [doc.id for doc in batch_docs]
+                    batch_embeddings = [doc.embedding for doc in batch_docs]
+                    batch_texts = [doc.text for doc in batch_docs]
+                    batch_metadatas = [doc.metadata for doc in batch_docs]
+                    
+                    # Add documents to ChromaDB collection
+                    collection.add(
+                        ids=batch_ids,
+                        embeddings=batch_embeddings,
+                        documents=batch_texts,
+                        metadatas=batch_metadatas
+                    )
+                    
+                    logger.info(f"Added batch of {len(batch_docs)} documents to ChromaDB")
+            else:
+                logger.info("No new entries to add to ChromaDB")
+            
+            # Store ChromaDB collection and client for later use
+            self.chroma_collection = collection
+            self.chroma_client = chroma_client
+            self.embedding_client = embedding_client
+            
+            logger.info(f"ChromaDB vector store ready with {collection.count()} total documents")
+            return True
+        except Exception as e:
+            logger.error(f"Error setting up vector store: {e}")
+            raise
+
+
+
+
+
+
 def setup_vector_store(self, persist_directory="./chroma_db", collection_name="column_matcher"):
     """
     Set up ChromaDB vector store with persistence and incremental updates.
