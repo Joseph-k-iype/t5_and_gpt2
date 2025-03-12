@@ -440,29 +440,18 @@ class SemanticColumnMatcher:
         
     def setup_components(self):
         """Initialize all components needed for semantic matching"""
-        # Set up embedding client
-        model_name = self.env.get("EMBEDDINGS_MODEL", "text-embedding-3-large")
-        api_version = self.env.get("API_VERSION", "2023-05-15")
-        azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
-        azure_deployment = self.env.get("AZURE_DEPLOYMENT", "text-embedding-3-large")
-        
-        # Set up LangChain Azure embeddings
-        token_provider = get_bearer_token_provider(
-            self._get_credential(),
-            "https://cognitiveservices.azure.com/.default"
-        )
-        
-        self.embeddings = AzureOpenAIEmbeddings(
-            azure_deployment=azure_deployment,
-            azure_endpoint=azure_endpoint,
-            api_version=api_version,
-            azure_ad_token_provider=token_provider
-        )
-        
         # Set up Azure Chat LLM
         model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
         temperature = float(self.env.get("TEMPERATURE", "0.7"))
         max_tokens = int(self.env.get("MAX_TOKENS", "800"))
+        api_version = self.env.get("API_VERSION", "2023-05-15")
+        azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
+        
+        # Get token provider
+        token_provider = get_bearer_token_provider(
+            self._get_credential(),
+            "https://cognitiveservices.azure.com/.default"
+        )
         
         self.llm = AzureChatOpenAI(
             model_name=model_name,
@@ -528,12 +517,16 @@ class SemanticColumnMatcher:
             raise
     
     def setup_vector_store(self):
-        """Set up ChromaDB vector store with target column data"""
+        """Set up ChromaDB vector store with target column data using EmbeddingClient and MyDocument"""
         try:
+            # Initialize the EmbeddingClient
+            embedding_client = EmbeddingClient(
+                azure_api_version=self.env.get("API_VERSION", "2023-05-15"),
+                embeddings_model=self.env.get("EMBEDDINGS_MODEL", "text-embedding-3-large")
+            )
+            
             # Create documents for each target column
             documents = []
-            metadatas = []
-            ids = []
             
             for _, row in self.target_df.iterrows():
                 doc_id = str(uuid.uuid4())
@@ -543,9 +536,16 @@ class SemanticColumnMatcher:
                     'definition': row['definition']
                 }
                 
-                documents.append(doc_text)
-                metadatas.append(doc_metadata)
-                ids.append(doc_id)
+                # Create MyDocument instance
+                doc = MyDocument(
+                    id=doc_id,
+                    text=doc_text,
+                    metadata=doc_metadata
+                )
+                
+                # Generate embeddings using EmbeddingClient
+                doc_with_embedding = embedding_client.generate_embeddings(doc)
+                documents.append(doc_with_embedding)
             
             # Create in-memory Chroma collection with telemetry disabled
             chroma_settings = Settings(
@@ -553,15 +553,104 @@ class SemanticColumnMatcher:
                 allow_reset=True
             )
             
-            self.vectorstore = LangChainChroma.from_texts(
-                documents,
-                self.embeddings,
-                metadatas=metadatas,
-                ids=ids,
-                client_settings=chroma_settings
-            )
+            # Create ChromaDB client
+            chroma_client = chromadb.Client(settings=chroma_settings)
             
-            logger.info(f"Vector store created with {len(documents)} documents")
+            # Create or get collection
+            collection_name = f"column_matcher_{uuid.uuid4().hex[:8]}"
+            collection = chroma_client.create_collection(name=collection_name)
+            
+            # Add documents to collection
+            if documents:
+                # Prepare data for batch add
+                ids = [doc.id for doc in documents]
+                embeddings = [doc.embedding for doc in documents]
+                metadatas = [doc.metadata for doc in documents]
+                texts = [doc.text for doc in documents]
+                
+                # Add documents to ChromaDB
+                collection.add(
+                    ids=ids,
+                    embeddings=embeddings,
+                    metadatas=metadatas,
+                    documents=texts
+                )
+            
+            # Create a wrapper for compatibility with LangChain retriever API
+            class ChromaDBRetriever(BaseRetriever):
+                def __init__(self, collection, embedding_client, k=8):
+                    self.collection = collection
+                    self.embedding_client = embedding_client
+                    self.k = k
+                
+                def get_relevant_documents(self, query):
+                    # Create a document for the query
+                    query_doc = MyDocument(
+                        id="query",
+                        text=query
+                    )
+                    
+                    # Generate embedding for the query
+                    query_doc_with_embedding = self.embedding_client.generate_embeddings(query_doc)
+                    
+                    # Query the collection
+                    results = self.collection.query(
+                        query_embeddings=[query_doc_with_embedding.embedding],
+                        n_results=self.k,
+                        include=["documents", "metadatas", "distances"]
+                    )
+                    
+                    # Convert to LangChain Document format for compatibility
+                    documents = []
+                    for i in range(len(results["ids"][0])):
+                        doc = Document(
+                            page_content=results["documents"][0][i],
+                            metadata=results["metadatas"][0][i]
+                        )
+                        documents.append(doc)
+                    
+                    return documents
+                
+                def get_retrieved_docs_with_scores(self, query, k=8):
+                    self.k = k
+                    # Create a document for the query
+                    query_doc = MyDocument(
+                        id="query",
+                        text=query
+                    )
+                    
+                    # Generate embedding for the query
+                    query_doc_with_embedding = self.embedding_client.generate_embeddings(query_doc)
+                    
+                    # Query the collection
+                    results = self.collection.query(
+                        query_embeddings=[query_doc_with_embedding.embedding],
+                        n_results=self.k,
+                        include=["documents", "metadatas", "distances"]
+                    )
+                    
+                    # Convert to LangChain Document format with scores
+                    documents_with_scores = []
+                    for i in range(len(results["ids"][0])):
+                        doc = Document(
+                            page_content=results["documents"][0][i],
+                            metadata=results["metadatas"][0][i]
+                        )
+                        # Convert distance to similarity score (1 - normalized_distance)
+                        similarity = 1.0 - min(1.0, results["distances"][0][i])
+                        documents_with_scores.append((doc, similarity))
+                    
+                    return documents_with_scores
+            
+            # Create the retriever
+            self.retriever = ChromaDBRetriever(collection, embedding_client)
+            
+            # Store ChromaDB collection and client for later use
+            self.chroma_collection = collection
+            self.chroma_client = chroma_client
+            self.embedding_client = embedding_client
+            
+            logger.info(f"ChromaDB vector store created with {len(documents)} documents using EmbeddingClient")
             return True
         except Exception as e:
             logger.error(f"Error setting up vector store: {e}")
@@ -569,18 +658,20 @@ class SemanticColumnMatcher:
     
     def enhance_retrieval(self, source_column, source_app, k=8):
         """Enhance vector retrieval with hybrid matching strategies"""
-        # Get initial candidates from vector store
+        # Get initial candidates from ChromaDB retriever
         query = f"Column name: {source_column} from application: {source_app}"
-        initial_docs = self.vectorstore.as_retriever(search_kwargs={"k": k*2}).get_relevant_documents(query)
+        
+        # Use the custom ChromaDBRetriever to get documents with scores
+        initial_docs_with_scores = self.retriever.get_retrieved_docs_with_scores(query, k*2)
         
         # If TF-IDF vectorizer not fit yet, fit on all column names
-        if not self.hybrid_matcher.tfidf_fit and len(initial_docs) > 0:
-            all_column_names = [doc.metadata['name'] for doc in initial_docs]
+        if not self.hybrid_matcher.tfidf_fit and len(initial_docs_with_scores) > 0:
+            all_column_names = [doc.metadata['name'] for doc, _ in initial_docs_with_scores]
             self.hybrid_matcher.fit_tfidf(all_column_names)
         
         # Calculate hybrid similarity scores for each candidate
         scores = []
-        for doc in initial_docs:
+        for doc, chroma_score in initial_docs_with_scores:
             target_name = doc.metadata['name']
             definition = doc.metadata.get('definition', '')
             
@@ -590,8 +681,8 @@ class SemanticColumnMatcher:
                 target_name
             )
             
-            # Extract ensemble score
-            combined_score = hybrid_results['ensemble']
+            # Extract ensemble score and blend with ChromaDB score
+            combined_score = 0.7 * hybrid_results['ensemble'] + 0.3 * chroma_score
             
             # Also compute similarity between source column and definition
             # if definition is available
@@ -601,8 +692,7 @@ class SemanticColumnMatcher:
                     definition
                 )
                 
-                # Blend vector similarity with definition similarity
-                # Weight name matching higher than definition matching
+                # Blend name similarity with definition similarity
                 final_score = 0.7 * combined_score + 0.3 * definition_sim['ensemble']
             else:
                 final_score = combined_score
@@ -695,7 +785,7 @@ INSTRUCTIONS:
             
         # Define the retrieval node
         def retrieve_and_analyze(state):
-            # Enhanced retrieval using both vector similarity and NLP
+            # Enhanced retrieval using ChromaDB and hybrid matching
             docs, docs_with_scores = self.enhance_retrieval(
                 state.source_column, 
                 state.source_app
@@ -838,8 +928,8 @@ INSTRUCTIONS:
 # REST API Models
 class APIConfig(BaseModel):
     """API configuration settings"""
-    api_title: str = "Column Matcher API"
-    api_description: str = "API for matching column names semantically"
+    api_title: str = "ChromaDB Column Matcher API"
+    api_description: str = "API for matching column names semantically using ChromaDB and Azure OpenAI Embeddings"
     api_version: str = "1.0.0"
     allowed_origins: List[str] = ["*"]
     host: str = "0.0.0.0"
@@ -916,9 +1006,11 @@ class RestAPI:
             # Load CSV data
             self.matcher.load_csv_data(source_csv_path, target_csv_path)
             
-            # Set up vector store
+            # Set up vector store using EmbeddingClient and MyDocument
             self.matcher.setup_vector_store()
-            self.vectorstore = self.matcher.vectorstore
+            
+            # Store retriever for later use
+            self.retriever = self.matcher.retriever
             
             # Create RAG chain
             self.matcher.create_rag_chain()
@@ -941,10 +1033,20 @@ class RestAPI:
         async def root():
             """API health check endpoint"""
             status_msg = "initialized" if self.initialized else "not initialized"
+            docs_count = 0
+            if hasattr(self, 'matcher') and self.matcher and hasattr(self.matcher, 'chroma_collection'):
+                try:
+                    docs_count = self.matcher.chroma_collection.count()
+                except:
+                    pass
+                
             return {
                 "status": "healthy", 
                 "version": self.config.api_version,
-                "matcher_status": status_msg
+                "matcher_status": status_msg,
+                "embeddings_provider": "Azure OpenAI",
+                "vector_database": "ChromaDB",
+                "documents_count": docs_count
             }
         
         @self.app.post("/initialize", tags=["Setup"])
@@ -953,7 +1055,7 @@ class RestAPI:
             target_file: UploadFile = File(...)
         ):
             """
-            Initialize the matcher with data sources
+            Initialize the matcher with data sources using ChromaDB and Azure OpenAI embeddings
             
             - **source_file**: CSV file with columns id, appname, colname
             - **target_file**: CSV file with columns name, definition
@@ -992,10 +1094,10 @@ class RestAPI:
             request: ColumnTestRequest
         ):
             """
-            Test a new column name against the existing embeddings
+            Test a new column name against the existing embeddings in ChromaDB
             
             Matches the provided column name against the previously loaded target columns
-            and returns the best semantic matches with confidence scores.
+            using Azure OpenAI embeddings via EmbeddingClient and ChromaDB.
             
             - **column_name**: The column name to test
             - **application_name**: Optional application context
