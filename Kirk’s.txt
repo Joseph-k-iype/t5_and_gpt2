@@ -1,371 +1,562 @@
-import os
-import time
-import logging
 import re
-import uuid
-import json
+import csv
 import pandas as pd
-from pathlib import Path
-from typing import Optional, List, Dict, Any
-from dotenv import load_dotenv, dotenv_values
-import requests
-import chromadb
-from chromadb.config import Settings
-from azure.identity import ClientSecretCredential, get_bearer_token_provider
-from langchain.chat_models import AzureChatOpenAI
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationChain
+import string
+from typing import List, Dict, Set, Tuple, Union, Optional
 
-# ------------------------------
-# Logging Configuration
-# ------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Natural language processing libraries
+import spacy
+import nltk
+from nltk.corpus import stopwords, wordnet
+from nltk.stem import PorterStemmer, WordNetLemmatizer
+from nltk.tokenize import word_tokenize
 
-# ------------------------------
-# Helper Functions
-# ------------------------------
-def is_file_readable(filepath: str) -> bool:
-    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
-        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
-    return True
 
-def str_to_bool(s: str) -> bool:
-    if s == 'True':
-        return True
-    elif s == 'False':
-        return False
-    else:
-        raise ValueError(f"Invalid boolean string: {s}")
-
-def stable_chunk_text(text: str, max_chars: int = 1000) -> List[str]:
-    """Chunk text into smaller pieces at sentence boundaries."""
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    chunks = []
-    current_chunk = ""
-    for sentence in sentences:
-        if len(current_chunk) + len(sentence) + 1 <= max_chars:
-            current_chunk = (current_chunk + " " + sentence).strip() if current_chunk else sentence
-        else:
-            chunks.append(current_chunk)
-            current_chunk = sentence
-    if current_chunk:
-        chunks.append(current_chunk)
-    return chunks
-
-# ------------------------------
-# OSEnv Class: Environment, Proxy, Certificate, and Token Management
-# ------------------------------
-class OSEnv:
-    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
-        self.var_list = []
-        self.bulk_set(config_file, True)
-        logger.info(f"Loaded main configuration from {config_file}")
-        self.bulk_set(creds_file, False)
-        logger.info(f"Loaded credentials from {creds_file}")
-        self.set_certificate_path(certificate_path)
-        logger.info("Certificate path configured")
-        if str_to_bool(self.get("PROXY_ENABLED", "False")):
-            self.set_proxy()
-            logger.info("Proxy configured")
-        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
-            logger.info("Securing endpoints using Azure AD")
-            self.token = self.get_azure_token()
-        else:
-            self.token = None
-
-    def set_certificate_path(self, certificate_path: str) -> None:
-        if not os.path.isabs(certificate_path):
-            certificate_path = os.path.abspath(certificate_path)
-        if not is_file_readable(certificate_path):
-            raise Exception("Certificate file missing or not readable")
-        self.set("REQUESTS_CA_BUNDLE", certificate_path)
-        self.set("SSL_CERT_FILE", certificate_path)
-        self.set("CURL_CA_BUNDLE", certificate_path)
-        logger.info(f"Certificate path set to: {certificate_path}")
-
-    def bulk_set(self, dotenvfile: str, print_val: bool = False) -> None:
-        if not os.path.isabs(dotenvfile):
-            dotenvfile = os.path.abspath(dotenvfile)
-        if is_file_readable(dotenvfile):
-            logger.info(f"Loading environment variables from {dotenvfile}")
-            temp_dict = dotenv_values(dotenvfile)
-            for k, v in temp_dict.items():
-                self.set(k, v, print_val)
-            del temp_dict
-
-    def set(self, var_name: str, val: str, print_val: bool = True) -> None:
-        os.environ[var_name] = val
-        if var_name not in self.var_list:
-            self.var_list.append(var_name)
-        if print_val:
-            logger.info(f"Set {var_name}={val}")
-
-    def get(self, var_name: str, default: Optional[str] = None) -> Optional[str]:
-        return os.environ.get(var_name, default)
-
-    def set_proxy(self) -> None:
-        ad_username = self.get("AD_USERNAME")
-        ad_password = self.get("AD_USER_PW")
-        proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
-        if not all([ad_username, ad_password, proxy_domain]):
-            raise ValueError("Missing proxy credentials")
-        proxy_url = f"http://{ad_username}:{ad_password}@{proxy_domain}"
-        self.set("HTTP_PROXY", proxy_url, print_val=False)
-        self.set("HTTPS_PROXY", proxy_url, print_val=False)
-        no_proxy_domains = ['cognitiveservices.azure.com', 'search.windows.net', 'openai.azure.com', 'core.windows.net', 'azurewebsites.net']
-        self.set("NO_PROXY", ",".join(no_proxy_domains))
-        logger.info("Proxy configuration completed")
-
-    def get_azure_token(self) -> str:
-        credential = ClientSecretCredential(
-            tenant_id=self.get("AZURE_TENANT_ID"),
-            client_id=self.get("AZURE_CLIENT_ID"),
-            client_secret=self.get("AZURE_CLIENT_SECRET")
-        )
-        token = credential.get_token("https://cognitiveservices.azure.com/.default")
-        self.set("AZURE_TOKEN", token.token, print_val=False)
-        logger.info("Azure token acquired successfully")
-        return token.token
-
-    def list_env_vars(self) -> None:
-        for var in self.var_list:
-            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET'}:
-                logger.info(f"{var}: [HIDDEN]")
-            else:
-                logger.info(f"{var}: {self.get(var)}")
-
-# ------------------------------
-# AzureChatbot: For validation using Azure OpenAI (LangChain)
-# ------------------------------
-class AzureChatbot:
-    def __init__(self, config_file: str, creds_file: str, cert_file: str):
-        logger.info("Initializing chatbot...")
-        self.env = OSEnv(config_file, creds_file, cert_file)
-        self._setup_chat_model()
-
-    def _setup_chat_model(self) -> None:
-        api_key = self.env.get("AZURE_OPENAI_API_KEY")
-        endpoint = self.env.get("AZURE_OPENAI_ENDPOINT")
-        api_version = self.env.get("API_VERSION", "2024-02-01")
-        model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
-        temperature = float(self.env.get("MODEL_TEMPERATURE", "0.7"))
-        max_tokens = int(self.env.get("MAX_TOKENS", "800"))
-        if api_key:
-            self.llm = AzureChatOpenAI(
-                model_name=model_name,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                openai_api_version=api_version,
-                azure_endpoint=endpoint,
-                openai_api_key=api_key
-            )
-        else:
-            if not self.env.token:
-                raise ValueError("Missing credentials: please provide AZURE_OPENAI_API_KEY or set SECURED_ENDPOINTS to True")
-            self.llm = AzureChatOpenAI(
-                model_name=model_name,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                openai_api_version=api_version,
-                azure_endpoint=endpoint,
-                azure_ad_token=self.env.token
-            )
-        self.memory = ConversationBufferMemory()
-        self.conversation = ConversationChain(llm=self.llm, memory=self.memory, verbose=True)
-        logger.info("Chat model initialized successfully")
-
-    def validate_matches(self, query: str, matches: List[Dict[str, Any]]) -> str:
-        prompt = f"""You are an expert validation agent. Given the query:
-"{query}"
-and the following candidate matches:
-"""
-        for idx, match in enumerate(matches, start=1):
-            prompt += f"\n{idx}. Name: {match.get('name')}\n   Definition: {match.get('definition')}\n"
-        prompt += "\nIf these matches are satisfactory, simply reply OK. Otherwise, suggest the best matching candidate from our knowledge base in the format:\nName: <name>\nDefinition: <definition>\nExplanation: <brief explanation>."
+class LexicalMatcher:
+    """
+    A class to generate robust regex patterns for lexical matching based on
+    terms, definitions, related terms, and acronyms using spaCy and NLTK.
+    """
+    
+    def __init__(self, spacy_model: str = 'en_core_web_sm'):
+        """
+        Initialize the LexicalMatcher with NLP tools.
+        
+        Args:
+            spacy_model: The spaCy model to use (default: small English model)
+        """
+        # Download necessary NLTK resources if not already present
         try:
-            response = self.conversation.predict(input=prompt)
-            return response.strip()
-        except Exception as e:
-            logger.error(f"Validation agent error: {str(e)}")
-            return "Validation failed"
-
-    def chat(self, message: str) -> str:
-        if not message.strip():
-            return "Please provide a non-empty message."
+            nltk.data.find('corpora/stopwords')
+            nltk.data.find('corpora/wordnet')
+        except LookupError:
+            nltk.download('stopwords')
+            nltk.download('wordnet')
+            nltk.download('punkt')
+            nltk.download('averaged_perceptron_tagger')
+        
+        # Load spaCy model
         try:
-            response = self.conversation.predict(input=message)
-            return response
-        except Exception as e:
-            logger.error(f"Error in chat: {str(e)}")
-            return f"An error occurred: {str(e)}"
-
-# ------------------------------
-# AzureEmbeddingClient: For generating embeddings via Azure OpenAI
-# ------------------------------
-class AzureEmbeddingClient:
-    def __init__(self, env: OSEnv):
-        self.env = env
-        endpoint = self.env.get("AZURE_OPENAI_EMBEDDINGS_ENDPOINT")
-        if not endpoint:
-            raise ValueError("Missing AZURE_OPENAI_EMBEDDINGS_ENDPOINT in environment")
-        if "/openai" not in endpoint:
-            endpoint = endpoint.rstrip("/") + "/openai"
-        self.endpoint = endpoint
-        self.deployment = self.env.get("EMBEDDINGS_DEPLOYMENT", "text-embedding-3-large")
-        self.api_version = self.env.get("EMBEDDINGS_API_VERSION", "2023-05-15")
-        proxy = self.env.get("HTTP_PROXY")
-        self.session = requests.Session()
-        self.session.trust_env = False
-        self.session.verify = self.env.get("REQUESTS_CA_BUNDLE", "cacert.pem")
-        if proxy:
-            self.session.proxies = {"http": proxy, "https": proxy}
-        logger.info("AzureEmbeddingClient session configured")
+            self.nlp = spacy.load(spacy_model)
+        except OSError:
+            # If model is not installed, provide instructions
+            print(f"SpaCy model {spacy_model} not found.")
+            print(f"Please install it with: python -m spacy download {spacy_model}")
+            raise
         
-    def get_embeddings(self, texts: List[str], batch_size: int = 100) -> List[Optional[List[float]]]:
-        headers = {
-            'Authorization': f'Bearer {self.env.token}',
-            'Content-Type': 'application/json'
-        }
-        api_url = f"{self.endpoint}/deployments/{self.deployment}/embeddings?api-version={self.api_version}"
-        logger.info(f"Requesting embeddings from URL: {api_url}")
-        all_embeddings = []
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i+batch_size]
-            payload = {"input": batch}
-            try:
-                response = self.session.post(api_url, headers=headers, json=payload)
-                if response.status_code == 200:
-                    data = response.json()
-                    batch_embeds = [item.get("embedding") for item in data.get("data", [])]
-                    all_embeddings.extend(batch_embeds)
-                    logger.info(f"Received embeddings for batch {i+1}-{min(i+batch_size, len(texts))}")
-                else:
-                    logger.error(f"Failed for batch {i+1}-{min(i+batch_size, len(texts))} (status {response.status_code}): {response.text}")
-                    all_embeddings.extend([None] * len(batch))
-            except Exception as e:
-                logger.error(f"Error processing batch {i+1}-{min(i+batch_size, len(texts))}: {str(e)}")
-                all_embeddings.extend([None] * len(batch))
-        return all_embeddings
-
-# ------------------------------
-# VectorStoreManager: Manage local ChromaDB storage
-# ------------------------------
-class VectorStoreManager:
-    def __init__(self, persist_dir: str = "./chroma_db"):
-        # Remove the anonymized_telemetry parameter as it is unexpected
-        self.client = chromadb.PersistentClient(path=persist_dir)
-        self.collection = self.client.get_or_create_collection(name="knowledge_base")
-        logger.info("ChromaDB collection initialized locally")
-
-    def add_documents(self, documents: List[Dict[str, Any]], embeddings: List[List[float]]):
-        if len(documents) != len(embeddings):
-            raise ValueError("Documents and embeddings count mismatch")
-        ids = [str(uuid.uuid4()) for _ in documents]
-        metadatas = [{"name": doc["name"], "definition": doc["definition"]} for doc in documents]
-        contents = [doc["name"] + "\n" + doc["definition"] for doc in documents]
-        self.collection.add(ids=ids, documents=contents, embeddings=embeddings, metadatas=metadatas)
-        logger.info(f"Added {len(documents)} documents to the vector store")
-
-    def query(self, query_embedding: List[float], n_results: int = 4) -> List[Dict[str, Any]]:
-        results = self.collection.query(query_embedding, n_results=n_results)
-        matches = []
-        if results and "metadatas" in results:
-            for meta in results["metadatas"]:
-                matches.append(meta)
-        return matches
-
-# ------------------------------
-# CSV Processing Functions
-# ------------------------------
-def load_csv_as_documents(csv_path: str) -> List[Dict[str, Any]]:
-    df = pd.read_csv(csv_path)
-    if not {"name", "definition"}.issubset(set(df.columns)):
-        raise ValueError("CSV must contain 'name' and 'definition' columns")
-    documents = []
-    for _, row in df.iterrows():
-        combined = f"{row['name']}\n{row['definition']}"
-        # Optionally perform chunking if needed (here we assume one chunk per row)
-        documents.append({"name": row["name"], "definition": row["definition"], "combined": combined})
-    return documents
-
-def save_results_to_csv(results: List[Dict[str, Any]], output_path: str) -> None:
-    df = pd.DataFrame(results)
-    df.to_csv(output_path, index=False)
-    logger.info(f"Results saved to {output_path}")
-
-# ------------------------------
-# Main Function: Workflow
-# ------------------------------
-def main():
-    try:
-        base_dir = Path(__file__).resolve().parent / "env"
-        config_path = str(base_dir / "config.env")
-        creds_path = str(base_dir / "credentials.env")
-        cert_path = str(base_dir / "cacert.pem")
-        for f in [config_path, creds_path, cert_path]:
-            if not os.path.exists(f):
-                print(f"Missing required file: {f}")
-                return
+        # Initialize NLTK tools
+        self.stop_words = set(stopwords.words('english'))
+        self.stemmer = PorterStemmer()
+        self.lemmatizer = WordNetLemmatizer()
         
-        logger.info("Initializing environment...")
-        env = OSEnv(config_path, creds_path, cert_path)
+        # Dictionary to store generated patterns
+        self.patterns = {}
+    
+    def _escape_regex(self, text: str) -> str:
+        """
+        Escape special regex characters.
         
-        logger.info("Initializing chatbot agent (for match validation)...")
-        chatbot = AzureChatbot(config_path, creds_path, cert_path)
-        
-        logger.info("Initializing Azure embedding client...")
-        embed_client = AzureEmbeddingClient(env)
-        
-        logger.info("Initializing local ChromaDB vector store...")
-        vector_store = VectorStoreManager(persist_dir="./chroma_db")
-        
-        # STEP 1: Ingest Knowledge Base from CSV
-        kb_csv = input("Enter path to knowledge base CSV: ").strip()
-        kb_documents = load_csv_as_documents(kb_csv)
-        combined_texts = [doc["combined"] for doc in kb_documents]
-        logger.info("Generating embeddings for knowledge base documents...")
-        kb_embeddings = embed_client.get_embeddings(combined_texts)
-        vector_store.add_documents(kb_documents, kb_embeddings)
-        
-        # STEP 2: Process Query CSV and perform vector matching
-        query_csv = input("Enter path to query CSV: ").strip()
-        query_df = pd.read_csv(query_csv)
-        if not {"name", "definition"}.issubset(set(query_df.columns)):
-            raise ValueError("Query CSV must contain 'name' and 'definition' columns")
-        
-        results = []
-        for index, row in query_df.iterrows():
-            query_text = f"{row['name']}\n{row['definition']}"
-            logger.info(f"Processing query {index+1}: {row['name']}")
-            query_embedding = embed_client.get_embeddings([query_text])[0]
-            matches = vector_store.query(query_embedding, n_results=4)
-            validation_prompt = f"""You are an expert validation agent. Given the query:
-"{query_text}"
-and the following candidate matches:
-"""
-            for idx, match in enumerate(matches, start=1):
-                validation_prompt += f"\n{idx}. Name: {match.get('name')}\n   Definition: {match.get('definition')}\n"
-            validation_prompt += "\nIf these matches are satisfactory, simply reply OK. Otherwise, suggest the best matching candidate from our knowledge base in the format:\nName: <name>\nDefinition: <definition>\nExplanation: <brief explanation>."
-            validation_response = chatbot.validate_matches(query_text, matches)
+        Args:
+            text: String to escape
             
-            results.append({
-                "query_name": row["name"],
-                "query_definition": row["definition"],
-                "matches": json.dumps(matches),
-                "validation": validation_response
-            })
+        Returns:
+            Escaped string safe for regex pattern
+        """
+        return re.escape(text)
+    
+    def _get_wordnet_pos(self, treebank_tag: str) -> str:
+        """
+        Convert Penn Treebank POS tags to WordNet POS tags.
         
-        output_csv = input("Enter path for output CSV (e.g., output.csv): ").strip()
-        save_results_to_csv(results, output_csv)
-        print("Workflow completed successfully.")
+        Args:
+            treebank_tag: Penn Treebank POS tag
+            
+        Returns:
+            WordNet POS tag
+        """
+        if treebank_tag.startswith('J'):
+            return wordnet.ADJ
+        elif treebank_tag.startswith('V'):
+            return wordnet.VERB
+        elif treebank_tag.startswith('N'):
+            return wordnet.NOUN
+        elif treebank_tag.startswith('R'):
+            return wordnet.ADV
+        else:
+            # Default is noun
+            return wordnet.NOUN
+    
+    def _lemmatize_text(self, text: str) -> str:
+        """
+        Lemmatize text using WordNet lemmatizer with correct POS.
         
-    except Exception as e:
-        logger.exception(f"Unexpected error: {str(e)}")
-        print(f"An error occurred: {str(e)}")
+        Args:
+            text: Text to lemmatize
+            
+        Returns:
+            Lemmatized text
+        """
+        tokens = word_tokenize(text)
+        pos_tags = nltk.pos_tag(tokens)
+        
+        return ' '.join([
+            self.lemmatizer.lemmatize(
+                word, 
+                self._get_wordnet_pos(pos)
+            ) for word, pos in pos_tags
+        ])
+    
+    def _remove_vowels(self, text: str, keep_first: bool = True) -> str:
+        """
+        Remove vowels from text, optionally keeping the first letter.
+        
+        Args:
+            text: Input text
+            keep_first: Whether to keep the first character regardless of vowel status
+            
+        Returns:
+            Text with vowels removed
+        """
+        if not text:
+            return text
+            
+        if keep_first:
+            first_char = text[0]
+            rest = text[1:]
+            return first_char + re.sub(r'[aeiou]', '', rest, flags=re.IGNORECASE)
+        else:
+            return re.sub(r'[aeiou]', '', text, flags=re.IGNORECASE)
+    
+    def _extract_important_words(self, text: str) -> List[str]:
+        """
+        Extract important words from text using spaCy.
+        
+        Args:
+            text: Input text
+            
+        Returns:
+            List of important words
+        """
+        doc = self.nlp(text)
+        
+        # Get nouns, proper nouns, and adjectives
+        important_words = []
+        for token in doc:
+            # Include nouns, proper nouns, adjectives, and verbs
+            if (token.pos_ in ('NOUN', 'PROPN', 'ADJ', 'VERB') and 
+                not token.is_stop and 
+                len(token.text) > 2):
+                important_words.append(token.text.lower())
+        
+        return important_words
+    
+    def _get_synonyms(self, word: str) -> List[str]:
+        """
+        Get synonyms for a word using WordNet.
+        
+        Args:
+            word: Input word
+            
+        Returns:
+            List of synonyms
+        """
+        synonyms = []
+        
+        # Get lemma
+        word = self.lemmatizer.lemmatize(word)
+        
+        # Get synonyms from WordNet
+        for syn in wordnet.synsets(word):
+            for lemma in syn.lemmas():
+                synonym = lemma.name().lower().replace('_', ' ')
+                if synonym != word and synonym not in synonyms:
+                    synonyms.append(synonym)
+        
+        # Limit to reasonable number of synonyms
+        return synonyms[:3]
+    
+    def _extract_entities(self, text: str) -> List[str]:
+        """
+        Extract named entities from text using spaCy.
+        
+        Args:
+            text: Input text
+            
+        Returns:
+            List of named entities
+        """
+        doc = self.nlp(text)
+        entities = [ent.text.lower() for ent in doc.ents]
+        return entities
+    
+    def _generate_sensible_abbreviations(self, term: str) -> List[str]:
+        """
+        Generate sensible abbreviations using NLP techniques.
+        
+        Args:
+            term: Input term
+            
+        Returns:
+            List of generated abbreviations
+        """
+        abbreviations = []
+        term = term.lower().strip()
+        
+        if not term:
+            return abbreviations
+        
+        # Use spaCy to process the term
+        doc = self.nlp(term)
+        
+        # 1. First letter acronym (for multi-word terms)
+        if ' ' in term:
+            # Get all words
+            words = [token.text for token in doc if not token.is_punct and not token.is_space]
+            
+            # Standard acronym (first letter of each word)
+            standard_acronym = ''.join(word[0] for word in words if word)
+            if len(standard_acronym) > 1:
+                abbreviations.append(standard_acronym)
+            
+            # Enhanced acronym (first letter of important words)
+            important_words = [token.text for token in doc 
+                            if token.pos_ in ('NOUN', 'PROPN', 'ADJ', 'VERB') 
+                            and not token.is_stop]
+            
+            if important_words:
+                enhanced_acronym = ''.join(word[0] for word in important_words)
+                if len(enhanced_acronym) > 1 and enhanced_acronym != standard_acronym:
+                    abbreviations.append(enhanced_acronym)
+        
+        # 2. Consonant skeleton variants
+        # Standard consonant skeleton
+        consonant_skeleton = self._remove_vowels(term, keep_first=True)
+        if consonant_skeleton != term and len(consonant_skeleton) > 1:
+            abbreviations.append(consonant_skeleton)
+        
+        # Partial consonant skeleton for longer terms
+        if len(term) > 5:
+            partial_skeleton = term[0] + self._remove_vowels(term[1:4], keep_first=False)
+            if partial_skeleton not in abbreviations and len(partial_skeleton) > 1:
+                abbreviations.append(partial_skeleton)
+        
+        # 3. Prefixes and truncations
+        # First 2-4 characters
+        if len(term) > 2:
+            abbreviations.append(term[:min(3, len(term))])
+            
+            if len(term) > 4:
+                abbreviations.append(term[:min(4, len(term))])
+        
+        # 4. For multi-word terms, create more abbreviations
+        if ' ' in term:
+            words = term.split()
+            
+            # For two-word terms
+            if len(words) == 2:
+                # First 3 chars of first word + first 3 chars of second word
+                if len(words[0]) >= 2 and len(words[1]) >= 2:
+                    combined = words[0][:min(3, len(words[0]))] + '_' + words[1][:min(3, len(words[1]))]
+                    abbreviations.append(combined)
+                
+                # First word's consonant skeleton + second word's consonant skeleton
+                first_cons = self._remove_vowels(words[0], keep_first=True)
+                second_cons = self._remove_vowels(words[1], keep_first=True)
+                if len(first_cons) > 1 and len(second_cons) > 1:
+                    combined_cons = first_cons + '_' + second_cons
+                    abbreviations.append(combined_cons)
+            
+            # For all multi-word terms
+            if len(words) > 1:
+                # Extract nouns and important words
+                doc = self.nlp(term)
+                important_pos = ('NOUN', 'PROPN')
+                
+                # Get all nouns in the term
+                nouns = [token.text for token in doc if token.pos_ in important_pos]
+                
+                # If we have nouns, create abbreviations using just the nouns
+                if len(nouns) > 1:
+                    noun_acr = ''.join(noun[0] for noun in nouns)
+                    if len(noun_acr) > 1:
+                        abbreviations.append(noun_acr)
+                
+                # For longer compound terms (3+ words), also add first letters of first and last word
+                if len(words) >= 3:
+                    first_last = words[0][0] + words[-1][0]
+                    if len(first_last) == 2:
+                        abbreviations.append(first_last)
+        
+        # 5. Special handling for industry-specific patterns
+        # For terms like "employee number", "customer identifier", etc.
+        if ' ' in term and len(term.split()) == 2:
+            words = term.split()
+            
+            # Check if second word is an identifier word
+            id_words = ['number', 'id', 'identifier', 'code', 'key', 'reference']
+            
+            if any(id_word == words[1].lower() for id_word in id_words):
+                # Create abbreviated version with first word abbreviated + id word abbreviated
+                abbr_first = self._remove_vowels(words[0], keep_first=True)
+                abbr_id = words[1][0:3]  # Take first 3 chars of id word
+                abbreviations.append(f"{abbr_first}_{abbr_id}")
+        
+        # Remove duplicates
+        return list(set(abbreviations))
+    
+    def create_pattern(self, name: str, definition: str = "", 
+                     related_terms: Union[str, List[str]] = "", 
+                     acronyms: Union[str, List[str]] = "") -> Dict:
+        """
+        Create a robust regex pattern for lexical matching.
+        
+        Args:
+            name: The main term
+            definition: Term definition
+            related_terms: Related terms (comma-separated string or list)
+            acronyms: Known acronyms (comma-separated string or list)
+            
+        Returns:
+            Dictionary with pattern and regex object
+        """
+        # Normalize inputs
+        name = str(name).strip().lower() if name else ""
+        definition = str(definition).strip().lower() if definition else ""
+        
+        # Convert to lists if they're strings
+        if isinstance(related_terms, str):
+            related_terms_list = [term.strip().lower() for term in related_terms.split(',') if term.strip()]
+        else:
+            related_terms_list = [term.lower().strip() for term in related_terms if term]
+        
+        if isinstance(acronyms, str):
+            acronyms_list = [acr.strip().lower() for acr in acronyms.split(',') if acr.strip()]
+        else:
+            acronyms_list = [acr.lower().strip() for acr in acronyms if acr]
+        
+        # Pattern collection
+        patterns = set()
+        
+        # 1. Add exact name match
+        if name:
+            patterns.add(self._escape_regex(name))
+            
+            # Add lemmatized version if different
+            lemma_name = self._lemmatize_text(name)
+            if lemma_name != name:
+                patterns.add(self._escape_regex(lemma_name))
+        
+        # 2. Generate and add sensible abbreviations from name
+        generated_abbreviations = self._generate_sensible_abbreviations(name)
+        for abbr in generated_abbreviations:
+            patterns.add(self._escape_regex(abbr))
+        
+        # 3. Extract important words from name using spaCy
+        if name:
+            important_words = self._extract_important_words(name)
+            for word in important_words:
+                if len(word) > 2 and word != name:
+                    patterns.add(self._escape_regex(word))
+        
+        # 4. Add related terms and their abbreviations
+        for term in related_terms_list:
+            patterns.add(self._escape_regex(term))
+            
+            # Add lemmatized version
+            lemma_term = self._lemmatize_text(term)
+            if lemma_term != term:
+                patterns.add(self._escape_regex(lemma_term))
+            
+            # Generate and add abbreviations for related terms
+            term_abbrevs = self._generate_sensible_abbreviations(term)
+            for abbr in term_abbrevs:
+                patterns.add(self._escape_regex(abbr))
+                
+            # For multi-word related terms, add important words
+            important_words = self._extract_important_words(term)
+            for word in important_words:
+                if len(word) > 2:
+                    patterns.add(self._escape_regex(word))
+        
+        # 5. Add explicit acronyms
+        for acronym in acronyms_list:
+            patterns.add(self._escape_regex(acronym))
+        
+        # 6. Extract meaningful terms from definition using NLP
+        if definition:
+            # Process with spaCy to get important words
+            important_def_words = self._extract_important_words(definition)
+            
+            # Add top 3 important words from definition
+            for word in important_def_words[:3]:
+                if len(word) > 3:
+                    patterns.add(self._escape_regex(word))
+            
+            # Extract any named entities
+            entities = self._extract_entities(definition)
+            for entity in entities:
+                if len(entity) > 2:
+                    patterns.add(self._escape_regex(entity))
+        
+        # 7. Generate compound patterns for special cases
+        if name and related_terms_list:
+            # Generate name abbreviation + related term combinations
+            name_abbrevs = self._generate_sensible_abbreviations(name)
+            
+            for rel_term in related_terms_list:
+                # Look for related terms containing identifier words
+                id_words = ['number', 'code', 'id', 'identifier', 'key', 'reference']
+                rel_lower = rel_term.lower()
+                
+                for id_word in id_words:
+                    if id_word in rel_lower:
+                        # For each abbreviation + id_word combination
+                        for abbr in name_abbrevs:
+                            if len(abbr) > 1:
+                                # Create patterns like "emply_num", "emply_id", etc.
+                                compound = f"{abbr}[_\\-\\s]*{id_word[:3]}"
+                                patterns.add(compound)
+                                
+                                # Also try with just the first letter of the id word
+                                compound_short = f"{abbr}[_\\-\\s]*{id_word[0]}"
+                                patterns.add(compound_short)
+        
+        # 8. Add synonyms for important terms (limited to avoid overly broad matching)
+        if name:
+            # Get the main words from the name
+            main_words = [word for word in name.split() if len(word) > 3 and word not in self.stop_words]
+            
+            # Add synonyms for the main words (limited to key terms)
+            for word in main_words[:1]:  # Limit to just the first main word
+                synonyms = self._get_synonyms(word)
+                # Add only the first 2 synonyms to avoid too broad matching
+                for synonym in synonyms[:2]:
+                    if len(synonym) > 3:
+                        patterns.add(self._escape_regex(synonym))
+        
+        # Build final pattern with word boundaries and flexible separators
+        pattern_list = list(patterns)
+        combined_pattern = '|'.join(pattern_list)
+        
+        # Final pattern with:
+        # - Word boundaries
+        # - Optional separators between pattern components
+        # - Case insensitivity
+        final_pattern = f"\\b(?:{combined_pattern})(?:[_\\-\\s]*(?:{combined_pattern}))*\\b"
+        
+        return {
+            'pattern': final_pattern,
+            'regex': re.compile(final_pattern, re.IGNORECASE),
+            'original_term': name,
+            'generated_abbreviations': generated_abbreviations,
+            'all_terms': list(patterns)
+        }
+    
+    def process_csv(self, file_path: str, 
+                   name_col: str = 'name', 
+                   def_col: str = 'definition',
+                   rel_terms_col: str = 'related terms',
+                   acronyms_col: str = 'acronyms') -> Dict:
+        """
+        Process a CSV file to generate regex patterns for all terms.
+        
+        Args:
+            file_path: Path to the CSV file
+            name_col: Column name for the main term
+            def_col: Column name for definition
+            rel_terms_col: Column name for related terms
+            acronyms_col: Column name for acronyms
+            
+        Returns:
+            Dictionary of patterns keyed by term name
+        """
+        try:
+            df = pd.read_csv(file_path)
+            
+            # Ensure required columns exist
+            if name_col not in df.columns:
+                raise ValueError(f"CSV file must contain a '{name_col}' column")
+            
+            # Process each row
+            for _, row in df.iterrows():
+                name = row.get(name_col, '')
+                if not name:
+                    continue
+                    
+                definition = row.get(def_col, '') if def_col in df.columns else ''
+                related_terms = row.get(rel_terms_col, '') if rel_terms_col in df.columns else ''
+                acronyms = row.get(acronyms_col, '') if acronyms_col in df.columns else ''
+                
+                self.patterns[name] = self.create_pattern(name, definition, related_terms, acronyms)
+            
+            return self.patterns
+            
+        except Exception as e:
+            print(f"Error processing CSV: {e}")
+            return {}
+    
+    def match(self, term: str, original_term: str) -> bool:
+        """
+        Check if a term matches a pattern.
+        
+        Args:
+            term: Term to check
+            original_term: Original term whose pattern to use
+            
+        Returns:
+            True if match found, False otherwise
+        """
+        if original_term not in self.patterns:
+            return False
+            
+        pattern = self.patterns[original_term]['regex']
+        return bool(pattern.search(term))
+    
+    def get_all_patterns(self) -> Dict:
+        """
+        Get all generated patterns.
+        
+        Returns:
+            Dictionary of all patterns
+        """
+        return self.patterns
 
+
+# Example usage
 if __name__ == "__main__":
-    main()
+    # Create a matcher
+    matcher = LexicalMatcher()
+    
+    # Example with single term
+    employee_pattern = matcher.create_pattern(
+        name="employee",
+        definition="A person who works for a company",
+        related_terms="training, expense account, number",
+        acronyms="emp, ee"
+    )
+    
+    print(f"Original term: {employee_pattern['original_term']}")
+    print(f"Generated abbreviations: {', '.join(employee_pattern['generated_abbreviations'])}")
+    print(f"Regex pattern: {employee_pattern['pattern']}")
+    
+    # Test matching
+    test_terms = [
+        "EMPLY_NUM", "employee", "Employee Number", "emp",
+        "employee training", "EMPLOYEE_TRAINING", "expense account",
+        "number", "expns_acct", "something unrelated", "empl"
+    ]
+    
+    print("\nMatching test:")
+    for test in test_terms:
+        match = employee_pattern['regex'].search(test) is not None
+        print(f"  \"{test}\" => {'✓ Match' if match else '✗ No match'}")
+    
+    # Example with CSV processing
+    print("\nTo process a CSV file:")
+    print("matcher = LexicalMatcher()")
+    print("patterns = matcher.process_csv('your_terms.csv')")
+    
+    # Explanation of installation requirements
+    print("\n# Requirements Installation:")
+    print("# pip install spacy nltk pandas")
+    print("# python -m spacy download en_core_web_sm")
