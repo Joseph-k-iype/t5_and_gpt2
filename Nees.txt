@@ -1,28 +1,205 @@
-from typing import Optional
+import uuid
+from typing import Dict, Any, List, Optional, Tuple, TypedDict, Annotated
 from langchain_openai import AzureChatOpenAI
-from azure.identity import DefaultAzureCredential, get_bearer_token_provider
-from app.config.environment import get_os_env
+from langgraph.graph import StateGraph, END
+from pydantic import BaseModel, Field
+from app.core.models import (
+    DataElement, 
+    EnhancedDataElement, 
+    ValidationResult, 
+    EnhancementResult, 
+    DataQualityStatus
+)
+from app.agents.validator_agent import ValidatorAgent
+from app.agents.enhancer_agent import EnhancerAgent
 
-def get_llm() -> AzureChatOpenAI:
-    """Get the language model for the application."""
-    env = get_os_env()
+# Define workflow state
+class WorkflowState(TypedDict):
+    """State for the data enhancement workflow."""
+    data_element: Dict[str, Any]
+    enhanced_data: Optional[Dict[str, Any]]
+    validation_result: Optional[Dict[str, Any]]
+    enhancement_result: Optional[Dict[str, Any]]
+    iterations: int
+    max_iterations: int
+    is_complete: bool
+    error: Optional[str]
+
+class DataEnhancementWorkflow:
+    """LangGraph workflow for enhancing data elements."""
     
-    token_provider = get_bearer_token_provider(
-        env.credential,
-        "https://cognitiveservices.azure.com/.default"
-    )
+    def __init__(self, llm: AzureChatOpenAI):
+        self.llm = llm
+        self.validator = ValidatorAgent(llm)
+        self.enhancer = EnhancerAgent(llm)
+        self.graph = self._build_graph()
     
-    model_name = env.get("MODEL_NAME", "gpt-4o")
-    temperature = float(env.get("TEMPERATURE", "0.3"))  # Lower temperature for more deterministic outputs
-    max_tokens = int(env.get("MAX_TOKENS", "2000"))
-    api_version = env.get("API_VERSION", "2023-05-15")
-    azure_endpoint = env.get("AZURE_ENDPOINT", "")
+    async def _validate_data(self, state: WorkflowState) -> WorkflowState:
+        """Validate the data element."""
+        try:
+            # If there's enhanced data, validate that
+            if state.get("enhanced_data"):
+                data_to_validate = DataElement(
+                    existing_name=state["enhanced_data"]["enhanced_name"],
+                    existing_description=state["enhanced_data"]["enhanced_description"],
+                    example=state["data_element"].get("example"),
+                    process_name=state["data_element"].get("process_name"),
+                    process_description=state["data_element"].get("process_description")
+                )
+            else:
+                # Otherwise validate the original data
+                data_to_validate = DataElement(**state["data_element"])
+            
+            # Validate the data
+            validation_result = await self.validator.validate(data_to_validate)
+            
+            # Update state with validation result
+            state["validation_result"] = validation_result.dict()
+            
+            # If this is a subsequent iteration, update the enhanced data with validation feedback
+            if state.get("enhanced_data") and state["iterations"] > 0:
+                if "validation_feedback" not in state["enhanced_data"]:
+                    state["enhanced_data"]["validation_feedback"] = []
+                state["enhanced_data"]["validation_feedback"].append(validation_result.feedback)
+                state["enhanced_data"]["quality_status"] = validation_result.quality_status
+            
+            return state
+        except Exception as e:
+            state["error"] = f"Validation error: {str(e)}"
+            state["is_complete"] = True
+            return state
     
-    return AzureChatOpenAI(
-        model_name=model_name,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        api_version=api_version,
-        azure_endpoint=azure_endpoint,
-        azure_ad_token_provider=token_provider
-    )
+    async def _enhance_data(self, state: WorkflowState) -> WorkflowState:
+        """Enhance the data element."""
+        try:
+            # Get validation feedback
+            validation_feedback = state["validation_result"]["feedback"]
+            if state["validation_result"].get("suggested_improvements"):
+                validation_feedback += "\n\nSuggested improvements:\n" + "\n".join(
+                    state["validation_result"]["suggested_improvements"]
+                )
+            
+            # Use the enhancer to improve the data
+            enhancement_result = await self.enhancer.enhance(
+                DataElement(**state["data_element"]), 
+                validation_feedback
+            )
+            state["enhancement_result"] = enhancement_result.dict()
+            
+            # Create or update enhanced data
+            if not state.get("enhanced_data"):
+                enhanced_data = {
+                    **state["data_element"],
+                    "enhanced_name": enhancement_result.enhanced_name,
+                    "enhanced_description": enhancement_result.enhanced_description,
+                    "quality_status": state["validation_result"]["quality_status"],
+                    "enhancement_iterations": 1,
+                    "enhancement_feedback": [enhancement_result.feedback],
+                    "validation_feedback": [state["validation_result"]["feedback"]]
+                }
+                state["enhanced_data"] = enhanced_data
+            else:
+                state["enhanced_data"]["enhanced_name"] = enhancement_result.enhanced_name
+                state["enhanced_data"]["enhanced_description"] = enhancement_result.enhanced_description
+                state["enhanced_data"]["enhancement_iterations"] = state["enhanced_data"].get("enhancement_iterations", 0) + 1
+                
+                if "enhancement_feedback" not in state["enhanced_data"]:
+                    state["enhanced_data"]["enhancement_feedback"] = []
+                state["enhanced_data"]["enhancement_feedback"].append(enhancement_result.feedback)
+            
+            # Increment iteration counter
+            state["iterations"] = state["iterations"] + 1
+            
+            return state
+        except Exception as e:
+            state["error"] = f"Enhancement error: {str(e)}"
+            state["is_complete"] = True
+            return state
+    
+    def _should_enhance(self, state: WorkflowState) -> str:
+        """Determine if the data needs enhancement."""
+        # Check if we've hit the maximum number of iterations
+        if state["iterations"] >= state["max_iterations"]:
+            return "complete"
+        
+        # Check validation result
+        if state["validation_result"]["quality_status"] == DataQualityStatus.GOOD:
+            return "complete"
+        
+        # Otherwise, continue enhancing
+        return "enhance"
+    
+    async def _complete_workflow(self, state: WorkflowState) -> WorkflowState:
+        """Mark the workflow as complete."""
+        state["is_complete"] = True
+        return state
+    
+    def _build_graph(self) -> StateGraph:
+        """Build the LangGraph workflow."""
+        workflow = StateGraph(WorkflowState)
+        
+        # Add nodes
+        workflow.add_node("validate", self._validate_data)
+        workflow.add_node("enhance", self._enhance_data)
+        workflow.add_node("complete", self._complete_workflow)
+        
+        # Add conditional edges
+        workflow.add_conditional_edges(
+            "validate",
+            self._should_enhance,
+            {
+                "enhance": "enhance",
+                "complete": "complete"
+            }
+        )
+        
+        # Add remaining edges
+        workflow.add_edge("enhance", "validate")
+        workflow.add_edge("complete", END)  # End of workflow
+        
+        # Set entrypoint
+        workflow.set_entry_point("validate")
+        
+        return workflow.compile()
+    
+    async def run(self, data_element: DataElement, max_iterations: int = 5) -> EnhancedDataElement:
+        """
+        Run the data enhancement workflow on a data element.
+        
+        Args:
+            data_element: The data element to enhance
+            max_iterations: Maximum number of enhancement iterations to perform
+        
+        Returns:
+            Enhanced data element
+        """
+        initial_state: WorkflowState = {
+            "data_element": data_element.dict(),
+            "enhanced_data": None,
+            "validation_result": None,
+            "enhancement_result": None,
+            "iterations": 0,
+            "max_iterations": max_iterations,
+            "is_complete": False,
+            "error": None
+        }
+        
+        # Run the workflow
+        result = await self.graph.ainvoke(initial_state)
+        
+        if result.get("error"):
+            raise ValueError(result["error"])
+        
+        if not result.get("enhanced_data"):
+            # If no enhancement was performed, create an enhanced data element from the original
+            return EnhancedDataElement(
+                **data_element.dict(),
+                enhanced_name=data_element.existing_name,
+                enhanced_description=data_element.existing_description,
+                quality_status=result["validation_result"]["quality_status"] if result.get("validation_result") else DataQualityStatus.GOOD,
+                enhancement_iterations=0,
+                validation_feedback=[result["validation_result"]["feedback"]] if result.get("validation_result") else []
+            )
+        
+        # Convert the enhanced data dict back to an EnhancedDataElement
+        return EnhancedDataElement(**result["enhanced_data"])
