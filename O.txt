@@ -1,66 +1,314 @@
-from fastapi import FastAPI, Depends
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
+import os
+import csv
 import logging
-from app.api.routes.enhancement import router as enhancement_router
-from app.api.routes.tagging import router as tagging_router
+import uuid
+from typing import Dict, List, Any, Optional, Tuple
+from pydantic import BaseModel, Field
+import chromadb
+from chromadb.config import Settings
+from app.core.embedding import EmbeddingClient, MyDocument
 from app.config.environment import get_os_env
-
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler()
-    ]
-)
 
 logger = logging.getLogger(__name__)
 
-def create_application() -> FastAPI:
-    """Create the FastAPI application."""
-    # Initialize environment
-    env = get_os_env()
+class BusinessTerm(BaseModel):
+    """Model representing a preferred business term."""
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    description: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
     
-    # Create FastAPI app
-    app = FastAPI(
-        title="Data Element Enhancement and Tagging API",
-        description="API for enhancing data element names and descriptions based on ISO/IEC 11179 standards, and tagging with preferred business terms",
-        version="1.0.0",
-    )
+class TaggingResult(BaseModel):
+    """Model representing the result of tagging an element with business terms."""
+    element_name: str
+    element_description: str
+    matching_terms: List[Dict[str, Any]]
+    confidence_scores: List[float]
     
-    # Configure CORS
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],  # Restrict in production
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+class TaggingValidationResult(BaseModel):
+    """Model representing the validation result of tagging."""
+    is_valid: bool
+    feedback: str
+    suggested_alternatives: List[Dict[str, Any]] = Field(default_factory=list)
     
-    # Include routers
-    app.include_router(enhancement_router)
-    app.include_router(tagging_router)
+class BusinessTermManager:
+    """Manager for business terms and tagging operations."""
     
-    @app.get("/health")
-    async def health_check():
-        """Health check endpoint."""
-        return {"status": "healthy"}
+    def __init__(self, persistent_dir: str = "./chroma_db"):
+        """Initialize the business term manager."""
+        self.env = get_os_env()
+        self.embedding_client = EmbeddingClient()
+        self.persistent_dir = persistent_dir
+        self.chroma_client = self._setup_chroma_db()
+        self.collection = self.chroma_client.get_or_create_collection("business_terms")
+        
+    def _setup_chroma_db(self):
+        """Set up the ChromaDB client with persistent storage."""
+        try:
+            # Create directory if it doesn't exist
+            os.makedirs(self.persistent_dir, exist_ok=True)
+            
+            # Initialize ChromaDB client with persistent storage using current API
+            client = chromadb.PersistentClient(
+                path=self.persistent_dir,
+                settings=chromadb.Settings(
+                    anonymized_telemetry=False
+                )
+            )
+            
+            logger.info(f"ChromaDB initialized with persistent storage at {self.persistent_dir}")
+            return client
+        except Exception as e:
+            logger.error(f"Error setting up ChromaDB: {e}")
+            raise
+            
+    def import_terms_from_csv(self, csv_path: str) -> int:
+        """
+        Import business terms from a CSV file.
+        
+        Args:
+            csv_path: Path to the CSV file
+            
+        Returns:
+            Number of terms imported
+        """
+        try:
+            terms = []
+            ids = []
+            embeddings = []
+            metadatas = []
+            
+            with open(csv_path, 'r', encoding='utf-8') as file:
+                reader = csv.DictReader(file)
+                
+                for row in reader:
+                    if 'name' not in row or 'description' not in row:
+                        logger.warning(f"Skipping row missing required fields: {row}")
+                        continue
+                    
+                    # Create business term
+                    term_id = str(uuid.uuid4())
+                    term = BusinessTerm(
+                        id=term_id,
+                        name=row['name'],
+                        description=row['description']
+                    )
+                    
+                    # Create document for embedding
+                    doc = MyDocument(
+                        id=term_id,
+                        text=f"{term.name}. {term.description}"
+                    )
+                    
+                    # Generate embedding
+                    doc_with_embedding = self.embedding_client.generate_embeddings(doc)
+                    
+                    if not doc_with_embedding.embedding:
+                        logger.warning(f"Could not generate embedding for term: {term.name}. Skipping.")
+                        continue
+                    
+                    # Add to lists for batch addition
+                    terms.append(term)
+                    ids.append(term_id)
+                    embeddings.append(doc_with_embedding.embedding)
+                    metadatas.append({
+                        "name": term.name,
+                        "description": term.description
+                    })
+            
+            # Add terms to ChromaDB in batch
+            if ids:
+                self.collection.add(
+                    ids=ids,
+                    embeddings=embeddings,
+                    metadatas=metadatas,
+                    documents=[f"{term.name}. {term.description}" for term in terms]
+                )
+                
+            logger.info(f"Imported {len(terms)} business terms from {csv_path}")
+            return len(terms)
+            
+        except Exception as e:
+            logger.error(f"Error importing terms from CSV: {e}")
+            raise
     
-    @app.get("/")
-    async def root():
-        """Root endpoint with basic information."""
-        return {
-            "application": "Data Element Enhancement and Tagging API",
-            "version": "1.0.0",
-            "status": "running",
-            "documentation": "/docs"
-        }
+    def tag_element(self, name: str, description: str, top_k: int = 3) -> TaggingResult:
+        """
+        Tag a data element with the most similar business terms.
+        
+        Args:
+            name: Enhanced data element name
+            description: Enhanced data element description
+            top_k: Number of top terms to return
+            
+        Returns:
+            Tagging result with matching terms and confidence scores
+        """
+        try:
+            # Create document for embedding
+            doc = MyDocument(
+                id=str(uuid.uuid4()),
+                text=f"{name}. {description}"
+            )
+            
+            # Generate embedding
+            doc_with_embedding = self.embedding_client.generate_embeddings(doc)
+            
+            if not doc_with_embedding.embedding:
+                raise ValueError(f"Could not generate embedding for element: {name}")
+            
+            # Query the collection
+            results = self.collection.query(
+                query_embeddings=[doc_with_embedding.embedding],
+                n_results=top_k,
+                include=["metadatas", "documents", "distances"]
+            )
+            
+            matching_terms = []
+            confidence_scores = []
+            
+            if results["ids"] and len(results["ids"][0]) > 0:
+                for i, term_id in enumerate(results["ids"][0]):
+                    # Convert distance to confidence score (1 - normalized_distance)
+                    # Chroma returns L2 distance, so we need to convert it to a confidence score
+                    distance = results["distances"][0][i]
+                    # Normalize distance to [0, 1] range and convert to confidence score
+                    # For L2 distance, smaller is better, so we invert it
+                    confidence = max(0, min(1, 1 - (distance / 2)))  # Simple normalization
+                    
+                    matching_terms.append({
+                        "id": term_id,
+                        "name": results["metadatas"][0][i]["name"],
+                        "description": results["metadatas"][0][i]["description"]
+                    })
+                    confidence_scores.append(confidence)
+            
+            return TaggingResult(
+                element_name=name,
+                element_description=description,
+                matching_terms=matching_terms,
+                confidence_scores=confidence_scores
+            )
+            
+        except Exception as e:
+            logger.error(f"Error tagging element: {e}")
+            raise
     
-    return app
-
-app = create_application()
-
-if __name__ == "__main__":
-    # For local development
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    async def validate_tagging(self, tagging_result: TaggingResult) -> TaggingValidationResult:
+        """
+        Validate the tagging result to check if it makes sense.
+        
+        Args:
+            tagging_result: The tagging result to validate
+            
+        Returns:
+            Validation result with feedback and suggestions
+        """
+        try:
+            # If there are no matching terms, validation fails
+            if not tagging_result.matching_terms:
+                return TaggingValidationResult(
+                    is_valid=False,
+                    feedback="No matching business terms found.",
+                    suggested_alternatives=[]
+                )
+            
+            # Check confidence scores
+            highest_confidence = max(tagging_result.confidence_scores) if tagging_result.confidence_scores else 0
+            
+            # If highest confidence is less than 0.7, validation is questionable
+            if highest_confidence < 0.7:
+                # Find alternative terms with a different query approach
+                alternative_doc = MyDocument(
+                    id=str(uuid.uuid4()),
+                    # Use only the name for a different perspective
+                    text=tagging_result.element_name
+                )
+                
+                alternative_doc_with_embedding = self.embedding_client.generate_embeddings(alternative_doc)
+                
+                if alternative_doc_with_embedding.embedding:
+                    alt_results = self.collection.query(
+                        query_embeddings=[alternative_doc_with_embedding.embedding],
+                        n_results=3,
+                        include=["metadatas", "documents", "distances"]
+                    )
+                    
+                    alternatives = []
+                    if alt_results["ids"] and len(alt_results["ids"][0]) > 0:
+                        for i, term_id in enumerate(alt_results["ids"][0]):
+                            if term_id not in [term["id"] for term in tagging_result.matching_terms]:
+                                alternatives.append({
+                                    "id": term_id,
+                                    "name": alt_results["metadatas"][0][i]["name"],
+                                    "description": alt_results["metadatas"][0][i]["description"]
+                                })
+                    
+                    return TaggingValidationResult(
+                        is_valid=False,
+                        feedback=f"Low confidence match ({highest_confidence:.2f}). Consider reviewing alternative terms.",
+                        suggested_alternatives=alternatives
+                    )
+            
+            # High confidence match
+            return TaggingValidationResult(
+                is_valid=True,
+                feedback=f"Strong match with highest confidence of {highest_confidence:.2f}.",
+                suggested_alternatives=[]
+            )
+            
+        except Exception as e:
+            logger.error(f"Error validating tagging: {e}")
+            raise
+    
+    def get_all_terms(self) -> List[BusinessTerm]:
+        """
+        Get all business terms in the collection.
+        
+        Returns:
+            List of all business terms
+        """
+        try:
+            # Query all items (limited to 10000 for safety)
+            results = self.collection.get(limit=10000)
+            
+            terms = []
+            if results["ids"]:
+                for i, term_id in enumerate(results["ids"]):
+                    terms.append(BusinessTerm(
+                        id=term_id,
+                        name=results["metadatas"][i]["name"],
+                        description=results["metadatas"][i]["description"]
+                    ))
+            
+            return terms
+            
+        except Exception as e:
+            logger.error(f"Error getting all terms: {e}")
+            raise
+    
+    def get_term_by_id(self, term_id: str) -> Optional[BusinessTerm]:
+        """
+        Get a business term by its ID.
+        
+        Args:
+            term_id: ID of the term to retrieve
+            
+        Returns:
+            Business term if found, None otherwise
+        """
+        try:
+            results = self.collection.get(ids=[term_id])
+            
+            if results["ids"] and len(results["ids"]) > 0:
+                return BusinessTerm(
+                    id=results["ids"][0],
+                    name=results["metadatas"][0]["name"],
+                    description=results["metadatas"][0]["description"]
+                )
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting term by ID: {e}")
+            raise
