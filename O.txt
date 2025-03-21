@@ -1,323 +1,152 @@
-import os
-import csv
-import logging
-import uuid
-from typing import Dict, List, Any, Optional, Tuple
-from pydantic import BaseModel, Field
-import chromadb
-from chromadb.config import Settings
-from app.core.embedding import EmbeddingClient, MyDocument
-from app.config.environment import get_os_env
+from typing import Dict, Any, List, Tuple
+import re
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_openai import AzureChatOpenAI
+from app.core.models import DataElement, ValidationResult, DataQualityStatus
+from app.utils.iso_standards import ISO11179Validator
 
-logger = logging.getLogger(__name__)
-
-class BusinessTerm(BaseModel):
-    """Model representing a preferred business term."""
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    name: str
-    description: str
-    metadata: Dict[str, Any] = Field(default_factory=dict)
+class ValidatorAgent:
+    """Agent for validating data elements against ISO/IEC 11179 standards."""
     
-class TaggingResult(BaseModel):
-    """Model representing the result of tagging an element with business terms."""
-    element_name: str
-    element_description: str
-    matching_terms: List[Dict[str, Any]]
-    confidence_scores: List[float]
+    def __init__(self, llm: AzureChatOpenAI):
+        self.llm = llm
+        self.iso_validator = ISO11179Validator()
+        self._setup_validation_chain()
     
-class TaggingValidationResult(BaseModel):
-    """Model representing the validation result of tagging."""
-    is_valid: bool
-    feedback: str
-    suggested_alternatives: List[Dict[str, Any]] = Field(default_factory=list)
-    
-class BusinessTermManager:
-    """Manager for business terms and tagging operations."""
-    
-    def __init__(self, persistent_dir: str = "./chroma_db"):
-        """Initialize the business term manager."""
-        self.env = get_os_env()
-        self.embedding_client = EmbeddingClient()
-        self.persistent_dir = persistent_dir
-        self.chroma_client = self._setup_chroma_db()
-        self.collection = self.chroma_client.get_or_create_collection("business_terms")
+    def _setup_validation_chain(self):
+        """Set up the validation chain with the language model."""
+        template = """
+        You are an expert in data governance and ISO/IEC 11179 metadata standards. Your task is to evaluate 
+        if the given data element name and description adhere to these standards and represent high-quality metadata.
         
-    def _setup_chroma_db(self):
-        """Set up the ChromaDB client with persistent storage."""
-        try:
-            # Create directory if it doesn't exist
-            os.makedirs(self.persistent_dir, exist_ok=True)
+        ISO/IEC 11179 standards for data element names (adapted for business-friendly format):
+        - Names should be in lowercase with spaces between words (e.g., "customer account balance")
+        - Names should be clear, unambiguous, and self-describing
+        - Names should NOT use technical formatting like camelCase, snake_case, or PascalCase
+        - Names should NOT contain underscores, hyphens, or special characters
+        - Names should not use acronyms or abbreviations unless they are widely understood
+        - Names should be concise yet descriptive
+        - Names should use standard terminology in the domain
+        - Names should use business language that non-technical users can understand
+        
+        ISO/IEC 11179 standards for data element descriptions:
+        - Descriptions should clearly define what the data element represents
+        - Descriptions should be complete, covering the concept fully
+        - Descriptions should be precise, specific enough to distinguish from other concepts
+        - Descriptions should be objective and factual, not opinion-based
+        - Descriptions should use complete sentences with proper grammar and punctuation
+        - Descriptions should be written in business language, not technical jargon
+        
+        Data Element:
+        - Name: {name}
+        - Description: {description}
+        - Example (if provided): {example}
+        - Related Process Name (if provided): {process_name}
+        - Related Process Description (if provided): {process_description}
+        
+        Based on the ISO/IEC 11179 standards, evaluate the quality of this data element.
+        
+        Provide your evaluation as follows:
+        1. Is the name valid according to standards? Yes/No
+        2. Detailed feedback on the name
+        3. Is the description valid according to standards? Yes/No
+        4. Detailed feedback on the description
+        5. Overall quality status: "GOOD", "NEEDS_IMPROVEMENT", or "POOR"
+        6. List of specific improvements that could be made
+        
+        Please be thorough and specific in your feedback, as it will be used to improve the data element.
+        """
+        
+        self.validation_prompt = PromptTemplate(
+            input_variables=["name", "description", "example", "process_name", "process_description"],
+            template=template
+        )
+        
+        # Using the new RunnableSequence pattern instead of deprecated LLMChain
+        self.validation_chain = self.validation_prompt | self.llm | StrOutputParser()
+    
+    def _parse_validation_result(self, result: str) -> ValidationResult:
+        """Parse the validation result from the LLM output."""
+        lines = result.strip().split('\n')
+        
+        is_name_valid = "yes" in lines[0].lower() if lines else False
+        is_desc_valid = False
+        
+        for line in lines:
+            if line.startswith("3.") and "yes" in line.lower():
+                is_desc_valid = True
+        
+        # Determine quality status
+        quality_status = DataQualityStatus.POOR
+        for line in lines:
+            if "Overall quality status:" in line:
+                if "GOOD" in line:
+                    quality_status = DataQualityStatus.GOOD
+                elif "NEEDS_IMPROVEMENT" in line:
+                    quality_status = DataQualityStatus.NEEDS_IMPROVEMENT
+                break
+        
+        # Extract suggested improvements
+        improvements = []
+        improvements_section = False
+        for line in lines:
+            if "6. List of specific improvements" in line:
+                improvements_section = True
+                continue
+            if improvements_section and line.strip() and "- " in line:
+                improvements.append(line.strip())
+        
+        # Extract feedback
+        feedback_lines = []
+        for i, line in enumerate(lines):
+            if i > 0 and "Detailed feedback on the name" in line:
+                feedback_lines.append(line)
+            elif i > 0 and "Detailed feedback on the description" in line:
+                feedback_lines.append(line)
+            elif i > 0 and line.strip() and not line.startswith("1.") and not line.startswith("3.") and not line.startswith("5.") and not line.startswith("6."):
+                feedback_lines.append(line)
+        
+        feedback = "\n".join(feedback_lines)
+        
+        return ValidationResult(
+            is_valid=is_name_valid and is_desc_valid,
+            quality_status=quality_status,
+            feedback=feedback,
+            suggested_improvements=improvements
+        )
+    
+    async def validate(self, data_element: DataElement) -> ValidationResult:
+        """
+        Validate a data element against ISO/IEC 11179 standards.
+        First applies rule-based validation, then uses LLM for deeper analysis.
+        """
+        # First, apply rule-based validation
+        name_valid, name_feedback = self.iso_validator.validate_name(data_element.existing_name)
+        desc_valid, desc_feedback = self.iso_validator.validate_description(data_element.existing_description)
+        
+        # If rule-based validation fails, return immediately
+        if not name_valid or not desc_valid:
+            feedback = ""
+            if not name_valid:
+                feedback += f"Name validation failed: {name_feedback}\n"
+            if not desc_valid:
+                feedback += f"Description validation failed: {desc_feedback}"
             
-            # Initialize ChromaDB client with persistent storage using current API
-            client = chromadb.PersistentClient(
-                path=self.persistent_dir,
-                settings=chromadb.Settings(
-                    anonymized_telemetry=False
-                )
+            return ValidationResult(
+                is_valid=False,
+                quality_status=DataQualityStatus.POOR,
+                feedback=feedback.strip(),
+                suggested_improvements=["Fix basic validation issues before proceeding with deeper analysis."]
             )
-            
-            logger.info(f"ChromaDB initialized with persistent storage at {self.persistent_dir}")
-            return client
-        except Exception as e:
-            logger.error(f"Error setting up ChromaDB: {e}")
-            raise
-            
-    def import_terms_from_csv(self, csv_path: str) -> int:
-        """
-        Import business terms from a CSV file.
         
-        Args:
-            csv_path: Path to the CSV file
-            
-        Returns:
-            Number of terms imported
-        """
-        try:
-            terms = []
-            ids = []
-            embeddings = []
-            metadatas = []
-            
-            with open(csv_path, 'r', encoding='utf-8') as file:
-                reader = csv.DictReader(file)
-                
-                for row in reader:
-                    if 'name' not in row or 'description' not in row:
-                        logger.warning(f"Skipping row missing required fields: {row}")
-                        continue
-                    
-                    # Create business term
-                    term_id = str(uuid.uuid4())
-                    term = BusinessTerm(
-                        id=term_id,
-                        name=row['name'],
-                        description=row['description']
-                    )
-                    
-                    # Create document for embedding
-                    doc = MyDocument(
-                        id=term_id,
-                        text=f"{term.name}. {term.description}"
-                    )
-                    
-                    # Generate embedding
-                    doc_with_embedding = self.embedding_client.generate_embeddings(doc)
-                    
-                    if not doc_with_embedding.embedding:
-                        logger.warning(f"Could not generate embedding for term: {term.name}. Skipping.")
-                        continue
-                    
-                    # Add to lists for batch addition
-                    terms.append(term)
-                    ids.append(term_id)
-                    embeddings.append(doc_with_embedding.embedding)
-                    metadatas.append({
-                        "name": term.name,
-                        "description": term.description
-                    })
-            
-            # Add terms to ChromaDB in batch
-            if ids:
-                self.collection.add(
-                    ids=ids,
-                    embeddings=embeddings,
-                    metadatas=metadatas,
-                    documents=[f"{term.name}. {term.description}" for term in terms]
-                )
-                
-            logger.info(f"Imported {len(terms)} business terms from {csv_path}")
-            return len(terms)
-            
-        except Exception as e:
-            logger.error(f"Error importing terms from CSV: {e}")
-            raise
-    
-    def tag_element(self, name: str, description: str, top_k: int = 3) -> TaggingResult:
-        """
-        Tag a data element with the most similar business terms.
+        # If rule-based validation passes, use LLM for deeper analysis
+        result = await self.validation_chain.ainvoke({
+            "name": data_element.existing_name,
+            "description": data_element.existing_description,
+            "example": data_element.example or "Not provided",
+            "process_name": data_element.process_name or "Not provided",
+            "process_description": data_element.process_description or "Not provided"
+        })
         
-        Args:
-            name: Enhanced data element name
-            description: Enhanced data element description
-            top_k: Number of top terms to return
-            
-        Returns:
-            Tagging result with matching terms and confidence scores
-        """
-        try:
-            # Create document for embedding
-            doc = MyDocument(
-                id=str(uuid.uuid4()),
-                text=f"{name}. {description}"
-            )
-            
-            # Generate embedding
-            doc_with_embedding = self.embedding_client.generate_embeddings(doc)
-            
-            if not doc_with_embedding.embedding:
-                raise ValueError(f"Could not generate embedding for element: {name}")
-            
-            # Query the collection using cosine similarity
-            results = self.collection.query(
-                query_embeddings=[doc_with_embedding.embedding],
-                n_results=top_k,
-                include=["metadatas", "documents", "distances"],
-                where={},  # Empty where clause for all documents
-                where_document={},  # Empty where_document for all documents
-                distance_metric="cosine"  # Use cosine similarity instead of L2
-            )
-            
-            matching_terms = []
-            confidence_scores = []
-            
-            if results["ids"] and len(results["ids"][0]) > 0:
-                for i, term_id in enumerate(results["ids"][0]):
-                    # Cosine distance is 1 - cosine similarity, so we need to convert back to similarity
-                    distance = results["distances"][0][i]
-                    # Convert cosine distance to cosine similarity (confidence score)
-                    # Cosine similarity ranges from -1 to 1, with 1 being most similar
-                    # For embeddings, we typically get positive values in [0, 1] range
-                    cosine_similarity = 1 - distance
-                    
-                    matching_terms.append({
-                        "id": term_id,
-                        "name": results["metadatas"][0][i]["name"],
-                        "description": results["metadatas"][0][i]["description"]
-                    })
-                    confidence_scores.append(cosine_similarity)
-            
-            return TaggingResult(
-                element_name=name,
-                element_description=description,
-                matching_terms=matching_terms,
-                confidence_scores=confidence_scores
-            )
-            
-        except Exception as e:
-            logger.error(f"Error tagging element: {e}")
-            raise
-    
-    async def validate_tagging(self, tagging_result: TaggingResult) -> TaggingValidationResult:
-        """
-        Validate the tagging result to check if it makes sense.
-        
-        Args:
-            tagging_result: The tagging result to validate
-            
-        Returns:
-            Validation result with feedback and suggestions
-        """
-        try:
-            # If there are no matching terms, validation fails
-            if not tagging_result.matching_terms:
-                return TaggingValidationResult(
-                    is_valid=False,
-                    feedback="No matching business terms found.",
-                    suggested_alternatives=[]
-                )
-            
-            # Check confidence scores - for cosine similarity, threshold is higher
-            # With cosine similarity, good matches typically have scores > 0.75
-            highest_confidence = max(tagging_result.confidence_scores) if tagging_result.confidence_scores else 0
-            
-            # If highest confidence is less than 0.75, validation is questionable
-            if highest_confidence < 0.75:
-                # Find alternative terms with a different query approach
-                alternative_doc = MyDocument(
-                    id=str(uuid.uuid4()),
-                    # Use only the name for a different perspective
-                    text=tagging_result.element_name
-                )
-                
-                alternative_doc_with_embedding = self.embedding_client.generate_embeddings(alternative_doc)
-                
-                if alternative_doc_with_embedding.embedding:
-                    # Also use cosine similarity for alternatives
-                    alt_results = self.collection.query(
-                        query_embeddings=[alternative_doc_with_embedding.embedding],
-                        n_results=3,
-                        include=["metadatas", "documents", "distances"],
-                        distance_metric="cosine"
-                    )
-                    
-                    alternatives = []
-                    if alt_results["ids"] and len(alt_results["ids"][0]) > 0:
-                        for i, term_id in enumerate(alt_results["ids"][0]):
-                            if term_id not in [term["id"] for term in tagging_result.matching_terms]:
-                                # Calculate confidence for alternative
-                                alt_confidence = 1 - alt_results["distances"][0][i]
-                                alternatives.append({
-                                    "id": term_id,
-                                    "name": alt_results["metadatas"][0][i]["name"],
-                                    "description": alt_results["metadatas"][0][i]["description"],
-                                    "confidence": alt_confidence
-                                })
-                    
-                    return TaggingValidationResult(
-                        is_valid=False,
-                        feedback=f"Low confidence match ({highest_confidence:.2f}). Consider reviewing alternative terms.",
-                        suggested_alternatives=alternatives
-                    )
-            
-            # High confidence match
-            return TaggingValidationResult(
-                is_valid=True,
-                feedback=f"Strong match with highest confidence of {highest_confidence:.2f}.",
-                suggested_alternatives=[]
-            )
-            
-        except Exception as e:
-            logger.error(f"Error validating tagging: {e}")
-            raise
-    
-    def get_all_terms(self) -> List[BusinessTerm]:
-        """
-        Get all business terms in the collection.
-        
-        Returns:
-            List of all business terms
-        """
-        try:
-            # Query all items (limited to 10000 for safety)
-            results = self.collection.get(limit=10000)
-            
-            terms = []
-            if results["ids"]:
-                for i, term_id in enumerate(results["ids"]):
-                    terms.append(BusinessTerm(
-                        id=term_id,
-                        name=results["metadatas"][i]["name"],
-                        description=results["metadatas"][i]["description"]
-                    ))
-            
-            return terms
-            
-        except Exception as e:
-            logger.error(f"Error getting all terms: {e}")
-            raise
-    
-    def get_term_by_id(self, term_id: str) -> Optional[BusinessTerm]:
-        """
-        Get a business term by its ID.
-        
-        Args:
-            term_id: ID of the term to retrieve
-            
-        Returns:
-            Business term if found, None otherwise
-        """
-        try:
-            results = self.collection.get(ids=[term_id])
-            
-            if results["ids"] and len(results["ids"]) > 0:
-                return BusinessTerm(
-                    id=results["ids"][0],
-                    name=results["metadatas"][0]["name"],
-                    description=results["metadatas"][0]["description"]
-                )
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"Error getting term by ID: {e}")
-            raise
+        return self._parse_validation_result(result)
