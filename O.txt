@@ -1,246 +1,47 @@
-import os
 import logging
-import uuid
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, BackgroundTasks, Depends
-from typing import Dict, List, Any, Optional
-import json
-from app.core.business_terms import BusinessTermManager
-from app.core.models import EnhancedDataElement, TaggingRequest, TaggingResponse
-from app.config.settings import get_llm
-from app.agents.confidence_evaluator import ConfidenceEvaluator
-from pydantic import BaseModel
-
-router = APIRouter(prefix="/api/v1", tags=["business-terms"])
+from typing import Optional
+from langchain_openai import AzureChatOpenAI
+from azure.identity import get_bearer_token_provider
+from app.config.environment import get_os_env
 
 logger = logging.getLogger(__name__)
 
-# In-memory storage for tagging jobs
-# In a production system, this would be a database
-tagging_jobs: Dict[str, Dict[str, Any]] = {}
-
-# Business Term Manager instance with persistent storage
-business_term_manager = BusinessTermManager(persistent_dir="./chroma_db")
-
-def get_confidence_evaluator():
-    """Get the confidence evaluator."""
-    llm = get_llm()
-    return ConfidenceEvaluator(llm)
-
-class ImportResponse(BaseModel):
-    """Response model for importing business terms."""
-    success: bool
-    message: str
-    imported_count: int
-
-@router.post("/terms/import", response_model=ImportResponse)
-async def import_business_terms(
-    file: UploadFile = File(...),
-    background_tasks: BackgroundTasks = None
-):
+def get_llm(proxy_enabled: Optional[bool] = None) -> AzureChatOpenAI:
     """
-    Import business terms from a CSV file.
-    The CSV must have 'id', 'name', and 'description' columns.
-    """
-    try:
-        # Save the uploaded file temporarily
-        temp_file_path = f"temp_{uuid.uuid4()}.csv"
-        with open(temp_file_path, "wb") as buffer:
-            buffer.write(await file.read())
-        
-        # Import terms
-        import_count = business_term_manager.import_terms_from_csv(temp_file_path)
-        
-        # Clean up the temp file
-        if background_tasks:
-            background_tasks.add_task(os.unlink, temp_file_path)
-        else:
-            os.unlink(temp_file_path)
-        
-        return ImportResponse(
-            success=True,
-            message=f"Successfully imported business terms from {file.filename}",
-            imported_count=import_count
-        )
-    except Exception as e:
-        logger.error(f"Error importing terms: {str(e)}")
-        # Clean up the temp file in case of error
-        if os.path.exists(temp_file_path):
-            os.unlink(temp_file_path)
-        raise HTTPException(status_code=500, detail=f"Error importing terms: {str(e)}")
-
-@router.post("/tag", response_model=TaggingResponse)
-async def tag_element(request: TaggingRequest):
-    """
-    Tag an enhanced data element with the most similar business terms.
-    Also validates if the tagging makes sense.
-    """
-    try:
-        # Check if we already have this job
-        request_id = request.element_id
-        if request_id in tagging_jobs:
-            logger.info(f"Returning existing tagging result for {request_id}")
-            job = tagging_jobs[request_id]
-            return TaggingResponse(
-                request_id=request_id,
-                element_name=job["tagging_result"]["element_name"],
-                matching_terms=job["tagging_result"]["matching_terms"],
-                confidence_scores=job["tagging_result"]["confidence_scores"],
-                validation_result=job["validation_result"],
-                modeling_required=job["tagging_result"]["modeling_required"],
-                message=job["tagging_result"]["message"]
-            )
-        
-        # Tag the element
-        logger.info(f"Tagging element: {request.element_id} - {request.element_name}")
-        tagging_result = business_term_manager.tag_element(
-            element_id=request.element_id,
-            name=request.element_name,
-            description=request.element_description,
-            top_k=request.top_k
-        )
-        
-        # Validate the tagging
-        validation_result = await business_term_manager.validate_tagging(tagging_result)
-        
-        # Evaluate the confidence
-        confidence_evaluator = get_confidence_evaluator()
-        
-        # Only evaluate if not modeling_required
-        if not tagging_result.modeling_required:
-            logger.info(f"Evaluating tagging confidence for {request.element_id}")
-            try:
-                overall_confidence = await confidence_evaluator.evaluate_tagging(tagging_result)
-                
-                # Adjust confidence scores with the overall evaluation
-                adjusted_scores = []
-                for score in tagging_result.confidence_scores:
-                    # Blend the original score with overall confidence (70/30 split)
-                    adjusted_score = (score * 0.7) + (overall_confidence * 0.3)
-                    adjusted_scores.append(min(1.0, max(0.0, adjusted_score)))
-                
-                tagging_result.confidence_scores = adjusted_scores
-            except Exception as e:
-                logger.error(f"Error evaluating tagging confidence: {str(e)}")
-        
-        # Store the result
-        tagging_jobs[request_id] = {
-            "tagging_result": tagging_result.dict(),
-            "validation_result": validation_result.dict()
-        }
-        
-        return TaggingResponse(
-            request_id=request_id,
-            element_name=request.element_name,
-            matching_terms=tagging_result.matching_terms,
-            confidence_scores=tagging_result.confidence_scores,
-            validation_result=validation_result.dict(),
-            modeling_required=tagging_result.modeling_required,
-            message=tagging_result.message
-        )
-    except Exception as e:
-        logger.error(f"Error tagging element: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error tagging element: {str(e)}")
-
-@router.post("/tag/enhanced", response_model=TaggingResponse)
-async def tag_enhanced_element(element: EnhancedDataElement):
-    """
-    Tag an enhanced data element with the most similar business terms.
-    This endpoint is designed to work with the output of the enhancement process.
-    """
-    try:
-        # Create a tagging request from the enhanced element
-        request = TaggingRequest(
-            element_id=element.id,
-            element_name=element.enhanced_name,
-            element_description=element.enhanced_description,
-            top_k=3
-        )
-        
-        # Use the main tagging endpoint
-        return await tag_element(request)
-    except Exception as e:
-        logger.error(f"Error tagging enhanced element: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error tagging element: {str(e)}")
-
-@router.get("/tag/{element_id}", response_model=TaggingResponse)
-async def get_tagging_result(element_id: str):
-    """
-    Get the result of a tagging request.
-    """
-    if element_id not in tagging_jobs:
-        raise HTTPException(status_code=404, detail=f"Tagging result {element_id} not found")
+    Get the language model for the application.
     
-    job = tagging_jobs[element_id]
-    tagging_result = job["tagging_result"]
-    validation_result = job["validation_result"]
+    Args:
+        proxy_enabled: Override the PROXY_ENABLED setting in the config file
     
-    return TaggingResponse(
-        request_id=element_id,
-        element_name=tagging_result["element_name"],
-        matching_terms=tagging_result["matching_terms"],
-        confidence_scores=tagging_result["confidence_scores"],
-        validation_result=validation_result,
-        modeling_required=tagging_result.get("modeling_required", False),
-        message=tagging_result.get("message", "")
+    Returns:
+        AzureChatOpenAI: The language model
+    """
+    # Get environment with proxy setting override if provided
+    env = get_os_env(proxy_enabled=proxy_enabled)
+    
+    logger.info(f"Setting up Azure OpenAI client with proxy enabled: {env.get('PROXY_ENABLED', 'False')}")
+    
+    # Get token provider for Azure AD auth
+    token_provider = get_bearer_token_provider(
+        env.credential,
+        "https://cognitiveservices.azure.com/.default"
     )
-
-@router.delete("/tag/{element_id}", response_model=Dict[str, Any])
-async def delete_tagging_result(element_id: str):
-    """
-    Delete a tagging result from memory.
-    """
-    if element_id not in tagging_jobs:
-        raise HTTPException(status_code=404, detail=f"Tagging result {element_id} not found")
     
-    del tagging_jobs[element_id]
+    # Get model configuration
+    model_name = env.get("MODEL_NAME", "gpt-4o")
+    temperature = float(env.get("TEMPERATURE", "0.3"))  # Lower temperature for more deterministic outputs
+    max_tokens = int(env.get("MAX_TOKENS", "2000"))
+    api_version = env.get("API_VERSION", "2023-05-15")
+    azure_endpoint = env.get("AZURE_ENDPOINT", "")
     
-    return {"message": f"Tagging result for {element_id} deleted successfully"}
-
-@router.get("/terms", response_model=List[Dict[str, Any]])
-async def get_all_terms():
-    """
-    Get all business terms in the collection.
-    """
-    try:
-        terms = business_term_manager.get_all_terms()
-        return [term.dict() for term in terms]
-    except Exception as e:
-        logger.error(f"Error getting terms: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error getting terms: {str(e)}")
-
-@router.get("/terms/{term_id}", response_model=Dict[str, Any])
-async def get_term(term_id: str):
-    """
-    Get a business term by its ID.
-    """
-    try:
-        term = business_term_manager.get_term_by_id(term_id)
-        if not term:
-            raise HTTPException(status_code=404, detail=f"Term {term_id} not found")
-        return term.dict()
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting term: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error getting term: {str(e)}")
-
-@router.post("/tag/batch", response_model=List[str])
-async def batch_tag_elements(requests: List[TaggingRequest], background_tasks: BackgroundTasks):
-    """
-    Tag multiple data elements in batch mode.
-    Returns a list of element IDs that can be used to check status.
-    """
-    element_ids = []
+    logger.info(f"Using model: {model_name}, temperature: {temperature}, max_tokens: {max_tokens}")
     
-    for request in requests:
-        element_id = request.element_id
-        element_ids.append(element_id)
-        
-        # Skip if already processed
-        if element_id in tagging_jobs:
-            continue
-        
-        # Add tagging task to background tasks
-        background_tasks.add_task(tag_element, request)
-    
-    return element_ids
+    # Create and return the LLM
+    return AzureChatOpenAI(
+        model_name=model_name,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        api_version=api_version,
+        azure_endpoint=azure_endpoint,
+        azure_ad_token_provider=token_provider
+    )
