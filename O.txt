@@ -1,531 +1,222 @@
 import os
-import csv
+import sys
 import logging
-import uuid
-from typing import Dict, List, Any, Optional, Tuple
-from pydantic import BaseModel, Field
-import numpy as np
-import chromadb
-from chromadb.config import Settings
-from app.core.embedding import EmbeddingClient, MyDocument
-from app.config.environment import get_os_env
+import chardet
+from typing import Optional, Any, Dict, List, Union
+from pathlib import Path
+from dotenv import dotenv_values
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider, ClientSecretCredential
 
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-class BusinessTerm(BaseModel):
-    """Model representing a preferred business term."""
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    name: str
-    description: str
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-    
-class TaggingResult(BaseModel):
-    """Model representing the result of tagging an element with business terms."""
-    element_name: str
-    element_description: str
-    matching_terms: List[Dict[str, Any]]
-    confidence_scores: List[float]
-    
-class TaggingValidationResult(BaseModel):
-    """Model representing the validation result of tagging."""
-    is_valid: bool
-    feedback: str
-    suggested_alternatives: List[Dict[str, Any]] = Field(default_factory=list)
-    
-class BusinessTermManager:
-    """Manager for business terms and tagging operations."""
-    
-    def __init__(self, persistent_dir: str = "./chroma_db"):
-        """Initialize the business term manager."""
-        self.env = get_os_env()
-        self.embedding_client = EmbeddingClient()
-        self.persistent_dir = persistent_dir
-        self.chroma_client = self._setup_chroma_db()
+ENV_DIR = "env"
+CONFIG_PATH = f"{ENV_DIR}/config.env"
+CREDS_PATH = f"{ENV_DIR}/credentials.env"
+CERT_PATH = f"{ENV_DIR}/cacert.pem"
+
+def is_file_readable(filepath: str) -> bool:
+    """Check if a file is readable."""
+    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
+        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
+    return True
+
+def str_to_bool(s: str) -> bool:
+    """Convert a string to a boolean."""
+    if s.lower() in ('true', 't', 'yes', 'y', '1'):
+        return True
+    elif s.lower() in ('false', 'f', 'no', 'n', '0'):
+        return False
+    else:
+        raise ValueError(f"Invalid boolean value: {s}")
+
+class OSEnv:
+    def __init__(self, config_file: str, creds_file: str, certificate_path: str, proxy_enabled: Optional[bool] = None):
+        self.var_list = []
+        self.bulk_set(config_file, True)
+        self.bulk_set(creds_file, False)
+        self.set_certificate_path(certificate_path)
         
-        # Get or create collection with HNSW index using cosine similarity
-        try:
-            # Try to get existing collection first
-            self.collection = self.chroma_client.get_collection("business_terms")
-            logger.info("Retrieved existing business_terms collection")
-        except Exception as e:
-            # Collection doesn't exist, create new one with HNSW and cosine similarity
-            logger.info("Creating new business_terms collection with HNSW cosine space")
-            self.collection = self.chroma_client.create_collection(
-                name="business_terms",
-                metadata={"hnsw:space": "cosine"},  # Use cosine similarity for HNSW index
-                embedding_function=None  # We'll provide embeddings manually
+        # Handle proxy_enabled override
+        if proxy_enabled is not None:
+            self.set("PROXY_ENABLED", str(proxy_enabled))
+            logger.info(f"Proxy enabled setting overridden to: {proxy_enabled}")
+        
+        # Set proxy if enabled
+        proxy_enabled_env = str_to_bool(self.get("PROXY_ENABLED", "False"))
+        if proxy_enabled_env:
+            self.set_proxy()
+            logger.info("Proxy settings applied")
+        else:
+            logger.info("Running without proxy")
+        
+        # Handle secured endpoints
+        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
+            self.token = self.get_azure_token()
+        else:
+            self.token = None
+        
+        self.credential = self._get_credential()
+        
+    def _get_credential(self):
+        """Get the appropriate Azure credential."""
+        if str_to_bool(self.get("USE_MANAGED_IDENTITY", "False")):
+            logger.info("Using DefaultAzureCredential (managed identity)")
+            return DefaultAzureCredential()
+        else:
+            logger.info("Using ClientSecretCredential")
+            return ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID"), 
+                client_id=self.get("AZURE_CLIENT_ID"), 
+                client_secret=self.get("AZURE_CLIENT_SECRET")
             )
     
-    def _setup_chroma_db(self):
-        """Set up the ChromaDB client with persistent storage."""
+    def set_certificate_path(self, path: str):
+        """Set the certificate path for SSL verification."""
         try:
-            # Create directory if it doesn't exist
-            os.makedirs(self.persistent_dir, exist_ok=True)
+            if not os.path.isabs(path):
+                path = os.path.abspath(path)
             
-            # Initialize ChromaDB client with persistent storage using current API
-            client = chromadb.PersistentClient(
-                path=self.persistent_dir,
-                settings=chromadb.Settings(
-                    anonymized_telemetry=False
-                )
-            )
-            
-            logger.info(f"ChromaDB initialized with persistent storage at {self.persistent_dir}")
-            return client
+            if os.path.exists(path):
+                if is_file_readable(path):
+                    self.set("REQUESTS_CA_BUNDLE", path)
+                    self.set("SSL_CERT_FILE", path)
+                    self.set("CURL_CA_BUNDLE", path)
+                    logger.info(f"Certificate path set to {path}")
+                else:
+                    logger.warning(f"Certificate file {path} exists but is not readable")
+            else:
+                logger.warning(f"Certificate file {path} not found, using system certificates")
         except Exception as e:
-            logger.error(f"Error setting up ChromaDB: {e}")
+            logger.error(f"Error setting certificate path: {e}")
             raise
     
-    def compute_cosine_similarity(self, embedding1, embedding2):
-        """
-        Manually compute cosine similarity between two embeddings.
-        
-        Args:
-            embedding1: First embedding vector
-            embedding2: Second embedding vector
-            
-        Returns:
-            float: Cosine similarity value between -1 and 1 (higher is more similar)
-        """
-        # Convert to numpy arrays
-        a = np.array(embedding1)
-        b = np.array(embedding2)
-        
-        # Compute dot product and magnitudes
-        dot_product = np.dot(a, b)
-        magnitude_a = np.linalg.norm(a)
-        magnitude_b = np.linalg.norm(b)
-        
-        # Avoid division by zero
-        if magnitude_a == 0 or magnitude_b == 0:
-            return 0
-            
-        # Compute cosine similarity
-        return dot_product / (magnitude_a * magnitude_b)
-            
-    def import_terms_from_csv(self, csv_path: str, batch_size: int = 100) -> int:
-        """
-        Import business terms from a CSV file.
-        
-        Args:
-            csv_path: Path to the CSV file
-            batch_size: Size of batches for adding to ChromaDB
-            
-        Returns:
-            Number of terms imported
-        """
+    def bulk_set(self, dotenvfile: str, print_val: bool = False) -> None:
+        """Load environment variables from a dotenv file."""
         try:
-            # First, get all existing terms from the collection
-            existing_terms = {}
-            try:
-                results = self.collection.get(limit=10000)
-                if results["ids"]:
-                    for i, term_id in enumerate(results["ids"]):
-                        name = results["metadatas"][i]["name"]
-                        description = results["metadatas"][i]["description"]
-                        # Create a key to identify unique terms
-                        term_key = f"{name}::{description}"
-                        existing_terms[term_key] = term_id
-                logger.info(f"Found {len(existing_terms)} existing terms in ChromaDB")
-            except Exception as e:
-                logger.warning(f"Error getting existing terms: {e}")
-                existing_terms = {}
+            if not os.path.isabs(dotenvfile):
+                dotenvfile = os.path.abspath(dotenvfile)
             
-            # Read the CSV and track which terms exist in it
-            csv_term_keys = set()
-            terms_to_add = []
-            
-            with open(csv_path, 'r', encoding='utf-8') as file:
-                reader = csv.DictReader(file)
-                
-                for row in reader:
-                    if 'name' not in row or 'description' not in row:
-                        logger.warning(f"Skipping row missing required fields: {row}")
-                        continue
-                    
-                    name = row['name'].strip()
-                    description = row['description'].strip()
-                    term_key = f"{name}::{description}"
-                    csv_term_keys.add(term_key)
-                    
-                    # If this term already exists in ChromaDB, skip it
-                    if term_key in existing_terms:
-                        continue
-                    
-                    # Add new term to our list to process
-                    term_id = str(uuid.uuid4())
-                    terms_to_add.append({
-                        "id": term_id,
-                        "name": name,
-                        "description": description,
-                        "term_key": term_key
-                    })
-            
-            # Process new terms in batches
-            added_count = 0
-            for i in range(0, len(terms_to_add), batch_size):
-                batch = terms_to_add[i:i+batch_size]
-                
-                # Process this batch
-                ids = []
-                embeddings = []
-                metadatas = []
-                documents = []
-                
-                for term in batch:
-                    # Create document for embedding
-                    doc = MyDocument(
-                        id=term["id"],
-                        text=f"{term['name']}. {term['description']}"
-                    )
-                    
-                    # Generate embedding
-                    doc_with_embedding = self.embedding_client.generate_embeddings(doc)
-                    
-                    if not doc_with_embedding.embedding:
-                        logger.warning(f"Could not generate embedding for term: {term['name']}. Skipping.")
-                        continue
-                    
-                    # Add to lists for batch addition
-                    ids.append(term["id"])
-                    embeddings.append(doc_with_embedding.embedding)
-                    metadatas.append({
-                        "name": term["name"],
-                        "description": term["description"]
-                    })
-                    documents.append(f"{term['name']}. {term['description']}")
-                
-                # Add batch to ChromaDB
-                if ids:
-                    self.collection.add(
-                        ids=ids,
-                        embeddings=embeddings,
-                        metadatas=metadatas,
-                        documents=documents
-                    )
-                    added_count += len(ids)
-                    logger.info(f"Added batch of {len(ids)} terms to ChromaDB")
-            
-            # Find terms to delete (in ChromaDB but not in CSV)
-            terms_to_delete = []
-            for term_key, term_id in existing_terms.items():
-                if term_key not in csv_term_keys:
-                    terms_to_delete.append(term_id)
-            
-            # Delete terms in batches
-            deleted_count = 0
-            for i in range(0, len(terms_to_delete), batch_size):
-                batch = terms_to_delete[i:i+batch_size]
-                self.collection.delete(ids=batch)
-                deleted_count += len(batch)
-                logger.info(f"Deleted batch of {len(batch)} terms from ChromaDB")
-            
-            logger.info(f"Import complete: Added {added_count} new terms, deleted {deleted_count} terms")
-            return added_count
-            
+            if os.path.exists(dotenvfile) and is_file_readable(dotenvfile):
+                temp_dict = dotenv_values(dotenvfile)
+                for key, value in temp_dict.items():
+                    self.set(key, value, print_val)
+                del temp_dict
+                logger.info(f"Loaded environment from {dotenvfile}")
+            else:
+                logger.warning(f"Environment file {dotenvfile} not found or not readable, skipping")
         except Exception as e:
-            logger.error(f"Error importing terms from CSV: {e}")
+            logger.error(f"Error loading environment variables from {dotenvfile}: {e}")
             raise
     
-    def tag_element(self, name: str, description: str, top_k: int = 3) -> TaggingResult:
-        """
-        Tag a data element with the most similar business terms.
-        Since we've configured HNSW with cosine space, this will use cosine similarity.
-        
-        Args:
-            name: Enhanced data element name
-            description: Enhanced data element description
-            top_k: Number of top terms to return
-            
-        Returns:
-            Tagging result with matching terms and confidence scores
-        """
+    def set(self, key: str, value: str, print_val: bool = False) -> None:
+        """Set an environment variable."""
         try:
-            # Create document for embedding
-            doc = MyDocument(
-                id=str(uuid.uuid4()),
-                text=f"{name}. {description}"
-            )
-            
-            # Generate embedding
-            doc_with_embedding = self.embedding_client.generate_embeddings(doc)
-            
-            if not doc_with_embedding.embedding:
-                raise ValueError(f"Could not generate embedding for element: {name}")
-            
-            # Query the collection - will use HNSW with cosine space as configured
-            results = self.collection.query(
-                query_embeddings=[doc_with_embedding.embedding],
-                n_results=top_k,
-                include=["metadatas", "documents", "distances"]
-            )
-            
-            matching_terms = []
-            confidence_scores = []
-            
-            if results["ids"] and len(results["ids"][0]) > 0:
-                for i, term_id in enumerate(results["ids"][0]):
-                    # With HNSW cosine space, the distance is 1-cosine_similarity
-                    # Convert back to similarity
-                    distance = results["distances"][0][i]
-                    cosine_similarity = 1 - distance
-                    
-                    matching_terms.append({
-                        "id": term_id,
-                        "name": results["metadatas"][0][i]["name"],
-                        "description": results["metadatas"][0][i]["description"]
-                    })
-                    confidence_scores.append(cosine_similarity)
-            
-            return TaggingResult(
-                element_name=name,
-                element_description=description,
-                matching_terms=matching_terms,
-                confidence_scores=confidence_scores
-            )
-            
+            os.environ[key] = value
+            if key not in self.var_list:
+                self.var_list.append(key)
+            if print_val:
+                if key in {'AZURE_CLIENT_SECRET', 'AD_USER_PW'}:
+                    logger.info(f"{key}: [REDACTED]")
+                else:
+                    logger.info(f"{key}: {value}")
         except Exception as e:
-            logger.error(f"Error tagging element: {e}")
-            # Fall back to manual cosine similarity if query fails
-            try:
-                logger.info("Falling back to manual cosine similarity calculation")
-                
-                # Get all terms from the collection with their embeddings
-                results = self.collection.get(include=["embeddings", "metadatas"])
-                
-                if not results["ids"] or len(results["ids"]) == 0:
-                    logger.warning("No terms found in the collection")
-                    return TaggingResult(
-                        element_name=name,
-                        element_description=description,
-                        matching_terms=[],
-                        confidence_scores=[]
-                    )
-                
-                # Calculate cosine similarity manually for each term
-                similarities = []
-                for i, term_id in enumerate(results["ids"]):
-                    # Get term embedding
-                    term_embedding = results["embeddings"][i]
-                    
-                    # Calculate cosine similarity
-                    similarity = self.compute_cosine_similarity(doc_with_embedding.embedding, term_embedding)
-                    
-                    similarities.append({
-                        "id": term_id,
-                        "name": results["metadatas"][i]["name"],
-                        "description": results["metadatas"][i]["description"],
-                        "similarity": similarity
-                    })
-                
-                # Sort by similarity (highest first)
-                sorted_similarities = sorted(similarities, key=lambda x: x["similarity"], reverse=True)
-                
-                # Get top_k results
-                top_results = sorted_similarities[:top_k]
-                
-                matching_terms = []
-                confidence_scores = []
-                
-                for result in top_results:
-                    matching_terms.append({
-                        "id": result["id"],
-                        "name": result["name"],
-                        "description": result["description"]
-                    })
-                    confidence_scores.append(result["similarity"])
-                
-                return TaggingResult(
-                    element_name=name,
-                    element_description=description,
-                    matching_terms=matching_terms,
-                    confidence_scores=confidence_scores
-                )
-            except Exception as fallback_error:
-                logger.error(f"Fallback method also failed: {fallback_error}")
-                raise e
-    
-    async def validate_tagging(self, tagging_result: TaggingResult) -> TaggingValidationResult:
-        """
-        Validate the tagging result to check if it makes sense.
-        
-        Args:
-            tagging_result: The tagging result to validate
-            
-        Returns:
-            Validation result with feedback and suggestions
-        """
-        try:
-            # If there are no matching terms, validation fails
-            if not tagging_result.matching_terms:
-                return TaggingValidationResult(
-                    is_valid=False,
-                    feedback="No matching business terms found.",
-                    suggested_alternatives=[]
-                )
-            
-            # Check confidence scores - with cosine similarity, good matches have scores > 0.75
-            highest_confidence = max(tagging_result.confidence_scores) if tagging_result.confidence_scores else 0
-            
-            # If highest confidence is less than 0.75, validation is questionable
-            if highest_confidence < 0.75:
-                # Find alternative terms with a different query approach
-                alternative_doc = MyDocument(
-                    id=str(uuid.uuid4()),
-                    # Use only the name for a different perspective
-                    text=tagging_result.element_name
-                )
-                
-                alternative_doc_with_embedding = self.embedding_client.generate_embeddings(alternative_doc)
-                
-                if alternative_doc_with_embedding.embedding:
-                    try:
-                        # Try to use the configured collection first (HNSW with cosine similarity)
-                        alt_results = self.collection.query(
-                            query_embeddings=[alternative_doc_with_embedding.embedding],
-                            n_results=5,  # Get more results to have alternatives after filtering
-                            include=["metadatas", "documents", "distances"]
-                        )
-                        
-                        alternatives = []
-                        if alt_results["ids"] and len(alt_results["ids"][0]) > 0:
-                            for i, term_id in enumerate(alt_results["ids"][0]):
-                                if term_id not in [term["id"] for term in tagging_result.matching_terms]:
-                                    # With HNSW cosine, distance is 1-cosine_similarity
-                                    distance = alt_results["distances"][0][i]
-                                    alt_confidence = 1 - distance
-                                    
-                                    alternatives.append({
-                                        "id": term_id,
-                                        "name": alt_results["metadatas"][0][i]["name"],
-                                        "description": alt_results["metadatas"][0][i]["description"],
-                                        "confidence": alt_confidence
-                                    })
-                            
-                        # If we have alternatives, return them, otherwise fall through to manual method
-                        if alternatives:
-                            return TaggingValidationResult(
-                                is_valid=False,
-                                feedback=f"Low confidence match ({highest_confidence:.2f}). Consider reviewing alternative terms.",
-                                suggested_alternatives=alternatives[:3]  # Limit to top 3
-                            )
-                    
-                    except Exception as e:
-                        logger.warning(f"Error finding alternatives with HNSW query: {e}")
-                        # Continue to manual method
-                    
-                    # Get all terms from the collection with their embeddings (manual method)
-                    try:
-                        results = self.collection.get(include=["embeddings", "metadatas"])
-                        
-                        if not results["ids"] or len(results["ids"]) == 0:
-                            return TaggingValidationResult(
-                                is_valid=False,
-                                feedback=f"Low confidence match ({highest_confidence:.2f}) but no alternative terms found.",
-                                suggested_alternatives=[]
-                            )
-                        
-                        # Calculate cosine similarity manually for each term
-                        alternative_similarities = []
-                        for i, term_id in enumerate(results["ids"]):
-                            # Skip terms that were already in the top matches
-                            if term_id in [term["id"] for term in tagging_result.matching_terms]:
-                                continue
-                                
-                            # Calculate cosine similarity
-                            similarity = self.compute_cosine_similarity(
-                                alternative_doc_with_embedding.embedding, 
-                                results["embeddings"][i]
-                            )
-                            
-                            alternative_similarities.append({
-                                "id": term_id,
-                                "name": results["metadatas"][i]["name"],
-                                "description": results["metadatas"][i]["description"],
-                                "confidence": similarity
-                            })
-                        
-                        # Sort by similarity (highest first) and get top 3
-                        sorted_alternatives = sorted(
-                            alternative_similarities, 
-                            key=lambda x: x["confidence"], 
-                            reverse=True
-                        )[:3]
-                        
-                        return TaggingValidationResult(
-                            is_valid=False,
-                            feedback=f"Low confidence match ({highest_confidence:.2f}). Consider reviewing alternative terms.",
-                            suggested_alternatives=sorted_alternatives
-                        )
-                        
-                    except Exception as e:
-                        logger.error(f"Error finding alternative terms: {e}")
-                        # If manual method fails, return without alternatives
-                        return TaggingValidationResult(
-                            is_valid=False,
-                            feedback=f"Low confidence match ({highest_confidence:.2f}). Consider reviewing different terms.",
-                            suggested_alternatives=[]
-                        )
-            
-            # High confidence match
-            return TaggingValidationResult(
-                is_valid=True,
-                feedback=f"Strong match with highest confidence of {highest_confidence:.2f}.",
-                suggested_alternatives=[]
-            )
-            
-        except Exception as e:
-            logger.error(f"Error validating tagging: {e}")
+            logger.error(f"Error setting environment variable {key}: {e}")
             raise
     
-    def get_all_terms(self) -> List[BusinessTerm]:
-        """
-        Get all business terms in the collection.
-        
-        Returns:
-            List of all business terms
-        """
+    def get(self, key: str, default: Optional[str] = None) -> str:
+        """Get an environment variable."""
         try:
-            # Query all items (limited to 10000 for safety)
-            results = self.collection.get(limit=10000)
-            
-            terms = []
-            if results["ids"]:
-                for i, term_id in enumerate(results["ids"]):
-                    terms.append(BusinessTerm(
-                        id=term_id,
-                        name=results["metadatas"][i]["name"],
-                        description=results["metadatas"][i]["description"]
-                    ))
-            
-            return terms
-            
+            return os.environ.get(key, default)
         except Exception as e:
-            logger.error(f"Error getting all terms: {e}")
+            logger.error(f"Error getting environment variable {key}: {e}")
             raise
     
-    def get_term_by_id(self, term_id: str) -> Optional[BusinessTerm]:
-        """
-        Get a business term by its ID.
-        
-        Args:
-            term_id: ID of the term to retrieve
-            
-        Returns:
-            Business term if found, None otherwise
-        """
+    def set_proxy(self) -> None:
+        """Set up proxy configuration."""
         try:
-            results = self.collection.get(ids=[term_id])
+            ad_username = self.get("AD_USERNAME")
+            ad_password = self.get("AD_USER_PW")
+            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
             
-            if results["ids"] and len(results["ids"]) > 0:
-                return BusinessTerm(
-                    id=results["ids"][0],
-                    name=results["metadatas"][0]["name"],
-                    description=results["metadatas"][0]["description"]
-                )
+            if not all([ad_username, ad_password, proxy_domain]):
+                logger.error("Proxy settings are incomplete, cannot configure proxy")
+                raise ValueError("Proxy settings are incomplete. Check AD_USERNAME, AD_USER_PW, and HTTPS_PROXY_DOMAIN")
             
+            # Use http:// instead of https:// as the proxy only supports HTTP
+            proxy_url = f"http://{ad_username}:{ad_password}@{proxy_domain}"
+            self.set("HTTP_PROXY", proxy_url, print_val=False)
+            self.set("HTTPS_PROXY", proxy_url, print_val=False)
+            
+            # Set no_proxy domains
+            no_proxy_domains = [
+                'cognitiveservices.azure.com',
+                'search.windows.net',
+                'openai.azure.com',
+                'core.windows.net',
+                'azurewebsites.net'
+            ]
+            
+            # Add any custom NO_PROXY entries from environment
+            custom_no_proxy = self.get("CUSTOM_NO_PROXY", "")
+            if custom_no_proxy:
+                no_proxy_domains.extend(custom_no_proxy.split(","))
+            
+            self.set("NO_PROXY", ",".join(no_proxy_domains), print_val=False)
+            logger.info("Proxy settings configured with HTTP protocol")
+            logger.info(f"NO_PROXY domains: {', '.join(no_proxy_domains)}")
+        except Exception as e:
+            logger.error(f"Error setting proxy: {e}")
+            raise
+    
+    def get_azure_token(self) -> str:
+        """Get an Azure AD token for authenticated API calls."""
+        try:
+            credential = ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID"),
+                client_id=self.get("AZURE_CLIENT_ID"),
+                client_secret=self.get("AZURE_CLIENT_SECRET")
+            )
+            token = credential.get_token("https://cognitiveservices.azure.com/.default")
+            self.set("AZURE_TOKEN", token.token, print_val=False)
+            logger.info("Azure token set successfully")
+            return token.token
+        except Exception as e:
+            logger.error(f"Error retrieving Azure token: {e}")
             return None
-            
-        except Exception as e:
-            logger.error(f"Error getting term by ID: {e}")
-            raise
+    
+    def list_env_vars(self) -> None:
+        """List all environment variables (with sensitive values redacted)."""
+        for var in self.var_list:
+            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET'}:
+                logger.info(f"{var}: [REDACTED]")
+            else:
+                logger.info(f"{var}: {os.getenv(var)}")
+
+# Singleton instance for application-wide access
+_os_env_instance = None
+
+def get_os_env(
+    config_file: str = CONFIG_PATH, 
+    creds_file: str = CREDS_PATH, 
+    certificate_path: str = CERT_PATH,
+    proxy_enabled: Optional[bool] = None
+) -> OSEnv:
+    """
+    Get the OSEnv instance.
+    
+    Args:
+        config_file: Path to configuration file
+        creds_file: Path to credentials file
+        certificate_path: Path to SSL certificate
+        proxy_enabled: Override the PROXY_ENABLED setting in the config file
+    """
+    global _os_env_instance
+    if _os_env_instance is None:
+        _os_env_instance = OSEnv(config_file, creds_file, certificate_path, proxy_enabled)
+    elif proxy_enabled is not None and proxy_enabled != str_to_bool(_os_env_instance.get("PROXY_ENABLED", "False")):
+        # If proxy_enabled changes, recreate the instance
+        logger.info("Re-initializing environment with new proxy settings")
+        _os_env_instance = OSEnv(config_file, creds_file, certificate_path, proxy_enabled)
+    
+    return _os_env_instance
