@@ -1,277 +1,502 @@
 import os
+import csv
 import logging
-import uuid
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, BackgroundTasks, Depends
-from typing import Dict, List, Any, Optional
-import json
-from app.core.business_terms import BusinessTermManager
-from app.core.models import EnhancedDataElement, TaggingRequest, TaggingResponse
-from app.config.settings import get_llm
-from app.agents.confidence_evaluator import ConfidenceEvaluator
-from pydantic import BaseModel
-import chardet
-
-router = APIRouter(prefix="/api/v1", tags=["business-terms"])
+import numpy as np
+import chromadb
+from typing import List, Dict, Optional, Tuple, Any
+from pydantic import BaseModel, Field
+from app.core.embedding import EmbeddingClient, MyDocument
+from app.core.models import TaggingResult, TaggingValidationResult
+from app.config.environment import get_os_env
 
 logger = logging.getLogger(__name__)
 
-tagging_jobs: Dict[str, Dict[str, Any]] = {}
+class BusinessTerm(BaseModel):
+    id: str
+    name: str
+    description: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
-# Create directory for persistent storage if it doesn't exist
-os.makedirs("./chroma_db", exist_ok=True)
-
-# Business Term Manager instance with persistent storage
-try:
-    business_term_manager = BusinessTermManager(persistent_dir="./chroma_db")
-    logger.info("Business term manager initialized successfully")
-except Exception as e:
-    logger.error(f"Error initializing business term manager: {e}")
-    # Create a minimally functional instance as a fallback
-    business_term_manager = BusinessTermManager(persistent_dir="./chroma_db")
-
-def get_confidence_evaluator():
-    """Get the confidence evaluator."""
-    llm = get_llm()
-    return ConfidenceEvaluator(llm)
-
-class ImportResponse(BaseModel):
-    """Response model for importing business terms."""
-    success: bool
-    message: str
-    imported_count: int
-
-@router.post("/terms/import", response_model=ImportResponse)
-async def import_business_terms(
-    file: UploadFile = File(...),
-    background_tasks: BackgroundTasks = None
-):
-    """
-    Import business terms from a CSV file.
-    The CSV must have 'id', 'name', and 'description' columns.
-    """
-    try:
-        # Create a unique temp file path
-        temp_file_path = f"temp_{uuid.uuid4()}.csv"
+class BusinessTermManager:
+    def __init__(self, persistent_dir: str):
+        self.env = get_os_env()
+        self.embedding_client = EmbeddingClient()
+        self.persistent_dir = persistent_dir
+        self.chroma_client = self._setup_chroma_db()
+        self.similarity_threshold = 0.5  # 50% similarity threshold
         
-        # Read and save the uploaded file
-        file_content = await file.read()
-        
-        # Detect the encoding
-        detection = chardet.detect(file_content)
-        encoding = detection['encoding'] or 'utf-8'
-        logger.info(f"Detected CSV encoding: {encoding} with confidence {detection['confidence']}")
-        
-        # Save the file with the detected encoding
-        with open(temp_file_path, "wb") as buffer:
-            buffer.write(file_content)
-        
-        # Import terms with encoding information
         try:
-            logger.info(f"Importing terms from {file.filename} with encoding {encoding}")
-            import_count = business_term_manager.import_terms_from_csv(temp_file_path, encoding=encoding)
-            
-            # Clean up the temp file
-            try:
-                if background_tasks:
-                    background_tasks.add_task(os.unlink, temp_file_path)
-                else:
-                    os.unlink(temp_file_path)
-            except Exception as e:
-                logger.warning(f"Error deleting temporary file: {e}")
-            
-            return ImportResponse(
-                success=True,
-                message=f"Successfully imported business terms from {file.filename}",
-                imported_count=import_count
-            )
+            self.collection = self.chroma_client.get_collection("business_terms")
+            logger.info("Retrieved collection 'business_terms'")
         except Exception as e:
-            logger.error(f"Error importing terms: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Error importing terms: {str(e)}")
-            
-    except Exception as e:
-        logger.error(f"Error processing file upload: {str(e)}")
-        # Clean up the temp file in case of error
-        if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
-            try:
-                os.unlink(temp_file_path)
-            except Exception as cleanup_error:
-                logger.warning(f"Error cleaning up temporary file: {cleanup_error}")
-        
-        raise HTTPException(status_code=500, detail=f"Error importing terms: {str(e)}")
-
-@router.post("/tag", response_model=TaggingResponse)
-async def tag_element(request: TaggingRequest):
-    """
-    Tag an enhanced data element with the most similar business terms.
-    Also validates if the tagging makes sense.
-    """
-    try:
-        # Check if we already have this job
-        request_id = request.element_id
-        if request_id in tagging_jobs:
-            logger.info(f"Returning existing tagging result for {request_id}")
-            job = tagging_jobs[request_id]
-            return TaggingResponse(
-                request_id=request_id,
-                element_name=job["tagging_result"]["element_name"],
-                matching_terms=job["tagging_result"]["matching_terms"],
-                confidence_scores=job["tagging_result"]["confidence_scores"],
-                validation_result=job["validation_result"],
-                modeling_required=job["tagging_result"]["modeling_required"],
-                message=job["tagging_result"]["message"]
+            logger.info("Creating collection 'business_terms'")
+            self.collection = self.chroma_client.create_collection(
+                name = "business_terms",
+                metadata = {'hnsw:space': "cosine"},  # Explicitly use cosine similarity
+                embedding_function=None
             )
+    
+    def _setup_chroma_db(self):
+        """Set up ChromaDB with persistence."""
+        try:
+            os.makedirs(self.persistent_dir, exist_ok=True)
+            client = chromadb.PersistentClient(
+                path = self.persistent_dir,
+                settings = chromadb.Settings(
+                    anonymized_telemetry=False
+                )
+            )
+            return client
+        except Exception as e:
+            logger.error(f"Error setting up ChromaDB: {e}")
+            raise
+    
+    def compute_cosine_similarity(self, embedding1, embedding2):
+        """Compute cosine similarity between two embeddings."""
+        a = np.array(embedding1)
+        b = np.array(embedding2)
         
-        # Tag the element
-        logger.info(f"Tagging element: {request.element_id} - {request.element_name}")
-        tagging_result = business_term_manager.tag_element(
-            element_id=request.element_id,
-            name=request.element_name,
-            description=request.element_description,
-            top_k=request.top_k
-        )
+        dot_product = np.dot(a, b)
+        magnitude_a = np.linalg.norm(a)
+        magnitude_b = np.linalg.norm(b)
         
-        # Validate the tagging
-        validation_result = await business_term_manager.validate_tagging(tagging_result)
+        if magnitude_a == 0 or magnitude_b == 0:
+            return 0.0
         
-        # Evaluate the confidence
-        confidence_evaluator = get_confidence_evaluator()
-        
-        # Only evaluate if not modeling_required
-        if not tagging_result.modeling_required:
-            logger.info(f"Evaluating tagging confidence for {request.element_id}")
+        similarity = dot_product / (magnitude_a * magnitude_b)
+        return max(0.0, min(similarity, 1.0))  # Ensure bounds between 0 and 1
+    
+    def import_terms_from_csv(self, csv_path: str, encoding: str = 'utf-8', batch_size: int = 100) -> int:
+        """Import business terms from a CSV file."""
+        try:
+            # Get existing terms
+            existing_terms = {}
             try:
-                overall_confidence = await confidence_evaluator.evaluate_tagging(tagging_result)
-                
-                # Adjust confidence scores with the overall evaluation
-                adjusted_scores = []
-                for score in tagging_result.confidence_scores:
-                    # Blend the original score with overall confidence (70/30 split)
-                    adjusted_score = (score * 0.7) + (overall_confidence * 0.3)
-                    adjusted_scores.append(min(1.0, max(0.0, adjusted_score)))
-                
-                tagging_result.confidence_scores = adjusted_scores
+                results = self.collection.get(limit=10000)
+                if results["ids"]:
+                    for i, term_id in enumerate(results["ids"]):
+                        name = results["metadatas"][i]["name"]
+                        description = results["metadatas"][i]["description"]
+                        term_key = f"{name}::{description}"
+                        existing_terms[term_key] = term_id
             except Exception as e:
-                logger.error(f"Error evaluating tagging confidence: {str(e)}")
-        
-        # Store the result
-        tagging_jobs[request_id] = {
-            "tagging_result": tagging_result.dict(),
-            "validation_result": validation_result.dict()
-        }
-        
-        return TaggingResponse(
-            request_id=request_id,
-            element_name=request.element_name,
-            matching_terms=tagging_result.matching_terms,
-            confidence_scores=tagging_result.confidence_scores,
-            validation_result=validation_result.dict(),
-            modeling_required=tagging_result.modeling_required,
-            message=tagging_result.message
-        )
-    except Exception as e:
-        logger.error(f"Error tagging element: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error tagging element: {str(e)}")
-
-@router.post("/tag/enhanced", response_model=TaggingResponse)
-async def tag_enhanced_element(element: EnhancedDataElement):
-    """
-    Tag an enhanced data element with the most similar business terms.
-    This endpoint is designed to work with the output of the enhancement process.
-    """
-    try:
-        # Create a tagging request from the enhanced element
-        request = TaggingRequest(
-            element_id=element.id,
-            element_name=element.enhanced_name,
-            element_description=element.enhanced_description,
-            top_k=3
-        )
-        
-        # Use the main tagging endpoint
-        return await tag_element(request)
-    except Exception as e:
-        logger.error(f"Error tagging enhanced element: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error tagging element: {str(e)}")
-
-@router.get("/tag/{element_id}", response_model=TaggingResponse)
-async def get_tagging_result(element_id: str):
-    """
-    Get the result of a tagging request.
-    """
-    if element_id not in tagging_jobs:
-        raise HTTPException(status_code=404, detail=f"Tagging result {element_id} not found")
+                logger.error(f"Error retrieving existing terms: {e}")
+                existing_terms = {}
+            
+            # Track terms in CSV
+            csv_term_keys = set()
+            terms_to_add = []
+            
+            # Read terms from CSV with specified encoding
+            with open(csv_path, 'r', encoding=encoding) as csvfile:
+                reader = csv.DictReader(csvfile)
+                for row in reader:
+                    if 'id' not in row or 'name' not in row or 'description' not in row:
+                        logger.warning("Skipping row with missing 'id', 'name', or 'description'")
+                        continue
+                    
+                    term_id = row['id'].strip()
+                    name = row['name'].strip()
+                    description = row['description'].strip()
+                    
+                    if not term_id:
+                        logger.warning(f"Skipping term with empty ID: {name}")
+                        continue
+                    
+                    term_key = f"{name}::{description}"
+                    csv_term_keys.add(term_key)
+                    
+                    # Skip if term already exists
+                    if term_key in existing_terms and existing_terms[term_key] == term_id:
+                        continue
+                    
+                    terms_to_add.append({
+                        "id": term_id,
+                        "name": name,
+                        "description": description,
+                        "term_key": term_key
+                    })
+            
+            # Add terms in batches
+            added_count = 0
+            for i in range(0, len(terms_to_add), batch_size):
+                batch = terms_to_add[i:i + batch_size]
+                ids = []
+                embeddings = []
+                metadatas = []
+                documents = []
+                
+                for term in batch:
+                    doc = MyDocument(
+                        id = term["id"],
+                        text = f"{term['name']}. {term['description']}"
+                    )
+                    
+                    doc_with_embedding = self.embedding_client.generate_embeddings(doc)
+                    
+                    if not doc_with_embedding.embedding:
+                        logger.warning(f"Skipping term without embedding: {term['name']}")
+                        continue
+                    
+                    ids.append(term["id"])
+                    embeddings.append(doc_with_embedding.embedding)
+                    metadatas.append({
+                        "name": term["name"],
+                        "description": term["description"]
+                    })
+                    documents.append(f"{term['name']}. {term['description']}")
+                
+                if ids:
+                    # Add to collection
+                    self.collection.add(
+                        ids=ids,
+                        embeddings=embeddings,
+                        metadatas=metadatas,
+                        documents=documents
+                    )
+                    added_count += len(ids)
+            
+            # Handle any terms to delete
+            terms_to_delete = []
+            for term_key, term_id in existing_terms.items():
+                if term_key not in csv_term_keys:
+                    terms_to_delete.append(term_id)
+            
+            # Delete in batches
+            deleted_count = 0
+            for i in range(0, len(terms_to_delete), batch_size):
+                batch = terms_to_delete[i:i + batch_size]
+                self.collection.delete(ids=batch)
+                deleted_count += len(batch)
+                
+            logger.info(f"Added {added_count} terms, deleted {deleted_count} terms")
+            return added_count
+            
+        except Exception as e:
+            logger.error(f"Error importing terms from CSV: {e}")
+            raise
     
-    job = tagging_jobs[element_id]
-    tagging_result = job["tagging_result"]
-    validation_result = job["validation_result"]
+    def tag_element(self, element_id: str, name: str, description: str, top_k: int = 3) -> TaggingResult:
+        """Tag a data element with the most similar business terms."""
+        try:
+            # Create document with embedding
+            doc = MyDocument(
+                id = element_id,
+                text = f"{name}. {description}"
+            )
+            
+            doc_with_embedding = self.embedding_client.generate_embeddings(doc)
+            
+            if not doc_with_embedding.embedding:
+                logger.warning(f"Could not generate embedding for element: {name}")
+                return TaggingResult(
+                    element_id = element_id,
+                    element_name = name,
+                    element_description = description,
+                    matching_terms = [],
+                    confidence_scores = [],
+                    modeling_required = True,
+                    message = "Could not generate embedding. Modeling should be performed."
+                )
+            
+            # Query the collection for similar terms
+            results = self.collection.query(
+                query_embeddings=[doc_with_embedding.embedding],
+                n_results=top_k * 2,  # Get more results to filter by threshold
+                include=['metadatas', 'documents', 'distances']
+            )
+            
+            matching_terms = []
+            confidence_scores = []
+            
+            if results["ids"] and len(results["ids"][0]) > 0:
+                for i, term_id in enumerate(results["ids"][0]):
+                    distance = results["distances"][0][i]
+                    cosine_similarity = 1.0 - distance  # Convert distance to similarity
+                    
+                    # Only include terms with similarity >= threshold (50%)
+                    if cosine_similarity >= self.similarity_threshold:
+                        matching_terms.append({
+                            "id": term_id,
+                            "name": results["metadatas"][0][i]["name"],
+                            "description": results["metadatas"][0][i]["description"],
+                            "similarity": cosine_similarity
+                        })
+                        confidence_scores.append(cosine_similarity)
+            
+            # If no terms have similarity >= threshold, recommend modeling
+            if not matching_terms:
+                return TaggingResult(
+                    element_id = element_id,
+                    element_name = name,
+                    element_description = description,
+                    matching_terms = [],
+                    confidence_scores = [],
+                    modeling_required = True,
+                    message = f"Similarity is less than {self.similarity_threshold*100}%. Modeling should be performed."
+                )
+            
+            # Limit to top_k results
+            if len(matching_terms) > top_k:
+                matching_terms = matching_terms[:top_k]
+                confidence_scores = confidence_scores[:top_k]
+            
+            return TaggingResult(
+                element_id = element_id,
+                element_name = name,
+                element_description = description,
+                matching_terms = matching_terms,
+                confidence_scores = confidence_scores,
+                modeling_required = False,
+                message = ""
+            )
+            
+        except Exception as e:
+            logger.error(f"Error tagging element: {e}")
+            
+            # Fallback to manual similarity calculation
+            try:
+                logger.info("Attempting fallback similarity calculation")
+                results = self.collection.get(include=["embeddings", "metadatas"])
+                
+                if not results["ids"] or len(results["ids"]) == 0:
+                    logger.warning("No terms found in collection")
+                    return TaggingResult(
+                        element_id = element_id,
+                        element_name = name,
+                        element_description = description,
+                        matching_terms = [],
+                        confidence_scores = [],
+                        modeling_required = True,
+                        message = "No business terms available. Modeling should be performed."
+                    )
+                
+                similarities = []
+                for i, term_id in enumerate(results["ids"]):
+                    term_embedding = results["embeddings"][i]
+                    similarity = self.compute_cosine_similarity(
+                        doc_with_embedding.embedding, 
+                        term_embedding
+                    )
+                    
+                    if similarity >= self.similarity_threshold:
+                        similarities.append({
+                            "id": term_id,
+                            "name": results["metadatas"][i]["name"],
+                            "description": results["metadatas"][i]["description"],
+                            "similarity": similarity
+                        })
+                
+                # Sort by similarity
+                sorted_similarities = sorted(similarities, key=lambda x: x["similarity"], reverse=True)
+                top_results = sorted_similarities[:top_k]
+                
+                matching_terms = []
+                confidence_scores = []
+                
+                for result in top_results:
+                    matching_terms.append({
+                        "id": result["id"],
+                        "name": result["name"],
+                        "description": result["description"],
+                        "similarity": result["similarity"]
+                    })
+                    confidence_scores.append(result["similarity"])
+                
+                # If no terms have similarity >= threshold, recommend modeling
+                if not matching_terms:
+                    return TaggingResult(
+                        element_id = element_id,
+                        element_name = name,
+                        element_description = description,
+                        matching_terms = [],
+                        confidence_scores = [],
+                        modeling_required = True,
+                        message = f"Similarity is less than {self.similarity_threshold*100}%. Modeling should be performed."
+                    )
+                
+                return TaggingResult(
+                    element_id = element_id,
+                    element_name = name,
+                    element_description = description,
+                    matching_terms = matching_terms,
+                    confidence_scores = confidence_scores,
+                    modeling_required = False,
+                    message = ""
+                )
+                
+            except Exception as fallback_error:
+                logger.error(f"Fallback tagging also failed: {fallback_error}")
+                return TaggingResult(
+                    element_id = element_id,
+                    element_name = name,
+                    element_description = description,
+                    matching_terms = [],
+                    confidence_scores = [],
+                    modeling_required = True,
+                    message = f"Error during tagging: {str(e)}. Modeling should be performed."
+                )
     
-    return TaggingResponse(
-        request_id=element_id,
-        element_name=tagging_result["element_name"],
-        matching_terms=tagging_result["matching_terms"],
-        confidence_scores=tagging_result["confidence_scores"],
-        validation_result=validation_result,
-        modeling_required=tagging_result.get("modeling_required", False),
-        message=tagging_result.get("message", "")
-    )
-
-@router.delete("/tag/{element_id}", response_model=Dict[str, Any])
-async def delete_tagging_result(element_id: str):
-    """
-    Delete a tagging result from memory.
-    """
-    if element_id not in tagging_jobs:
-        raise HTTPException(status_code=404, detail=f"Tagging result {element_id} not found")
+    async def validate_tagging(self, tagging_result: TaggingResult) -> TaggingValidationResult:
+        """Validate the tagging result."""
+        try:
+            # Skip validation if modeling is required
+            if tagging_result.modeling_required:
+                return TaggingValidationResult(
+                    is_valid = False,
+                    feedback = tagging_result.message,
+                    suggested_alternatives = []
+                )
+            
+            # If no matching terms, validation fails
+            if not tagging_result.matching_terms:
+                return TaggingValidationResult(
+                    is_valid = False,
+                    feedback = "No matching terms found",
+                    suggested_alternatives = []
+                )
+            
+            # Get highest confidence score
+            highest_confidence = max(tagging_result.confidence_scores) if tagging_result.confidence_scores else 0.0
+            
+            # If highest confidence is barely above threshold, find alternatives
+            if highest_confidence < 0.75:
+                # Try to find better alternatives
+                alternative_doc = MyDocument(
+                    id = tagging_result.element_id,
+                    text = tagging_result.element_name  # Use just the name for alternative searching
+                )
+                
+                alternative_doc_with_embedding = self.embedding_client.generate_embeddings(alternative_doc)
+                
+                if alternative_doc_with_embedding.embedding:
+                    try:
+                        # Query for alternatives
+                        alt_results = self.collection.query(
+                            query_embeddings=[alternative_doc_with_embedding.embedding],
+                            n_results=5,
+                            include=['metadatas', 'documents', 'distances']
+                        )
+                        
+                        alternatives = []
+                        if alt_results["ids"] and len(alt_results["ids"][0]) > 0:
+                            for i, term_id in enumerate(alt_results['ids'][0]):
+                                # Skip terms already in the matching terms
+                                if term_id not in [term["id"] for term in tagging_result.matching_terms]:
+                                    distance = alt_results["distances"][0][i]
+                                    alt_confidence = 1.0 - distance
+                                    
+                                    # Only suggest alternatives with good confidence
+                                    if alt_confidence >= self.similarity_threshold:
+                                        alternatives.append({
+                                            "id": term_id,
+                                            "name": alt_results["metadatas"][0][i]["name"],
+                                            "description": alt_results["metadatas"][0][i]["description"],
+                                            "confidence": alt_confidence
+                                        })
+                        
+                        if alternatives:
+                            return TaggingValidationResult(
+                                is_valid = False,
+                                feedback = "Low confidence in matching terms. Alternative terms found.",
+                                suggested_alternatives = alternatives[:3]
+                            )
+                    except Exception as e:
+                        logger.warning(f"Error retrieving alternative terms: {e}")
+                        
+                    # Fallback to manual similarity calculation for alternatives
+                    try:
+                        results = self.collection.get(include=["embeddings", "metadatas"])
+                        
+                        if not results["ids"] or len(results["ids"]) == 0:
+                            logger.warning("No terms found in collection")
+                            return TaggingValidationResult(
+                                is_valid = True,
+                                feedback = "Low confidence but no alternatives available",
+                                suggested_alternatives = []
+                            )
+                        
+                        alternative_similarities = []
+                        for i, term_id in enumerate(results["ids"]):
+                            # Skip terms already in the matching terms
+                            if term_id in [term["id"] for term in tagging_result.matching_terms]:
+                                continue
+                            
+                            similarity = self.compute_cosine_similarity(
+                                alternative_doc_with_embedding.embedding,
+                                results["embeddings"][i]
+                            )
+                            
+                            if similarity >= self.similarity_threshold:
+                                alternative_similarities.append({
+                                    "id": term_id,
+                                    "name": results["metadatas"][i]["name"],
+                                    "description": results["metadatas"][i]["description"],
+                                    "confidence": similarity
+                                })
+                        
+                        sorted_alternatives = sorted(
+                            alternative_similarities,
+                            key=lambda x: x["confidence"],
+                            reverse=True
+                        )[:3]
+                        
+                        if sorted_alternatives:
+                            return TaggingValidationResult(
+                                is_valid = False,
+                                feedback = "Low confidence in matching terms. Alternative terms found.",
+                                suggested_alternatives = sorted_alternatives
+                            )
+                    except Exception as e:
+                        logger.error(f"Error validating tagging: {e}")
+            
+            # Default case - validation passes
+            return TaggingValidationResult(
+                is_valid = True,
+                feedback = "Matching terms found with good confidence",
+                suggested_alternatives = []
+            )
+            
+        except Exception as e:
+            logger.error(f"Error validating tagging: {e}")
+            return TaggingValidationResult(
+                is_valid = False,
+                feedback = f"Error during validation: {str(e)}",
+                suggested_alternatives = []
+            )
     
-    del tagging_jobs[element_id]
+    def get_all_terms(self) -> List[BusinessTerm]:
+        """Get all business terms in the collection."""
+        try:
+            results = self.collection.get(limit=10000)
+            terms = []
+            
+            if results["ids"]:
+                for i, term_id in enumerate(results["ids"]):
+                    terms.append(BusinessTerm(
+                        id = term_id,
+                        name = results["metadatas"][i]["name"],
+                        description = results["metadatas"][i]["description"]
+                    ))
+            
+            return terms
+        except Exception as e:
+            logger.error(f"Error retrieving all terms: {e}")
+            raise
     
-    return {"message": f"Tagging result for {element_id} deleted successfully"}
-
-@router.get("/terms", response_model=List[Dict[str, Any]])
-async def get_all_terms():
-    """
-    Get all business terms in the collection.
-    """
-    try:
-        terms = business_term_manager.get_all_terms()
-        return [term.dict() for term in terms]
-    except Exception as e:
-        logger.error(f"Error getting terms: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error getting terms: {str(e)}")
-
-@router.get("/terms/{term_id}", response_model=Dict[str, Any])
-async def get_term(term_id: str):
-    """
-    Get a business term by its ID.
-    """
-    try:
-        term = business_term_manager.get_term_by_id(term_id)
-        if not term:
-            raise HTTPException(status_code=404, detail=f"Term {term_id} not found")
-        return term.dict()
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting term: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error getting term: {str(e)}")
-
-@router.post("/tag/batch", response_model=List[str])
-async def batch_tag_elements(requests: List[TaggingRequest], background_tasks: BackgroundTasks):
-    """
-    Tag multiple data elements in batch mode.
-    Returns a list of element IDs that can be used to check status.
-    """
-    element_ids = []
-    
-    for request in requests:
-        element_id = request.element_id
-        element_ids.append(element_id)
-        
-        # Skip if already processed
-        if element_id in tagging_jobs:
-            continue
-        
-        # Add tagging task to background tasks
-        background_tasks.add_task(tag_element, request)
-    
-    return element_ids
+    def get_term_by_id(self, term_id: str) -> Optional[BusinessTerm]:
+        """Get a business term by its ID."""
+        try:
+            results = self.collection.get(ids=[term_id])
+            
+            if results["ids"] and len(results["ids"]) > 0:
+                return BusinessTerm(
+                    id = term_id,
+                    name = results["metadatas"][0]["name"],
+                    description = results["metadatas"][0]["description"]
+                )
+            
+            return None
+        except Exception as e:
+            logger.error(f"Error retrieving term by ID: {e}")
+            raise
