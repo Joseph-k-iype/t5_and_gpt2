@@ -1,222 +1,246 @@
-import os
-import sys
 import logging
-import chardet
-from typing import Optional, Any, Dict, List, Union
-from pathlib import Path
-from dotenv import dotenv_values
-from azure.identity import DefaultAzureCredential, get_bearer_token_provider, ClientSecretCredential
+from typing import Dict, Any, List, Optional, Tuple, TypedDict, Annotated
+from langchain_openai import AzureChatOpenAI
+from langgraph.graph import StateGraph, END
+from pydantic import BaseModel, Field
+from app.core.models import (
+    DataElement, 
+    EnhancedDataElement, 
+    ValidationResult, 
+    EnhancementResult, 
+    DataQualityStatus
+)
+from app.agents.validator_agent import ValidatorAgent
+from app.agents.enhancer_agent import EnhancerAgent
+from app.agents.confidence_evaluator import ConfidenceEvaluator
 
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-ENV_DIR = "env"
-CONFIG_PATH = f"{ENV_DIR}/config.env"
-CREDS_PATH = f"{ENV_DIR}/credentials.env"
-CERT_PATH = f"{ENV_DIR}/cacert.pem"
+# Define workflow state
+class WorkflowState(TypedDict):
+    """State for the data enhancement workflow."""
+    data_element: Dict[str, Any]
+    enhanced_data: Optional[Dict[str, Any]]
+    validation_result: Optional[Dict[str, Any]]
+    enhancement_result: Optional[Dict[str, Any]]
+    iterations: int
+    max_iterations: int
+    is_complete: bool
+    error: Optional[str]
 
-def is_file_readable(filepath: str) -> bool:
-    """Check if a file is readable."""
-    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
-        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
-    return True
-
-def str_to_bool(s: str) -> bool:
-    """Convert a string to a boolean."""
-    if s.lower() in ('true', 't', 'yes', 'y', '1'):
-        return True
-    elif s.lower() in ('false', 'f', 'no', 'n', '0'):
-        return False
-    else:
-        raise ValueError(f"Invalid boolean value: {s}")
-
-class OSEnv:
-    def __init__(self, config_file: str, creds_file: str, certificate_path: str, proxy_enabled: Optional[bool] = None):
-        self.var_list = []
-        self.bulk_set(config_file, True)
-        self.bulk_set(creds_file, False)
-        self.set_certificate_path(certificate_path)
-        
-        # Handle proxy_enabled override
-        if proxy_enabled is not None:
-            self.set("PROXY_ENABLED", str(proxy_enabled))
-            logger.info(f"Proxy enabled setting overridden to: {proxy_enabled}")
-        
-        # Set proxy if enabled
-        proxy_enabled_env = str_to_bool(self.get("PROXY_ENABLED", "False"))
-        if proxy_enabled_env:
-            self.set_proxy()
-            logger.info("Proxy settings applied")
-        else:
-            logger.info("Running without proxy")
-        
-        # Handle secured endpoints
-        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
-            self.token = self.get_azure_token()
-        else:
-            self.token = None
-        
-        self.credential = self._get_credential()
-        
-    def _get_credential(self):
-        """Get the appropriate Azure credential."""
-        if str_to_bool(self.get("USE_MANAGED_IDENTITY", "False")):
-            logger.info("Using DefaultAzureCredential (managed identity)")
-            return DefaultAzureCredential()
-        else:
-            logger.info("Using ClientSecretCredential")
-            return ClientSecretCredential(
-                tenant_id=self.get("AZURE_TENANT_ID"), 
-                client_id=self.get("AZURE_CLIENT_ID"), 
-                client_secret=self.get("AZURE_CLIENT_SECRET")
+class DataEnhancementWorkflow:
+    """LangGraph workflow for enhancing data elements."""
+    
+    def __init__(self, llm: AzureChatOpenAI):
+        self.llm = llm
+        self.validator = ValidatorAgent(llm)
+        self.enhancer = EnhancerAgent(llm)
+        self.confidence_evaluator = ConfidenceEvaluator(llm)
+        self.graph = self._build_graph()
+    
+    async def _validate_data(self, state: WorkflowState) -> WorkflowState:
+        """Validate the data element."""
+        try:
+            # If there's enhanced data, validate that
+            if state.get("enhanced_data"):
+                data_to_validate = DataElement(
+                    id=state["data_element"]["id"],
+                    existing_name=state["enhanced_data"]["enhanced_name"],
+                    existing_description=state["enhanced_data"]["enhanced_description"],
+                    example=state["data_element"].get("example"),
+                    process_name=state["data_element"].get("process_name"),
+                    process_description=state["data_element"].get("process_description")
+                )
+            else:
+                # Otherwise validate the original data
+                data_to_validate = DataElement(**state["data_element"])
+            
+            # Validate the data
+            validation_result = await self.validator.validate(data_to_validate)
+            
+            # Update state with validation result
+            state["validation_result"] = validation_result.dict()
+            
+            # If this is a subsequent iteration, update the enhanced data with validation feedback
+            if state.get("enhanced_data") and state["iterations"] > 0:
+                if "validation_feedback" not in state["enhanced_data"]:
+                    state["enhanced_data"]["validation_feedback"] = []
+                state["enhanced_data"]["validation_feedback"].append(validation_result.feedback)
+                state["enhanced_data"]["quality_status"] = validation_result.quality_status
+            
+            return state
+        except Exception as e:
+            logger.error(f"Validation error: {str(e)}")
+            state["error"] = f"Validation error: {str(e)}"
+            state["is_complete"] = True
+            return state
+    
+    async def _enhance_data(self, state: WorkflowState) -> WorkflowState:
+        """Enhance the data element."""
+        try:
+            # Get validation feedback
+            validation_feedback = state["validation_result"]["feedback"]
+            if state["validation_result"].get("suggested_improvements"):
+                validation_feedback += "\n\nSuggested improvements:\n" + "\n".join(
+                    state["validation_result"]["suggested_improvements"]
+                )
+            
+            # Use the enhancer to improve the data
+            original_element = DataElement(**state["data_element"])
+            enhancement_result = await self.enhancer.enhance(
+                original_element, 
+                validation_feedback
             )
-    
-    def set_certificate_path(self, path: str):
-        """Set the certificate path for SSL verification."""
-        try:
-            if not os.path.isabs(path):
-                path = os.path.abspath(path)
+            state["enhancement_result"] = enhancement_result.dict()
             
-            if os.path.exists(path):
-                if is_file_readable(path):
-                    self.set("REQUESTS_CA_BUNDLE", path)
-                    self.set("SSL_CERT_FILE", path)
-                    self.set("CURL_CA_BUNDLE", path)
-                    logger.info(f"Certificate path set to {path}")
-                else:
-                    logger.warning(f"Certificate file {path} exists but is not readable")
+            # Create or update enhanced data
+            if not state.get("enhanced_data"):
+                confidence_score = enhancement_result.confidence
+                
+                if state["iterations"] == 0:
+                    # Evaluate confidence for first iteration
+                    confidence_score = await self.confidence_evaluator.evaluate_enhancement(
+                        original_element,
+                        enhancement_result,
+                        validation_feedback
+                    )
+                
+                enhanced_data = {
+                    **state["data_element"],
+                    "enhanced_name": enhancement_result.enhanced_name,
+                    "enhanced_description": enhancement_result.enhanced_description,
+                    "quality_status": state["validation_result"]["quality_status"],
+                    "enhancement_iterations": 1,
+                    "enhancement_feedback": [enhancement_result.feedback],
+                    "validation_feedback": [state["validation_result"]["feedback"]],
+                    "confidence_score": confidence_score
+                }
+                state["enhanced_data"] = enhanced_data
             else:
-                logger.warning(f"Certificate file {path} not found, using system certificates")
+                previous_confidence = state["enhanced_data"].get("confidence_score", 0.5)
+                new_confidence = enhancement_result.confidence
+                
+                # Evaluate confidence if it's significantly different
+                if abs(new_confidence - previous_confidence) > 0.15:
+                    new_confidence = await self.confidence_evaluator.evaluate_enhancement(
+                        original_element,
+                        enhancement_result,
+                        validation_feedback
+                    )
+                
+                state["enhanced_data"]["enhanced_name"] = enhancement_result.enhanced_name
+                state["enhanced_data"]["enhanced_description"] = enhancement_result.enhanced_description
+                state["enhanced_data"]["enhancement_iterations"] = state["enhanced_data"].get("enhancement_iterations", 0) + 1
+                state["enhanced_data"]["confidence_score"] = new_confidence
+                
+                if "enhancement_feedback" not in state["enhanced_data"]:
+                    state["enhanced_data"]["enhancement_feedback"] = []
+                state["enhanced_data"]["enhancement_feedback"].append(enhancement_result.feedback)
+            
+            # Increment iteration counter
+            state["iterations"] = state["iterations"] + 1
+            
+            return state
         except Exception as e:
-            logger.error(f"Error setting certificate path: {e}")
-            raise
+            logger.error(f"Enhancement error: {str(e)}")
+            state["error"] = f"Enhancement error: {str(e)}"
+            state["is_complete"] = True
+            return state
     
-    def bulk_set(self, dotenvfile: str, print_val: bool = False) -> None:
-        """Load environment variables from a dotenv file."""
-        try:
-            if not os.path.isabs(dotenvfile):
-                dotenvfile = os.path.abspath(dotenvfile)
-            
-            if os.path.exists(dotenvfile) and is_file_readable(dotenvfile):
-                temp_dict = dotenv_values(dotenvfile)
-                for key, value in temp_dict.items():
-                    self.set(key, value, print_val)
-                del temp_dict
-                logger.info(f"Loaded environment from {dotenvfile}")
-            else:
-                logger.warning(f"Environment file {dotenvfile} not found or not readable, skipping")
-        except Exception as e:
-            logger.error(f"Error loading environment variables from {dotenvfile}: {e}")
-            raise
+    def _should_enhance(self, state: WorkflowState) -> str:
+        """Determine if the data needs enhancement."""
+        # Check if we've hit the maximum number of iterations
+        if state["iterations"] >= state["max_iterations"]:
+            logger.info(f"Reached maximum iterations ({state['max_iterations']})")
+            return "complete"
+        
+        # Check validation result
+        if state["validation_result"]["quality_status"] == DataQualityStatus.GOOD:
+            logger.info("Quality status is GOOD, completing workflow")
+            return "complete"
+        
+        # Otherwise, continue enhancing
+        logger.info(f"Quality status is {state['validation_result']['quality_status']}, continuing enhancement")
+        return "enhance"
     
-    def set(self, key: str, value: str, print_val: bool = False) -> None:
-        """Set an environment variable."""
-        try:
-            os.environ[key] = value
-            if key not in self.var_list:
-                self.var_list.append(key)
-            if print_val:
-                if key in {'AZURE_CLIENT_SECRET', 'AD_USER_PW'}:
-                    logger.info(f"{key}: [REDACTED]")
-                else:
-                    logger.info(f"{key}: {value}")
-        except Exception as e:
-            logger.error(f"Error setting environment variable {key}: {e}")
-            raise
+    async def _complete_workflow(self, state: WorkflowState) -> WorkflowState:
+        """Mark the workflow as complete."""
+        state["is_complete"] = True
+        logger.info("Workflow completed")
+        return state
     
-    def get(self, key: str, default: Optional[str] = None) -> str:
-        """Get an environment variable."""
-        try:
-            return os.environ.get(key, default)
-        except Exception as e:
-            logger.error(f"Error getting environment variable {key}: {e}")
-            raise
+    def _build_graph(self) -> StateGraph:
+        """Build the LangGraph workflow."""
+        workflow = StateGraph(WorkflowState)
+        
+        # Add nodes
+        workflow.add_node("validate", self._validate_data)
+        workflow.add_node("enhance", self._enhance_data)
+        workflow.add_node("complete", self._complete_workflow)
+        
+        # Add conditional edges
+        workflow.add_conditional_edges(
+            "validate",
+            self._should_enhance,
+            {
+                "enhance": "enhance",
+                "complete": "complete"
+            }
+        )
+        
+        # Add remaining edges
+        workflow.add_edge("enhance", "validate")
+        workflow.add_edge("complete", END)  # End of workflow
+        
+        # Set entrypoint
+        workflow.set_entry_point("validate")
+        
+        return workflow.compile()
     
-    def set_proxy(self) -> None:
-        """Set up proxy configuration."""
-        try:
-            ad_username = self.get("AD_USERNAME")
-            ad_password = self.get("AD_USER_PW")
-            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
-            
-            if not all([ad_username, ad_password, proxy_domain]):
-                logger.error("Proxy settings are incomplete, cannot configure proxy")
-                raise ValueError("Proxy settings are incomplete. Check AD_USERNAME, AD_USER_PW, and HTTPS_PROXY_DOMAIN")
-            
-            # Use http:// instead of https:// as the proxy only supports HTTP
-            proxy_url = f"http://{ad_username}:{ad_password}@{proxy_domain}"
-            self.set("HTTP_PROXY", proxy_url, print_val=False)
-            self.set("HTTPS_PROXY", proxy_url, print_val=False)
-            
-            # Set no_proxy domains
-            no_proxy_domains = [
-                'cognitiveservices.azure.com',
-                'search.windows.net',
-                'openai.azure.com',
-                'core.windows.net',
-                'azurewebsites.net'
-            ]
-            
-            # Add any custom NO_PROXY entries from environment
-            custom_no_proxy = self.get("CUSTOM_NO_PROXY", "")
-            if custom_no_proxy:
-                no_proxy_domains.extend(custom_no_proxy.split(","))
-            
-            self.set("NO_PROXY", ",".join(no_proxy_domains), print_val=False)
-            logger.info("Proxy settings configured with HTTP protocol")
-            logger.info(f"NO_PROXY domains: {', '.join(no_proxy_domains)}")
-        except Exception as e:
-            logger.error(f"Error setting proxy: {e}")
-            raise
-    
-    def get_azure_token(self) -> str:
-        """Get an Azure AD token for authenticated API calls."""
-        try:
-            credential = ClientSecretCredential(
-                tenant_id=self.get("AZURE_TENANT_ID"),
-                client_id=self.get("AZURE_CLIENT_ID"),
-                client_secret=self.get("AZURE_CLIENT_SECRET")
+    async def run(self, data_element: DataElement, max_iterations: int = 5) -> EnhancedDataElement:
+        """
+        Run the data enhancement workflow on a data element.
+        
+        Args:
+            data_element: The data element to enhance
+            max_iterations: Maximum number of enhancement iterations to perform
+        
+        Returns:
+            Enhanced data element
+        """
+        logger.info(f"Starting enhancement workflow for element: {data_element.id}")
+        
+        initial_state: WorkflowState = {
+            "data_element": data_element.dict(),
+            "enhanced_data": None,
+            "validation_result": None,
+            "enhancement_result": None,
+            "iterations": 0,
+            "max_iterations": max_iterations,
+            "is_complete": False,
+            "error": None
+        }
+        
+        # Run the workflow
+        result = await self.graph.ainvoke(initial_state)
+        
+        if result.get("error"):
+            logger.error(f"Workflow error: {result['error']}")
+            raise ValueError(result["error"])
+        
+        if not result.get("enhanced_data"):
+            logger.info("No enhancement was performed, using original data")
+            # If no enhancement was performed, create an enhanced data element from the original
+            return EnhancedDataElement(
+                **data_element.dict(),
+                enhanced_name=data_element.existing_name,
+                enhanced_description=data_element.existing_description,
+                quality_status=result["validation_result"]["quality_status"] if result.get("validation_result") else DataQualityStatus.GOOD,
+                enhancement_iterations=0,
+                validation_feedback=[result["validation_result"]["feedback"]] if result.get("validation_result") else [],
+                confidence_score=0.5  # Default confidence
             )
-            token = credential.get_token("https://cognitiveservices.azure.com/.default")
-            self.set("AZURE_TOKEN", token.token, print_val=False)
-            logger.info("Azure token set successfully")
-            return token.token
-        except Exception as e:
-            logger.error(f"Error retrieving Azure token: {e}")
-            return None
-    
-    def list_env_vars(self) -> None:
-        """List all environment variables (with sensitive values redacted)."""
-        for var in self.var_list:
-            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET'}:
-                logger.info(f"{var}: [REDACTED]")
-            else:
-                logger.info(f"{var}: {os.getenv(var)}")
-
-# Singleton instance for application-wide access
-_os_env_instance = None
-
-def get_os_env(
-    config_file: str = CONFIG_PATH, 
-    creds_file: str = CREDS_PATH, 
-    certificate_path: str = CERT_PATH,
-    proxy_enabled: Optional[bool] = None
-) -> OSEnv:
-    """
-    Get the OSEnv instance.
-    
-    Args:
-        config_file: Path to configuration file
-        creds_file: Path to credentials file
-        certificate_path: Path to SSL certificate
-        proxy_enabled: Override the PROXY_ENABLED setting in the config file
-    """
-    global _os_env_instance
-    if _os_env_instance is None:
-        _os_env_instance = OSEnv(config_file, creds_file, certificate_path, proxy_enabled)
-    elif proxy_enabled is not None and proxy_enabled != str_to_bool(_os_env_instance.get("PROXY_ENABLED", "False")):
-        # If proxy_enabled changes, recreate the instance
-        logger.info("Re-initializing environment with new proxy settings")
-        _os_env_instance = OSEnv(config_file, creds_file, certificate_path, proxy_enabled)
-    
-    return _os_env_instance
+        
+        # Convert the enhanced data dict back to an EnhancedDataElement
+        logger.info(f"Workflow completed with {result['enhanced_data'].get('enhancement_iterations', 0)} iterations")
+        return EnhancedDataElement(**result["enhanced_data"])
