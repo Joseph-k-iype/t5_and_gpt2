@@ -1,133 +1,277 @@
-import argparse
-import logging
 import os
-from fastapi import FastAPI, Depends
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-from app.api.routes.enhancement import router as enhancement_router
-from app.api.routes.tagging import router as tagging_router
-from app.config.environment import get_os_env, str_to_bool
+import logging
+import uuid
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, BackgroundTasks, Depends
+from typing import Dict, List, Any, Optional
+import json
+from app.core.business_terms import BusinessTermManager
+from app.core.models import EnhancedDataElement, TaggingRequest, TaggingResponse
+from app.config.settings import get_llm
+from app.agents.confidence_evaluator import ConfidenceEvaluator
+from pydantic import BaseModel
+import chardet
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler()
-    ]
-)
+router = APIRouter(prefix="/api/v1", tags=["business-terms"])
 
 logger = logging.getLogger(__name__)
 
-def create_application(proxy_enabled: bool = None) -> FastAPI:
+tagging_jobs: Dict[str, Dict[str, Any]] = {}
+
+# Create directory for persistent storage if it doesn't exist
+os.makedirs("./chroma_db", exist_ok=True)
+
+# Business Term Manager instance with persistent storage
+try:
+    business_term_manager = BusinessTermManager(persistent_dir="./chroma_db")
+    logger.info("Business term manager initialized successfully")
+except Exception as e:
+    logger.error(f"Error initializing business term manager: {e}")
+    # Create a minimally functional instance as a fallback
+    business_term_manager = BusinessTermManager(persistent_dir="./chroma_db")
+
+def get_confidence_evaluator():
+    """Get the confidence evaluator."""
+    llm = get_llm()
+    return ConfidenceEvaluator(llm)
+
+class ImportResponse(BaseModel):
+    """Response model for importing business terms."""
+    success: bool
+    message: str
+    imported_count: int
+
+@router.post("/terms/import", response_model=ImportResponse)
+async def import_business_terms(
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None
+):
     """
-    Create the FastAPI application.
-    
-    Args:
-        proxy_enabled: Whether to use proxy for API connections
-    
-    Returns:
-        FastAPI: The application instance
+    Import business terms from a CSV file.
+    The CSV must have 'id', 'name', and 'description' columns.
     """
-    # Initialize environment with proxy setting
-    env = get_os_env(proxy_enabled=proxy_enabled)
-    
-    # Create FastAPI app
-    app = FastAPI(
-        title="Data Element Enhancement and Tagging API",
-        description="API for enhancing data element names and descriptions based on ISO/IEC 11179 standards, and tagging with preferred business terms",
-        version="1.0.0",
-    )
-    
-    # Configure CORS
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],  # Restrict in production
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-    
-    # Include routers
-    app.include_router(enhancement_router)
-    app.include_router(tagging_router)
-    
-    @app.get("/health")
-    async def health_check():
-        """Health check endpoint."""
-        return {
-            "status": "healthy",
-            "proxy_enabled": str_to_bool(env.get("PROXY_ENABLED", "False")),
-            "azure_endpoint": env.get("AZURE_ENDPOINT", ""),
-            "model": env.get("MODEL_NAME", "gpt-4o")
+    try:
+        # Create a unique temp file path
+        temp_file_path = f"temp_{uuid.uuid4()}.csv"
+        
+        # Read and save the uploaded file
+        file_content = await file.read()
+        
+        # Detect the encoding
+        detection = chardet.detect(file_content)
+        encoding = detection['encoding'] or 'utf-8'
+        logger.info(f"Detected CSV encoding: {encoding} with confidence {detection['confidence']}")
+        
+        # Save the file with the detected encoding
+        with open(temp_file_path, "wb") as buffer:
+            buffer.write(file_content)
+        
+        # Import terms with encoding information
+        try:
+            logger.info(f"Importing terms from {file.filename} with encoding {encoding}")
+            import_count = business_term_manager.import_terms_from_csv(temp_file_path, encoding=encoding)
+            
+            # Clean up the temp file
+            try:
+                if background_tasks:
+                    background_tasks.add_task(os.unlink, temp_file_path)
+                else:
+                    os.unlink(temp_file_path)
+            except Exception as e:
+                logger.warning(f"Error deleting temporary file: {e}")
+            
+            return ImportResponse(
+                success=True,
+                message=f"Successfully imported business terms from {file.filename}",
+                imported_count=import_count
+            )
+        except Exception as e:
+            logger.error(f"Error importing terms: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error importing terms: {str(e)}")
+            
+    except Exception as e:
+        logger.error(f"Error processing file upload: {str(e)}")
+        # Clean up the temp file in case of error
+        if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
+            try:
+                os.unlink(temp_file_path)
+            except Exception as cleanup_error:
+                logger.warning(f"Error cleaning up temporary file: {cleanup_error}")
+        
+        raise HTTPException(status_code=500, detail=f"Error importing terms: {str(e)}")
+
+@router.post("/tag", response_model=TaggingResponse)
+async def tag_element(request: TaggingRequest):
+    """
+    Tag an enhanced data element with the most similar business terms.
+    Also validates if the tagging makes sense.
+    """
+    try:
+        # Check if we already have this job
+        request_id = request.element_id
+        if request_id in tagging_jobs:
+            logger.info(f"Returning existing tagging result for {request_id}")
+            job = tagging_jobs[request_id]
+            return TaggingResponse(
+                request_id=request_id,
+                element_name=job["tagging_result"]["element_name"],
+                matching_terms=job["tagging_result"]["matching_terms"],
+                confidence_scores=job["tagging_result"]["confidence_scores"],
+                validation_result=job["validation_result"],
+                modeling_required=job["tagging_result"]["modeling_required"],
+                message=job["tagging_result"]["message"]
+            )
+        
+        # Tag the element
+        logger.info(f"Tagging element: {request.element_id} - {request.element_name}")
+        tagging_result = business_term_manager.tag_element(
+            element_id=request.element_id,
+            name=request.element_name,
+            description=request.element_description,
+            top_k=request.top_k
+        )
+        
+        # Validate the tagging
+        validation_result = await business_term_manager.validate_tagging(tagging_result)
+        
+        # Evaluate the confidence
+        confidence_evaluator = get_confidence_evaluator()
+        
+        # Only evaluate if not modeling_required
+        if not tagging_result.modeling_required:
+            logger.info(f"Evaluating tagging confidence for {request.element_id}")
+            try:
+                overall_confidence = await confidence_evaluator.evaluate_tagging(tagging_result)
+                
+                # Adjust confidence scores with the overall evaluation
+                adjusted_scores = []
+                for score in tagging_result.confidence_scores:
+                    # Blend the original score with overall confidence (70/30 split)
+                    adjusted_score = (score * 0.7) + (overall_confidence * 0.3)
+                    adjusted_scores.append(min(1.0, max(0.0, adjusted_score)))
+                
+                tagging_result.confidence_scores = adjusted_scores
+            except Exception as e:
+                logger.error(f"Error evaluating tagging confidence: {str(e)}")
+        
+        # Store the result
+        tagging_jobs[request_id] = {
+            "tagging_result": tagging_result.dict(),
+            "validation_result": validation_result.dict()
         }
-    
-    @app.get("/")
-    async def root():
-        """Root endpoint with basic information."""
-        return {
-            "application": "Data Element Enhancement and Tagging API",
-            "version": "1.0.0",
-            "status": "running",
-            "documentation": "/docs",
-            "proxy_enabled": str_to_bool(env.get("PROXY_ENABLED", "False"))
-        }
-    
-    return app
+        
+        return TaggingResponse(
+            request_id=request_id,
+            element_name=request.element_name,
+            matching_terms=tagging_result.matching_terms,
+            confidence_scores=tagging_result.confidence_scores,
+            validation_result=validation_result.dict(),
+            modeling_required=tagging_result.modeling_required,
+            message=tagging_result.message
+        )
+    except Exception as e:
+        logger.error(f"Error tagging element: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error tagging element: {str(e)}")
 
-def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="ISO/IEC 11179 Data Enhancement API")
-    parser.add_argument("--proxy", dest="proxy_enabled", action="store_true", 
-                        help="Enable proxy for API connections")
-    parser.add_argument("--no-proxy", dest="proxy_enabled", action="store_false", 
-                        help="Disable proxy for API connections")
-    parser.add_argument("--host", type=str, default="0.0.0.0", 
-                        help="Host to bind the server to")
-    parser.add_argument("--port", type=int, default=8000, 
-                        help="Port to bind the server to")
-    parser.add_argument("--reload", action="store_true", 
-                        help="Enable auto-reload for development")
-    parser.add_argument("--config", type=str, default="env/config.env", 
-                        help="Path to configuration file")
-    parser.add_argument("--creds", type=str, default="env/credentials.env", 
-                        help="Path to credentials file")
-    parser.add_argument("--cert", type=str, default="env/cacert.pem", 
-                        help="Path to SSL certificate file")
-    
-    parser.set_defaults(proxy_enabled=None)  # Default to None to use config file setting
-    
-    return parser.parse_args()
+@router.post("/tag/enhanced", response_model=TaggingResponse)
+async def tag_enhanced_element(element: EnhancedDataElement):
+    """
+    Tag an enhanced data element with the most similar business terms.
+    This endpoint is designed to work with the output of the enhancement process.
+    """
+    try:
+        # Create a tagging request from the enhanced element
+        request = TaggingRequest(
+            element_id=element.id,
+            element_name=element.enhanced_name,
+            element_description=element.enhanced_description,
+            top_k=3
+        )
+        
+        # Use the main tagging endpoint
+        return await tag_element(request)
+    except Exception as e:
+        logger.error(f"Error tagging enhanced element: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error tagging element: {str(e)}")
 
-# Create a simple app instance for module import cases
-app = create_application()
-
-if __name__ == "__main__":
-    # For local development with command line arguments
-    args = parse_args()
+@router.get("/tag/{element_id}", response_model=TaggingResponse)
+async def get_tagging_result(element_id: str):
+    """
+    Get the result of a tagging request.
+    """
+    if element_id not in tagging_jobs:
+        raise HTTPException(status_code=404, detail=f"Tagging result {element_id} not found")
     
-    # Log startup configuration
-    logger.info(f"Starting server with configuration:")
-    logger.info(f"  Host: {args.host}")
-    logger.info(f"  Port: {args.port}")
-    logger.info(f"  Proxy: {args.proxy_enabled}")
-    logger.info(f"  Config file: {args.config}")
-    logger.info(f"  Credentials file: {args.creds}")
-    logger.info(f"  Certificate file: {args.cert}")
-    logger.info(f"  Auto-reload: {args.reload}")
+    job = tagging_jobs[element_id]
+    tagging_result = job["tagging_result"]
+    validation_result = job["validation_result"]
     
-    # Create application with command line arguments
-    os.environ["ENV_CONFIG_PATH"] = args.config
-    os.environ["ENV_CREDS_PATH"] = args.creds
-    os.environ["ENV_CERT_PATH"] = args.cert
-    
-    # Override the default app with command line configured one
-    app = create_application(proxy_enabled=args.proxy_enabled)
-    
-    # Run server
-    uvicorn.run(
-        "main:app", 
-        host=args.host, 
-        port=args.port, 
-        reload=args.reload
+    return TaggingResponse(
+        request_id=element_id,
+        element_name=tagging_result["element_name"],
+        matching_terms=tagging_result["matching_terms"],
+        confidence_scores=tagging_result["confidence_scores"],
+        validation_result=validation_result,
+        modeling_required=tagging_result.get("modeling_required", False),
+        message=tagging_result.get("message", "")
     )
+
+@router.delete("/tag/{element_id}", response_model=Dict[str, Any])
+async def delete_tagging_result(element_id: str):
+    """
+    Delete a tagging result from memory.
+    """
+    if element_id not in tagging_jobs:
+        raise HTTPException(status_code=404, detail=f"Tagging result {element_id} not found")
+    
+    del tagging_jobs[element_id]
+    
+    return {"message": f"Tagging result for {element_id} deleted successfully"}
+
+@router.get("/terms", response_model=List[Dict[str, Any]])
+async def get_all_terms():
+    """
+    Get all business terms in the collection.
+    """
+    try:
+        terms = business_term_manager.get_all_terms()
+        return [term.dict() for term in terms]
+    except Exception as e:
+        logger.error(f"Error getting terms: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error getting terms: {str(e)}")
+
+@router.get("/terms/{term_id}", response_model=Dict[str, Any])
+async def get_term(term_id: str):
+    """
+    Get a business term by its ID.
+    """
+    try:
+        term = business_term_manager.get_term_by_id(term_id)
+        if not term:
+            raise HTTPException(status_code=404, detail=f"Term {term_id} not found")
+        return term.dict()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting term: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error getting term: {str(e)}")
+
+@router.post("/tag/batch", response_model=List[str])
+async def batch_tag_elements(requests: List[TaggingRequest], background_tasks: BackgroundTasks):
+    """
+    Tag multiple data elements in batch mode.
+    Returns a list of element IDs that can be used to check status.
+    """
+    element_ids = []
+    
+    for request in requests:
+        element_id = request.element_id
+        element_ids.append(element_id)
+        
+        # Skip if already processed
+        if element_id in tagging_jobs:
+            continue
+        
+        # Add tagging task to background tasks
+        background_tasks.add_task(tag_element, request)
+    
+    return element_ids
