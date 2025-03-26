@@ -1,206 +1,246 @@
+import os
 import logging
-from typing import Dict, Any, List, Optional
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
-from langchain_openai import AzureChatOpenAI
-from app.core.models import (
-    DataElement, 
-    EnhancedDataElement, 
-    EnhancementRequest, 
-    EnhancementResponse, 
-    EnhancementStatus
-)
-from app.agents.workflow import DataEnhancementWorkflow
+import uuid
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, BackgroundTasks, Depends
+from typing import Dict, List, Any, Optional
+import json
+from app.core.business_terms import BusinessTermManager
+from app.core.models import EnhancedDataElement, TaggingRequest, TaggingResponse
 from app.config.settings import get_llm
+from app.agents.confidence_evaluator import ConfidenceEvaluator
+from pydantic import BaseModel
 
-router = APIRouter(prefix="/api/v1", tags=["data-enhancement"])
-
-# In-memory storage for enhancement jobs
-# In a production system, this would be a database
-enhancement_jobs: Dict[str, Dict[str, Any]] = {}
+router = APIRouter(prefix="/api/v1", tags=["business-terms"])
 
 logger = logging.getLogger(__name__)
 
-def get_workflow() -> DataEnhancementWorkflow:
-    """Get the data enhancement workflow."""
+# In-memory storage for tagging jobs
+# In a production system, this would be a database
+tagging_jobs: Dict[str, Dict[str, Any]] = {}
+
+# Business Term Manager instance with persistent storage
+business_term_manager = BusinessTermManager(persistent_dir="./chroma_db")
+
+def get_confidence_evaluator():
+    """Get the confidence evaluator."""
     llm = get_llm()
-    return DataEnhancementWorkflow(llm)
+    return ConfidenceEvaluator(llm)
 
-@router.post("/validate", response_model=Dict[str, Any])
-async def validate_data_element(data_element: DataElement):
-    """
-    Validate a data element against ISO/IEC 11179 standards.
-    
-    This endpoint performs initial validation without enhancement.
-    """
-    logger.info(f"Validating data element: {data_element.id}")
-    workflow = get_workflow()
-    try:
-        # Run just the validation step
-        result = await workflow.validator.validate(data_element)
-        return {
-            "id": data_element.id,
-            "is_valid": result.is_valid,
-            "quality_status": result.quality_status,
-            "feedback": result.feedback,
-            "suggested_improvements": result.suggested_improvements
-        }
-    except Exception as e:
-        logger.error(f"Validation error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Validation error: {str(e)}")
+class ImportResponse(BaseModel):
+    """Response model for importing business terms."""
+    success: bool
+    message: str
+    imported_count: int
 
-@router.post("/enhance", response_model=EnhancementResponse)
-async def enhance_data_element(
-    request: EnhancementRequest,
-    background_tasks: BackgroundTasks
+@router.post("/terms/import", response_model=ImportResponse)
+async def import_business_terms(
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None
 ):
     """
-    Enhance a data element to meet ISO/IEC 11179 standards.
-    This is an asynchronous operation that will run in the background.
+    Import business terms from a CSV file.
+    The CSV must have 'id', 'name', and 'description' columns.
     """
-    # Use the provided ID as the request ID for tracking
-    request_id = request.data_element.id
-    logger.info(f"Enhancement request received for data element: {request_id}")
-    
-    # Check if this ID is already being processed
-    if request_id in enhancement_jobs:
-        logger.info(f"Enhancement job already exists for ID: {request_id}")
-        job = enhancement_jobs[request_id]
+    try:
+        # Save the uploaded file temporarily
+        temp_file_path = f"temp_{uuid.uuid4()}.csv"
+        with open(temp_file_path, "wb") as buffer:
+            buffer.write(await file.read())
         
-        # If already completed or failed, return the result
-        if job["status"] in [EnhancementStatus.COMPLETED, EnhancementStatus.FAILED]:
-            return EnhancementResponse(
+        # Import terms
+        import_count = business_term_manager.import_terms_from_csv(temp_file_path)
+        
+        # Clean up the temp file
+        if background_tasks:
+            background_tasks.add_task(os.unlink, temp_file_path)
+        else:
+            os.unlink(temp_file_path)
+        
+        return ImportResponse(
+            success=True,
+            message=f"Successfully imported business terms from {file.filename}",
+            imported_count=import_count
+        )
+    except Exception as e:
+        logger.error(f"Error importing terms: {str(e)}")
+        # Clean up the temp file in case of error
+        if os.path.exists(temp_file_path):
+            os.unlink(temp_file_path)
+        raise HTTPException(status_code=500, detail=f"Error importing terms: {str(e)}")
+
+@router.post("/tag", response_model=TaggingResponse)
+async def tag_element(request: TaggingRequest):
+    """
+    Tag an enhanced data element with the most similar business terms.
+    Also validates if the tagging makes sense.
+    """
+    try:
+        # Check if we already have this job
+        request_id = request.element_id
+        if request_id in tagging_jobs:
+            logger.info(f"Returning existing tagging result for {request_id}")
+            job = tagging_jobs[request_id]
+            return TaggingResponse(
                 request_id=request_id,
-                status=job["status"],
-                enhanced_data=job["result"] if job["status"] == EnhancementStatus.COMPLETED else None,
-                error_message=job["error"] if job["status"] == EnhancementStatus.FAILED else None
+                element_name=job["tagging_result"]["element_name"],
+                matching_terms=job["tagging_result"]["matching_terms"],
+                confidence_scores=job["tagging_result"]["confidence_scores"],
+                validation_result=job["validation_result"],
+                modeling_required=job["tagging_result"]["modeling_required"],
+                message=job["tagging_result"]["message"]
             )
         
-        # Otherwise, return the current status
-        return EnhancementResponse(
-            request_id=request_id,
-            status=job["status"],
-            enhanced_data=None,
-            error_message=None
+        # Tag the element
+        logger.info(f"Tagging element: {request.element_id} - {request.element_name}")
+        tagging_result = business_term_manager.tag_element(
+            element_id=request.element_id,
+            name=request.element_name,
+            description=request.element_description,
+            top_k=request.top_k
         )
-    
-    # Initialize job status
-    enhancement_jobs[request_id] = {
-        "status": EnhancementStatus.PENDING,
-        "request": request.dict(),
-        "result": None,
-        "error": None
-    }
-    
-    # Add the enhancement task to the background tasks
-    background_tasks.add_task(
-        run_enhancement_job,
-        request_id=request_id,
-        data_element=request.data_element,
-        max_iterations=request.max_iterations
-    )
-    
-    return EnhancementResponse(
-        request_id=request_id,
-        status=EnhancementStatus.PENDING,
-        enhanced_data=None,
-        error_message=None
-    )
-
-@router.get("/enhance/{request_id}", response_model=EnhancementResponse)
-async def get_enhancement_status(request_id: str):
-    """
-    Get the status of an enhancement job.
-    """
-    if request_id not in enhancement_jobs:
-        raise HTTPException(status_code=404, detail=f"Enhancement job {request_id} not found")
-    
-    job = enhancement_jobs[request_id]
-    
-    return EnhancementResponse(
-        request_id=request_id,
-        status=job["status"],
-        enhanced_data=job["result"] if job["status"] == EnhancementStatus.COMPLETED else None,
-        error_message=job["error"] if job["status"] == EnhancementStatus.FAILED else None
-    )
-
-@router.post("/enhance/batch", response_model=List[str])
-async def batch_enhance_data_elements(
-    requests: List[EnhancementRequest],
-    background_tasks: BackgroundTasks
-):
-    """
-    Enhance multiple data elements in batch mode.
-    Returns a list of request IDs that can be used to check status.
-    """
-    request_ids = []
-    
-    for request in requests:
-        request_id = request.data_element.id
         
-        # Skip if already processing
-        if request_id in enhancement_jobs:
-            if enhancement_jobs[request_id]["status"] not in [EnhancementStatus.COMPLETED, EnhancementStatus.FAILED]:
-                request_ids.append(request_id)
-                continue
+        # Validate the tagging
+        validation_result = await business_term_manager.validate_tagging(tagging_result)
         
-        # Initialize job status
-        enhancement_jobs[request_id] = {
-            "status": EnhancementStatus.PENDING,
-            "request": request.dict(),
-            "result": None,
-            "error": None
+        # Evaluate the confidence
+        confidence_evaluator = get_confidence_evaluator()
+        
+        # Only evaluate if not modeling_required
+        if not tagging_result.modeling_required:
+            logger.info(f"Evaluating tagging confidence for {request.element_id}")
+            try:
+                overall_confidence = await confidence_evaluator.evaluate_tagging(tagging_result)
+                
+                # Adjust confidence scores with the overall evaluation
+                adjusted_scores = []
+                for score in tagging_result.confidence_scores:
+                    # Blend the original score with overall confidence (70/30 split)
+                    adjusted_score = (score * 0.7) + (overall_confidence * 0.3)
+                    adjusted_scores.append(min(1.0, max(0.0, adjusted_score)))
+                
+                tagging_result.confidence_scores = adjusted_scores
+            except Exception as e:
+                logger.error(f"Error evaluating tagging confidence: {str(e)}")
+        
+        # Store the result
+        tagging_jobs[request_id] = {
+            "tagging_result": tagging_result.dict(),
+            "validation_result": validation_result.dict()
         }
         
-        # Add the enhancement task to the background tasks
-        background_tasks.add_task(
-            run_enhancement_job,
+        return TaggingResponse(
             request_id=request_id,
-            data_element=request.data_element,
-            max_iterations=request.max_iterations
+            element_name=request.element_name,
+            matching_terms=tagging_result.matching_terms,
+            confidence_scores=tagging_result.confidence_scores,
+            validation_result=validation_result.dict(),
+            modeling_required=tagging_result.modeling_required,
+            message=tagging_result.message
+        )
+    except Exception as e:
+        logger.error(f"Error tagging element: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error tagging element: {str(e)}")
+
+@router.post("/tag/enhanced", response_model=TaggingResponse)
+async def tag_enhanced_element(element: EnhancedDataElement):
+    """
+    Tag an enhanced data element with the most similar business terms.
+    This endpoint is designed to work with the output of the enhancement process.
+    """
+    try:
+        # Create a tagging request from the enhanced element
+        request = TaggingRequest(
+            element_id=element.id,
+            element_name=element.enhanced_name,
+            element_description=element.enhanced_description,
+            top_k=3
         )
         
-        request_ids.append(request_id)
-    
-    return request_ids
-
-@router.delete("/enhance/{request_id}", response_model=Dict[str, Any])
-async def delete_enhancement_job(request_id: str):
-    """
-    Delete an enhancement job from memory.
-    """
-    if request_id not in enhancement_jobs:
-        raise HTTPException(status_code=404, detail=f"Enhancement job {request_id} not found")
-    
-    status = enhancement_jobs[request_id]["status"]
-    
-    # Don't allow deleting running jobs
-    if status == EnhancementStatus.IN_PROGRESS:
-        raise HTTPException(status_code=400, detail=f"Cannot delete a job that is currently in progress")
-    
-    del enhancement_jobs[request_id]
-    
-    return {"message": f"Enhancement job {request_id} deleted successfully"}
-
-async def run_enhancement_job(request_id: str, data_element: DataElement, max_iterations: int = 5):
-    """
-    Run the enhancement job in the background.
-    """
-    logger.info(f"Starting enhancement job for {request_id}")
-    workflow = get_workflow()
-    
-    # Update job status to in progress
-    enhancement_jobs[request_id]["status"] = EnhancementStatus.IN_PROGRESS
-    
-    try:
-        # Run the workflow
-        result = await workflow.run(data_element, max_iterations)
-        
-        # Update job status to completed
-        enhancement_jobs[request_id]["status"] = EnhancementStatus.COMPLETED
-        enhancement_jobs[request_id]["result"] = result
-        logger.info(f"Enhancement job completed for {request_id}")
+        # Use the main tagging endpoint
+        return await tag_element(request)
     except Exception as e:
-        # Update job status to failed
-        logger.error(f"Enhancement job failed for {request_id}: {str(e)}")
-        enhancement_jobs[request_id]["status"] = EnhancementStatus.FAILED
-        enhancement_jobs[request_id]["error"] = str(e)
+        logger.error(f"Error tagging enhanced element: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error tagging element: {str(e)}")
+
+@router.get("/tag/{element_id}", response_model=TaggingResponse)
+async def get_tagging_result(element_id: str):
+    """
+    Get the result of a tagging request.
+    """
+    if element_id not in tagging_jobs:
+        raise HTTPException(status_code=404, detail=f"Tagging result {element_id} not found")
+    
+    job = tagging_jobs[element_id]
+    tagging_result = job["tagging_result"]
+    validation_result = job["validation_result"]
+    
+    return TaggingResponse(
+        request_id=element_id,
+        element_name=tagging_result["element_name"],
+        matching_terms=tagging_result["matching_terms"],
+        confidence_scores=tagging_result["confidence_scores"],
+        validation_result=validation_result,
+        modeling_required=tagging_result.get("modeling_required", False),
+        message=tagging_result.get("message", "")
+    )
+
+@router.delete("/tag/{element_id}", response_model=Dict[str, Any])
+async def delete_tagging_result(element_id: str):
+    """
+    Delete a tagging result from memory.
+    """
+    if element_id not in tagging_jobs:
+        raise HTTPException(status_code=404, detail=f"Tagging result {element_id} not found")
+    
+    del tagging_jobs[element_id]
+    
+    return {"message": f"Tagging result for {element_id} deleted successfully"}
+
+@router.get("/terms", response_model=List[Dict[str, Any]])
+async def get_all_terms():
+    """
+    Get all business terms in the collection.
+    """
+    try:
+        terms = business_term_manager.get_all_terms()
+        return [term.dict() for term in terms]
+    except Exception as e:
+        logger.error(f"Error getting terms: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error getting terms: {str(e)}")
+
+@router.get("/terms/{term_id}", response_model=Dict[str, Any])
+async def get_term(term_id: str):
+    """
+    Get a business term by its ID.
+    """
+    try:
+        term = business_term_manager.get_term_by_id(term_id)
+        if not term:
+            raise HTTPException(status_code=404, detail=f"Term {term_id} not found")
+        return term.dict()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting term: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error getting term: {str(e)}")
+
+@router.post("/tag/batch", response_model=List[str])
+async def batch_tag_elements(requests: List[TaggingRequest], background_tasks: BackgroundTasks):
+    """
+    Tag multiple data elements in batch mode.
+    Returns a list of element IDs that can be used to check status.
+    """
+    element_ids = []
+    
+    for request in requests:
+        element_id = request.element_id
+        element_ids.append(element_id)
+        
+        # Skip if already processed
+        if element_id in tagging_jobs:
+            continue
+        
+        # Add tagging task to background tasks
+        background_tasks.add_task(tag_element, request)
+    
+    return element_ids
