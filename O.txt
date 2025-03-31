@@ -1,705 +1,165 @@
-import os
-import csv
+import argparse
 import logging
-import numpy as np
-import chromadb
-from typing import List, Dict, Optional, Tuple, Any
-from pydantic import BaseModel, Field
-from app.core.embedding import EmbeddingClient, MyDocument
-from app.core.models import TaggingResult, TaggingValidationResult
-from app.config.environment import get_os_env
+import os
+from fastapi import FastAPI, Depends
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+from app.api.routes.enhancement import router as enhancement_router
+from app.api.routes.tagging import router as tagging_router
+from app.config.environment import get_os_env, str_to_bool
+from app.core.chroma_server import get_chroma_server
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
 
 logger = logging.getLogger(__name__)
 
-class BusinessTerm(BaseModel):
-    """Model representing a business term in the repository."""
-    id: str
-    name: str
-    description: str
-    metadata: Dict[str, Any] = Field(default_factory=dict)
+def create_application(proxy_enabled: bool = None, start_chroma: bool = True) -> FastAPI:
+    """
+    Create the FastAPI application.
+    
+    Args:
+        proxy_enabled: Whether to use proxy for API connections
+        start_chroma: Whether to start the ChromaDB server
+    
+    Returns:
+        FastAPI: The application instance
+    """
+    # Initialize environment with proxy setting
+    env = get_os_env(proxy_enabled=proxy_enabled)
+    
+    # Create database directory
+    chroma_dir = os.environ.get("CHROMA_DB_DIR", "./chroma_db")
+    os.makedirs(chroma_dir, exist_ok=True)
+    logger.info(f"Ensured database directory exists: {chroma_dir}")
+    
+    # Start ChromaDB server if requested
+    if start_chroma:
+        try:
+            logger.info("Starting ChromaDB server...")
+            chroma_server = get_chroma_server(persistent_dir=chroma_dir)
+            success = chroma_server.start()
+            if success:
+                logger.info("ChromaDB server started successfully")
+            else:
+                logger.warning("ChromaDB server could not be started")
+        except Exception as e:
+            logger.error(f"Error starting ChromaDB server: {e}")
+    
+    # Create FastAPI app
+    app = FastAPI(
+        title="Data Element Enhancement and Tagging API",
+        description="API for enhancing data element names and descriptions based on ISO/IEC 11179 standards, and tagging with preferred business terms",
+        version="1.0.0",
+    )
+    
+    # Configure CORS
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],  # Restrict in production
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    
+    # Include routers
+    app.include_router(enhancement_router)
+    app.include_router(tagging_router)
+    
+    @app.get("/health")
+    async def health_check():
+        """Health check endpoint."""
+        return {
+            "status": "healthy",
+            "proxy_enabled": str_to_bool(env.get("PROXY_ENABLED", "False")),
+            "azure_endpoint": env.get("AZURE_ENDPOINT", ""),
+            "model": env.get("MODEL_NAME", "gpt-4o"),
+            "chroma_dir": chroma_dir
+        }
+    
+    @app.get("/")
+    async def root():
+        """Root endpoint with basic information."""
+        return {
+            "application": "Data Element Enhancement and Tagging API",
+            "version": "1.0.0",
+            "status": "running",
+            "documentation": "/docs",
+            "proxy_enabled": str_to_bool(env.get("PROXY_ENABLED", "False"))
+        }
+    
+    return app
 
-class BusinessTermManager:
-    """
-    Manager for business terms, handling storage, retrieval, and similarity matching.
-    Uses vector embeddings via ChromaDB for semantic similarity search.
-    """
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="ISO/IEC 11179 Data Enhancement API")
+    parser.add_argument("--proxy", dest="proxy_enabled", action="store_true", 
+                        help="Enable proxy for API connections")
+    parser.add_argument("--no-proxy", dest="proxy_enabled", action="store_false", 
+                        help="Disable proxy for API connections")
+    parser.add_argument("--host", type=str, default="0.0.0.0", 
+                        help="Host to bind the server to")
+    parser.add_argument("--port", type=int, default=8000, 
+                        help="Port to bind the server to")
+    parser.add_argument("--reload", action="store_true", 
+                        help="Enable auto-reload for development")
+    parser.add_argument("--config", type=str, default="env/config.env", 
+                        help="Path to configuration file")
+    parser.add_argument("--creds", type=str, default="env/credentials.env", 
+                        help="Path to credentials file")
+    parser.add_argument("--cert", type=str, default="env/cacert.pem", 
+                        help="Path to SSL certificate file")
+    parser.add_argument("--chroma-server", dest="start_chroma", action="store_true",
+                        help="Start the ChromaDB server")
+    parser.add_argument("--no-chroma-server", dest="start_chroma", action="store_false",
+                        help="Don't start the ChromaDB server")
+    parser.add_argument("--chroma-dir", type=str, default="./chroma_db",
+                        help="Directory for ChromaDB persistent storage")
     
-    def __init__(self, persistent_dir: str):
-        """
-        Initialize the business term manager.
-        
-        Args:
-            persistent_dir: Directory for persistent storage of business terms
-        """
-        self.env = get_os_env()
-        self.embedding_client = EmbeddingClient()
-        self.persistent_dir = persistent_dir
-        self.similarity_threshold = float(self.env.get("SIMILARITY_THRESHOLD", "0.5"))  # 50% similarity threshold
-        self.collection = None
-        
-        # Set up ChromaDB with error handling
-        try:
-            self.chroma_client = self._setup_chroma_db()
-            logger.info("ChromaDB client initialized successfully")
-            
-            # Try to get or create the collection
-            self._setup_collection()
-        except Exception as e:
-            logger.error(f"Failed to initialize ChromaDB: {e}")
-            self.chroma_client = None
-            
-    def _setup_collection(self):
-        """Set up the collection for business terms."""
-        if self.chroma_client is None:
-            logger.error("Cannot set up collection: ChromaDB client is not initialized")
-            return
-            
-        try:
-            # Try to get existing collection
-            self.collection = self.chroma_client.get_collection(
-                name="business_terms"
-            )
-            logger.info("Retrieved collection 'business_terms'")
-        except Exception as e:
-            logger.info(f"Collection not found, creating new one: {e}")
-            try:
-                # Create new collection
-                self.collection = self.chroma_client.create_collection(
-                    name="business_terms",
-                    metadata={'hnsw:space': "cosine"}  # Explicitly use cosine similarity
-                )
-                logger.info("Created new collection 'business_terms'")
-            except Exception as create_error:
-                logger.error(f"Failed to create collection: {create_error}")
-                self.collection = None
+    parser.set_defaults(proxy_enabled=None, start_chroma=True)  # Default values
     
-    def _setup_chroma_db(self):
-        """
-        Set up ChromaDB with persistence.
-        
-        Returns:
-            ChromaDB client instance
-        """
-        try:
-            # First, try to create the directory for persistent storage
-            os.makedirs(self.persistent_dir, exist_ok=True)
-            
-            # Try HTTP client (recommended for stability)
-            try:
-                logger.info("Attempting to use HttpClient")
-                client = chromadb.HttpClient(
-                    host="localhost",
-                    port=8000,
-                    settings=chromadb.Settings(
-                        anonymized_telemetry=False
-                    )
-                )
-                # Test connection
-                client.heartbeat()
-                logger.info("Successfully connected to ChromaDB server with HttpClient")
-                return client
-            except Exception as http_e:
-                logger.warning(f"HttpClient initialization failed (this is normal if server isn't running): {http_e}")
-                raise
-                
-        except Exception as e:
-            logger.warning(f"Error setting up ChromaDB with HttpClient: {e}")
-            
-            # Try with PersistentClient as fallback
-            try:
-                logger.info("Falling back to PersistentClient")
-                # Import FastAPI implementation for ChromaDB
-                from chromadb.api.fastapi import FastAPI as ChromaFastAPI
-                
-                # Use PersistentClient with FastAPI implementation
-                client = chromadb.PersistentClient(
-                    path=self.persistent_dir,
-                    settings=chromadb.Settings(
-                        anonymized_telemetry=False,
-                        allow_reset=True,
-                        is_persistent=True,
-                        chroma_api_impl=ChromaFastAPI
-                    )
-                )
-                
-                logger.info(f"ChromaDB initialized in persistent mode at {self.persistent_dir}")
-                return client
-            except Exception as persist_e:
-                logger.error(f"Error with PersistentClient: {persist_e}")
-                
-                # Last resort - try in-memory with FastAPI implementation
-                try:
-                    logger.info("Trying in-memory client with FastAPI implementation as last resort")
-                    from chromadb.api.fastapi import FastAPI as ChromaFastAPI
-                    
-                    return chromadb.Client(
-                        settings=chromadb.Settings(
-                            anonymized_telemetry=False,
-                            allow_reset=True,
-                            chroma_api_impl=ChromaFastAPI
-                        )
-                    )
-                except Exception as mem_e:
-                    logger.error(f"In-memory client also failed: {mem_e}")
-                    raise RuntimeError("Could not initialize ChromaDB with any method")
+    return parser.parse_args()
+
+# Create a simple app instance for module import cases
+app = create_application(start_chroma=False)
+
+if __name__ == "__main__":
+    # For local development with command line arguments
+    args = parse_args()
     
-    def compute_cosine_similarity(self, embedding1, embedding2):
-        """
-        Compute cosine similarity between two embeddings.
-        
-        Args:
-            embedding1: First embedding vector
-            embedding2: Second embedding vector
-            
-        Returns:
-            Cosine similarity score between 0 and 1
-        """
-        a = np.array(embedding1)
-        b = np.array(embedding2)
-        
-        dot_product = np.dot(a, b)
-        magnitude_a = np.linalg.norm(a)
-        magnitude_b = np.linalg.norm(b)
-        
-        if magnitude_a == 0 or magnitude_b == 0:
-            return 0.0
-        
-        similarity = dot_product / (magnitude_a * magnitude_b)
-        return max(0.0, min(similarity, 1.0))  # Ensure bounds between 0 and 1
+    # Set ChromaDB directory in environment
+    os.environ["CHROMA_DB_DIR"] = args.chroma_dir
     
-    def import_terms_from_csv(self, csv_path: str, encoding: str = 'utf-8', batch_size: int = 100) -> int:
-        """
-        Import business terms from a CSV file.
-        
-        Args:
-            csv_path: Path to the CSV file
-            encoding: File encoding (auto-detected if not provided)
-            batch_size: Number of terms to process in each batch
-            
-        Returns:
-            Number of terms imported
-        """
-        try:
-            # Check if collection is available
-            if self.collection is None:
-                logger.error("No business terms collection available")
-                
-                # Try to create the collection again
-                try:
-                    self.collection = self.chroma_client.create_collection(
-                        name="business_terms",
-                        metadata={'hnsw:space': "cosine"},
-                    )
-                    logger.info("Created new collection 'business_terms'")
-                except Exception as e:
-                    logger.error(f"Failed to create collection: {e}")
-                    return 0
-            
-            # Get existing terms
-            existing_terms = {}
-            try:
-                results = self.collection.get(limit=10000)
-                if results["ids"]:
-                    for i, term_id in enumerate(results["ids"]):
-                        name = results["metadatas"][i]["name"]
-                        description = results["metadatas"][i]["description"]
-                        term_key = f"{name}::{description}"
-                        existing_terms[term_key] = term_id
-            except Exception as e:
-                logger.error(f"Error retrieving existing terms: {e}")
-                existing_terms = {}
-            
-            # Track terms in CSV
-            csv_term_keys = set()
-            terms_to_add = []
-            
-            # Read terms from CSV with specified encoding
-            with open(csv_path, 'r', encoding=encoding) as csvfile:
-                reader = csv.DictReader(csvfile)
-                for row in reader:
-                    if 'id' not in row or 'name' not in row or 'description' not in row:
-                        logger.warning("Skipping row with missing 'id', 'name', or 'description'")
-                        continue
-                    
-                    term_id = row['id'].strip()
-                    name = row['name'].strip()
-                    description = row['description'].strip()
-                    
-                    if not term_id:
-                        logger.warning(f"Skipping term with empty ID: {name}")
-                        continue
-                    
-                    term_key = f"{name}::{description}"
-                    csv_term_keys.add(term_key)
-                    
-                    # Skip if term already exists
-                    if term_key in existing_terms and existing_terms[term_key] == term_id:
-                        continue
-                    
-                    terms_to_add.append({
-                        "id": term_id,
-                        "name": name,
-                        "description": description,
-                        "term_key": term_key
-                    })
-            
-            # Add terms in batches
-            added_count = 0
-            for i in range(0, len(terms_to_add), batch_size):
-                batch = terms_to_add[i:i + batch_size]
-                ids = []
-                embeddings = []
-                metadatas = []
-                documents = []
-                
-                for term in batch:
-                    doc = MyDocument(
-                        id = term["id"],
-                        text = f"{term['name']}. {term['description']}"
-                    )
-                    
-                    doc_with_embedding = self.embedding_client.generate_embeddings(doc)
-                    
-                    if not doc_with_embedding.embedding:
-                        logger.warning(f"Skipping term without embedding: {term['name']}")
-                        continue
-                    
-                    ids.append(term["id"])
-                    embeddings.append(doc_with_embedding.embedding)
-                    metadatas.append({
-                        "name": term["name"],
-                        "description": term["description"]
-                    })
-                    documents.append(f"{term['name']}. {term['description']}")
-                
-                if ids:
-                    # Add to collection
-                    self.collection.add(
-                        ids=ids,
-                        embeddings=embeddings,
-                        metadatas=metadatas,
-                        documents=documents
-                    )
-                    added_count += len(ids)
-            
-            # Handle any terms to delete
-            terms_to_delete = []
-            for term_key, term_id in existing_terms.items():
-                if term_key not in csv_term_keys:
-                    terms_to_delete.append(term_id)
-            
-            # Delete in batches
-            deleted_count = 0
-            for i in range(0, len(terms_to_delete), batch_size):
-                batch = terms_to_delete[i:i + batch_size]
-                self.collection.delete(ids=batch)
-                deleted_count += len(batch)
-                
-            logger.info(f"Added {added_count} terms, deleted {deleted_count} terms")
-            return added_count
-            
-        except Exception as e:
-            logger.error(f"Error importing terms from CSV: {e}")
-            return 0
+    # Log startup configuration
+    logger.info(f"Starting server with configuration:")
+    logger.info(f"  Host: {args.host}")
+    logger.info(f"  Port: {args.port}")
+    logger.info(f"  Proxy: {args.proxy_enabled}")
+    logger.info(f"  Config file: {args.config}")
+    logger.info(f"  Credentials file: {args.creds}")
+    logger.info(f"  Certificate file: {args.cert}")
+    logger.info(f"  Auto-reload: {args.reload}")
+    logger.info(f"  Start ChromaDB server: {args.start_chroma}")
+    logger.info(f"  ChromaDB directory: {args.chroma_dir}")
     
-    def tag_element(self, element_id: str, name: str, description: str, top_k: int = 3) -> TaggingResult:
-        """
-        Tag a data element with the most similar business terms.
-        
-        Args:
-            element_id: Unique identifier for the element
-            name: Enhanced name of the element
-            description: Enhanced description of the element
-            top_k: Number of top matching terms to return
-            
-        Returns:
-            TaggingResult containing matching terms and confidence scores
-        """
-        try:
-            # Check if collection is available
-            if self.collection is None:
-                logger.warning("No business terms collection available")
-                return TaggingResult(
-                    element_id = element_id,
-                    element_name = name,
-                    element_description = description,
-                    matching_terms = [],
-                    confidence_scores = [],
-                    modeling_required = True,
-                    message = "Business terms repository is not available. Modeling should be performed."
-                )
-                
-            # Create document with embedding
-            doc = MyDocument(
-                id = element_id,
-                text = f"{name}. {description}"
-            )
-            
-            doc_with_embedding = self.embedding_client.generate_embeddings(doc)
-            
-            if not doc_with_embedding.embedding:
-                logger.warning(f"Could not generate embedding for element: {name}")
-                return TaggingResult(
-                    element_id = element_id,
-                    element_name = name,
-                    element_description = description,
-                    matching_terms = [],
-                    confidence_scores = [],
-                    modeling_required = True,
-                    message = "Could not generate embedding. Modeling should be performed."
-                )
-            
-            # Query the collection for similar terms
-            results = self.collection.query(
-                query_embeddings=[doc_with_embedding.embedding],
-                n_results=top_k * 2,  # Get more results to filter by threshold
-                include=['metadatas', 'documents', 'distances']
-            )
-            
-            matching_terms = []
-            confidence_scores = []
-            
-            if results["ids"] and len(results["ids"][0]) > 0:
-                for i, term_id in enumerate(results["ids"][0]):
-                    distance = results["distances"][0][i]
-                    cosine_similarity = 1.0 - distance  # Convert distance to similarity
-                    
-                    # Only include terms with similarity >= threshold (50%)
-                    if cosine_similarity >= self.similarity_threshold:
-                        matching_terms.append({
-                            "id": term_id,
-                            "name": results["metadatas"][0][i]["name"],
-                            "description": results["metadatas"][0][i]["description"],
-                            "similarity": cosine_similarity
-                        })
-                        confidence_scores.append(cosine_similarity)
-            
-            # If no terms have similarity >= threshold, recommend modeling
-            if not matching_terms:
-                return TaggingResult(
-                    element_id = element_id,
-                    element_name = name,
-                    element_description = description,
-                    matching_terms = [],
-                    confidence_scores = [],
-                    modeling_required = True,
-                    message = f"Similarity is less than {self.similarity_threshold*100}%. Modeling should be performed."
-                )
-            
-            # Limit to top_k results
-            if len(matching_terms) > top_k:
-                matching_terms = matching_terms[:top_k]
-                confidence_scores = confidence_scores[:top_k]
-            
-            return TaggingResult(
-                element_id = element_id,
-                element_name = name,
-                element_description = description,
-                matching_terms = matching_terms,
-                confidence_scores = confidence_scores,
-                modeling_required = False,
-                message = ""
-            )
-            
-        except Exception as e:
-            logger.error(f"Error tagging element: {e}")
-            
-            # Fallback to manual similarity calculation
-            try:
-                logger.info("Attempting fallback similarity calculation")
-                
-                if self.collection is None:
-                    logger.warning("No business terms collection available for fallback")
-                    return TaggingResult(
-                        element_id = element_id,
-                        element_name = name,
-                        element_description = description,
-                        matching_terms = [],
-                        confidence_scores = [],
-                        modeling_required = True,
-                        message = "Business terms repository is not available. Modeling should be performed."
-                    )
-                
-                results = self.collection.get(include=["embeddings", "metadatas"])
-                
-                if not results["ids"] or len(results["ids"]) == 0:
-                    logger.warning("No terms found in collection")
-                    return TaggingResult(
-                        element_id = element_id,
-                        element_name = name,
-                        element_description = description,
-                        matching_terms = [],
-                        confidence_scores = [],
-                        modeling_required = True,
-                        message = "No business terms available. Modeling should be performed."
-                    )
-                
-                similarities = []
-                for i, term_id in enumerate(results["ids"]):
-                    term_embedding = results["embeddings"][i]
-                    similarity = self.compute_cosine_similarity(
-                        doc_with_embedding.embedding, 
-                        term_embedding
-                    )
-                    
-                    if similarity >= self.similarity_threshold:
-                        similarities.append({
-                            "id": term_id,
-                            "name": results["metadatas"][i]["name"],
-                            "description": results["metadatas"][i]["description"],
-                            "similarity": similarity
-                        })
-                
-                # Sort by similarity
-                sorted_similarities = sorted(similarities, key=lambda x: x["similarity"], reverse=True)
-                top_results = sorted_similarities[:top_k]
-                
-                matching_terms = []
-                confidence_scores = []
-                
-                for result in top_results:
-                    matching_terms.append({
-                        "id": result["id"],
-                        "name": result["name"],
-                        "description": result["description"],
-                        "similarity": result["similarity"]
-                    })
-                    confidence_scores.append(result["similarity"])
-                
-                # If no terms have similarity >= threshold, recommend modeling
-                if not matching_terms:
-                    return TaggingResult(
-                        element_id = element_id,
-                        element_name = name,
-                        element_description = description,
-                        matching_terms = [],
-                        confidence_scores = [],
-                        modeling_required = True,
-                        message = f"Similarity is less than {self.similarity_threshold*100}%. Modeling should be performed."
-                    )
-                
-                return TaggingResult(
-                    element_id = element_id,
-                    element_name = name,
-                    element_description = description,
-                    matching_terms = matching_terms,
-                    confidence_scores = confidence_scores,
-                    modeling_required = False,
-                    message = ""
-                )
-                
-            except Exception as fallback_error:
-                logger.error(f"Fallback tagging also failed: {fallback_error}")
-                return TaggingResult(
-                    element_id = element_id,
-                    element_name = name,
-                    element_description = description,
-                    matching_terms = [],
-                    confidence_scores = [],
-                    modeling_required = True,
-                    message = f"Error during tagging: {str(e)}. Modeling should be performed."
-                )
+    # Create application with command line arguments
+    os.environ["ENV_CONFIG_PATH"] = args.config
+    os.environ["ENV_CREDS_PATH"] = args.creds
+    os.environ["ENV_CERT_PATH"] = args.cert
     
-    async def validate_tagging(self, tagging_result: TaggingResult) -> TaggingValidationResult:
-        """
-        Validate the tagging result.
-        
-        Args:
-            tagging_result: Result of tagging to validate
-            
-        Returns:
-            TaggingValidationResult with validation status and suggestions
-        """
-        try:
-            # Check if collection is available
-            if self.collection is None:
-                logger.warning("No business terms collection available")
-                return TaggingValidationResult(
-                    is_valid = False,
-                    feedback = "Business terms repository is not available",
-                    suggested_alternatives = []
-                )
-                
-            # Skip validation if modeling is required
-            if tagging_result.modeling_required:
-                return TaggingValidationResult(
-                    is_valid = False,
-                    feedback = tagging_result.message,
-                    suggested_alternatives = []
-                )
-            
-            # If no matching terms, validation fails
-            if not tagging_result.matching_terms:
-                return TaggingValidationResult(
-                    is_valid = False,
-                    feedback = "No matching terms found",
-                    suggested_alternatives = []
-                )
-            
-            # Get highest confidence score
-            highest_confidence = max(tagging_result.confidence_scores) if tagging_result.confidence_scores else 0.0
-            
-            # If highest confidence is barely above threshold, find alternatives
-            if highest_confidence < 0.75:
-                # Try to find better alternatives
-                alternative_doc = MyDocument(
-                    id = tagging_result.element_id,
-                    text = tagging_result.element_name  # Use just the name for alternative searching
-                )
-                
-                alternative_doc_with_embedding = self.embedding_client.generate_embeddings(alternative_doc)
-                
-                if alternative_doc_with_embedding.embedding:
-                    try:
-                        # Query for alternatives
-                        alt_results = self.collection.query(
-                            query_embeddings=[alternative_doc_with_embedding.embedding],
-                            n_results=5,
-                            include=['metadatas', 'documents', 'distances']
-                        )
-                        
-                        alternatives = []
-                        if alt_results["ids"] and len(alt_results["ids"][0]) > 0:
-                            for i, term_id in enumerate(alt_results['ids'][0]):
-                                # Skip terms already in the matching terms
-                                if term_id not in [term["id"] for term in tagging_result.matching_terms]:
-                                    distance = alt_results["distances"][0][i]
-                                    alt_confidence = 1.0 - distance
-                                    
-                                    # Only suggest alternatives with good confidence
-                                    if alt_confidence >= self.similarity_threshold:
-                                        alternatives.append({
-                                            "id": term_id,
-                                            "name": alt_results["metadatas"][0][i]["name"],
-                                            "description": alt_results["metadatas"][0][i]["description"],
-                                            "confidence": alt_confidence
-                                        })
-                        
-                        if alternatives:
-                            return TaggingValidationResult(
-                                is_valid = False,
-                                feedback = "Low confidence in matching terms. Alternative terms found.",
-                                suggested_alternatives = alternatives[:3]
-                            )
-                    except Exception as e:
-                        logger.warning(f"Error retrieving alternative terms: {e}")
-                        
-                    # Fallback to manual similarity calculation for alternatives
-                    try:
-                        results = self.collection.get(include=["embeddings", "metadatas"])
-                        
-                        if not results["ids"] or len(results["ids"]) == 0:
-                            logger.warning("No terms found in collection")
-                            return TaggingValidationResult(
-                                is_valid = True,
-                                feedback = "Low confidence but no alternatives available",
-                                suggested_alternatives = []
-                            )
-                        
-                        alternative_similarities = []
-                        for i, term_id in enumerate(results["ids"]):
-                            # Skip terms already in the matching terms
-                            if term_id in [term["id"] for term in tagging_result.matching_terms]:
-                                continue
-                            
-                            similarity = self.compute_cosine_similarity(
-                                alternative_doc_with_embedding.embedding,
-                                results["embeddings"][i]
-                            )
-                            
-                            if similarity >= self.similarity_threshold:
-                                alternative_similarities.append({
-                                    "id": term_id,
-                                    "name": results["metadatas"][i]["name"],
-                                    "description": results["metadatas"][i]["description"],
-                                    "confidence": similarity
-                                })
-                        
-                        sorted_alternatives = sorted(
-                            alternative_similarities,
-                            key=lambda x: x["confidence"],
-                            reverse=True
-                        )[:3]
-                        
-                        if sorted_alternatives:
-                            return TaggingValidationResult(
-                                is_valid = False,
-                                feedback = "Low confidence in matching terms. Alternative terms found.",
-                                suggested_alternatives = sorted_alternatives
-                            )
-                    except Exception as e:
-                        logger.error(f"Error validating tagging: {e}")
-            
-            # Default case - validation passes
-            return TaggingValidationResult(
-                is_valid = True,
-                feedback = "Matching terms found with good confidence",
-                suggested_alternatives = []
-            )
-            
-        except Exception as e:
-            logger.error(f"Error validating tagging: {e}")
-            return TaggingValidationResult(
-                is_valid = False,
-                feedback = f"Error during validation: {str(e)}",
-                suggested_alternatives = []
-            )
+    # Override the default app with command line configured one
+    app = create_application(proxy_enabled=args.proxy_enabled, start_chroma=args.start_chroma)
     
-    def get_all_terms(self) -> List[BusinessTerm]:
-        """
-        Get all business terms in the collection.
-        
-        Returns:
-            List of BusinessTerm objects
-        """
-        try:
-            # Check if collection is available
-            if self.collection is None:
-                logger.warning("No business terms collection available")
-                return []
-                
-            results = self.collection.get(limit=10000)
-            terms = []
-            
-            if results["ids"]:
-                for i, term_id in enumerate(results["ids"]):
-                    terms.append(BusinessTerm(
-                        id = term_id,
-                        name = results["metadatas"][i]["name"],
-                        description = results["metadatas"][i]["description"]
-                    ))
-            
-            return terms
-        except Exception as e:
-            logger.error(f"Error retrieving all terms: {e}")
-            return []
-    
-    def get_term_by_id(self, term_id: str) -> Optional[BusinessTerm]:
-        """
-        Get a business term by its ID.
-        
-        Args:
-            term_id: Unique identifier of the term
-            
-        Returns:
-            BusinessTerm if found, None otherwise
-        """
-        try:
-            # Check if collection is available
-            if self.collection is None:
-                logger.warning("No business terms collection available")
-                return None
-                
-            results = self.collection.get(ids=[term_id])
-            
-            if results["ids"] and len(results["ids"]) > 0:
-                return BusinessTerm(
-                    id = term_id,
-                    name = results["metadatas"][0]["name"],
-                    description = results["metadatas"][0]["description"]
-                )
-            
-            return None
-        except Exception as e:
-            logger.error(f"Error retrieving term by ID: {e}")
-            return None
+    # Run server
+    uvicorn.run(
+        "main:app", 
+        host=args.host, 
+        port=args.port, 
+        reload=args.reload
+    )
