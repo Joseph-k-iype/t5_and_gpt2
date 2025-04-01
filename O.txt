@@ -1,631 +1,249 @@
-"""
-Business Terms Manager using PostgreSQL with pgvector for semantic similarity matching.
-Manages the storage, retrieval, and similarity search of business terms.
-"""
-
-import csv
-import logging
 import os
-import time
-from typing import List, Dict, Any, Optional, Tuple
-import numpy as np
-from pydantic import BaseModel
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import sys
+import logging
+import chardet
+from typing import Optional, Any, Dict, List, Union
+from pathlib import Path
+from dotenv import dotenv_values
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider, ClientSecretCredential
 
-from app.core.db_manager import DBManager
-from app.core.embedding import EmbeddingClient, MyDocument
-from app.core.models import TaggingResult, TaggingValidationResult
-from app.config.environment import get_os_env
-
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-class BusinessTerm(BaseModel):
-    """Model representing a business term in the repository."""
-    id: str
-    name: str
-    description: str
-    metadata: Dict[str, Any] = {}
-    
-    def dict(self):
-        """Convert the business term to a dictionary."""
-        return {
-            "id": self.id,
-            "name": self.name,
-            "description": self.description,
-            "metadata": self.metadata
-        }
+ENV_DIR = "env"
+CONFIG_PATH = f"{ENV_DIR}/config.env"
+CREDS_PATH = f"{ENV_DIR}/credentials.env"
+CERT_PATH = f"{ENV_DIR}/cacert.pem"
 
-class BusinessTermManager:
-    """
-    Manager for business terms, handling storage, retrieval, and similarity matching.
-    Uses pgvector for semantic similarity search via PostgreSQL.
-    """
-    
-    _instance = None
-    
-    def __new__(cls):
-        """Singleton pattern to ensure only one instance is created."""
-        if cls._instance is None:
-            cls._instance = super(BusinessTermManager, cls).__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
-    
-    def __init__(self):
-        """Initialize the business term manager."""
-        if self._initialized:
-            return
-            
-        self._initialized = True
-        self.env = get_os_env()
-        self.embedding_client = EmbeddingClient()
-        self.db_manager = DBManager()
-        self.similarity_threshold = float(self.env.get("SIMILARITY_THRESHOLD", "0.5"))  # 50% similarity threshold
+def is_file_readable(filepath: str) -> bool:
+    """Check if a file is readable."""
+    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
+        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
+    return True
+
+def str_to_bool(s: str) -> bool:
+    """Convert a string to a boolean."""
+    if s.lower() in ('true', 't', 'yes', 'y', '1'):
+        return True
+    elif s.lower() in ('false', 'f', 'no', 'n', '0'):
+        return False
+    else:
+        raise ValueError(f"Invalid boolean value: {s}")
+
+class OSEnv:
+    def __init__(self, config_file: str, creds_file: str, certificate_path: str, proxy_enabled: Optional[bool] = None):
+        self.var_list = []
+        self.bulk_set(config_file, True)
+        self.bulk_set(creds_file, False)
+        self.set_certificate_path(certificate_path)
         
-        # Verify database connection and pgvector extension
-        self._verify_database()
+        # Handle proxy_enabled override
+        if proxy_enabled is not None:
+            self.set("PROXY_ENABLED", str(proxy_enabled))
+            logger.info(f"Proxy enabled setting overridden to: {proxy_enabled}")
         
-        logger.info("Business term manager initialized with PostgreSQL backend")
+        # Set proxy if enabled
+        proxy_enabled_env = str_to_bool(self.get("PROXY_ENABLED", "False"))
+        if proxy_enabled_env:
+            self.set_proxy()
+            logger.info("Proxy settings applied")
+        else:
+            logger.info("Running without proxy")
+        
+        # Handle secured endpoints
+        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
+            self.token = self.get_azure_token()
+        else:
+            self.token = None
+        
+        self.credential = self._get_credential()
+        
+        # Set PostgreSQL environment variables if not already set
+        self._set_postgres_defaults()
+        
+    def _set_postgres_defaults(self):
+        """Set default PostgreSQL environment variables if not already set."""
+        # Default PostgreSQL configuration
+        postgres_defaults = {
+            "PG_HOST": self.get("PG_HOST", "localhost"),
+            "PG_PORT": self.get("PG_PORT", "5432"),
+            "PG_USER": self.get("PG_USER", "postgres"),
+            "PG_PASSWORD": self.get("PG_PASSWORD", "postgres"),
+            "PG_DB": self.get("PG_DB", "metadata_db")
+        }
+        
+        # Set defaults if not already set
+        for key, value in postgres_defaults.items():
+            if not self.get(key):
+                self.set(key, value)
+                
+        # Log PostgreSQL configuration (without password)
+        logger.info(f"PostgreSQL configuration: host={self.get('PG_HOST')}, port={self.get('PG_PORT')}, db={self.get('PG_DB')}, user={self.get('PG_USER')}")
+        
+    def _get_credential(self):
+        """Get the appropriate Azure credential."""
+        if str_to_bool(self.get("USE_MANAGED_IDENTITY", "False")):
+            logger.info("Using DefaultAzureCredential (managed identity)")
+            return DefaultAzureCredential()
+        else:
+            logger.info("Using ClientSecretCredential")
+            return ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID"), 
+                client_id=self.get("AZURE_CLIENT_ID"), 
+                client_secret=self.get("AZURE_CLIENT_SECRET")
+            )
     
-    def _verify_database(self) -> bool:
-        """
-        Verify database connection and pgvector extension.
-        
-        Returns:
-            bool: True if verification succeeds, False otherwise
-        """
+    def set_certificate_path(self, path: str):
+        """Set the certificate path for SSL verification."""
         try:
-            # Check database health
-            health = self.db_manager.health_check()
+            if not os.path.isabs(path):
+                path = os.path.abspath(path)
             
-            if health["status"] != "healthy":
-                logger.error(f"Database health check failed: {health.get('error', 'Unknown error')}")
-                return False
-            
-            # Check if pgvector extension is enabled
-            if not health.get("vector_enabled", False):
-                logger.error("pgvector extension is not enabled in the database")
-                return False
-            
-            # Check if business_terms table exists
-            with self.db_manager.get_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                    SELECT EXISTS (
-                        SELECT FROM information_schema.tables 
-                        WHERE table_name = 'business_terms'
-                    );
-                    """)
-                    
-                    table_exists = cursor.fetchone()[0]
-                    
-                    if not table_exists:
-                        logger.error("business_terms table does not exist in the database")
-                        return False
-            
-            return True
-        
+            if os.path.exists(path):
+                if is_file_readable(path):
+                    self.set("REQUESTS_CA_BUNDLE", path)
+                    self.set("SSL_CERT_FILE", path)
+                    self.set("CURL_CA_BUNDLE", path)
+                    logger.info(f"Certificate path set to {path}")
+                else:
+                    logger.warning(f"Certificate file {path} exists but is not readable")
+            else:
+                logger.warning(f"Certificate file {path} not found, using system certificates")
         except Exception as e:
-            logger.error(f"Database verification failed: {e}")
-            return False
-    
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type(Exception),
-        reraise=True
-    )
-    def import_terms_from_csv(self, csv_path: str, encoding: str = 'utf-8', batch_size: int = 100) -> int:
-        """
-        Import business terms from a CSV file.
-        
-        Args:
-            csv_path: Path to the CSV file
-            encoding: File encoding (auto-detected if not provided)
-            batch_size: Number of terms to process in each batch
-            
-        Returns:
-            Number of terms imported
-        """
-        try:
-            # Get existing terms
-            existing_terms = {}
-            for term in self.get_all_terms():
-                term_key = f"{term.name}::{term.description}"
-                existing_terms[term_key] = term.id
-            
-            # Track terms in CSV
-            csv_term_keys = set()
-            terms_to_add = []
-            
-            # Read terms from CSV
-            with open(csv_path, 'r', encoding=encoding) as csvfile:
-                reader = csv.DictReader(csvfile)
-                for row in reader:
-                    if 'id' not in row or 'name' not in row or 'description' not in row:
-                        logger.warning(f"Skipping row with missing required fields: {row}")
-                        continue
-                    
-                    term_id = row['id'].strip()
-                    name = row['name'].strip()
-                    description = row['description'].strip()
-                    
-                    if not term_id:
-                        logger.warning(f"Skipping term with empty ID: {name}")
-                        continue
-                    
-                    term_key = f"{name}::{description}"
-                    csv_term_keys.add(term_key)
-                    
-                    # Skip if term already exists and is unchanged
-                    if term_key in existing_terms and existing_terms[term_key] == term_id:
-                        continue
-                    
-                    # Extract metadata if present in CSV
-                    metadata = {}
-                    for key, value in row.items():
-                        if key not in ['id', 'name', 'description'] and value:
-                            metadata[key] = value
-                    
-                    terms_to_add.append({
-                        "id": term_id,
-                        "name": name,
-                        "description": description,
-                        "term_key": term_key,
-                        "metadata": metadata
-                    })
-            
-            # Process terms in batches
-            added_count = 0
-            for i in range(0, len(terms_to_add), batch_size):
-                batch = terms_to_add[i:i + batch_size]
-                batch_start_time = time.time()
-                
-                # Create batch of vectors to insert
-                vectors_batch = []
-                for term in batch:
-                    # Generate embedding for the term
-                    doc = MyDocument(
-                        id=term["id"],
-                        text=f"{term['name']}. {term['description']}"
-                    )
-                    
-                    doc_with_embedding = self.embedding_client.generate_embeddings(doc)
-                    
-                    if not doc_with_embedding.embedding:
-                        logger.warning(f"Skipping term without embedding: {term['name']}")
-                        continue
-                    
-                    vectors_batch.append({
-                        "id": term["id"],
-                        "name": term["name"],
-                        "description": term["description"],
-                        "embedding": doc_with_embedding.embedding,
-                        "metadata": term.get("metadata", {})
-                    })
-                
-                # Batch insert into database
-                if vectors_batch:
-                    inserted = self.db_manager.batch_store_vectors(vectors_batch)
-                    added_count += inserted
-                    
-                    batch_duration = time.time() - batch_start_time
-                    logger.info(f"Processed batch {i//batch_size + 1}/{(len(terms_to_add) + batch_size - 1)//batch_size}: "
-                               f"{inserted} terms in {batch_duration:.2f}s "
-                               f"({inserted/batch_duration:.2f} terms/sec)")
-            
-            # Handle term deletion (terms that exist in the database but not in the CSV)
-            deleted_count = 0
-            terms_to_delete = []
-            for term_key, term_id in existing_terms.items():
-                if term_key not in csv_term_keys:
-                    terms_to_delete.append(term_id)
-            
-            # Delete in batches
-            for i in range(0, len(terms_to_delete), batch_size):
-                batch = terms_to_delete[i:i + batch_size]
-                deleted_in_batch = 0
-                
-                for term_id in batch:
-                    if self.db_manager.delete_term(term_id):
-                        deleted_in_batch += 1
-                
-                deleted_count += deleted_in_batch
-                if deleted_in_batch > 0:
-                    logger.info(f"Deleted batch of {deleted_in_batch} terms")
-            
-            logger.info(f"Import summary: Added {added_count} terms, deleted {deleted_count} terms")
-            return added_count
-        
-        except Exception as e:
-            logger.error(f"Error importing terms from CSV: {e}")
+            logger.error(f"Error setting certificate path: {e}")
             raise
     
-    def tag_element(self, element_id: str, name: str, description: str, top_k: int = 3) -> TaggingResult:
-        """
-        Tag a data element with the most similar business terms.
-        
-        Args:
-            element_id: Unique identifier for the element
-            name: Enhanced name of the element
-            description: Enhanced description of the element
-            top_k: Number of top matching terms to return
-            
-        Returns:
-            TaggingResult containing matching terms and confidence scores
-        """
+    def bulk_set(self, dotenvfile: str, print_val: bool = False) -> None:
+        """Load environment variables from a dotenv file."""
         try:
-            # Validate inputs
-            if not name or not description:
-                logger.warning(f"Empty name or description for element: {element_id}")
-                return TaggingResult(
-                    element_id=element_id,
-                    element_name=name or "",
-                    element_description=description or "",
-                    matching_terms=[],
-                    confidence_scores=[],
-                    modeling_required=True,
-                    message="Name or description is empty. Modeling should be performed."
-                )
+            if not os.path.isabs(dotenvfile):
+                dotenvfile = os.path.abspath(dotenvfile)
             
-            # Create document with embedding
-            doc = MyDocument(
-                id=element_id,
-                text=f"{name}. {description}"
-            )
-            
-            doc_with_embedding = self.embedding_client.generate_embeddings(doc)
-            
-            if not doc_with_embedding.embedding:
-                logger.warning(f"Could not generate embedding for element: {name}")
-                return TaggingResult(
-                    element_id=element_id,
-                    element_name=name,
-                    element_description=description,
-                    matching_terms=[],
-                    confidence_scores=[],
-                    modeling_required=True,
-                    message="Could not generate embedding. Modeling should be performed."
-                )
-            
-            # Query for similar terms
-            similar_terms = self.db_manager.find_similar_vectors(
-                query_vector=doc_with_embedding.embedding,
-                top_k=top_k * 2,  # Fetch more and filter later
-                threshold=self.similarity_threshold
-            )
-            
-            # If no similar terms found, recommend modeling
-            if not similar_terms:
-                return TaggingResult(
-                    element_id=element_id,
-                    element_name=name,
-                    element_description=description,
-                    matching_terms=[],
-                    confidence_scores=[],
-                    modeling_required=True,
-                    message=f"Similarity is less than {self.similarity_threshold*100}%. Modeling should be performed."
-                )
-            
-            # Format matching terms and filter by top_k
-            matching_terms = []
-            confidence_scores = []
-            
-            # Sort by similarity (in case DB didn't return in sorted order)
-            similar_terms.sort(key=lambda x: x["similarity"], reverse=True)
-            
-            # Take top_k items
-            for term in similar_terms[:top_k]:
-                matching_terms.append({
-                    "id": term["id"],
-                    "name": term["name"],
-                    "description": term["description"],
-                    "similarity": term["similarity"]
-                })
-                confidence_scores.append(term["similarity"])
-            
-            return TaggingResult(
-                element_id=element_id,
-                element_name=name,
-                element_description=description,
-                matching_terms=matching_terms,
-                confidence_scores=confidence_scores,
-                modeling_required=False,
-                message=""
-            )
-            
+            if os.path.exists(dotenvfile) and is_file_readable(dotenvfile):
+                temp_dict = dotenv_values(dotenvfile)
+                for key, value in temp_dict.items():
+                    self.set(key, value, print_val)
+                del temp_dict
+                logger.info(f"Loaded environment from {dotenvfile}")
+            else:
+                logger.warning(f"Environment file {dotenvfile} not found or not readable, skipping")
         except Exception as e:
-            logger.error(f"Error tagging element: {e}", exc_info=True)
-            
-            # Attempt fallback matching using direct vector comparison
-            try:
-                logger.info(f"Attempting fallback matching for element: {element_id}")
-                
-                # Get all terms
-                all_terms = self.get_all_terms()
-                if not all_terms:
-                    logger.warning("No business terms available for fallback matching")
-                    return TaggingResult(
-                        element_id=element_id,
-                        element_name=name,
-                        element_description=description,
-                        matching_terms=[],
-                        confidence_scores=[],
-                        modeling_required=True,
-                        message="Business terms repository is not available. Modeling should be performed."
-                    )
-                
-                # Compare directly with available terms using dot product
-                # This is a slow fallback method but ensures we can still match
-                # even if the database query fails
-                return TaggingResult(
-                    element_id=element_id,
-                    element_name=name,
-                    element_description=description,
-                    matching_terms=[],
-                    confidence_scores=[],
-                    modeling_required=True,
-                    message=f"Error during tagging: {str(e)}. Modeling should be performed."
-                )
-            except Exception as fallback_error:
-                logger.error(f"Fallback matching also failed: {fallback_error}")
-                return TaggingResult(
-                    element_id=element_id,
-                    element_name=name,
-                    element_description=description,
-                    matching_terms=[],
-                    confidence_scores=[],
-                    modeling_required=True,
-                    message=f"Error during tagging: {str(e)}. Modeling should be performed."
-                )
+            logger.error(f"Error loading environment variables from {dotenvfile}: {e}")
+            raise
     
-    async def validate_tagging(self, tagging_result: TaggingResult) -> TaggingValidationResult:
-        """
-        Validate the tagging result.
-        
-        Args:
-            tagging_result: Result of tagging to validate
-            
-        Returns:
-            TaggingValidationResult with validation status and suggestions
-        """
+    def set(self, key: str, value: str, print_val: bool = False) -> None:
+        """Set an environment variable."""
         try:
-            # Skip validation if modeling is required
-            if tagging_result.modeling_required:
-                return TaggingValidationResult(
-                    is_valid=False,
-                    feedback=tagging_result.message,
-                    suggested_alternatives=[]
-                )
-                
-            # If no matching terms, validation fails
-            if not tagging_result.matching_terms:
-                return TaggingValidationResult(
-                    is_valid=False,
-                    feedback="No matching terms found",
-                    suggested_alternatives=[]
-                )
-            
-            # Get highest confidence score
-            highest_confidence = max(tagging_result.confidence_scores) if tagging_result.confidence_scores else 0.0
-            
-            # If highest confidence is barely above threshold, find alternatives
-            if highest_confidence < 0.75:
-                # Try to find better alternatives
-                alternative_doc = MyDocument(
-                    id=tagging_result.element_id,
-                    text=tagging_result.element_name  # Use just the name for alternative searching
-                )
-                
-                alternative_doc_with_embedding = self.embedding_client.generate_embeddings(alternative_doc)
-                
-                if alternative_doc_with_embedding.embedding:
-                    # Exclude already matched terms
-                    matched_ids = [term["id"] for term in tagging_result.matching_terms]
-                    
-                    all_similar_terms = self.db_manager.find_similar_vectors(
-                        query_vector=alternative_doc_with_embedding.embedding,
-                        top_k=10,  # Get more to filter out already matched terms
-                        threshold=self.similarity_threshold
-                    )
-                    
-                    # Filter out already matched terms
-                    alternative_terms = [
-                        term for term in all_similar_terms
-                        if term["id"] not in matched_ids
-                    ][:3]  # Limit to top 3 alternatives
-                    
-                    if alternative_terms:
-                        return TaggingValidationResult(
-                            is_valid=False,
-                            feedback="Low confidence in matching terms. Alternative terms found.",
-                            suggested_alternatives=alternative_terms
-                        )
-            
-            # Default case - validation passes
-            return TaggingValidationResult(
-                is_valid=True,
-                feedback="Matching terms found with good confidence",
-                suggested_alternatives=[]
-            )
-            
+            os.environ[key] = value
+            if key not in self.var_list:
+                self.var_list.append(key)
+            if print_val:
+                if key in {'AZURE_CLIENT_SECRET', 'AD_USER_PW', 'PG_PASSWORD'}:
+                    logger.info(f"{key}: [REDACTED]")
+                else:
+                    logger.info(f"{key}: {value}")
         except Exception as e:
-            logger.error(f"Error validating tagging: {e}")
-            return TaggingValidationResult(
-                is_valid=False,
-                feedback=f"Error during validation: {str(e)}",
-                suggested_alternatives=[]
-            )
+            logger.error(f"Error setting environment variable {key}: {e}")
+            raise
     
-    def get_all_terms(self) -> List[BusinessTerm]:
-        """
-        Get all business terms in the collection.
-        
-        Returns:
-            List of BusinessTerm objects
-        """
+    def get(self, key: str, default: Optional[str] = None) -> str:
+        """Get an environment variable."""
         try:
-            term_dicts = self.db_manager.get_all_terms()
-            
-            terms = []
-            for term_dict in term_dicts:
-                terms.append(BusinessTerm(
-                    id=term_dict["id"],
-                    name=term_dict["name"],
-                    description=term_dict["description"],
-                    metadata=term_dict.get("metadata", {})
-                ))
-                
-            return terms
+            return os.environ.get(key, default)
         except Exception as e:
-            logger.error(f"Error retrieving all terms: {e}")
-            return []
+            logger.error(f"Error getting environment variable {key}: {e}")
+            raise
     
-    def get_term_by_id(self, term_id: str) -> Optional[BusinessTerm]:
-        """
-        Get a business term by its ID.
-        
-        Args:
-            term_id: Unique identifier of the term
-            
-        Returns:
-            BusinessTerm if found, None otherwise
-        """
+    def set_proxy(self) -> None:
+        """Set up proxy configuration."""
         try:
-            term_dict = self.db_manager.get_term_by_id(term_id)
+            ad_username = self.get("AD_USERNAME")
+            ad_password = self.get("AD_USER_PW")
+            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
             
-            if term_dict:
-                return BusinessTerm(
-                    id=term_dict["id"],
-                    name=term_dict["name"],
-                    description=term_dict["description"],
-                    metadata=term_dict.get("metadata", {})
-                )
+            if not all([ad_username, ad_password, proxy_domain]):
+                logger.error("Proxy settings are incomplete, cannot configure proxy")
+                raise ValueError("Proxy settings are incomplete. Check AD_USERNAME, AD_USER_PW, and HTTPS_PROXY_DOMAIN")
             
-            return None
+            # Use http:// instead of https:// as the proxy only supports HTTP
+            proxy_url = f"http://{ad_username}:{ad_password}@{proxy_domain}"
+            self.set("HTTP_PROXY", proxy_url, print_val=False)
+            self.set("HTTPS_PROXY", proxy_url, print_val=False)
+            
+            # Set no_proxy domains
+            no_proxy_domains = [
+                'cognitiveservices.azure.com',
+                'search.windows.net',
+                'openai.azure.com',
+                'core.windows.net',
+                'azurewebsites.net'
+            ]
+            
+            # Add any custom NO_PROXY entries from environment
+            custom_no_proxy = self.get("CUSTOM_NO_PROXY", "")
+            if custom_no_proxy:
+                no_proxy_domains.extend(custom_no_proxy.split(","))
+            
+            # Add PostgreSQL host to NO_PROXY if it's not localhost
+            pg_host = self.get("PG_HOST")
+            if pg_host and pg_host not in ["localhost", "127.0.0.1"]:
+                no_proxy_domains.append(pg_host)
+            
+            self.set("NO_PROXY", ",".join(no_proxy_domains), print_val=False)
+            logger.info("Proxy settings configured with HTTP protocol")
+            logger.info(f"NO_PROXY domains: {', '.join(no_proxy_domains)}")
         except Exception as e:
-            logger.error(f"Error retrieving term by ID: {e}")
+            logger.error(f"Error setting proxy: {e}")
+            raise
+    
+    def get_azure_token(self) -> str:
+        """Get an Azure AD token for authenticated API calls."""
+        try:
+            credential = ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID"),
+                client_id=self.get("AZURE_CLIENT_ID"),
+                client_secret=self.get("AZURE_CLIENT_SECRET")
+            )
+            token = credential.get_token("https://cognitiveservices.azure.com/.default")
+            self.set("AZURE_TOKEN", token.token, print_val=False)
+            logger.info("Azure token set successfully")
+            return token.token
+        except Exception as e:
+            logger.error(f"Error retrieving Azure token: {e}")
             return None
     
-    def get_term_count(self) -> int:
-        """
-        Get the total count of business terms.
-        
-        Returns:
-            Total number of terms
-        """
-        try:
-            with self.db_manager.get_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("SELECT COUNT(*) FROM business_terms")
-                    return cursor.fetchone()[0]
-        except Exception as e:
-            logger.error(f"Error getting term count: {e}")
-            return 0
+    def list_env_vars(self) -> None:
+        """List all environment variables (with sensitive values redacted)."""
+        for var in self.var_list:
+            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET', 'PG_PASSWORD'}:
+                logger.info(f"{var}: [REDACTED]")
+            else:
+                logger.info(f"{var}: {os.getenv(var)}")
+
+# Singleton instance for application-wide access
+_os_env_instance = None
+
+def get_os_env(
+    config_file: str = CONFIG_PATH, 
+    creds_file: str = CREDS_PATH, 
+    certificate_path: str = CERT_PATH,
+    proxy_enabled: Optional[bool] = None
+) -> OSEnv:
+    """
+    Get the OSEnv instance.
     
-    def delete_term(self, term_id: str) -> bool:
-        """
-        Delete a business term by ID.
-        
-        Args:
-            term_id: ID of the term to delete
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            return self.db_manager.delete_term(term_id)
-        except Exception as e:
-            logger.error(f"Error deleting term: {e}")
-            return False
+    Args:
+        config_file: Path to configuration file
+        creds_file: Path to credentials file
+        certificate_path: Path to SSL certificate
+        proxy_enabled: Override the PROXY_ENABLED setting in the config file
+    """
+    global _os_env_instance
+    if _os_env_instance is None:
+        _os_env_instance = OSEnv(config_file, creds_file, certificate_path, proxy_enabled)
+    elif proxy_enabled is not None and proxy_enabled != str_to_bool(_os_env_instance.get("PROXY_ENABLED", "False")):
+        # If proxy_enabled changes, recreate the instance
+        logger.info("Re-initializing environment with new proxy settings")
+        _os_env_instance = OSEnv(config_file, creds_file, certificate_path, proxy_enabled)
     
-    def delete_all_terms(self) -> int:
-        """
-        Delete all business terms.
-        
-        Returns:
-            Number of terms deleted
-        """
-        try:
-            with self.db_manager.get_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("DELETE FROM business_terms")
-                    deleted = cursor.rowcount
-                    conn.commit()
-                    return deleted
-        except Exception as e:
-            logger.error(f"Error deleting all terms: {e}")
-            return 0
-    
-    def search_terms(self, query: str, limit: int = 20) -> List[BusinessTerm]:
-        """
-        Search for business terms by name or description.
-        
-        Args:
-            query: Search query
-            limit: Maximum number of results
-            
-        Returns:
-            List of matching BusinessTerm objects
-        """
-        try:
-            with self.db_manager.get_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                    SELECT id, name, description, metadata
-                    FROM business_terms
-                    WHERE 
-                        name ILIKE %s OR 
-                        description ILIKE %s
-                    ORDER BY 
-                        CASE WHEN name ILIKE %s THEN 0 ELSE 1 END,
-                        CASE WHEN description ILIKE %s THEN 0 ELSE 1 END,
-                        name
-                    LIMIT %s
-                    """, (f"%{query}%", f"%{query}%", f"{query}%", f"{query}%", limit))
-                    
-                    results = []
-                    for row in cursor.fetchall():
-                        id, name, description, metadata = row
-                        results.append(BusinessTerm(
-                            id=id,
-                            name=name,
-                            description=description,
-                            metadata=metadata or {}
-                        ))
-                    
-                    return results
-        except Exception as e:
-            logger.error(f"Error searching terms: {e}")
-            return []
-    
-    def compute_similarity(self, text1: str, text2: str) -> float:
-        """
-        Compute semantic similarity between two text strings.
-        
-        Args:
-            text1: First text
-            text2: Second text
-            
-        Returns:
-            Similarity score between 0 and 1
-        """
-        try:
-            # Generate embeddings
-            doc1 = MyDocument(id="temp1", text=text1)
-            doc2 = MyDocument(id="temp2", text=text2)
-            
-            doc1_with_embedding = self.embedding_client.generate_embeddings(doc1)
-            doc2_with_embedding = self.embedding_client.generate_embeddings(doc2)
-            
-            if not doc1_with_embedding.embedding or not doc2_with_embedding.embedding:
-                logger.warning("Could not generate embeddings for similarity computation")
-                return 0.0
-            
-            # Compute cosine similarity
-            return self.db_manager.compute_cosine_similarity(
-                doc1_with_embedding.embedding,
-                doc2_with_embedding.embedding
-            )
-        except Exception as e:
-            logger.error(f"Error computing similarity: {e}")
-            return 0.0
+    return _os_env_instance
