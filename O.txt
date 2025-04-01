@@ -1,343 +1,351 @@
 import logging
-import os
-from typing import Dict, Any, List
-from fastapi import APIRouter, HTTPException, Request, Depends
-from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
-from fastapi.staticfiles import StaticFiles
-from app.config.environment import get_os_env, str_to_bool
+from typing import Dict, Any, List, Optional
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
+from langchain_openai import AzureChatOpenAI
+from app.core.models import (
+    DataElement, 
+    EnhancedDataElement, 
+    EnhancementRequest, 
+    EnhancementResponse, 
+    EnhancementStatus
+)
 from app.core.db_manager import DBManager
-from app.api.routes.enhancement import enhancement_jobs
-from app.api.routes.tagging import tagging_jobs
-from app.core.models import EnhancementStatus
-import psutil
-import time
-from datetime import datetime
+from app.agents.workflow import DataEnhancementWorkflow
+from app.config.settings import get_llm
+
+router = APIRouter(prefix="/api/v1", tags=["data-enhancement"])
+
+# In-memory cache for current jobs for fast access
+# The persistent storage is in PostgreSQL
+enhancement_jobs: Dict[str, Dict[str, Any]] = {}
 
 logger = logging.getLogger(__name__)
-router = APIRouter(tags=["dashboard"])
 
-# Set up templates
-templates_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "templates")
-os.makedirs(templates_dir, exist_ok=True)
-templates = Jinja2Templates(directory=templates_dir)
+def get_workflow() -> DataEnhancementWorkflow:
+    """Get the data enhancement workflow."""
+    llm = get_llm()
+    return DataEnhancementWorkflow(llm)
 
-# Create the templates directory and dashboard.html if they don't exist
-dashboard_html_path = os.path.join(templates_dir, "dashboard.html")
-if not os.path.exists(dashboard_html_path):
-    # Create a basic dashboard template
-    with open(dashboard_html_path, "w") as f:
-        f.write("""<!DOCTYPE html>
-<html>
-<head>
-    <title>Data Element Enhancement API Dashboard</title>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/htmx.org@1.9.2"></script>
-    <script src="https://unpkg.com/alpinejs@3.12.3/dist/cdn.min.js" defer></script>
-    <style>
-        [x-cloak] { display: none !important; }
-    </style>
-</head>
-<body class="bg-gray-100">
-    <div class="min-h-screen">
-        <nav class="bg-blue-600 text-white p-4">
-            <div class="container mx-auto flex justify-between items-center">
-                <h1 class="text-2xl font-bold">Data Element Enhancement API</h1>
-                <div>
-                    <span id="current-time" class="text-sm"></span>
-                </div>
-            </div>
-        </nav>
-        
-        <div class="container mx-auto p-4">
-            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-6">
-                <!-- System Status Card -->
-                <div class="bg-white rounded-lg shadow p-4">
-                    <h2 class="text-lg font-semibold mb-2">System Status</h2>
-                    <div id="system-status" hx-get="/api/dashboard/system-status" hx-trigger="load, every 10s" hx-swap="innerHTML">
-                        Loading...
-                    </div>
-                </div>
-                
-                <!-- Proxy Settings Card -->
-                <div class="bg-white rounded-lg shadow p-4">
-                    <h2 class="text-lg font-semibold mb-2">Proxy Settings</h2>
-                    <div id="proxy-settings" hx-get="/api/dashboard/proxy-status" hx-trigger="load, every 10s" hx-swap="innerHTML">
-                        Loading...
-                    </div>
-                </div>
-                
-                <!-- PostgreSQL Status Card -->
-                <div class="bg-white rounded-lg shadow p-4">
-                    <h2 class="text-lg font-semibold mb-2">PostgreSQL Status</h2>
-                    <div id="postgres-status" hx-get="/api/dashboard/postgres-status" hx-trigger="load, every 10s" hx-swap="innerHTML">
-                        Loading...
-                    </div>
-                </div>
-            </div>
-            
-            <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                <!-- Active Enhancement Jobs -->
-                <div class="bg-white rounded-lg shadow p-4">
-                    <h2 class="text-lg font-semibold mb-2">Active Enhancement Jobs</h2>
-                    <div id="enhancement-jobs" hx-get="/api/dashboard/enhancement-jobs" hx-trigger="load, every 5s" hx-swap="innerHTML">
-                        Loading...
-                    </div>
-                </div>
-                
-                <!-- Active Tagging Jobs -->
-                <div class="bg-white rounded-lg shadow p-4">
-                    <h2 class="text-lg font-semibold mb-2">Active Tagging Jobs</h2>
-                    <div id="tagging-jobs" hx-get="/api/dashboard/tagging-jobs" hx-trigger="load, every 5s" hx-swap="innerHTML">
-                        Loading...
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
+def get_db():
+    """Get the database manager."""
+    return DBManager()
+
+@router.post("/validate", response_model=Dict[str, Any])
+async def validate_data_element(data_element: DataElement):
+    """
+    Validate a data element against ISO/IEC 11179 standards.
     
-    <script>
-        // Update current time
-        function updateTime() {
-            const now = new Date();
-            document.getElementById('current-time').textContent = now.toLocaleString();
+    This endpoint performs initial validation without enhancement.
+    """
+    logger.info(f"Validating data element: {data_element.id}")
+    workflow = get_workflow()
+    try:
+        # Run just the validation step
+        result = await workflow.validator.validate(data_element)
+        return {
+            "id": data_element.id,
+            "is_valid": result.is_valid,
+            "quality_status": result.quality_status,
+            "feedback": result.feedback,
+            "suggested_improvements": result.suggested_improvements
+        }
+    except Exception as e:
+        logger.error(f"Validation error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Validation error: {str(e)}")
+
+@router.post("/enhance", response_model=EnhancementResponse)
+async def enhance_data_element(
+    request: EnhancementRequest,
+    background_tasks: BackgroundTasks,
+    db: DBManager = Depends(get_db)
+):
+    """
+    Enhance a data element to meet ISO/IEC 11179 standards.
+    This is an asynchronous operation that will run in the background.
+    """
+    # Use the provided ID as the request ID for tracking
+    request_id = request.data_element.id
+    logger.info(f"Enhancement request received for data element: {request_id}")
+    
+    # Check if this ID is already being processed in memory
+    if request_id in enhancement_jobs:
+        logger.info(f"Enhancement job already exists in memory for ID: {request_id}")
+        job = enhancement_jobs[request_id]
+        
+        # If already completed or failed, return the result
+        if job["status"] in [EnhancementStatus.COMPLETED, EnhancementStatus.FAILED]:
+            return EnhancementResponse(
+                request_id=request_id,
+                status=job["status"],
+                enhanced_data=job["result"] if job["status"] == EnhancementStatus.COMPLETED else None,
+                error_message=job["error"] if job["status"] == EnhancementStatus.FAILED else None
+            )
+        
+        # Otherwise, return the current status
+        return EnhancementResponse(
+            request_id=request_id,
+            status=job["status"],
+            enhanced_data=None,
+            error_message=None
+        )
+    
+    # Check if job exists in the database
+    db_job = db.get_job(request_id)
+    if db_job is not None:
+        # Job exists in database
+        status = EnhancementStatus(db_job["status"])
+        
+        # Load job data from database to memory for faster access
+        enhancement_jobs[request_id] = {
+            "status": status,
+            "request": db_job["data"].get("request", {}),
+            "result": db_job["data"].get("result", None),
+            "error": db_job["data"].get("error", None)
         }
         
-        setInterval(updateTime, 1000);
-        updateTime();
+        # If already completed or failed, return the result
+        if status in [EnhancementStatus.COMPLETED, EnhancementStatus.FAILED]:
+            return EnhancementResponse(
+                request_id=request_id,
+                status=status,
+                enhanced_data=enhancement_jobs[request_id]["result"] if status == EnhancementStatus.COMPLETED else None,
+                error_message=enhancement_jobs[request_id]["error"] if status == EnhancementStatus.FAILED else None
+            )
         
-        // Toggle proxy setting
-        function toggleProxy(enabled) {
-            fetch('/api/v1/settings/proxy', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({ enabled: enabled })
-            })
-            .then(response => response.json())
-            .then(data => {
-                // Refresh the proxy status component
-                document.getElementById('proxy-settings').setAttribute('hx-trigger', 'load');
-                htmx.process(document.getElementById('proxy-settings'));
-            })
-            .catch(error => {
-                console.error('Error toggling proxy:', error);
-                alert('Error toggling proxy setting. See console for details.');
-            });
+        # Otherwise, return the current status
+        return EnhancementResponse(
+            request_id=request_id,
+            status=status,
+            enhanced_data=None,
+            error_message=None
+        )
+    
+    # Initialize job status in memory
+    enhancement_jobs[request_id] = {
+        "status": EnhancementStatus.PENDING,
+        "request": request.dict(),
+        "result": None,
+        "error": None
+    }
+    
+    # Store job in database
+    db.store_job(
+        job_id=request_id,
+        job_type="enhancement",
+        status=EnhancementStatus.PENDING.value,
+        data={
+            "request": request.dict(),
+            "result": None,
+            "error": None
         }
-    </script>
-</body>
-</html>""")
-    logger.info(f"Created dashboard template at {dashboard_html_path}")
+    )
+    
+    # Add the enhancement task to the background tasks
+    background_tasks.add_task(
+        run_enhancement_job,
+        request_id=request_id,
+        data_element=request.data_element,
+        max_iterations=request.max_iterations
+    )
+    
+    return EnhancementResponse(
+        request_id=request_id,
+        status=EnhancementStatus.PENDING,
+        enhanced_data=None,
+        error_message=None
+    )
 
+@router.get("/enhance/{request_id}", response_model=EnhancementResponse)
+async def get_enhancement_status(request_id: str, db: DBManager = Depends(get_db)):
+    """
+    Get the status of an enhancement job.
+    """
+    # First check in-memory cache for faster access
+    if request_id in enhancement_jobs:
+        job = enhancement_jobs[request_id]
+        
+        return EnhancementResponse(
+            request_id=request_id,
+            status=job["status"],
+            enhanced_data=job["result"] if job["status"] == EnhancementStatus.COMPLETED else None,
+            error_message=job["error"] if job["status"] == EnhancementStatus.FAILED else None
+        )
+    
+    # If not in memory, check the database
+    db_job = db.get_job(request_id)
+    if db_job is None:
+        raise HTTPException(status_code=404, detail=f"Enhancement job {request_id} not found")
+    
+    # Convert status string to enum
+    status = EnhancementStatus(db_job["status"])
+    
+    # Load into memory cache for future requests
+    enhancement_jobs[request_id] = {
+        "status": status,
+        "request": db_job["data"].get("request", {}),
+        "result": db_job["data"].get("result", None),
+        "error": db_job["data"].get("error", None)
+    }
+    
+    return EnhancementResponse(
+        request_id=request_id,
+        status=status,
+        enhanced_data=enhancement_jobs[request_id]["result"] if status == EnhancementStatus.COMPLETED else None,
+        error_message=enhancement_jobs[request_id]["error"] if status == EnhancementStatus.FAILED else None
+    )
 
-@router.get("/dashboard", response_class=HTMLResponse)
-async def get_dashboard(request: Request):
-    """Render the dashboard UI."""
-    return templates.TemplateResponse("dashboard.html", {"request": request})
+@router.post("/enhance/batch", response_model=List[str])
+async def batch_enhance_data_elements(
+    requests: List[EnhancementRequest],
+    background_tasks: BackgroundTasks,
+    db: DBManager = Depends(get_db)
+):
+    """
+    Enhance multiple data elements in batch mode.
+    Returns a list of request IDs that can be used to check status.
+    """
+    request_ids = []
+    
+    for request in requests:
+        request_id = request.data_element.id
+        request_ids.append(request_id)
+        
+        # Skip if already processing in memory
+        if request_id in enhancement_jobs:
+            if enhancement_jobs[request_id]["status"] not in [EnhancementStatus.COMPLETED, EnhancementStatus.FAILED]:
+                continue
+        
+        # Check if job exists in database
+        db_job = db.get_job(request_id)
+        if db_job is not None:
+            status = EnhancementStatus(db_job["status"])
+            
+            # Skip if already completed or failed
+            if status in [EnhancementStatus.COMPLETED, EnhancementStatus.FAILED]:
+                # Load into memory cache
+                enhancement_jobs[request_id] = {
+                    "status": status,
+                    "request": db_job["data"].get("request", {}),
+                    "result": db_job["data"].get("result", None),
+                    "error": db_job["data"].get("error", None)
+                }
+                continue
+        
+        # Initialize job status
+        enhancement_jobs[request_id] = {
+            "status": EnhancementStatus.PENDING,
+            "request": request.dict(),
+            "result": None,
+            "error": None
+        }
+        
+        # Store job in database
+        db.store_job(
+            job_id=request_id,
+            job_type="enhancement",
+            status=EnhancementStatus.PENDING.value,
+            data={
+                "request": request.dict(),
+                "result": None,
+                "error": None
+            }
+        )
+        
+        # Add the enhancement task to the background tasks
+        background_tasks.add_task(
+            run_enhancement_job,
+            request_id=request_id,
+            data_element=request.data_element,
+            max_iterations=request.max_iterations
+        )
+    
+    return request_ids
 
+@router.delete("/enhance/{request_id}", response_model=Dict[str, Any])
+async def delete_enhancement_job(request_id: str, db: DBManager = Depends(get_db)):
+    """
+    Delete an enhancement job from the system.
+    """
+    # Check if job exists
+    if request_id not in enhancement_jobs and db.get_job(request_id) is None:
+        raise HTTPException(status_code=404, detail=f"Enhancement job {request_id} not found")
+    
+    # Get status from memory or database
+    status = None
+    if request_id in enhancement_jobs:
+        status = enhancement_jobs[request_id]["status"]
+    else:
+        db_job = db.get_job(request_id)
+        if db_job:
+            status = EnhancementStatus(db_job["status"])
+    
+    # Don't allow deleting running jobs
+    if status == EnhancementStatus.IN_PROGRESS:
+        raise HTTPException(status_code=400, detail=f"Cannot delete a job that is currently in progress")
+    
+    # Delete from memory
+    if request_id in enhancement_jobs:
+        del enhancement_jobs[request_id]
+    
+    # Delete from database
+    db.delete_job(request_id)
+    
+    return {"message": f"Enhancement job {request_id} deleted successfully"}
 
-@router.get("/dashboard/system-status", response_class=HTMLResponse)
-async def get_system_status_component():
-    """Get the system status component for the dashboard."""
+async def run_enhancement_job(request_id: str, data_element: DataElement, max_iterations: int = 5):
+    """
+    Run the enhancement job in the background.
+    """
+    logger.info(f"Starting enhancement job for {request_id}")
+    workflow = get_workflow()
+    db = DBManager()
+    
+    # Update job status to in progress
+    enhancement_jobs[request_id]["status"] = EnhancementStatus.IN_PROGRESS
+    
+    # Update database status
+    db.store_job(
+        job_id=request_id,
+        job_type="enhancement",
+        status=EnhancementStatus.IN_PROGRESS.value,
+        data=enhancement_jobs[request_id]
+    )
+    
     try:
-        # Get system metrics
-        cpu_percent = psutil.cpu_percent(interval=0.1)
-        memory = psutil.virtual_memory()
-        memory_percent = memory.percent
+        # Run the workflow
+        result = await workflow.run(data_element, max_iterations)
         
-        # Get uptime
-        uptime = time.time() - psutil.boot_time()
-        uptime_str = f"{int(uptime // 86400)}d {int((uptime % 86400) // 3600)}h {int((uptime % 3600) // 60)}m"
+        # Update job status to completed in memory
+        enhancement_jobs[request_id]["status"] = EnhancementStatus.COMPLETED
+        enhancement_jobs[request_id]["result"] = result
         
-        # Format HTML response
-        html = f"""
-        <div class="grid grid-cols-2 gap-2">
-            <div>
-                <p class="text-sm font-medium text-gray-600">CPU Usage</p>
-                <div class="w-full bg-gray-200 rounded-full h-2.5">
-                    <div class="bg-blue-600 h-2.5 rounded-full" style="width: {cpu_percent}%"></div>
-                </div>
-                <p class="text-xs mt-1">{cpu_percent}%</p>
-            </div>
-            <div>
-                <p class="text-sm font-medium text-gray-600">Memory Usage</p>
-                <div class="w-full bg-gray-200 rounded-full h-2.5">
-                    <div class="bg-blue-600 h-2.5 rounded-full" style="width: {memory_percent}%"></div>
-                </div>
-                <p class="text-xs mt-1">{memory_percent}% ({memory.used // (1024*1024)} MB / {memory.total // (1024*1024)} MB)</p>
-            </div>
-        </div>
-        <div class="mt-2">
-            <p class="text-sm"><span class="font-medium text-gray-600">System Uptime:</span> {uptime_str}</p>
-            <p class="text-sm"><span class="font-medium text-gray-600">Server Time:</span> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-        </div>
-        """
-        return HTMLResponse(content=html)
+        # Update database with result
+        db.store_job(
+            job_id=request_id,
+            job_type="enhancement",
+            status=EnhancementStatus.COMPLETED.value,
+            data={
+                "request": enhancement_jobs[request_id]["request"],
+                "result": result.dict(),
+                "error": None
+            }
+        )
+        
+        logger.info(f"Enhancement job completed for {request_id}")
     except Exception as e:
-        logger.error(f"Error retrieving system status: {e}")
-        return HTMLResponse(content=f"<p class='text-red-500'>Error retrieving system status: {str(e)}</p>")
-
-
-@router.get("/dashboard/proxy-status", response_class=HTMLResponse)
-async def get_proxy_status_component():
-    """Get the proxy status component for the dashboard."""
-    try:
-        env = get_os_env()
-        proxy_enabled = str_to_bool(env.get("PROXY_ENABLED", "False"))
+        # Update job status to failed in memory
+        logger.error(f"Enhancement job failed for {request_id}: {str(e)}")
+        enhancement_jobs[request_id]["status"] = EnhancementStatus.FAILED
+        enhancement_jobs[request_id]["error"] = str(e)
         
-        proxy_domain = env.get("HTTPS_PROXY_DOMAIN", "Not configured")
-        
-        # Format HTML response with toggle buttons
-        html = f"""
-        <div>
-            <p class="text-sm mb-2"><span class="font-medium text-gray-600">Proxy Status:</span> 
-                <span class="{'text-green-600 font-medium' if proxy_enabled else 'text-gray-500'}">
-                    {"Enabled" if proxy_enabled else "Disabled"}
-                </span>
-            </p>
-            <p class="text-sm mb-3"><span class="font-medium text-gray-600">Proxy Domain:</span> {proxy_domain}</p>
-            
-            <div class="flex space-x-2">
-                <button onclick="toggleProxy(true)" 
-                        class="{'bg-blue-600 text-white' if proxy_enabled else 'bg-gray-200 text-gray-700'} px-3 py-1 rounded text-sm">
-                    Enable
-                </button>
-                <button onclick="toggleProxy(false)" 
-                        class="{'bg-blue-600 text-white' if not proxy_enabled else 'bg-gray-200 text-gray-700'} px-3 py-1 rounded text-sm">
-                    Disable
-                </button>
-            </div>
-        </div>
-        """
-        return HTMLResponse(content=html)
-    except Exception as e:
-        logger.error(f"Error retrieving proxy status: {e}")
-        return HTMLResponse(content=f"<p class='text-red-500'>Error retrieving proxy status: {str(e)}</p>")
-
-
-@router.get("/dashboard/postgres-status", response_class=HTMLResponse)
-async def get_postgres_status_component():
-    """Get the PostgreSQL status component for the dashboard."""
-    try:
-        # Get database status from DB manager
-        db_manager = DBManager()
-        db_health = db_manager.health_check()
-        
-        status_color = "text-green-600 font-medium" if db_health["status"] == "healthy" else "text-red-500 font-medium"
-        
-        # Format HTML response
-        html = f"""
-        <div>
-            <p class="text-sm mb-2">
-                <span class="font-medium text-gray-600">Database Status:</span> 
-                <span class="{status_color}">
-                    {db_health["status"].capitalize()}
-                </span>
-            </p>
-            """
-        
-        if db_health["status"] == "healthy":
-            html += f"""
-            <p class="text-sm mb-2"><span class="font-medium text-gray-600">PostgreSQL Version:</span> {db_health["version"].split()[1]}</p>
-            <p class="text-sm mb-2"><span class="font-medium text-gray-600">pgvector Extension:</span> {'Enabled' if db_health["vector_enabled"] else 'Disabled'}</p>
-            <p class="text-sm mb-2"><span class="font-medium text-gray-600">Database Size:</span> {db_health["db_size_mb"]:.2f} MB</p>
-            <p class="text-sm mb-2"><span class="font-medium text-gray-600">Business Terms:</span> {db_health["terms_count"]}</p>
-            <p class="text-sm"><span class="font-medium text-gray-600">Active Connections:</span> {db_health["active_connections"]}</p>
-            """
-        else:
-            html += f"""
-            <p class="text-sm text-red-500">Error: {db_health.get("error", "Unknown error")}</p>
-            """
-        
-        html += "</div>"
-        return HTMLResponse(content=html)
-    except Exception as e:
-        logger.error(f"Error retrieving PostgreSQL status: {e}")
-        return HTMLResponse(content=f"<p class='text-red-500'>Error retrieving PostgreSQL status: {str(e)}</p>")
-
-
-@router.get("/dashboard/enhancement-jobs", response_class=HTMLResponse)
-async def get_enhancement_jobs_component():
-    """Get the enhancement jobs component for the dashboard."""
-    try:
-        if not enhancement_jobs:
-            return HTMLResponse(content="<p class='text-sm text-gray-500'>No active enhancement jobs</p>")
-        
-        jobs_html = ""
-        for job_id, job in enhancement_jobs.items():
-            status = job["status"]
-            status_color = {
-                EnhancementStatus.PENDING: "bg-yellow-100 text-yellow-800",
-                EnhancementStatus.IN_PROGRESS: "bg-blue-100 text-blue-800",
-                EnhancementStatus.COMPLETED: "bg-green-100 text-green-800",
-                EnhancementStatus.FAILED: "bg-red-100 text-red-800"
-            }.get(status, "bg-gray-100 text-gray-800")
-            
-            element_name = job["request"]["data_element"]["existing_name"]
-            
-            jobs_html += f"""
-            <div class="border rounded p-2 mb-2">
-                <div class="flex justify-between items-center">
-                    <div class="text-sm font-medium">{element_name}</div>
-                    <div class="text-xs px-2 py-1 rounded {status_color}">{status.value}</div>
-                </div>
-                <div class="text-xs text-gray-500 mt-1">ID: {job_id}</div>
-            </div>
-            """
-        
-        html = f"""
-        <div class="max-h-64 overflow-y-auto">
-            {jobs_html}
-        </div>
-        <div class="mt-2 text-xs text-gray-500">Total: {len(enhancement_jobs)} jobs</div>
-        """
-        return HTMLResponse(content=html)
-    except Exception as e:
-        logger.error(f"Error retrieving enhancement jobs: {e}")
-        return HTMLResponse(content=f"<p class='text-red-500'>Error retrieving enhancement jobs: {str(e)}</p>")
-
-
-@router.get("/dashboard/tagging-jobs", response_class=HTMLResponse)
-async def get_tagging_jobs_component():
-    """Get the tagging jobs component for the dashboard."""
-    try:
-        if not tagging_jobs:
-            return HTMLResponse(content="<p class='text-sm text-gray-500'>No active tagging jobs</p>")
-        
-        jobs_html = ""
-        for job_id, job in tagging_jobs.items():
-            element_name = job["tagging_result"]["element_name"]
-            terms_count = len(job["tagging_result"]["matching_terms"])
-            modeling_required = job["tagging_result"]["modeling_required"]
-            
-            status_color = "bg-green-100 text-green-800"
-            status_text = f"{terms_count} terms matched"
-            
-            if modeling_required:
-                status_color = "bg-yellow-100 text-yellow-800"
-                status_text = "Modeling required"
-            
-            jobs_html += f"""
-            <div class="border rounded p-2 mb-2">
-                <div class="flex justify-between items-center">
-                    <div class="text-sm font-medium">{element_name}</div>
-                    <div class="text-xs px-2 py-1 rounded {status_color}">{status_text}</div>
-                </div>
-                <div class="text-xs text-gray-500 mt-1">ID: {job_id}</div>
-            </div>
-            """
-        
-        html = f"""
-        <div class="max-h-64 overflow-y-auto">
-            {jobs_html}
-        </div>
-        <div class="mt-2 text-xs text-gray-500">Total: {len(tagging_jobs)} jobs</div>
-        """
-        return HTMLResponse(content=html)
-    except Exception as e:
-        logger.error(f"Error retrieving tagging jobs: {e}")
-        return HTMLResponse(content=f"<p class='text-red-500'>Error retrieving tagging jobs: {str(e)}</p>")
+        # Update database with error
+        db.store_job(
+            job_id=request_id,
+            job_type="enhancement",
+            status=EnhancementStatus.FAILED.value,
+            data={
+                "request": enhancement_jobs[request_id]["request"],
+                "result": None,
+                "error": str(e)
+            }
+        )
