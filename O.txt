@@ -1,286 +1,657 @@
-#!/usr/bin/env python
 """
-Load testing script for PostgreSQL with pgvector.
-This script tests the performance of vector search operations with various loads.
-
-Usage:
-    python -m tests.load_test_db --terms=10000 --queries=100 --concurrency=5
+PostgreSQL Database Manager with pgvector extension support.
+Handles connection pooling, vector operations, and database initialization.
 """
 
-import os
-import sys
-import time
-import random
-import string
 import logging
-import argparse
-import threading
-import concurrent.futures
-from typing import List, Dict, Any
-import numpy as np
+import os
+import time
+from contextlib import contextmanager
+from typing import List, Dict, Any, Optional, Generator, Tuple
 
-# Add parent directory to path for imports
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import numpy as np
+import psycopg2
+from psycopg2 import pool
+from psycopg2.extras import execute_values, DictCursor
+from sqlalchemy import create_engine, text, MetaData, Table, Column, String, Float, JSON, Integer
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from app.config.environment import get_os_env
-from app.core.db_manager import DBManager
-
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()]
-)
 
 logger = logging.getLogger(__name__)
 
-def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="Load test PostgreSQL with pgvector")
-    
-    parser.add_argument("--terms", type=int, default=1000,
-                        help="Number of terms to generate (default: 1000)")
-    
-    parser.add_argument("--queries", type=int, default=100,
-                        help="Number of queries to perform (default: 100)")
-    
-    parser.add_argument("--dimensions", type=int, default=1536,
-                        help="Embedding dimensions (default: 1536)")
-    
-    parser.add_argument("--concurrency", type=int, default=1,
-                        help="Number of concurrent clients (default: 1)")
-    
-    parser.add_argument("--batch-size", type=int, default=100,
-                        help="Batch size for inserts (default: 100)")
-    
-    parser.add_argument("--similarity-threshold", type=float, default=0.5,
-                        help="Similarity threshold for queries (default: 0.5)")
-    
-    parser.add_argument("--top-k", type=int, default=3,
-                        help="Number of results for queries (default: 3)")
-    
-    parser.add_argument("--clean", action="store_true",
-                        help="Clean up generated data after test")
-    
-    parser.add_argument("--pg-host", type=str, 
-                        help="PostgreSQL host")
-    parser.add_argument("--pg-port", type=int, 
-                        help="PostgreSQL port")
-    parser.add_argument("--pg-user", type=str, 
-                        help="PostgreSQL user")
-    parser.add_argument("--pg-password", type=str, 
-                        help="PostgreSQL password")
-    parser.add_argument("--pg-db", type=str, 
-                        help="PostgreSQL database name")
-    
-    return parser.parse_args()
+Base = declarative_base()
 
-def generate_random_string(length: int = 10) -> str:
-    """Generate a random string of given length."""
-    return ''.join(random.choices(string.ascii_lowercase, k=length))
-
-def generate_random_embedding(dimensions: int) -> List[float]:
-    """Generate a random embedding vector of given dimensions."""
-    vector = np.random.rand(dimensions)
-    return (vector / np.linalg.norm(vector)).tolist()  # Normalize to unit vector
-
-def generate_test_data(args) -> List[Dict[str, Any]]:
-    """Generate test data for load testing."""
-    logger.info(f"Generating {args.terms} test terms...")
+class DBManager:
+    """PostgreSQL Database Manager with pgvector support."""
     
-    terms = []
-    for i in range(args.terms):
-        term_id = f"test_term_{i}"
-        name = f"test {generate_random_string(8)} {generate_random_string(5)}"
-        description = f"This is a test term for {name} with random words {generate_random_string(20)}"
+    _instance = None
+    
+    def __new__(cls):
+        """Singleton pattern to ensure only one instance of the database connection pool."""
+        if cls._instance is None:
+            cls._instance = super(DBManager, cls).__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self):
+        """Initialize the PostgreSQL connection and pgvector extension."""
+        if self._initialized:
+            return
         
-        embedding = generate_random_embedding(args.dimensions)
+        self._initialized = True
+        self.env = get_os_env()
         
-        terms.append({
-            "id": term_id,
-            "name": name,
-            "description": description,
-            "embedding": embedding,
-            "metadata": {"test": True}
-        })
-    
-    return terms
-
-def insert_test_data(db_manager: DBManager, terms: List[Dict[str, Any]], batch_size: int) -> float:
-    """Insert test data into the database."""
-    logger.info(f"Inserting {len(terms)} terms in batches of {batch_size}...")
-    
-    start_time = time.time()
-    
-    inserted = 0
-    for i in range(0, len(terms), batch_size):
-        batch = terms[i:i + batch_size]
+        # Get PostgreSQL connection details
+        self.pg_host = self.env.get("PG_HOST", "localhost")
+        self.pg_port = int(self.env.get("PG_PORT", "5432"))
+        self.pg_user = self.env.get("PG_USER", "postgres")
+        self.pg_password = self.env.get("PG_PASSWORD", "postgres")
+        self.pg_db = self.env.get("PG_DB", "metadata_db")
         
-        count = db_manager.batch_store_vectors(batch)
-        inserted += count
+        # Configure connection pooling
+        self.min_connections = int(self.env.get("PG_MIN_CONNECTIONS", "2"))
+        self.max_connections = int(self.env.get("PG_MAX_CONNECTIONS", "10"))
         
-        if (i + batch_size) % 1000 == 0 or (i + batch_size) >= len(terms):
-            logger.info(f"Inserted {inserted}/{len(terms)} terms")
-    
-    duration = time.time() - start_time
-    logger.info(f"Inserted {inserted} terms in {duration:.2f} seconds ({inserted/duration:.2f} terms/sec)")
-    
-    return duration
-
-def perform_queries(db_manager: DBManager, terms: List[Dict[str, Any]], 
-                   args, thread_id: int = 0) -> List[Dict[str, Any]]:
-    """Perform vector search queries."""
-    queries_per_thread = args.queries // args.concurrency
-    if thread_id == args.concurrency - 1:
-        # Last thread gets any remainder
-        queries_per_thread += args.queries % args.concurrency
-    
-    logger.info(f"Thread {thread_id}: Performing {queries_per_thread} queries...")
-    
-    results = []
-    for i in range(queries_per_thread):
-        # Randomly select a term to query
-        query_term = random.choice(terms)
+        # Initialize connection pool and engine
+        self._setup_connection_pool()
+        self._setup_sqlalchemy()
         
-        # Start timing
-        start_time = time.time()
+        # Initialize the database if it doesn't exist
+        self._initialize_database()
         
-        # Perform query
-        similar_terms = db_manager.find_similar_vectors(
-            query_vector=query_term["embedding"],
-            top_k=args.top_k,
-            threshold=args.similarity_threshold
-        )
+        # Track connection statistics
+        self.connection_attempts = 0
+        self.successful_connections = 0
+        self.failed_connections = 0
         
-        # End timing
-        duration = time.time() - start_time
+        logger.info(f"Database manager initialized with host={self.pg_host}, port={self.pg_port}, db={self.pg_db}")
+    
+    def _setup_connection_pool(self):
+        """Set up a connection pool for PostgreSQL."""
+        try:
+            self.connection_pool = pool.ThreadedConnectionPool(
+                minconn=self.min_connections,
+                maxconn=self.max_connections,
+                host=self.pg_host,
+                port=self.pg_port,
+                user=self.pg_user,
+                password=self.pg_password,
+                database=self.pg_db
+            )
+            logger.info(f"Connection pool created with {self.min_connections}-{self.max_connections} connections")
+        except Exception as e:
+            logger.error(f"Failed to create connection pool: {e}")
+            self.connection_pool = None
+    
+    def _setup_sqlalchemy(self):
+        """Set up SQLAlchemy engine for ORM operations."""
+        try:
+            db_url = f"postgresql://{self.pg_user}:{self.pg_password}@{self.pg_host}:{self.pg_port}/{self.pg_db}"
+            self.engine = create_engine(db_url, pool_pre_ping=True)
+            self.Session = sessionmaker(bind=self.engine)
+            logger.info("SQLAlchemy engine initialized")
+        except Exception as e:
+            logger.error(f"Failed to create SQLAlchemy engine: {e}")
+            self.engine = None
+            self.Session = None
+    
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type((psycopg2.OperationalError, psycopg2.InterfaceError)),
+        reraise=True
+    )
+    def _initialize_database(self):
+        """Initialize database with required extensions and tables."""
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    try:
+                        # Create pgvector extension if it doesn't exist
+                        cursor.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+                        
+                        # Create business_terms table with vector support
+                        cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS business_terms (
+                            id VARCHAR(255) PRIMARY KEY,
+                            name VARCHAR(255) NOT NULL,
+                            description TEXT NOT NULL,
+                            embedding vector(1536),
+                            metadata JSONB
+                        );
+                        """)
+                        
+                        # Create index on vector column for similarity search
+                        cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS business_terms_embedding_idx 
+                        ON business_terms 
+                        USING ivfflat (embedding vector_cosine_ops) 
+                        WITH (lists = 100);
+                        """)
+                        
+                        # Create jobs table for tracking enhancement and tagging jobs
+                        cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS jobs (
+                            id VARCHAR(255) PRIMARY KEY,
+                            job_type VARCHAR(50) NOT NULL,
+                            status VARCHAR(50) NOT NULL,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            data JSONB
+                        );
+                        """)
+                        
+                        # Create stats table for monitoring
+                        cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS system_stats (
+                            id SERIAL PRIMARY KEY,
+                            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            cpu_usage FLOAT,
+                            memory_usage FLOAT,
+                            db_size BIGINT,
+                            active_connections INTEGER,
+                            enhancement_jobs_count INTEGER,
+                            tagging_jobs_count INTEGER
+                        );
+                        """)
+                        
+                        conn.commit()
+                        logger.info("Database initialized with required tables and extensions")
+                    except Exception as e:
+                        conn.rollback()
+                        logger.error(f"Error initializing database: {e}")
+                        raise
+        except Exception as e:
+            logger.error(f"Failed to initialize database: {e}")
+            raise
+    
+    @contextmanager
+    def get_connection(self) -> Generator:
+        """Get a connection from the pool with automatic cleanup."""
+        conn = None
+        self.connection_attempts += 1
         
-        # Record results
-        results.append({
-            "query_id": f"thread_{thread_id}_query_{i}",
-            "duration": duration,
-            "num_results": len(similar_terms),
-            "results": similar_terms
-        })
-    
-    return results
-
-def run_concurrent_queries(db_manager: DBManager, terms: List[Dict[str, Any]], args) -> List[Dict[str, Any]]:
-    """Run queries concurrently."""
-    logger.info(f"Running {args.queries} queries with {args.concurrency} concurrent clients...")
-    
-    start_time = time.time()
-    
-    all_results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as executor:
-        # Submit tasks
-        futures = [
-            executor.submit(perform_queries, db_manager, terms, args, thread_id)
-            for thread_id in range(args.concurrency)
-        ]
-        
-        # Collect results
-        for future in concurrent.futures.as_completed(futures):
-            all_results.extend(future.result())
-    
-    total_duration = time.time() - start_time
-    
-    # Calculate statistics
-    query_times = [result["duration"] for result in all_results]
-    avg_query_time = sum(query_times) / len(query_times)
-    min_query_time = min(query_times)
-    max_query_time = max(query_times)
-    p95_query_time = sorted(query_times)[int(len(query_times) * 0.95)]
-    
-    queries_per_second = len(all_results) / total_duration
-    
-    logger.info(f"Completed {len(all_results)} queries in {total_duration:.2f} seconds")
-    logger.info(f"Queries per second: {queries_per_second:.2f}")
-    logger.info(f"Average query time: {avg_query_time*1000:.2f} ms")
-    logger.info(f"Min query time: {min_query_time*1000:.2f} ms")
-    logger.info(f"Max query time: {max_query_time*1000:.2f} ms")
-    logger.info(f"95th percentile query time: {p95_query_time*1000:.2f} ms")
-    
-    return all_results
-
-def clean_up_test_data(db_manager: DBManager, terms: List[Dict[str, Any]]) -> None:
-    """Clean up test data from the database."""
-    logger.info(f"Cleaning up {len(terms)} test terms...")
-    
-    try:
-        with db_manager.get_connection() as conn:
-            with conn.cursor() as cursor:
-                # Delete all test terms
-                cursor.execute("""
-                DELETE FROM business_terms 
-                WHERE id LIKE 'test_term_%' AND metadata->>'test' = 'true'
-                """)
+        try:
+            if self.connection_pool is None:
+                # Try to recreate the pool if it's None
+                self._setup_connection_pool()
                 
-                deleted = cursor.rowcount
-                conn.commit()
-                
-                logger.info(f"Deleted {deleted} test terms")
-    except Exception as e:
-        logger.error(f"Error cleaning up test data: {e}")
-
-def main():
-    """Run the load test."""
-    args = parse_args()
+            conn = self.connection_pool.getconn()
+            self.successful_connections += 1
+            yield conn
+        except Exception as e:
+            self.failed_connections += 1
+            logger.error(f"Error getting database connection: {e}")
+            raise
+        finally:
+            if conn is not None:
+                self.connection_pool.putconn(conn)
     
-    # Set environment variables from command line
-    if args.pg_host:
-        os.environ["PG_HOST"] = args.pg_host
-    if args.pg_port:
-        os.environ["PG_PORT"] = str(args.pg_port)
-    if args.pg_user:
-        os.environ["PG_USER"] = args.pg_user
-    if args.pg_password:
-        os.environ["PG_PASSWORD"] = args.pg_password
-    if args.pg_db:
-        os.environ["PG_DB"] = args.pg_db
+    @contextmanager
+    def get_session(self) -> Generator:
+        """Get a SQLAlchemy session with automatic cleanup."""
+        if self.Session is None:
+            raise ValueError("SQLAlchemy Session not initialized")
+            
+        session = self.Session()
+        try:
+            yield session
+        finally:
+            session.close()
     
-    # Get environment
-    env = get_os_env()
+    def health_check(self) -> Dict[str, Any]:
+        """Check the health of the database connection."""
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    # Check connection
+                    cursor.execute("SELECT version();")
+                    version = cursor.fetchone()[0]
+                    
+                    # Check pgvector extension
+                    cursor.execute("SELECT * FROM pg_extension WHERE extname = 'vector';")
+                    vector_enabled = cursor.fetchone() is not None
+                    
+                    # Get database size
+                    cursor.execute(f"SELECT pg_database_size('{self.pg_db}');")
+                    db_size = cursor.fetchone()[0]
+                    
+                    # Get table counts
+                    cursor.execute("SELECT COUNT(*) FROM business_terms;")
+                    terms_count = cursor.fetchone()[0]
+                    
+                    # Get connection stats
+                    cursor.execute("SELECT count(*) FROM pg_stat_activity WHERE datname = %s;", (self.pg_db,))
+                    active_connections = cursor.fetchone()[0]
+                    
+                    return {
+                        "status": "healthy",
+                        "version": version,
+                        "vector_enabled": vector_enabled,
+                        "db_size_mb": round(db_size / (1024 * 1024), 2),
+                        "terms_count": terms_count,
+                        "active_connections": active_connections,
+                        "connection_pool_stats": {
+                            "attempts": self.connection_attempts,
+                            "successful": self.successful_connections,
+                            "failed": self.failed_connections
+                        }
+                    }
+        except Exception as e:
+            logger.error(f"Health check failed: {e}")
+            return {
+                "status": "unhealthy",
+                "error": str(e)
+            }
     
-    # Initialize DB manager
-    logger.info("Initializing PostgreSQL connection...")
-    db_manager = DBManager()
-    
-    # Check database connection
-    db_health = db_manager.health_check()
-    if db_health["status"] != "healthy":
-        logger.error(f"PostgreSQL connection failed: {db_health.get('error', 'Unknown error')}")
-        sys.exit(1)
-    
-    logger.info(f"Connected to PostgreSQL ({db_health['version']})")
-    logger.info(f"pgvector extension: {'Enabled' if db_health['vector_enabled'] else 'Disabled'}")
-    
-    # Generate test data
-    terms = generate_test_data(args)
-    
-    try:
-        # Insert test data
-        insert_duration = insert_test_data(db_manager, terms, args.batch_size)
+    def store_vector(self, id: str, name: str, description: str, embedding: List[float], metadata: Dict = None) -> bool:
+        """
+        Store a vector in the database.
         
-        # Run queries
-        results = run_concurrent_queries(db_manager, terms, args)
+        Args:
+            id: Unique identifier for the term
+            name: Name of the term
+            description: Description of the term
+            embedding: Vector embedding as a list of floats
+            metadata: Additional metadata as a dictionary
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    # Convert embedding to PostgreSQL vector format
+                    pg_vector = f"[{','.join(map(str, embedding))}]"
+                    
+                    # Insert or update the term
+                    cursor.execute("""
+                    INSERT INTO business_terms (id, name, description, embedding, metadata)
+                    VALUES (%s, %s, %s, %s::vector, %s)
+                    ON CONFLICT (id) 
+                    DO UPDATE SET 
+                        name = EXCLUDED.name,
+                        description = EXCLUDED.description,
+                        embedding = EXCLUDED.embedding,
+                        metadata = EXCLUDED.metadata;
+                    """, (id, name, description, pg_vector, psycopg2.extras.Json(metadata or {})))
+                    
+                    conn.commit()
+                    return True
+        except Exception as e:
+            logger.error(f"Error storing vector: {e}")
+            return False
+    
+    def batch_store_vectors(self, items: List[Dict[str, Any]]) -> int:
+        """
+        Store multiple vectors in the database.
         
-        # Print summary
-        print("\n=== Load Test Summary ===")
-        print(f"Database: PostgreSQL with pgvector")
-        print(f"Host: {env.get('PG_HOST')}")
-        print(f"Number of terms: {args.terms}")
-        print(f"Vector dimensions: {args.dimensions}")
-        print(f"Number of queries: {args.queries}")
-        print(f"Concurrency: {args.concurrency}")
-        print(f"Insert performance: {args.terms/insert_duration:.2f} terms/sec")
-        print(f"Query performance: {args.queries/(sum(r['duration'] for r in results)/args.concurrency):.2f} queries/sec")
-        print("============================\n")
+        Args:
+            items: List of dictionaries with id, name, description, embedding, and optional metadata
+            
+        Returns:
+            int: Number of items successfully stored
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    data = []
+                    for item in items:
+                        # Convert embedding to PostgreSQL vector format
+                        pg_vector = f"[{','.join(map(str, item['embedding']))}]"
+                        
+                        data.append((
+                            item['id'],
+                            item['name'],
+                            item['description'],
+                            pg_vector,
+                            psycopg2.extras.Json(item.get('metadata', {}))
+                        ))
+                    
+                    # Use execute_values for efficient batch insert
+                    execute_values(cursor, """
+                    INSERT INTO business_terms (id, name, description, embedding, metadata)
+                    VALUES %s
+                    ON CONFLICT (id) 
+                    DO UPDATE SET 
+                        name = EXCLUDED.name,
+                        description = EXCLUDED.description,
+                        embedding = EXCLUDED.embedding,
+                        metadata = EXCLUDED.metadata;
+                    """, data, template="(%s, %s, %s, %s::vector, %s)")
+                    
+                    conn.commit()
+                    return len(items)
+        except Exception as e:
+            logger.error(f"Error batch storing vectors: {e}")
+            return 0
+    
+    def find_similar_vectors(self, query_vector: List[float], top_k: int = 5, threshold: float = 0.5) -> List[Dict[str, Any]]:
+        """
+        Find similar vectors in the database.
         
-    finally:
-        # Clean up test data if requested
-        if args.clean:
-            clean_up_test_data(db_manager, terms)
-
-if __name__ == "__main__":
-    main()
+        Args:
+            query_vector: Vector to compare against
+            top_k: Number of results to return
+            threshold: Minimum similarity threshold (0-1)
+            
+        Returns:
+            List of dictionaries with id, name, description, similarity, and metadata
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor(cursor_factory=DictCursor) as cursor:
+                    # Convert query vector to PostgreSQL vector format
+                    pg_vector = f"[{','.join(map(str, query_vector))}]"
+                    
+                    # Query for similar vectors using cosine similarity
+                    cursor.execute("""
+                    SELECT 
+                        id, 
+                        name, 
+                        description, 
+                        metadata,
+                        1 - (embedding <=> %s::vector) as similarity
+                    FROM business_terms
+                    WHERE 1 - (embedding <=> %s::vector) >= %s
+                    ORDER BY similarity DESC
+                    LIMIT %s;
+                    """, (pg_vector, pg_vector, threshold, top_k))
+                    
+                    results = []
+                    for row in cursor.fetchall():
+                        results.append({
+                            "id": row["id"],
+                            "name": row["name"],
+                            "description": row["description"],
+                            "similarity": float(row["similarity"]),
+                            "metadata": row["metadata"]
+                        })
+                    
+                    return results
+        except Exception as e:
+            logger.error(f"Error finding similar vectors: {e}")
+            return []
+    
+    def get_all_terms(self) -> List[Dict[str, Any]]:
+        """
+        Get all business terms from the database.
+        
+        Returns:
+            List of dictionaries with id, name, description, and metadata
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor(cursor_factory=DictCursor) as cursor:
+                    cursor.execute("""
+                    SELECT id, name, description, metadata
+                    FROM business_terms;
+                    """)
+                    
+                    return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error getting all terms: {e}")
+            return []
+    
+    def get_term_by_id(self, term_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get a specific business term by ID.
+        
+        Args:
+            term_id: ID of the term to retrieve
+            
+        Returns:
+            Dictionary with term details or None if not found
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor(cursor_factory=DictCursor) as cursor:
+                    cursor.execute("""
+                    SELECT id, name, description, metadata
+                    FROM business_terms
+                    WHERE id = %s;
+                    """, (term_id,))
+                    
+                    row = cursor.fetchone()
+                    if row:
+                        return dict(row)
+                    return None
+        except Exception as e:
+            logger.error(f"Error getting term by ID: {e}")
+            return None
+    
+    def delete_term(self, term_id: str) -> bool:
+        """
+        Delete a business term from the database.
+        
+        Args:
+            term_id: ID of the term to delete
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                    DELETE FROM business_terms
+                    WHERE id = %s;
+                    """, (term_id,))
+                    
+                    conn.commit()
+                    return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error deleting term: {e}")
+            return False
+    
+    def store_job(self, job_id: str, job_type: str, status: str, data: Dict[str, Any]) -> bool:
+        """
+        Store a job in the database.
+        
+        Args:
+            job_id: Unique identifier for the job
+            job_type: Type of job (enhancement, tagging)
+            status: Status of the job
+            data: Job data as a dictionary
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                    INSERT INTO jobs (id, job_type, status, data, updated_at)
+                    VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (id) 
+                    DO UPDATE SET 
+                        status = EXCLUDED.status,
+                        data = EXCLUDED.data,
+                        updated_at = CURRENT_TIMESTAMP;
+                    """, (job_id, job_type, status, psycopg2.extras.Json(data)))
+                    
+                    conn.commit()
+                    return True
+        except Exception as e:
+            logger.error(f"Error storing job: {e}")
+            return False
+    
+    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get a job from the database.
+        
+        Args:
+            job_id: ID of the job to retrieve
+            
+        Returns:
+            Dictionary with job details or None if not found
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor(cursor_factory=DictCursor) as cursor:
+                    cursor.execute("""
+                    SELECT id, job_type, status, created_at, updated_at, data
+                    FROM jobs
+                    WHERE id = %s;
+                    """, (job_id,))
+                    
+                    row = cursor.fetchone()
+                    if row:
+                        return dict(row)
+                    return None
+        except Exception as e:
+            logger.error(f"Error getting job: {e}")
+            return None
+    
+    def get_jobs_by_type_and_status(self, job_type: str, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Get jobs by type and optional status.
+        
+        Args:
+            job_type: Type of jobs to retrieve
+            status: Optional status filter
+            
+        Returns:
+            List of dictionaries with job details
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor(cursor_factory=DictCursor) as cursor:
+                    if status:
+                        cursor.execute("""
+                        SELECT id, job_type, status, created_at, updated_at, data
+                        FROM jobs
+                        WHERE job_type = %s AND status = %s
+                        ORDER BY updated_at DESC;
+                        """, (job_type, status))
+                    else:
+                        cursor.execute("""
+                        SELECT id, job_type, status, created_at, updated_at, data
+                        FROM jobs
+                        WHERE job_type = %s
+                        ORDER BY updated_at DESC;
+                        """, (job_type,))
+                    
+                    return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error getting jobs by type and status: {e}")
+            return []
+    
+    def delete_job(self, job_id: str) -> bool:
+        """
+        Delete a job from the database.
+        
+        Args:
+            job_id: ID of the job to delete
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                    DELETE FROM jobs
+                    WHERE id = %s;
+                    """, (job_id,))
+                    
+                    conn.commit()
+                    return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error deleting job: {e}")
+            return False
+    
+    def record_system_stats(self, cpu_usage: float, memory_usage: float, 
+                           enhancement_jobs_count: int, tagging_jobs_count: int) -> bool:
+        """
+        Record system statistics for monitoring.
+        
+        Args:
+            cpu_usage: CPU usage percentage
+            memory_usage: Memory usage percentage
+            enhancement_jobs_count: Number of enhancement jobs
+            tagging_jobs_count: Number of tagging jobs
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    # Get database size
+                    cursor.execute(f"SELECT pg_database_size('{self.pg_db}');")
+                    db_size = cursor.fetchone()[0]
+                    
+                    # Get active connections
+                    cursor.execute("SELECT count(*) FROM pg_stat_activity WHERE datname = %s;", (self.pg_db,))
+                    active_connections = cursor.fetchone()[0]
+                    
+                    # Insert stats
+                    cursor.execute("""
+                    INSERT INTO system_stats 
+                    (cpu_usage, memory_usage, db_size, active_connections, 
+                     enhancement_jobs_count, tagging_jobs_count)
+                    VALUES (%s, %s, %s, %s, %s, %s);
+                    """, (cpu_usage, memory_usage, db_size, active_connections, 
+                          enhancement_jobs_count, tagging_jobs_count))
+                    
+                    conn.commit()
+                    return True
+        except Exception as e:
+            logger.error(f"Error recording system stats: {e}")
+            return False
+    
+    def get_system_stats(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Get recent system statistics.
+        
+        Args:
+            limit: Maximum number of records to retrieve
+            
+        Returns:
+            List of dictionaries with system statistics
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor(cursor_factory=DictCursor) as cursor:
+                    cursor.execute("""
+                    SELECT timestamp, cpu_usage, memory_usage, db_size, 
+                           active_connections, enhancement_jobs_count, tagging_jobs_count
+                    FROM system_stats
+                    ORDER BY timestamp DESC
+                    LIMIT %s;
+                    """, (limit,))
+                    
+                    return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error getting system stats: {e}")
+            return []
+    
+    def compute_cosine_similarity(self, vector1: List[float], vector2: List[float]) -> float:
+        """
+        Compute cosine similarity between two vectors.
+        
+        Args:
+            vector1: First vector
+            vector2: Second vector
+            
+        Returns:
+            float: Cosine similarity between 0 and 1
+        """
+        # Convert to numpy arrays
+        a = np.array(vector1)
+        b = np.array(vector2)
+        
+        # Compute cosine similarity
+        dot_product = np.dot(a, b)
+        norm_a = np.linalg.norm(a)
+        norm_b = np.linalg.norm(b)
+        
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        
+        similarity = dot_product / (norm_a * norm_b)
+        return max(0.0, min(similarity, 1.0))  # Ensure in range [0, 1]
