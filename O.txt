@@ -1,425 +1,530 @@
 """
-PostgreSQL Database Manager with pgvector extension support.
-Handles connection pooling, vector operations, and database initialization.
+Business Terms Manager using PostgreSQL with pgvector for semantic similarity matching.
+Manages the storage, retrieval, and similarity search of business terms.
 """
 
+import csv
 import logging
 import os
 import time
-from contextlib import contextmanager
-from typing import List, Dict, Any, Optional, Generator, Tuple
-
+from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
-import psycopg2
-from psycopg2 import pool
-from psycopg2.extras import execute_values, DictCursor
-from sqlalchemy import create_engine, text, MetaData, Table, Column, String, Float, JSON, Integer
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from pydantic import BaseModel
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
+from app.core.db_manager import DBManager
+from app.core.embedding import EmbeddingClient, MyDocument
+from app.core.models import TaggingResult, TaggingValidationResult
 from app.config.environment import get_os_env
 
 logger = logging.getLogger(__name__)
 
-Base = declarative_base()
+class BusinessTerm(BaseModel):
+    """Model representing a business term in the repository."""
+    id: str
+    name: str
+    description: str
+    metadata: Dict[str, Any] = {}
+    
+    def dict(self):
+        """Convert the business term to a dictionary."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
+            "metadata": self.metadata
+        }
 
-class DBManager:
-    """PostgreSQL Database Manager with pgvector support."""
+class BusinessTermManager:
+    """
+    Manager for business terms, handling storage, retrieval, and similarity matching.
+    Uses pgvector for semantic similarity search via PostgreSQL.
+    """
     
     _instance = None
     
     def __new__(cls):
-        """Singleton pattern to ensure only one instance of the database connection pool."""
+        """Singleton pattern to ensure only one instance is created."""
         if cls._instance is None:
-            cls._instance = super(DBManager, cls).__new__(cls)
+            cls._instance = super(BusinessTermManager, cls).__new__(cls)
             cls._instance._initialized = False
         return cls._instance
     
     def __init__(self):
-        """Initialize the PostgreSQL connection and pgvector extension."""
+        """Initialize the business term manager."""
         if self._initialized:
             return
-        
+            
         self._initialized = True
         self.env = get_os_env()
+        self.embedding_client = EmbeddingClient()
+        self.db_manager = DBManager()
+        self.similarity_threshold = float(self.env.get("SIMILARITY_THRESHOLD", "0.5"))  # 50% similarity threshold
         
-        # Get PostgreSQL connection details
-        self.pg_host = self.env.get("PG_HOST", "localhost")
-        self.pg_port = int(self.env.get("PG_PORT", "5432"))
-        self.pg_user = self.env.get("PG_USER", "postgres")
-        self.pg_password = self.env.get("PG_PASSWORD", "postgres")
-        self.pg_db = self.env.get("PG_DB", "metadata_db")
+        # Verify database connection and pgvector extension
+        self._verify_database()
         
-        # Configure connection pooling
-        self.min_connections = int(self.env.get("PG_MIN_CONNECTIONS", "2"))
-        self.max_connections = int(self.env.get("PG_MAX_CONNECTIONS", "10"))
-        
-        # Initialize connection pool and engine
-        self._setup_connection_pool()
-        self._setup_sqlalchemy()
-        self._initialize_database()
-        
-        # Track connection statistics
-        self.connection_attempts = 0
-        self.successful_connections = 0
-        self.failed_connections = 0
-        
-        logger.info(f"Database manager initialized with host={self.pg_host}, port={self.pg_port}, db={self.pg_db}")
+        logger.info("Business term manager initialized with PostgreSQL backend")
     
-    def _setup_connection_pool(self):
-        """Set up a connection pool for PostgreSQL."""
-        try:
-            self.connection_pool = pool.ThreadedConnectionPool(
-                minconn=self.min_connections,
-                maxconn=self.max_connections,
-                host=self.pg_host,
-                port=self.pg_port,
-                user=self.pg_user,
-                password=self.pg_password,
-                database=self.pg_db
-            )
-            logger.info(f"Connection pool created with {self.min_connections}-{self.max_connections} connections")
-        except Exception as e:
-            logger.error(f"Failed to create connection pool: {e}")
-            self.connection_pool = None
-    
-    def _setup_sqlalchemy(self):
-        """Set up SQLAlchemy engine for ORM operations."""
-        try:
-            db_url = f"postgresql://{self.pg_user}:{self.pg_password}@{self.pg_host}:{self.pg_port}/{self.pg_db}"
-            self.engine = create_engine(db_url, pool_pre_ping=True)
-            self.Session = sessionmaker(bind=self.engine)
-            logger.info("SQLAlchemy engine initialized")
-        except Exception as e:
-            logger.error(f"Failed to create SQLAlchemy engine: {e}")
-            self.engine = None
-            self.Session = None
-    
-    @retry(
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type((psycopg2.OperationalError, psycopg2.InterfaceError)),
-        reraise=True
-    )
-    def _initialize_database(self):
-        """Initialize database with required extensions and tables."""
-        with self.get_connection() as conn:
-            with conn.cursor() as cursor:
-                try:
-                    # Create pgvector extension if it doesn't exist
-                    cursor.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-                    
-                    # Create business_terms table with vector support
-                    cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS business_terms (
-                        id VARCHAR(255) PRIMARY KEY,
-                        name VARCHAR(255) NOT NULL,
-                        description TEXT NOT NULL,
-                        embedding vector(1536),
-                        metadata JSONB
-                    );
-                    """)
-                    
-                    # Create index on vector column for similarity search
-                    cursor.execute("""
-                    CREATE INDEX IF NOT EXISTS business_terms_embedding_idx 
-                    ON business_terms 
-                    USING ivfflat (embedding vector_cosine_ops) 
-                    WITH (lists = 100);
-                    """)
-                    
-                    # Create jobs table for tracking enhancement and tagging jobs
-                    cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS jobs (
-                        id VARCHAR(255) PRIMARY KEY,
-                        job_type VARCHAR(50) NOT NULL,
-                        status VARCHAR(50) NOT NULL,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        data JSONB
-                    );
-                    """)
-                    
-                    # Create stats table for monitoring
-                    cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS system_stats (
-                        id SERIAL PRIMARY KEY,
-                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        cpu_usage FLOAT,
-                        memory_usage FLOAT,
-                        db_size BIGINT,
-                        active_connections INTEGER,
-                        enhancement_jobs_count INTEGER,
-                        tagging_jobs_count INTEGER
-                    );
-                    """)
-                    
-                    conn.commit()
-                    logger.info("Database initialized with required tables and extensions")
-                except Exception as e:
-                    conn.rollback()
-                    logger.error(f"Error initializing database: {e}")
-                    raise
-    
-    @contextmanager
-    def get_connection(self) -> Generator:
-        """Get a connection from the pool with automatic cleanup."""
-        conn = None
-        self.connection_attempts += 1
-        
-        try:
-            if self.connection_pool is None:
-                # Try to recreate the pool if it's None
-                self._setup_connection_pool()
-                
-            conn = self.connection_pool.getconn()
-            self.successful_connections += 1
-            yield conn
-        except Exception as e:
-            self.failed_connections += 1
-            logger.error(f"Error getting database connection: {e}")
-            raise
-        finally:
-            if conn is not None:
-                self.connection_pool.putconn(conn)
-    
-    @contextmanager
-    def get_session(self) -> Generator:
-        """Get a SQLAlchemy session with automatic cleanup."""
-        if self.Session is None:
-            raise ValueError("SQLAlchemy Session not initialized")
-            
-        session = self.Session()
-        try:
-            yield session
-        finally:
-            session.close()
-    
-    def health_check(self) -> Dict[str, Any]:
-        """Check the health of the database connection."""
-        try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cursor:
-                    # Check connection
-                    cursor.execute("SELECT version();")
-                    version = cursor.fetchone()[0]
-                    
-                    # Check pgvector extension
-                    cursor.execute("SELECT * FROM pg_extension WHERE extname = 'vector';")
-                    vector_enabled = cursor.fetchone() is not None
-                    
-                    # Get database size
-                    cursor.execute(f"SELECT pg_database_size('{self.pg_db}');")
-                    db_size = cursor.fetchone()[0]
-                    
-                    # Get table counts
-                    cursor.execute("SELECT COUNT(*) FROM business_terms;")
-                    terms_count = cursor.fetchone()[0]
-                    
-                    # Get connection stats
-                    cursor.execute("SELECT count(*) FROM pg_stat_activity WHERE datname = %s;", (self.pg_db,))
-                    active_connections = cursor.fetchone()[0]
-                    
-                    return {
-                        "status": "healthy",
-                        "version": version,
-                        "vector_enabled": vector_enabled,
-                        "db_size_mb": round(db_size / (1024 * 1024), 2),
-                        "terms_count": terms_count,
-                        "active_connections": active_connections,
-                        "connection_pool_stats": {
-                            "attempts": self.connection_attempts,
-                            "successful": self.successful_connections,
-                            "failed": self.failed_connections
-                        }
-                    }
-        except Exception as e:
-            logger.error(f"Health check failed: {e}")
-            return {
-                "status": "unhealthy",
-                "error": str(e)
-            }
-    
-    def store_vector(self, id: str, name: str, description: str, embedding: List[float], metadata: Dict = None) -> bool:
+    def _verify_database(self) -> bool:
         """
-        Store a vector in the database.
+        Verify database connection and pgvector extension.
         
-        Args:
-            id: Unique identifier for the term
-            name: Name of the term
-            description: Description of the term
-            embedding: Vector embedding as a list of floats
-            metadata: Additional metadata as a dictionary
-            
         Returns:
-            bool: True if successful, False otherwise
+            bool: True if verification succeeds, False otherwise
         """
         try:
-            with self.get_connection() as conn:
+            # Check database health
+            health = self.db_manager.health_check()
+            
+            if health["status"] != "healthy":
+                logger.error(f"Database health check failed: {health.get('error', 'Unknown error')}")
+                return False
+            
+            # Check if pgvector extension is enabled
+            if not health.get("vector_enabled", False):
+                logger.error("pgvector extension is not enabled in the database")
+                return False
+            
+            # Check if business_terms table exists
+            with self.db_manager.get_connection() as conn:
                 with conn.cursor() as cursor:
-                    # Convert embedding to PostgreSQL vector format
-                    pg_vector = f"[{','.join(map(str, embedding))}]"
-                    
-                    # Insert or update the term
                     cursor.execute("""
-                    INSERT INTO business_terms (id, name, description, embedding, metadata)
-                    VALUES (%s, %s, %s, %s::vector, %s)
-                    ON CONFLICT (id) 
-                    DO UPDATE SET 
-                        name = EXCLUDED.name,
-                        description = EXCLUDED.description,
-                        embedding = EXCLUDED.embedding,
-                        metadata = EXCLUDED.metadata;
-                    """, (id, name, description, pg_vector, psycopg2.extras.Json(metadata or {})))
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_name = 'business_terms'
+                    );
+                    """)
                     
-                    conn.commit()
-                    return True
+                    table_exists = cursor.fetchone()[0]
+                    
+                    if not table_exists:
+                        logger.error("business_terms table does not exist in the database")
+                        return False
+            
+            return True
+        
         except Exception as e:
-            logger.error(f"Error storing vector: {e}")
+            logger.error(f"Database verification failed: {e}")
             return False
     
-    def batch_store_vectors(self, items: List[Dict[str, Any]]) -> int:
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type(Exception),
+        reraise=True
+    )
+    def import_terms_from_csv(self, csv_path: str, encoding: str = 'utf-8', batch_size: int = 100) -> int:
         """
-        Store multiple vectors in the database.
+        Import business terms from a CSV file.
         
         Args:
-            items: List of dictionaries with id, name, description, embedding, and optional metadata
+            csv_path: Path to the CSV file
+            encoding: File encoding (auto-detected if not provided)
+            batch_size: Number of terms to process in each batch
             
         Returns:
-            int: Number of items successfully stored
+            Number of terms imported
         """
         try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cursor:
-                    data = []
-                    for item in items:
-                        # Convert embedding to PostgreSQL vector format
-                        pg_vector = f"[{','.join(map(str, item['embedding']))}]"
-                        
-                        data.append((
-                            item['id'],
-                            item['name'],
-                            item['description'],
-                            pg_vector,
-                            psycopg2.extras.Json(item.get('metadata', {}))
-                        ))
+            # Get existing terms
+            existing_terms = {}
+            for term in self.get_all_terms():
+                term_key = f"{term.name}::{term.description}"
+                existing_terms[term_key] = term.id
+            
+            # Track terms in CSV
+            csv_term_keys = set()
+            terms_to_add = []
+            
+            # Read terms from CSV
+            with open(csv_path, 'r', encoding=encoding) as csvfile:
+                reader = csv.DictReader(csvfile)
+                for row in reader:
+                    if 'id' not in row or 'name' not in row or 'description' not in row:
+                        logger.warning(f"Skipping row with missing required fields: {row}")
+                        continue
                     
-                    # Use execute_values for efficient batch insert
-                    execute_values(cursor, """
-                    INSERT INTO business_terms (id, name, description, embedding, metadata)
-                    VALUES %s
-                    ON CONFLICT (id) 
-                    DO UPDATE SET 
-                        name = EXCLUDED.name,
-                        description = EXCLUDED.description,
-                        embedding = EXCLUDED.embedding,
-                        metadata = EXCLUDED.metadata;
-                    """, data, template="(%s, %s, %s, %s::vector, %s)")
+                    term_id = row['id'].strip()
+                    name = row['name'].strip()
+                    description = row['description'].strip()
                     
-                    conn.commit()
-                    return len(items)
+                    if not term_id:
+                        logger.warning(f"Skipping term with empty ID: {name}")
+                        continue
+                    
+                    term_key = f"{name}::{description}"
+                    csv_term_keys.add(term_key)
+                    
+                    # Skip if term already exists and is unchanged
+                    if term_key in existing_terms and existing_terms[term_key] == term_id:
+                        continue
+                    
+                    # Extract metadata if present in CSV
+                    metadata = {}
+                    for key, value in row.items():
+                        if key not in ['id', 'name', 'description'] and value:
+                            metadata[key] = value
+                    
+                    terms_to_add.append({
+                        "id": term_id,
+                        "name": name,
+                        "description": description,
+                        "term_key": term_key,
+                        "metadata": metadata
+                    })
+            
+            # Process terms in batches
+            added_count = 0
+            for i in range(0, len(terms_to_add), batch_size):
+                batch = terms_to_add[i:i + batch_size]
+                batch_start_time = time.time()
+                
+                # Create batch of vectors to insert
+                vectors_batch = []
+                for term in batch:
+                    # Generate embedding for the term
+                    doc = MyDocument(
+                        id=term["id"],
+                        text=f"{term['name']}. {term['description']}"
+                    )
+                    
+                    doc_with_embedding = self.embedding_client.generate_embeddings(doc)
+                    
+                    if not doc_with_embedding.embedding:
+                        logger.warning(f"Skipping term without embedding: {term['name']}")
+                        continue
+                    
+                    vectors_batch.append({
+                        "id": term["id"],
+                        "name": term["name"],
+                        "description": term["description"],
+                        "embedding": doc_with_embedding.embedding,
+                        "metadata": term.get("metadata", {})
+                    })
+                
+                # Batch insert into database
+                if vectors_batch:
+                    inserted = self.db_manager.batch_store_vectors(vectors_batch)
+                    added_count += inserted
+                    
+                    batch_duration = time.time() - batch_start_time
+                    logger.info(f"Processed batch {i//batch_size + 1}/{(len(terms_to_add) + batch_size - 1)//batch_size}: "
+                               f"{inserted} terms in {batch_duration:.2f}s "
+                               f"({inserted/batch_duration:.2f} terms/sec)")
+            
+            # Handle term deletion (terms that exist in the database but not in the CSV)
+            deleted_count = 0
+            terms_to_delete = []
+            for term_key, term_id in existing_terms.items():
+                if term_key not in csv_term_keys:
+                    terms_to_delete.append(term_id)
+            
+            # Delete in batches
+            for i in range(0, len(terms_to_delete), batch_size):
+                batch = terms_to_delete[i:i + batch_size]
+                deleted_in_batch = 0
+                
+                for term_id in batch:
+                    if self.db_manager.delete_term(term_id):
+                        deleted_in_batch += 1
+                
+                deleted_count += deleted_in_batch
+                if deleted_in_batch > 0:
+                    logger.info(f"Deleted batch of {deleted_in_batch} terms")
+            
+            logger.info(f"Import summary: Added {added_count} terms, deleted {deleted_count} terms")
+            return added_count
+        
         except Exception as e:
-            logger.error(f"Error batch storing vectors: {e}")
-            return 0
+            logger.error(f"Error importing terms from CSV: {e}")
+            raise
     
-    def find_similar_vectors(self, query_vector: List[float], top_k: int = 5, threshold: float = 0.5) -> List[Dict[str, Any]]:
+    def tag_element(self, element_id: str, name: str, description: str, top_k: int = 3) -> TaggingResult:
         """
-        Find similar vectors in the database.
+        Tag a data element with the most similar business terms.
         
         Args:
-            query_vector: Vector to compare against
-            top_k: Number of results to return
-            threshold: Minimum similarity threshold (0-1)
+            element_id: Unique identifier for the element
+            name: Enhanced name of the element
+            description: Enhanced description of the element
+            top_k: Number of top matching terms to return
             
         Returns:
-            List of dictionaries with id, name, description, similarity, and metadata
+            TaggingResult containing matching terms and confidence scores
         """
         try:
-            with self.get_connection() as conn:
-                with conn.cursor(cursor_factory=DictCursor) as cursor:
-                    # Convert query vector to PostgreSQL vector format
-                    pg_vector = f"[{','.join(map(str, query_vector))}]"
-                    
-                    # Query for similar vectors using cosine similarity
-                    cursor.execute("""
-                    SELECT 
-                        id, 
-                        name, 
-                        description, 
-                        metadata,
-                        1 - (embedding <=> %s::vector) as similarity
-                    FROM business_terms
-                    WHERE 1 - (embedding <=> %s::vector) >= %s
-                    ORDER BY similarity DESC
-                    LIMIT %s;
-                    """, (pg_vector, pg_vector, threshold, top_k))
-                    
-                    results = []
-                    for row in cursor.fetchall():
-                        results.append({
-                            "id": row["id"],
-                            "name": row["name"],
-                            "description": row["description"],
-                            "similarity": float(row["similarity"]),
-                            "metadata": row["metadata"]
-                        })
-                    
-                    return results
+            # Validate inputs
+            if not name or not description:
+                logger.warning(f"Empty name or description for element: {element_id}")
+                return TaggingResult(
+                    element_id=element_id,
+                    element_name=name or "",
+                    element_description=description or "",
+                    matching_terms=[],
+                    confidence_scores=[],
+                    modeling_required=True,
+                    message="Name or description is empty. Modeling should be performed."
+                )
+            
+            # Create document with embedding
+            doc = MyDocument(
+                id=element_id,
+                text=f"{name}. {description}"
+            )
+            
+            doc_with_embedding = self.embedding_client.generate_embeddings(doc)
+            
+            if not doc_with_embedding.embedding:
+                logger.warning(f"Could not generate embedding for element: {name}")
+                return TaggingResult(
+                    element_id=element_id,
+                    element_name=name,
+                    element_description=description,
+                    matching_terms=[],
+                    confidence_scores=[],
+                    modeling_required=True,
+                    message="Could not generate embedding. Modeling should be performed."
+                )
+            
+            # Query for similar terms
+            similar_terms = self.db_manager.find_similar_vectors(
+                query_vector=doc_with_embedding.embedding,
+                top_k=top_k * 2,  # Fetch more and filter later
+                threshold=self.similarity_threshold
+            )
+            
+            # If no similar terms found, recommend modeling
+            if not similar_terms:
+                return TaggingResult(
+                    element_id=element_id,
+                    element_name=name,
+                    element_description=description,
+                    matching_terms=[],
+                    confidence_scores=[],
+                    modeling_required=True,
+                    message=f"Similarity is less than {self.similarity_threshold*100}%. Modeling should be performed."
+                )
+            
+            # Format matching terms and filter by top_k
+            matching_terms = []
+            confidence_scores = []
+            
+            # Sort by similarity (in case DB didn't return in sorted order)
+            similar_terms.sort(key=lambda x: x["similarity"], reverse=True)
+            
+            # Take top_k items
+            for term in similar_terms[:top_k]:
+                matching_terms.append({
+                    "id": term["id"],
+                    "name": term["name"],
+                    "description": term["description"],
+                    "similarity": term["similarity"]
+                })
+                confidence_scores.append(term["similarity"])
+            
+            return TaggingResult(
+                element_id=element_id,
+                element_name=name,
+                element_description=description,
+                matching_terms=matching_terms,
+                confidence_scores=confidence_scores,
+                modeling_required=False,
+                message=""
+            )
+            
         except Exception as e:
-            logger.error(f"Error finding similar vectors: {e}")
+            logger.error(f"Error tagging element: {e}", exc_info=True)
+            
+            # Attempt fallback matching using direct vector comparison
+            try:
+                logger.info(f"Attempting fallback matching for element: {element_id}")
+                
+                # Get all terms
+                all_terms = self.get_all_terms()
+                if not all_terms:
+                    logger.warning("No business terms available for fallback matching")
+                    return TaggingResult(
+                        element_id=element_id,
+                        element_name=name,
+                        element_description=description,
+                        matching_terms=[],
+                        confidence_scores=[],
+                        modeling_required=True,
+                        message="Business terms repository is not available. Modeling should be performed."
+                    )
+                
+                # Compare directly with available terms using dot product
+                # This is a slow fallback method but ensures we can still match
+                # even if the database query fails
+                return TaggingResult(
+                    element_id=element_id,
+                    element_name=name,
+                    element_description=description,
+                    matching_terms=[],
+                    confidence_scores=[],
+                    modeling_required=True,
+                    message=f"Error during tagging: {str(e)}. Modeling should be performed."
+                )
+            except Exception as fallback_error:
+                logger.error(f"Fallback matching also failed: {fallback_error}")
+                return TaggingResult(
+                    element_id=element_id,
+                    element_name=name,
+                    element_description=description,
+                    matching_terms=[],
+                    confidence_scores=[],
+                    modeling_required=True,
+                    message=f"Error during tagging: {str(e)}. Modeling should be performed."
+                )
+    
+    async def validate_tagging(self, tagging_result: TaggingResult) -> TaggingValidationResult:
+        """
+        Validate the tagging result.
+        
+        Args:
+            tagging_result: Result of tagging to validate
+            
+        Returns:
+            TaggingValidationResult with validation status and suggestions
+        """
+        try:
+            # Skip validation if modeling is required
+            if tagging_result.modeling_required:
+                return TaggingValidationResult(
+                    is_valid=False,
+                    feedback=tagging_result.message,
+                    suggested_alternatives=[]
+                )
+                
+            # If no matching terms, validation fails
+            if not tagging_result.matching_terms:
+                return TaggingValidationResult(
+                    is_valid=False,
+                    feedback="No matching terms found",
+                    suggested_alternatives=[]
+                )
+            
+            # Get highest confidence score
+            highest_confidence = max(tagging_result.confidence_scores) if tagging_result.confidence_scores else 0.0
+            
+            # If highest confidence is barely above threshold, find alternatives
+            if highest_confidence < 0.75:
+                # Try to find better alternatives
+                alternative_doc = MyDocument(
+                    id=tagging_result.element_id,
+                    text=tagging_result.element_name  # Use just the name for alternative searching
+                )
+                
+                alternative_doc_with_embedding = self.embedding_client.generate_embeddings(alternative_doc)
+                
+                if alternative_doc_with_embedding.embedding:
+                    # Exclude already matched terms
+                    matched_ids = [term["id"] for term in tagging_result.matching_terms]
+                    
+                    all_similar_terms = self.db_manager.find_similar_vectors(
+                        query_vector=alternative_doc_with_embedding.embedding,
+                        top_k=10,  # Get more to filter out already matched terms
+                        threshold=self.similarity_threshold
+                    )
+                    
+                    # Filter out already matched terms
+                    alternative_terms = [
+                        term for term in all_similar_terms
+                        if term["id"] not in matched_ids
+                    ][:3]  # Limit to top 3 alternatives
+                    
+                    if alternative_terms:
+                        return TaggingValidationResult(
+                            is_valid=False,
+                            feedback="Low confidence in matching terms. Alternative terms found.",
+                            suggested_alternatives=alternative_terms
+                        )
+            
+            # Default case - validation passes
+            return TaggingValidationResult(
+                is_valid=True,
+                feedback="Matching terms found with good confidence",
+                suggested_alternatives=[]
+            )
+            
+        except Exception as e:
+            logger.error(f"Error validating tagging: {e}")
+            return TaggingValidationResult(
+                is_valid=False,
+                feedback=f"Error during validation: {str(e)}",
+                suggested_alternatives=[]
+            )
+    
+    def get_all_terms(self) -> List[BusinessTerm]:
+        """
+        Get all business terms in the collection.
+        
+        Returns:
+            List of BusinessTerm objects
+        """
+        try:
+            term_dicts = self.db_manager.get_all_terms()
+            
+            terms = []
+            for term_dict in term_dicts:
+                terms.append(BusinessTerm(
+                    id=term_dict["id"],
+                    name=term_dict["name"],
+                    description=term_dict["description"],
+                    metadata=term_dict.get("metadata", {})
+                ))
+                
+            return terms
+        except Exception as e:
+            logger.error(f"Error retrieving all terms: {e}")
             return []
     
-    def get_all_terms(self) -> List[Dict[str, Any]]:
+    def get_term_by_id(self, term_id: str) -> Optional[BusinessTerm]:
         """
-        Get all business terms from the database.
-        
-        Returns:
-            List of dictionaries with id, name, description, and metadata
-        """
-        try:
-            with self.get_connection() as conn:
-                with conn.cursor(cursor_factory=DictCursor) as cursor:
-                    cursor.execute("""
-                    SELECT id, name, description, metadata
-                    FROM business_terms;
-                    """)
-                    
-                    return [dict(row) for row in cursor.fetchall()]
-        except Exception as e:
-            logger.error(f"Error getting all terms: {e}")
-            return []
-    
-    def get_term_by_id(self, term_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Get a specific business term by ID.
+        Get a business term by its ID.
         
         Args:
-            term_id: ID of the term to retrieve
+            term_id: Unique identifier of the term
             
         Returns:
-            Dictionary with term details or None if not found
+            BusinessTerm if found, None otherwise
         """
         try:
-            with self.get_connection() as conn:
-                with conn.cursor(cursor_factory=DictCursor) as cursor:
-                    cursor.execute("""
-                    SELECT id, name, description, metadata
-                    FROM business_terms
-                    WHERE id = %s;
-                    """, (term_id,))
-                    
-                    row = cursor.fetchone()
-                    if row:
-                        return dict(row)
-                    return None
-        except Exception as e:
-            logger.error(f"Error getting term by ID: {e}")
+            term_dict = self.db_manager.get_term_by_id(term_id)
+            
+            if term_dict:
+                return BusinessTerm(
+                    id=term_dict["id"],
+                    name=term_dict["name"],
+                    description=term_dict["description"],
+                    metadata=term_dict.get("metadata", {})
+                )
+            
             return None
+        except Exception as e:
+            logger.error(f"Error retrieving term by ID: {e}")
+            return None
+    
+    def get_term_count(self) -> int:
+        """
+        Get the total count of business terms.
+        
+        Returns:
+            Total number of terms
+        """
+        try:
+            with self.db_manager.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT COUNT(*) FROM business_terms")
+                    return cursor.fetchone()[0]
+        except Exception as e:
+            logger.error(f"Error getting term count: {e}")
+            return 0
     
     def delete_term(self, term_id: str) -> bool:
         """
-        Delete a business term from the database.
+        Delete a business term by ID.
         
         Args:
             term_id: ID of the term to delete
@@ -428,224 +533,99 @@ class DBManager:
             True if successful, False otherwise
         """
         try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                    DELETE FROM business_terms
-                    WHERE id = %s;
-                    """, (term_id,))
-                    
-                    conn.commit()
-                    return cursor.rowcount > 0
+            return self.db_manager.delete_term(term_id)
         except Exception as e:
             logger.error(f"Error deleting term: {e}")
             return False
     
-    def store_job(self, job_id: str, job_type: str, status: str, data: Dict[str, Any]) -> bool:
+    def delete_all_terms(self) -> int:
         """
-        Store a job in the database.
+        Delete all business terms.
         
-        Args:
-            job_id: Unique identifier for the job
-            job_type: Type of job (enhancement, tagging)
-            status: Status of the job
-            data: Job data as a dictionary
-            
         Returns:
-            bool: True if successful, False otherwise
+            Number of terms deleted
         """
         try:
-            with self.get_connection() as conn:
+            with self.db_manager.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("DELETE FROM business_terms")
+                    deleted = cursor.rowcount
+                    conn.commit()
+                    return deleted
+        except Exception as e:
+            logger.error(f"Error deleting all terms: {e}")
+            return 0
+    
+    def search_terms(self, query: str, limit: int = 20) -> List[BusinessTerm]:
+        """
+        Search for business terms by name or description.
+        
+        Args:
+            query: Search query
+            limit: Maximum number of results
+            
+        Returns:
+            List of matching BusinessTerm objects
+        """
+        try:
+            with self.db_manager.get_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute("""
-                    INSERT INTO jobs (id, job_type, status, data, updated_at)
-                    VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
-                    ON CONFLICT (id) 
-                    DO UPDATE SET 
-                        status = EXCLUDED.status,
-                        data = EXCLUDED.data,
-                        updated_at = CURRENT_TIMESTAMP;
-                    """, (job_id, job_type, status, psycopg2.extras.Json(data)))
+                    SELECT id, name, description, metadata
+                    FROM business_terms
+                    WHERE 
+                        name ILIKE %s OR 
+                        description ILIKE %s
+                    ORDER BY 
+                        CASE WHEN name ILIKE %s THEN 0 ELSE 1 END,
+                        CASE WHEN description ILIKE %s THEN 0 ELSE 1 END,
+                        name
+                    LIMIT %s
+                    """, (f"%{query}%", f"%{query}%", f"{query}%", f"{query}%", limit))
                     
-                    conn.commit()
-                    return True
-        except Exception as e:
-            logger.error(f"Error storing job: {e}")
-            return False
-    
-    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Get a job from the database.
-        
-        Args:
-            job_id: ID of the job to retrieve
-            
-        Returns:
-            Dictionary with job details or None if not found
-        """
-        try:
-            with self.get_connection() as conn:
-                with conn.cursor(cursor_factory=DictCursor) as cursor:
-                    cursor.execute("""
-                    SELECT id, job_type, status, created_at, updated_at, data
-                    FROM jobs
-                    WHERE id = %s;
-                    """, (job_id,))
+                    results = []
+                    for row in cursor.fetchall():
+                        id, name, description, metadata = row
+                        results.append(BusinessTerm(
+                            id=id,
+                            name=name,
+                            description=description,
+                            metadata=metadata or {}
+                        ))
                     
-                    row = cursor.fetchone()
-                    if row:
-                        return dict(row)
-                    return None
+                    return results
         except Exception as e:
-            logger.error(f"Error getting job: {e}")
-            return None
-    
-    def get_jobs_by_type_and_status(self, job_type: str, status: Optional[str] = None) -> List[Dict[str, Any]]:
-        """
-        Get jobs by type and optional status.
-        
-        Args:
-            job_type: Type of jobs to retrieve
-            status: Optional status filter
-            
-        Returns:
-            List of dictionaries with job details
-        """
-        try:
-            with self.get_connection() as conn:
-                with conn.cursor(cursor_factory=DictCursor) as cursor:
-                    if status:
-                        cursor.execute("""
-                        SELECT id, job_type, status, created_at, updated_at, data
-                        FROM jobs
-                        WHERE job_type = %s AND status = %s
-                        ORDER BY updated_at DESC;
-                        """, (job_type, status))
-                    else:
-                        cursor.execute("""
-                        SELECT id, job_type, status, created_at, updated_at, data
-                        FROM jobs
-                        WHERE job_type = %s
-                        ORDER BY updated_at DESC;
-                        """, (job_type,))
-                    
-                    return [dict(row) for row in cursor.fetchall()]
-        except Exception as e:
-            logger.error(f"Error getting jobs by type and status: {e}")
+            logger.error(f"Error searching terms: {e}")
             return []
     
-    def delete_job(self, job_id: str) -> bool:
+    def compute_similarity(self, text1: str, text2: str) -> float:
         """
-        Delete a job from the database.
+        Compute semantic similarity between two text strings.
         
         Args:
-            job_id: ID of the job to delete
+            text1: First text
+            text2: Second text
             
         Returns:
-            True if successful, False otherwise
+            Similarity score between 0 and 1
         """
         try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                    DELETE FROM jobs
-                    WHERE id = %s;
-                    """, (job_id,))
-                    
-                    conn.commit()
-                    return cursor.rowcount > 0
-        except Exception as e:
-            logger.error(f"Error deleting job: {e}")
-            return False
-    
-    def record_system_stats(self, cpu_usage: float, memory_usage: float, 
-                           enhancement_jobs_count: int, tagging_jobs_count: int) -> bool:
-        """
-        Record system statistics for monitoring.
-        
-        Args:
-            cpu_usage: CPU usage percentage
-            memory_usage: Memory usage percentage
-            enhancement_jobs_count: Number of enhancement jobs
-            tagging_jobs_count: Number of tagging jobs
+            # Generate embeddings
+            doc1 = MyDocument(id="temp1", text=text1)
+            doc2 = MyDocument(id="temp2", text=text2)
             
-        Returns:
-            bool: True if successful, False otherwise
-        """
-        try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cursor:
-                    # Get database size
-                    cursor.execute(f"SELECT pg_database_size('{self.pg_db}');")
-                    db_size = cursor.fetchone()[0]
-                    
-                    # Get active connections
-                    cursor.execute("SELECT count(*) FROM pg_stat_activity WHERE datname = %s;", (self.pg_db,))
-                    active_connections = cursor.fetchone()[0]
-                    
-                    # Insert stats
-                    cursor.execute("""
-                    INSERT INTO system_stats 
-                    (cpu_usage, memory_usage, db_size, active_connections, 
-                     enhancement_jobs_count, tagging_jobs_count)
-                    VALUES (%s, %s, %s, %s, %s, %s);
-                    """, (cpu_usage, memory_usage, db_size, active_connections, 
-                          enhancement_jobs_count, tagging_jobs_count))
-                    
-                    conn.commit()
-                    return True
-        except Exception as e:
-            logger.error(f"Error recording system stats: {e}")
-            return False
-    
-    def get_system_stats(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """
-        Get recent system statistics.
-        
-        Args:
-            limit: Maximum number of records to retrieve
+            doc1_with_embedding = self.embedding_client.generate_embeddings(doc1)
+            doc2_with_embedding = self.embedding_client.generate_embeddings(doc2)
             
-        Returns:
-            List of dictionaries with system statistics
-        """
-        try:
-            with self.get_connection() as conn:
-                with conn.cursor(cursor_factory=DictCursor) as cursor:
-                    cursor.execute("""
-                    SELECT timestamp, cpu_usage, memory_usage, db_size, 
-                           active_connections, enhancement_jobs_count, tagging_jobs_count
-                    FROM system_stats
-                    ORDER BY timestamp DESC
-                    LIMIT %s;
-                    """, (limit,))
-                    
-                    return [dict(row) for row in cursor.fetchall()]
-        except Exception as e:
-            logger.error(f"Error getting system stats: {e}")
-            return []
-    
-    def compute_cosine_similarity(self, vector1: List[float], vector2: List[float]) -> float:
-        """
-        Compute cosine similarity between two vectors.
-        
-        Args:
-            vector1: First vector
-            vector2: Second vector
+            if not doc1_with_embedding.embedding or not doc2_with_embedding.embedding:
+                logger.warning("Could not generate embeddings for similarity computation")
+                return 0.0
             
-        Returns:
-            float: Cosine similarity between 0 and 1
-        """
-        # Convert to numpy arrays
-        a = np.array(vector1)
-        b = np.array(vector2)
-        
-        # Compute cosine similarity
-        dot_product = np.dot(a, b)
-        norm_a = np.linalg.norm(a)
-        norm_b = np.linalg.norm(b)
-        
-        if norm_a == 0 or norm_b == 0:
+            # Compute cosine similarity
+            return self.db_manager.compute_cosine_similarity(
+                doc1_with_embedding.embedding,
+                doc2_with_embedding.embedding
+            )
+        except Exception as e:
+            logger.error(f"Error computing similarity: {e}")
             return 0.0
-        
-        similarity = dot_product / (norm_a * norm_b)
-        return max(0.0, min(similarity, 1.0))  # Ensure in range [0, 1]
