@@ -1,714 +1,492 @@
+#!/usr/bin/env python
 """
-Business Terms Manager using PostgreSQL with pgvector for semantic similarity matching.
-Manages the storage, retrieval, and similarity search of business terms.
+Script to fix vector dimensions in PostgreSQL pgvector tables.
+This script will check the current vector dimensions and update the schema if needed.
 """
 
-import csv
-import logging
 import os
-import time
-from typing import List, Dict, Any, Optional, Tuple
-import numpy as np
-from pydantic import BaseModel
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import sys
+import logging
+import argparse
+import psycopg2
+import re
+from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
-from app.core.db_manager import DBManager
-from app.core.embedding import EmbeddingClient, MyDocument
-from app.core.models import TaggingResult, TaggingValidationResult
-from app.config.environment import get_os_env
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()]
+)
 
 logger = logging.getLogger(__name__)
 
-class BusinessTerm(BaseModel):
-    """Model representing a business term in the repository."""
-    id: str
-    name: str
-    description: str
-    metadata: Dict[str, Any] = {}
+def get_connection(host, port, dbname, user, password, schema_name):
+    """Get a PostgreSQL connection."""
+    conn = psycopg2.connect(
+        host=host,
+        port=port,
+        dbname=dbname,
+        user=user,
+        password=password
+    )
     
-    def dict(self):
-        """Convert the business term to a dictionary."""
-        return {
-            "id": self.id,
-            "name": self.name,
-            "description": self.description,
-            "metadata": self.metadata
-        }
+    # Set isolation level to AUTOCOMMIT for schema operations
+    conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+    
+    # Set search path to include our schema
+    with conn.cursor() as cursor:
+        cursor.execute(f"SET search_path TO {schema_name}, public")
+    
+    return conn
 
-class BusinessTermManager:
-    """
-    Manager for business terms, handling storage, retrieval, and similarity matching.
-    Uses pgvector for semantic similarity search via PostgreSQL.
-    """
-    
-    _instance = None
-    
-    def __new__(cls):
-        """Singleton pattern to ensure only one instance is created."""
-        if cls._instance is None:
-            cls._instance = super(BusinessTermManager, cls).__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
-    
-    def __init__(self):
-        """Initialize the business term manager."""
-        if self._initialized:
-            return
+def get_current_vector_dimension(conn, schema_name, table_name, column_name):
+    """Get the current vector dimension for a column."""
+    try:
+        with conn.cursor() as cursor:
+            # Query table definition
+            cursor.execute(f"""
+            SELECT 
+                a.attname as column_name, 
+                format_type(a.atttypid, a.atttypmod) as data_type
+            FROM pg_catalog.pg_attribute a
+            JOIN pg_catalog.pg_class c ON a.attrelid = c.oid
+            JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+            WHERE c.relname = %s
+            AND n.nspname = %s
+            AND a.attname = %s
+            AND a.attnum > 0 
+            AND NOT a.attisdropped
+            """, (table_name, schema_name, column_name))
             
-        self._initialized = True
-        self.env = get_os_env()
-        
-        # Get embedding model from environment
-        embedding_model = self.env.get("EMBEDDING_MODEL", "text-embedding-3-small")
-        logger.info(f"Using embedding model: {embedding_model}")
-        
-        self.embedding_client = EmbeddingClient(embeddings_model=embedding_model)
-        self.db_manager = DBManager()
-        self.similarity_threshold = float(self.env.get("SIMILARITY_THRESHOLD", "0.5"))  # 50% similarity threshold
-        
-        # Verify database connection and pgvector extension
-        self._verify_database()
-        
-        logger.info("Business term manager initialized with PostgreSQL backend")
+            result = cursor.fetchone()
+            if not result:
+                logger.error(f"Column {column_name} not found in table {schema_name}.{table_name}")
+                return None
+            
+            column_name, data_type = result
+            
+            # Extract dimension from data type
+            match = re.search(r'vector\((\d+)\)', data_type)
+            if match:
+                return int(match.group(1))
+            else:
+                logger.error(f"Could not determine vector dimension from data type: {data_type}")
+                return None
+    except Exception as e:
+        logger.error(f"Error getting vector dimension: {e}")
+        return None
+
+def check_embedding_model_dimension(model_name):
+    """Get the expected dimension for an embedding model."""
+    # Map of model names to dimensions
+    model_dimensions = {
+        "text-embedding-3-small": 1536,
+        "text-embedding-3-large": 3072,
+        "text-embedding-ada-002": 1536,
+    }
     
-    def _verify_database(self) -> bool:
-        """
-        Verify database connection and pgvector extension.
-        
-        Returns:
-            bool: True if verification succeeds, False otherwise
-        """
-        try:
-            # Check database health
-            health = self.db_manager.health_check()
+    return model_dimensions.get(model_name, None)
+
+def update_vector_dimension(conn, schema_name, table_name, column_name, new_dimension, backup_table=True):
+    """Update the vector dimension for a column."""
+    try:
+        with conn.cursor() as cursor:
+            # First, create a backup of the table if requested
+            if backup_table:
+                backup_table_name = f"{table_name}_backup_{new_dimension}"
+                logger.info(f"Creating backup table: {schema_name}.{backup_table_name}")
+                cursor.execute(f"""
+                CREATE TABLE IF NOT EXISTS {schema_name}.{backup_table_name} AS 
+                SELECT * FROM {schema_name}.{table_name}
+                """)
             
-            if health["status"] != "healthy":
-                logger.error(f"Database health check failed: {health.get('error', 'Unknown error')}")
-                return False
+            # Get the current table definition
+            cursor.execute(f"""
+            SELECT 
+                a.attname as column_name, 
+                format_type(a.atttypid, a.atttypmod) as data_type,
+                a.attnotnull as not_null,
+                pg_catalog.pg_get_expr(d.adbin, d.adrelid) as default_value
+            FROM pg_catalog.pg_attribute a
+            LEFT JOIN pg_catalog.pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+            JOIN pg_catalog.pg_class c ON a.attrelid = c.oid
+            JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+            WHERE c.relname = %s
+            AND n.nspname = %s
+            AND a.attnum > 0 
+            AND NOT a.attisdropped
+            ORDER BY a.attnum
+            """, (table_name, schema_name))
             
-            # Check if pgvector extension is enabled
-            if not health.get("vector_enabled", False):
-                logger.error("pgvector extension is not enabled in the database")
-                return False
+            columns = cursor.fetchall()
             
-            # Check if business_terms table exists
-            with self.db_manager.get_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                    SELECT EXISTS (
-                        SELECT FROM information_schema.tables 
-                        WHERE table_name = 'business_terms'
-                    );
+            # Create a new table with updated vector dimension
+            temp_table_name = f"{table_name}_new"
+            
+            # Generate column definitions
+            column_defs = []
+            for col in columns:
+                col_name, data_type, not_null, default_value = col
+                
+                # Replace the vector dimension
+                if col_name == column_name:
+                    data_type = f"vector({new_dimension})"
+                
+                # Build column definition
+                col_def = f"{col_name} {data_type}"
+                if not_null:
+                    col_def += " NOT NULL"
+                if default_value:
+                    col_def += f" DEFAULT {default_value}"
+                
+                column_defs.append(col_def)
+            
+            # Create the new table
+            logger.info(f"Creating new table with updated vector dimension: {schema_name}.{temp_table_name}")
+            cursor.execute(f"""
+            CREATE TABLE {schema_name}.{temp_table_name} (
+                {', '.join(column_defs)}
+            )
+            """)
+            
+            # Get constraints - indexes, primary keys, etc.
+            cursor.execute(f"""
+            SELECT 
+                c.conname as constraint_name,
+                pg_catalog.pg_get_constraintdef(c.oid) as constraint_def
+            FROM pg_catalog.pg_constraint c
+            JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid
+            JOIN pg_catalog.pg_namespace n ON cl.relnamespace = n.oid
+            WHERE cl.relname = %s
+            AND n.nspname = %s
+            """, (table_name, schema_name))
+            
+            constraints = cursor.fetchall()
+            
+            # Apply constraints to the new table
+            for constraint in constraints:
+                constraint_name, constraint_def = constraint
+                if "vector_ops" in constraint_def:
+                    # For vector indexes, we need to recreate with the new dimension
+                    logger.info(f"Skipping vector index: {constraint_name}, will create later")
+                    continue
+                else:
+                    logger.info(f"Adding constraint: {constraint_name}")
+                    # Apply the constraint to the new table
+                    cursor.execute(f"""
+                    ALTER TABLE {schema_name}.{temp_table_name} ADD CONSTRAINT {constraint_name} {constraint_def}
                     """)
-                    
-                    table_exists = cursor.fetchone()[0]
-                    
-                    if not table_exists:
-                        logger.error("business_terms table does not exist in the database")
-                        return False
-                    
-                    # Check the vector dimension in the table
-                    try:
-                        cursor.execute("""
-                        SELECT 
-                            a.attname, 
-                            format_type(a.atttypid, a.atttypmod),
-                            pg_catalog.col_description(a.attrelid, a.attnum)
-                        FROM pg_catalog.pg_attribute a
-                        WHERE a.attrelid = 'business_terms'::regclass
-                        AND a.attname = 'embedding'
-                        AND a.attnum > 0 
-                        AND NOT a.attisdropped
-                        """)
-                        
-                        embedding_info = cursor.fetchone()
-                        if embedding_info:
-                            logger.info(f"Embedding column found: {embedding_info}")
-                            
-                            # Get the dimension from the type
-                            # The format is typically 'vector(N)' where N is the dimension
-                            import re
-                            match = re.search(r'vector\((\d+)\)', embedding_info[1])
-                            if match:
-                                dimension = int(match.group(1))
-                                logger.info(f"Database vector dimension: {dimension}")
-                                
-                                # Store the dimension for later use
-                                self.vector_dimension = dimension
-                                
-                                # Compare with the expected dimension from our embedding model
-                                embedding_model = self.env.get("EMBEDDING_MODEL", "text-embedding-3-small")
-                                expected_dim = 1536  # Default for text-embedding-3-small
-                                if embedding_model == "text-embedding-3-large":
-                                    expected_dim = 3072
-                                
-                                if dimension != expected_dim:
-                                    logger.warning(f"Vector dimension mismatch: database uses {dimension}, but model {embedding_model} produces {expected_dim}. "
-                                                  f"Use the fix_vector_dimensions.py script to update the database schema, or change EMBEDDING_MODEL.")
-                    except Exception as e:
-                        logger.warning(f"Could not retrieve vector dimension: {e}")
+            
+            # Rename tables to swap the old and new
+            logger.info(f"Renaming tables to swap old and new")
+            cursor.execute(f"ALTER TABLE {schema_name}.{table_name} RENAME TO {table_name}_old")
+            cursor.execute(f"ALTER TABLE {schema_name}.{temp_table_name} RENAME TO {table_name}")
+            
+            # Create an index on the vector column if needed
+            logger.info(f"Creating index on {column_name} with dimension {new_dimension}")
+            cursor.execute(f"""
+            CREATE INDEX IF NOT EXISTS {table_name}_{column_name}_idx ON {schema_name}.{table_name} 
+            USING ivfflat ({column_name} vector_cosine_ops) WITH (lists = 100)
+            """)
+            
+            logger.info(f"Completed updating vector dimension for {schema_name}.{table_name}.{column_name} to {new_dimension}")
+            
+            # Optionally drop the old table
+            if not backup_table:
+                logger.info(f"Dropping old table: {schema_name}.{table_name}_old")
+                cursor.execute(f"DROP TABLE {schema_name}.{table_name}_old")
             
             return True
-        
-        except Exception as e:
-            logger.error(f"Database verification failed: {e}")
-            return False
+    except Exception as e:
+        logger.error(f"Error updating vector dimension: {e}")
+        return False
+
+def dimension_reduction(vectors, target_dimension):
+    """
+    Reduce the dimensionality of vectors from 3072 to 1536 dimensions.
+    This is a simple implementation that takes every other dimension.
     
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type(Exception),
-        reraise=True
-    )
-    def import_terms_from_csv(self, csv_path: str, encoding: str = 'utf-8', batch_size: int = 100) -> int:
-        """
-        Import business terms from a CSV file.
+    Args:
+        vectors: List of vectors to reduce
+        target_dimension: Target dimension for the vectors
         
-        Args:
-            csv_path: Path to the CSV file
-            encoding: File encoding (auto-detected if not provided)
-            batch_size: Number of terms to process in each batch
+    Returns:
+        List of reduced vectors
+    """
+    import numpy as np
+    
+    reduced_vectors = []
+    for vector in vectors:
+        if len(vector) > target_dimension:
+            # Simple approach: take every other dimension
+            # This is not optimal but can work as a quick solution
+            reduced = np.array(vector)[::len(vector)//target_dimension][:target_dimension]
+            reduced_vectors.append(reduced.tolist())
+        else:
+            reduced_vectors.append(vector)
+    
+    return reduced_vectors
+
+def migrate_data(conn, schema_name, old_table, new_table, column_name, source_dimension, target_dimension):
+    """
+    Migrate data from old table to new table with appropriate dimension conversion.
+    
+    Args:
+        conn: Database connection
+        schema_name: Schema name
+        old_table: Name of the old table
+        new_table: Name of the new table
+        column_name: Name of the vector column
+        source_dimension: Source vector dimension
+        target_dimension: Target vector dimension
+        
+    Returns:
+        Number of rows migrated
+    """
+    try:
+        with conn.cursor() as cursor:
+            # First count rows in old table
+            cursor.execute(f"SELECT COUNT(*) FROM {schema_name}.{old_table}")
+            total_rows = cursor.fetchone()[0]
+            logger.info(f"Migrating {total_rows} rows from {old_table} to {new_table}")
             
-        Returns:
-            Number of terms imported
-        """
-        try:
-            # Get existing terms
-            existing_terms = {}
-            for term in self.get_all_terms():
-                term_key = f"{term.name}::{term.description}"
-                existing_terms[term_key] = term.id
+            # Get column names from old table excluding vector column
+            cursor.execute(f"""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_schema = %s 
+            AND table_name = %s 
+            AND column_name != %s
+            """, (schema_name, old_table, column_name))
             
-            # Track terms in CSV
-            csv_term_keys = set()
-            terms_to_add = []
+            columns = [row[0] for row in cursor.fetchall()]
+            columns_str = ", ".join(columns)
             
-            # Read terms from CSV
-            with open(csv_path, 'r', encoding=encoding) as csvfile:
-                reader = csv.DictReader(csvfile)
-                for row in reader:
-                    if 'id' not in row or 'name' not in row or 'description' not in row:
-                        logger.warning(f"Skipping row with missing required fields: {row}")
-                        continue
-                    
-                    term_id = row['id'].strip()
-                    name = row['name'].strip()
-                    description = row['description'].strip()
-                    
-                    if not term_id:
-                        logger.warning(f"Skipping term with empty ID: {name}")
-                        continue
-                    
-                    term_key = f"{name}::{description}"
-                    csv_term_keys.add(term_key)
-                    
-                    # Skip if term already exists and is unchanged
-                    if term_key in existing_terms and existing_terms[term_key] == term_id:
-                        continue
-                    
-                    # Extract metadata if present in CSV
-                    metadata = {}
-                    for key, value in row.items():
-                        if key not in ['id', 'name', 'description'] and value:
-                            metadata[key] = value
-                    
-                    terms_to_add.append({
-                        "id": term_id,
-                        "name": name,
-                        "description": description,
-                        "term_key": term_key,
-                        "metadata": metadata
-                    })
-            
-            logger.info(f"Found {len(terms_to_add)} terms to add from CSV file")
-            
-            # Process terms in batches
-            added_count = 0
-            for i in range(0, len(terms_to_add), batch_size):
-                batch = terms_to_add[i:i + batch_size]
-                batch_start_time = time.time()
+            if source_dimension == target_dimension:
+                # If dimensions match, we can directly insert data
+                logger.info("Direct migration - dimensions match")
+                cursor.execute(f"""
+                INSERT INTO {schema_name}.{new_table} ({columns_str}, {column_name})
+                SELECT {columns_str}, {column_name} FROM {schema_name}.{old_table}
+                """)
                 
-                # Create batch of vectors to insert
-                vectors_batch = []
-                for term in batch:
-                    # Generate embedding for the term
-                    doc = MyDocument(
-                        id=term["id"],
-                        text=f"{term['name']}. {term['description']}"
-                    )
+                # Get row count
+                cursor.execute(f"SELECT COUNT(*) FROM {schema_name}.{new_table}")
+                migrated_rows = cursor.fetchone()[0]
+                logger.info(f"Migrated {migrated_rows} rows successfully")
+                
+                return migrated_rows
+            else:
+                # If dimensions don't match, we need to fetch and convert vectors
+                logger.info(f"Converting vectors from {source_dimension} to {target_dimension} dimensions")
+                
+                # Fetch all rows in batches
+                batch_size = 1000
+                migrated_rows = 0
+                
+                # Get total count for progress tracking
+                for offset in range(0, total_rows, batch_size):
+                    # Fetch batch of rows
+                    cursor.execute(f"""
+                    SELECT {columns_str}, {column_name} 
+                    FROM {schema_name}.{old_table}
+                    LIMIT %s OFFSET %s
+                    """, (batch_size, offset))
                     
-                    doc_with_embedding = self.embedding_client.generate_embeddings(doc)
+                    rows = cursor.fetchall()
                     
-                    if not doc_with_embedding.embedding:
-                        logger.warning(f"Skipping term without embedding: {term['name']}")
-                        continue
+                    if not rows:
+                        break
                     
-                    # Log the dimension of the embedding
-                    embedding_dim = len(doc_with_embedding.embedding)
-                    logger.debug(f"Term '{term['name']}' has embedding dimension: {embedding_dim}")
-                    
-                    # Check if we know the expected dimension
-                    if hasattr(self, 'vector_dimension') and embedding_dim != self.vector_dimension:
-                        logger.warning(f"Dimension mismatch: Generated {embedding_dim} dimensions but database expects {self.vector_dimension}")
+                    # Process each row
+                    for row in rows:
+                        # Extract values and vector
+                        values = list(row[:-1])
+                        vector = row[-1]
                         
-                        # If the model generates 3072 dimensions but DB expects 1536, 
-                        # we could implement dimension reduction here, but that's a more complex fix
+                        # Perform dimension reduction if needed
+                        if source_dimension > target_dimension:
+                            # Simple reduction by averaging pairs of elements
+                            reduced_vector = []
+                            for i in range(0, source_dimension, 2):
+                                if i+1 < source_dimension:
+                                    reduced_vector.append((vector[i] + vector[i+1]) / 2)
+                                else:
+                                    reduced_vector.append(vector[i])
+                            
+                            # Ensure exact dimension
+                            if len(reduced_vector) > target_dimension:
+                                reduced_vector = reduced_vector[:target_dimension]
+                            
+                            vector = reduced_vector
                         
-                        # For now, skip this term and continue with others
-                        continue
+                        # Convert vector to string for insertion
+                        vector_str = f"[{','.join(map(str, vector))}]"
+                        
+                        # Prepare placeholders for other columns
+                        placeholders = ", ".join(["%s"] * len(values))
+                        
+                        # Insert the row
+                        cursor.execute(f"""
+                        INSERT INTO {schema_name}.{new_table} ({columns_str}, {column_name})
+                        VALUES ({placeholders}, %s::vector)
+                        """, tuple(values) + (vector_str,))
+                        
+                        migrated_rows += 1
                     
-                    vectors_batch.append({
-                        "id": term["id"],
-                        "name": term["name"],
-                        "description": term["description"],
-                        "embedding": doc_with_embedding.embedding,
-                        "metadata": term.get("metadata", {})
-                    })
+                    logger.info(f"Migrated {migrated_rows}/{total_rows} rows")
                 
-                if not vectors_batch:
-                    logger.warning(f"No valid vectors in batch {i//batch_size + 1}, skipping")
-                    continue
-                
-                # Batch insert into database
-                try:
-                    inserted = self.db_manager.batch_store_vectors(vectors_batch)
-                    added_count += inserted
-                    
-                    batch_duration = time.time() - batch_start_time
-                    logger.info(f"Processed batch {i//batch_size + 1}/{(len(terms_to_add) + batch_size - 1)//batch_size}: "
-                               f"{inserted} terms in {batch_duration:.2f}s "
-                               f"({inserted/batch_duration:.2f} terms/sec)")
-                except Exception as e:
-                    logger.error(f"Error in batch_store_vectors: {e}")
-                    # Continue with next batch
-                    continue
-            
-            # Handle term deletion (terms that exist in the database but not in the CSV)
-            deleted_count = 0
-            terms_to_delete = []
-            for term_key, term_id in existing_terms.items():
-                if term_key not in csv_term_keys:
-                    terms_to_delete.append(term_id)
-            
-            # Delete in batches
-            for i in range(0, len(terms_to_delete), batch_size):
-                batch = terms_to_delete[i:i + batch_size]
-                deleted_in_batch = 0
-                
-                for term_id in batch:
-                    if self.db_manager.delete_term(term_id):
-                        deleted_in_batch += 1
-                
-                deleted_count += deleted_in_batch
-                if deleted_in_batch > 0:
-                    logger.info(f"Deleted batch of {deleted_in_batch} terms")
-            
-            logger.info(f"Import summary: Added {added_count} terms, deleted {deleted_count} terms")
-            return added_count
-        
-        except Exception as e:
-            logger.error(f"Error importing terms from CSV: {e}")
-            raise
+                logger.info(f"Completed migration of {migrated_rows} rows")
+                return migrated_rows
+    except Exception as e:
+        logger.error(f"Error migrating data: {e}")
+        return 0
+
+def print_help():
+    """Print help information."""
+    print("Vector Dimension Fixer")
+    print("---------------------")
+    print("This script checks and fixes vector dimensions in PostgreSQL pgvector tables.")
+    print("")
+    print("Arguments:")
+    print("  --host         PostgreSQL host (default: localhost)")
+    print("  --port         PostgreSQL port (default: 5432)")
+    print("  --db           PostgreSQL database name")
+    print("  --user         PostgreSQL user")
+    print("  --password     PostgreSQL password")
+    print("  --schema       PostgreSQL schema (default: ai_stitching_platform)")
+    print("  --table        Table name (default: business_terms)")
+    print("  --column       Column name (default: embedding)")
+    print("  --dimension    New dimension (default: determined from embedding model)")
+    print("  --embedding-model Embedding model to use (default: text-embedding-3-small)")
+    print("  --check-only   Only check dimensions, don't make changes")
+    print("  --no-backup    Don't create a backup table")
+    print("  --migrate      Migrate data to new table (only needed for complete implementation)")
+    print("  --help         Show this help message")
+
+def main():
+    # Parse arguments
+    parser = argparse.ArgumentParser(description="Fix vector dimensions in PostgreSQL pgvector tables.")
+    parser.add_argument("--host", default="localhost", help="PostgreSQL host")
+    parser.add_argument("--port", default=5432, type=int, help="PostgreSQL port")
+    parser.add_argument("--db", required=True, help="PostgreSQL database name")
+    parser.add_argument("--user", required=True, help="PostgreSQL user")
+    parser.add_argument("--password", required=True, help="PostgreSQL password")
+    parser.add_argument("--schema", default="ai_stitching_platform", help="PostgreSQL schema")
+    parser.add_argument("--table", default="business_terms", help="Table name")
+    parser.add_argument("--column", default="embedding", help="Column name")
+    parser.add_argument("--dimension", type=int, help="New dimension (default: determined from embedding model)")
+    parser.add_argument("--embedding-model", default="text-embedding-3-small", help="Embedding model to use")
+    parser.add_argument("--check-only", action="store_true", help="Only check dimensions, don't make changes")
+    parser.add_argument("--no-backup", action="store_true", help="Don't create a backup table")
+    parser.add_argument("--migrate", action="store_true", help="Migrate data to new table")
     
-    def tag_element(self, element_id: str, name: str, description: str, top_k: int = 3) -> TaggingResult:
-        """
-        Tag a data element with the most similar business terms.
-        
-        Args:
-            element_id: Unique identifier for the element
-            name: Enhanced name of the element
-            description: Enhanced description of the element
-            top_k: Number of top matching terms to return
-            
-        Returns:
-            TaggingResult containing matching terms and confidence scores
-        """
-        try:
-            # Validate inputs
-            if not name or not description:
-                logger.warning(f"Empty name or description for element: {element_id}")
-                return TaggingResult(
-                    element_id=element_id,
-                    element_name=name or "",
-                    element_description=description or "",
-                    matching_terms=[],
-                    confidence_scores=[],
-                    modeling_required=True,
-                    message="Name or description is empty. Modeling should be performed."
-                )
-            
-            # Create document with embedding
-            doc = MyDocument(
-                id=element_id,
-                text=f"{name}. {description}"
-            )
-            
-            doc_with_embedding = self.embedding_client.generate_embeddings(doc)
-            
-            if not doc_with_embedding.embedding:
-                logger.warning(f"Could not generate embedding for element: {name}")
-                return TaggingResult(
-                    element_id=element_id,
-                    element_name=name,
-                    element_description=description,
-                    matching_terms=[],
-                    confidence_scores=[],
-                    modeling_required=True,
-                    message="Could not generate embedding. Modeling should be performed."
-                )
-            
-            # Check if dimensions match the database expectation
-            if hasattr(self, 'vector_dimension') and len(doc_with_embedding.embedding) != self.vector_dimension:
-                logger.warning(f"Dimension mismatch: Generated {len(doc_with_embedding.embedding)} dimensions but database expects {self.vector_dimension}")
-                return TaggingResult(
-                    element_id=element_id,
-                    element_name=name,
-                    element_description=description,
-                    matching_terms=[],
-                    confidence_scores=[],
-                    modeling_required=True,
-                    message=f"Vector dimension mismatch: Generated {len(doc_with_embedding.embedding)} dimensions but database expects {self.vector_dimension}."
-                )
-            
-            # Query for similar terms
-            similar_terms = self.db_manager.find_similar_vectors(
-                query_vector=doc_with_embedding.embedding,
-                top_k=top_k * 2,  # Fetch more and filter later
-                threshold=self.similarity_threshold
-            )
-            
-            # If no similar terms found, recommend modeling
-            if not similar_terms:
-                return TaggingResult(
-                    element_id=element_id,
-                    element_name=name,
-                    element_description=description,
-                    matching_terms=[],
-                    confidence_scores=[],
-                    modeling_required=True,
-                    message=f"Similarity is less than {self.similarity_threshold*100}%. Modeling should be performed."
-                )
-            
-            # Format matching terms and filter by top_k
-            matching_terms = []
-            confidence_scores = []
-            
-            # Sort by similarity (in case DB didn't return in sorted order)
-            similar_terms.sort(key=lambda x: x["similarity"], reverse=True)
-            
-            # Take top_k items
-            for term in similar_terms[:top_k]:
-                matching_terms.append({
-                    "id": term["id"],
-                    "name": term["name"],
-                    "description": term["description"],
-                    "similarity": term["similarity"]
-                })
-                confidence_scores.append(term["similarity"])
-            
-            return TaggingResult(
-                element_id=element_id,
-                element_name=name,
-                element_description=description,
-                matching_terms=matching_terms,
-                confidence_scores=confidence_scores,
-                modeling_required=False,
-                message=""
-            )
-            
-        except Exception as e:
-            logger.error(f"Error tagging element: {e}", exc_info=True)
-            
-            # Attempt fallback matching using direct vector comparison
-            try:
-                logger.info(f"Attempting fallback matching for element: {element_id}")
-                
-                # Get all terms
-                all_terms = self.get_all_terms()
-                if not all_terms:
-                    logger.warning("No business terms available for fallback matching")
-                    return TaggingResult(
-                        element_id=element_id,
-                        element_name=name,
-                        element_description=description,
-                        matching_terms=[],
-                        confidence_scores=[],
-                        modeling_required=True,
-                        message="Business terms repository is not available. Modeling should be performed."
-                    )
-                
-                # Compare directly with available terms using dot product
-                # This is a slow fallback method but ensures we can still match
-                # even if the database query fails
-                return TaggingResult(
-                    element_id=element_id,
-                    element_name=name,
-                    element_description=description,
-                    matching_terms=[],
-                    confidence_scores=[],
-                    modeling_required=True,
-                    message=f"Error during tagging: {str(e)}. Modeling should be performed."
-                )
-            except Exception as fallback_error:
-                logger.error(f"Fallback matching also failed: {fallback_error}")
-                return TaggingResult(
-                    element_id=element_id,
-                    element_name=name,
-                    element_description=description,
-                    matching_terms=[],
-                    confidence_scores=[],
-                    modeling_required=True,
-                    message=f"Error during tagging: {str(e)}. Modeling should be performed."
-                )
+    if "--help" in sys.argv:
+        print_help()
+        sys.exit(0)
     
-    async def validate_tagging(self, tagging_result: TaggingResult) -> TaggingValidationResult:
-        """
-        Validate the tagging result.
+    args = parser.parse_args()
+    
+    # Connect to the database
+    try:
+        conn = get_connection(
+            host=args.host,
+            port=args.port,
+            dbname=args.db,
+            user=args.user,
+            password=args.password,
+            schema_name=args.schema
+        )
         
-        Args:
-            tagging_result: Result of tagging to validate
+        logger.info(f"Connected to {args.db} on {args.host}:{args.port}")
+    except Exception as e:
+        logger.error(f"Could not connect to database: {e}")
+        sys.exit(1)
+    
+    try:
+        # Check current dimension
+        current_dim = get_current_vector_dimension(
+            conn=conn,
+            schema_name=args.schema,
+            table_name=args.table,
+            column_name=args.column
+        )
+        
+        if current_dim is None:
+            logger.error(f"Could not determine current vector dimension for {args.schema}.{args.table}.{args.column}")
+            sys.exit(1)
+        
+        logger.info(f"Current vector dimension is {current_dim}")
+        
+        # Determine target dimension
+        target_dim = args.dimension
+        if target_dim is None:
+            model_dim = check_embedding_model_dimension(args.embedding_model)
+            if model_dim:
+                target_dim = model_dim
+                logger.info(f"Using dimension {target_dim} from model {args.embedding_model}")
+            else:
+                logger.error(f"Could not determine dimension for model {args.embedding_model}")
+                logger.error(f"Please specify --dimension explicitly")
+                sys.exit(1)
+        
+        # Check if update is needed
+        if current_dim == target_dim:
+            logger.info(f"Current dimension ({current_dim}) matches target dimension ({target_dim}). No update needed.")
+            sys.exit(0)
+        
+        logger.info(f"Need to update vector dimension from {current_dim} to {target_dim}")
+        
+        if args.check_only:
+            logger.info("Check-only mode, not making changes")
+            sys.exit(0)
+        
+        # Get confirmation from user
+        proceed = input(f"Proceed with updating vector dimension from {current_dim} to {target_dim}? [y/N] ")
+        if proceed.lower() != 'y':
+            logger.info("Operation cancelled by user")
+            sys.exit(0)
+        
+        # Update the vector dimension
+        success = update_vector_dimension(
+            conn=conn,
+            schema_name=args.schema,
+            table_name=args.table,
+            column_name=args.column,
+            new_dimension=target_dim,
+            backup_table=not args.no_backup
+        )
+        
+        if success:
+            logger.info(f"Successfully updated vector dimension to {target_dim}")
             
-        Returns:
-            TaggingValidationResult with validation status and suggestions
-        """
-        try:
-            # Skip validation if modeling is required
-            if tagging_result.modeling_required:
-                return TaggingValidationResult(
-                    is_valid=False,
-                    feedback=tagging_result.message,
-                    suggested_alternatives=[]
+            # Migrate data if requested
+            if args.migrate:
+                logger.info("Migrating data to new table...")
+                migrated_rows = migrate_data(
+                    conn=conn,
+                    schema_name=args.schema,
+                    old_table=f"{args.table}_old",
+                    new_table=args.table,
+                    column_name=args.column,
+                    source_dimension=current_dim,
+                    target_dimension=target_dim
                 )
                 
-            # If no matching terms, validation fails
-            if not tagging_result.matching_terms:
-                return TaggingValidationResult(
-                    is_valid=False,
-                    feedback="No matching terms found",
-                    suggested_alternatives=[]
-                )
-            
-            # Get highest confidence score
-            highest_confidence = max(tagging_result.confidence_scores) if tagging_result.confidence_scores else 0.0
-            
-            # If highest confidence is barely above threshold, find alternatives
-            if highest_confidence < 0.75:
-                # Try to find better alternatives
-                alternative_doc = MyDocument(
-                    id=tagging_result.element_id,
-                    text=tagging_result.element_name  # Use just the name for alternative searching
-                )
-                
-                alternative_doc_with_embedding = self.embedding_client.generate_embeddings(alternative_doc)
-                
-                if alternative_doc_with_embedding.embedding:
-                    # Exclude already matched terms
-                    matched_ids = [term["id"] for term in tagging_result.matching_terms]
-                    
-                    all_similar_terms = self.db_manager.find_similar_vectors(
-                        query_vector=alternative_doc_with_embedding.embedding,
-                        top_k=10,  # Get more to filter out already matched terms
-                        threshold=self.similarity_threshold
-                    )
-                    
-                    # Filter out already matched terms
-                    alternative_terms = [
-                        term for term in all_similar_terms
-                        if term["id"] not in matched_ids
-                    ][:3]  # Limit to top 3 alternatives
-                    
-                    if alternative_terms:
-                        return TaggingValidationResult(
-                            is_valid=False,
-                            feedback="Low confidence in matching terms. Alternative terms found.",
-                            suggested_alternatives=alternative_terms
-                        )
-            
-            # Default case - validation passes
-            return TaggingValidationResult(
-                is_valid=True,
-                feedback="Matching terms found with good confidence",
-                suggested_alternatives=[]
-            )
-            
-        except Exception as e:
-            logger.error(f"Error validating tagging: {e}")
-            return TaggingValidationResult(
-                is_valid=False,
-                feedback=f"Error during validation: {str(e)}",
-                suggested_alternatives=[]
-            )
-    
-    def get_all_terms(self) -> List[BusinessTerm]:
-        """
-        Get all business terms in the collection.
+                if migrated_rows > 0:
+                    logger.info(f"Successfully migrated {migrated_rows} rows")
+                else:
+                    logger.error("Failed to migrate data")
+            else:
+                logger.warning("Data migration not performed. The new table is empty!")
+                logger.warning("You need to re-import your data or use --migrate to migrate existing data")
+        else:
+            logger.error(f"Failed to update vector dimension")
+            sys.exit(1)
         
-        Returns:
-            List of BusinessTerm objects
-        """
-        try:
-            term_dicts = self.db_manager.get_all_terms()
-            
-            terms = []
-            for term_dict in term_dicts:
-                terms.append(BusinessTerm(
-                    id=term_dict["id"],
-                    name=term_dict["name"],
-                    description=term_dict["description"],
-                    metadata=term_dict.get("metadata", {})
-                ))
-                
-            return terms
-        except Exception as e:
-            logger.error(f"Error retrieving all terms: {e}")
-            return []
-    
-    def get_term_by_id(self, term_id: str) -> Optional[BusinessTerm]:
-        """
-        Get a business term by its ID.
-        
-        Args:
-            term_id: Unique identifier of the term
-            
-        Returns:
-            BusinessTerm if found, None otherwise
-        """
-        try:
-            term_dict = self.db_manager.get_term_by_id(term_id)
-            
-            if term_dict:
-                return BusinessTerm(
-                    id=term_dict["id"],
-                    name=term_dict["name"],
-                    description=term_dict["description"],
-                    metadata=term_dict.get("metadata", {})
-                )
-            
-            return None
-        except Exception as e:
-            logger.error(f"Error retrieving term by ID: {e}")
-            return None
-    
-    def get_term_count(self) -> int:
-        """
-        Get the total count of business terms.
-        
-        Returns:
-            Total number of terms
-        """
-        try:
-            with self.db_manager.get_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("SELECT COUNT(*) FROM business_terms")
-                    return cursor.fetchone()[0]
-        except Exception as e:
-            logger.error(f"Error getting term count: {e}")
-            return 0
-    
-    def delete_term(self, term_id: str) -> bool:
-        """
-        Delete a business term by ID.
-        
-        Args:
-            term_id: ID of the term to delete
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            return self.db_manager.delete_term(term_id)
-        except Exception as e:
-            logger.error(f"Error deleting term: {e}")
-            return False
-    
-    def delete_all_terms(self) -> int:
-        """
-        Delete all business terms.
-        
-        Returns:
-            Number of terms deleted
-        """
-        try:
-            with self.db_manager.get_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("DELETE FROM business_terms")
-                    deleted = cursor.rowcount
-                    conn.commit()
-                    return deleted
-        except Exception as e:
-            logger.error(f"Error deleting all terms: {e}")
-            return 0
-    
-    def search_terms(self, query: str, limit: int = 20) -> List[BusinessTerm]:
-        """
-        Search for business terms by name or description.
-        
-        Args:
-            query: Search query
-            limit: Maximum number of results
-            
-        Returns:
-            List of matching BusinessTerm objects
-        """
-        try:
-            with self.db_manager.get_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                    SELECT id, name, description, metadata
-                    FROM business_terms
-                    WHERE 
-                        name ILIKE %s OR 
-                        description ILIKE %s
-                    ORDER BY 
-                        CASE WHEN name ILIKE %s THEN 0 ELSE 1 END,
-                        CASE WHEN description ILIKE %s THEN 0 ELSE 1 END,
-                        name
-                    LIMIT %s
-                    """, (f"%{query}%", f"%{query}%", f"{query}%", f"{query}%", limit))
-                    
-                    results = []
-                    for row in cursor.fetchall():
-                        id, name, description, metadata = row
-                        results.append(BusinessTerm(
-                            id=id,
-                            name=name,
-                            description=description,
-                            metadata=metadata or {}
-                        ))
-                    
-                    return results
-        except Exception as e:
-            logger.error(f"Error searching terms: {e}")
-            return []
-    
-    def compute_similarity(self, text1: str, text2: str) -> float:
-        """
-        Compute semantic similarity between two text strings.
-        
-        Args:
-            text1: First text
-            text2: Second text
-            
-        Returns:
-            Similarity score between 0 and 1
-        """
-        try:
-            # Generate embeddings
-            doc1 = MyDocument(id="temp1", text=text1)
-            doc2 = MyDocument(id="temp2", text=text2)
-            
-            doc1_with_embedding = self.embedding_client.generate_embeddings(doc1)
-            doc2_with_embedding = self.embedding_client.generate_embeddings(doc2)
-            
-            if not doc1_with_embedding.embedding or not doc2_with_embedding.embedding:
-                logger.warning("Could not generate embeddings for similarity computation")
-                return 0.0
-            
-            # Compute cosine similarity
-            return self.db_manager.compute_cosine_similarity(
-                doc1_with_embedding.embedding,
-                doc2_with_embedding.embedding
-            )
-        except Exception as e:
-            logger.error(f"Error computing similarity: {e}")
-            return 0.0
+    finally:
+        conn.close()
+
+if __name__ == "__main__":
+    main()
