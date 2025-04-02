@@ -1,492 +1,280 @@
-#!/usr/bin/env python
 """
-Script to fix vector dimensions in PostgreSQL pgvector tables.
-This script will check the current vector dimensions and update the schema if needed.
+Embedding Client for generating vector embeddings using Azure OpenAI.
 """
 
-import os
-import sys
 import logging
-import argparse
-import psycopg2
-import re
-from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()]
-)
+import numpy as np
+from typing import List, Dict, Any, Optional, Union, Tuple
+from pydantic import BaseModel
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+from openai import AzureOpenAI
+from app.config.environment import get_os_env
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 logger = logging.getLogger(__name__)
 
-def get_connection(host, port, dbname, user, password, schema_name):
-    """Get a PostgreSQL connection."""
-    conn = psycopg2.connect(
-        host=host,
-        port=port,
-        dbname=dbname,
-        user=user,
-        password=password
-    )
-    
-    # Set isolation level to AUTOCOMMIT for schema operations
-    conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
-    
-    # Set search path to include our schema
-    with conn.cursor() as cursor:
-        cursor.execute(f"SET search_path TO {schema_name}, public")
-    
-    return conn
+class MyDocument(BaseModel):
+    """Model representing a document with its embedding."""
+    id: str = ""
+    text: str = ""
+    embedding: List[float] = []
+    metadata: Dict[str, Any] = {}
 
-def get_current_vector_dimension(conn, schema_name, table_name, column_name):
-    """Get the current vector dimension for a column."""
-    try:
-        with conn.cursor() as cursor:
-            # Query table definition
-            cursor.execute(f"""
-            SELECT 
-                a.attname as column_name, 
-                format_type(a.atttypid, a.atttypmod) as data_type
-            FROM pg_catalog.pg_attribute a
-            JOIN pg_catalog.pg_class c ON a.attrelid = c.oid
-            JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
-            WHERE c.relname = %s
-            AND n.nspname = %s
-            AND a.attname = %s
-            AND a.attnum > 0 
-            AND NOT a.attisdropped
-            """, (table_name, schema_name, column_name))
-            
-            result = cursor.fetchone()
-            if not result:
-                logger.error(f"Column {column_name} not found in table {schema_name}.{table_name}")
-                return None
-            
-            column_name, data_type = result
-            
-            # Extract dimension from data type
-            match = re.search(r'vector\((\d+)\)', data_type)
-            if match:
-                return int(match.group(1))
-            else:
-                logger.error(f"Could not determine vector dimension from data type: {data_type}")
-                return None
-    except Exception as e:
-        logger.error(f"Error getting vector dimension: {e}")
-        return None
 
-def check_embedding_model_dimension(model_name):
-    """Get the expected dimension for an embedding model."""
-    # Map of model names to dimensions
-    model_dimensions = {
+class EmbeddingClient:
+    """Client for generating embeddings for documents using Azure OpenAI."""
+    
+    # Define model dimension mappings for reference
+    MODEL_DIMENSIONS = {
         "text-embedding-3-small": 1536,
         "text-embedding-3-large": 3072,
-        "text-embedding-ada-002": 1536,
+        "text-embedding-ada-002": 1536
     }
     
-    return model_dimensions.get(model_name, None)
-
-def update_vector_dimension(conn, schema_name, table_name, column_name, new_dimension, backup_table=True):
-    """Update the vector dimension for a column."""
-    try:
-        with conn.cursor() as cursor:
-            # First, create a backup of the table if requested
-            if backup_table:
-                backup_table_name = f"{table_name}_backup_{new_dimension}"
-                logger.info(f"Creating backup table: {schema_name}.{backup_table_name}")
-                cursor.execute(f"""
-                CREATE TABLE IF NOT EXISTS {schema_name}.{backup_table_name} AS 
-                SELECT * FROM {schema_name}.{table_name}
-                """)
-            
-            # Get the current table definition
-            cursor.execute(f"""
-            SELECT 
-                a.attname as column_name, 
-                format_type(a.atttypid, a.atttypmod) as data_type,
-                a.attnotnull as not_null,
-                pg_catalog.pg_get_expr(d.adbin, d.adrelid) as default_value
-            FROM pg_catalog.pg_attribute a
-            LEFT JOIN pg_catalog.pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum
-            JOIN pg_catalog.pg_class c ON a.attrelid = c.oid
-            JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
-            WHERE c.relname = %s
-            AND n.nspname = %s
-            AND a.attnum > 0 
-            AND NOT a.attisdropped
-            ORDER BY a.attnum
-            """, (table_name, schema_name))
-            
-            columns = cursor.fetchall()
-            
-            # Create a new table with updated vector dimension
-            temp_table_name = f"{table_name}_new"
-            
-            # Generate column definitions
-            column_defs = []
-            for col in columns:
-                col_name, data_type, not_null, default_value = col
-                
-                # Replace the vector dimension
-                if col_name == column_name:
-                    data_type = f"vector({new_dimension})"
-                
-                # Build column definition
-                col_def = f"{col_name} {data_type}"
-                if not_null:
-                    col_def += " NOT NULL"
-                if default_value:
-                    col_def += f" DEFAULT {default_value}"
-                
-                column_defs.append(col_def)
-            
-            # Create the new table
-            logger.info(f"Creating new table with updated vector dimension: {schema_name}.{temp_table_name}")
-            cursor.execute(f"""
-            CREATE TABLE {schema_name}.{temp_table_name} (
-                {', '.join(column_defs)}
+    # Maximum dimension supported by pgvector
+    PGVECTOR_MAX_DIMENSION = 2000
+    
+    def __init__(self, azure_api_version: str = "2023-05-15", embeddings_model: str = None, target_dimension: int = None):
+        """
+        Initialize the embedding client.
+        
+        Args:
+            azure_api_version: API version for Azure OpenAI
+            embeddings_model: Model to use for embeddings
+            target_dimension: Target dimension for embeddings (for pgvector compatibility)
+        """
+        self.env = get_os_env()
+        self.azure_api_version = azure_api_version
+        
+        # Get embedding model from environment or use default
+        self.embeddings_model = embeddings_model or self.env.get("EMBEDDING_MODEL", "text-embedding-3-small")
+        
+        # Determine expected dimension for this model
+        self.expected_dimension = self.MODEL_DIMENSIONS.get(self.embeddings_model, 1536)
+        
+        # Set target dimension - important for pgvector compatibility
+        self.target_dimension = target_dimension or int(self.env.get("TARGET_DIMENSION", 
+                             str(min(self.expected_dimension, self.PGVECTOR_MAX_DIMENSION))))
+        
+        logger.info(f"Initializing embedding client with model: {self.embeddings_model} "
+                   f"(native dim: {self.expected_dimension}, target dim: {self.target_dimension})")
+        
+        self.direct_azure_client = self._get_direct_azure_client()
+        logger.info(f"Embedding client initialized with model: {self.embeddings_model}")
+    
+    def _get_direct_azure_client(self):
+        """Get the Azure OpenAI client for generating embeddings."""
+        try:
+            token_provider = get_bearer_token_provider(
+                self.env.credential,
+                "https://cognitiveservices.azure.com/.default"
             )
-            """)
+            azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
             
-            # Get constraints - indexes, primary keys, etc.
-            cursor.execute(f"""
-            SELECT 
-                c.conname as constraint_name,
-                pg_catalog.pg_get_constraintdef(c.oid) as constraint_def
-            FROM pg_catalog.pg_constraint c
-            JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid
-            JOIN pg_catalog.pg_namespace n ON cl.relnamespace = n.oid
-            WHERE cl.relname = %s
-            AND n.nspname = %s
-            """, (table_name, schema_name))
-            
-            constraints = cursor.fetchall()
-            
-            # Apply constraints to the new table
-            for constraint in constraints:
-                constraint_name, constraint_def = constraint
-                if "vector_ops" in constraint_def:
-                    # For vector indexes, we need to recreate with the new dimension
-                    logger.info(f"Skipping vector index: {constraint_name}, will create later")
-                    continue
-                else:
-                    logger.info(f"Adding constraint: {constraint_name}")
-                    # Apply the constraint to the new table
-                    cursor.execute(f"""
-                    ALTER TABLE {schema_name}.{temp_table_name} ADD CONSTRAINT {constraint_name} {constraint_def}
-                    """)
-            
-            # Rename tables to swap the old and new
-            logger.info(f"Renaming tables to swap old and new")
-            cursor.execute(f"ALTER TABLE {schema_name}.{table_name} RENAME TO {table_name}_old")
-            cursor.execute(f"ALTER TABLE {schema_name}.{temp_table_name} RENAME TO {table_name}")
-            
-            # Create an index on the vector column if needed
-            logger.info(f"Creating index on {column_name} with dimension {new_dimension}")
-            cursor.execute(f"""
-            CREATE INDEX IF NOT EXISTS {table_name}_{column_name}_idx ON {schema_name}.{table_name} 
-            USING ivfflat ({column_name} vector_cosine_ops) WITH (lists = 100)
-            """)
-            
-            logger.info(f"Completed updating vector dimension for {schema_name}.{table_name}.{column_name} to {new_dimension}")
-            
-            # Optionally drop the old table
-            if not backup_table:
-                logger.info(f"Dropping old table: {schema_name}.{table_name}_old")
-                cursor.execute(f"DROP TABLE {schema_name}.{table_name}_old")
-            
-            return True
-    except Exception as e:
-        logger.error(f"Error updating vector dimension: {e}")
-        return False
-
-def dimension_reduction(vectors, target_dimension):
-    """
-    Reduce the dimensionality of vectors from 3072 to 1536 dimensions.
-    This is a simple implementation that takes every other dimension.
+            return AzureOpenAI(
+                azure_endpoint=azure_endpoint,
+                api_version=self.azure_api_version,
+                azure_ad_token_provider=token_provider
+            )
+        except Exception as e:
+            logger.error(f"Error initializing Azure OpenAI client: {e}")
+            raise
     
-    Args:
-        vectors: List of vectors to reduce
-        target_dimension: Target dimension for the vectors
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type((Exception)),
+        reraise=True
+    )
+    def generate_embeddings(self, doc: MyDocument, auto_reduce: bool = True) -> MyDocument:
+        """
+        Generate embeddings for a document with retry logic.
         
-    Returns:
-        List of reduced vectors
-    """
-    import numpy as np
-    
-    reduced_vectors = []
-    for vector in vectors:
-        if len(vector) > target_dimension:
-            # Simple approach: take every other dimension
-            # This is not optimal but can work as a quick solution
-            reduced = np.array(vector)[::len(vector)//target_dimension][:target_dimension]
-            reduced_vectors.append(reduced.tolist())
-        else:
-            reduced_vectors.append(vector)
-    
-    return reduced_vectors
-
-def migrate_data(conn, schema_name, old_table, new_table, column_name, source_dimension, target_dimension):
-    """
-    Migrate data from old table to new table with appropriate dimension conversion.
-    
-    Args:
-        conn: Database connection
-        schema_name: Schema name
-        old_table: Name of the old table
-        new_table: Name of the new table
-        column_name: Name of the vector column
-        source_dimension: Source vector dimension
-        target_dimension: Target vector dimension
-        
-    Returns:
-        Number of rows migrated
-    """
-    try:
-        with conn.cursor() as cursor:
-            # First count rows in old table
-            cursor.execute(f"SELECT COUNT(*) FROM {schema_name}.{old_table}")
-            total_rows = cursor.fetchone()[0]
-            logger.info(f"Migrating {total_rows} rows from {old_table} to {new_table}")
+        Args:
+            doc: Document to generate embeddings for
+            auto_reduce: Whether to automatically reduce dimensions to target
             
-            # Get column names from old table excluding vector column
-            cursor.execute(f"""
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_schema = %s 
-            AND table_name = %s 
-            AND column_name != %s
-            """, (schema_name, old_table, column_name))
-            
-            columns = [row[0] for row in cursor.fetchall()]
-            columns_str = ", ".join(columns)
-            
-            if source_dimension == target_dimension:
-                # If dimensions match, we can directly insert data
-                logger.info("Direct migration - dimensions match")
-                cursor.execute(f"""
-                INSERT INTO {schema_name}.{new_table} ({columns_str}, {column_name})
-                SELECT {columns_str}, {column_name} FROM {schema_name}.{old_table}
-                """)
+        Returns:
+            Document with embedding
+        """
+        try:
+            # Check if text is empty
+            if not doc.text or len(doc.text.strip()) == 0:
+                logger.warning(f"Empty text for document ID: {doc.id}")
+                return doc
                 
-                # Get row count
-                cursor.execute(f"SELECT COUNT(*) FROM {schema_name}.{new_table}")
-                migrated_rows = cursor.fetchone()[0]
-                logger.info(f"Migrated {migrated_rows} rows successfully")
-                
-                return migrated_rows
+            # Generate embedding
+            response = self.direct_azure_client.embeddings.create(
+                model=self.embeddings_model,
+                input=doc.text
+            ).data[0].embedding
+            
+            # Log the dimension of the embedding for debugging
+            original_dim = len(response)
+            logger.debug(f"Generated embedding for '{doc.id}' with dimension: {original_dim}")
+            
+            # Automatically reduce dimensions if needed
+            if auto_reduce and original_dim > self.target_dimension:
+                reduced_embedding = self.reduce_dimensions(response, self.target_dimension)
+                doc.embedding = reduced_embedding
+                logger.debug(f"Reduced embedding dimensions from {original_dim} to {len(reduced_embedding)}")
             else:
-                # If dimensions don't match, we need to fetch and convert vectors
-                logger.info(f"Converting vectors from {source_dimension} to {target_dimension} dimensions")
-                
-                # Fetch all rows in batches
-                batch_size = 1000
-                migrated_rows = 0
-                
-                # Get total count for progress tracking
-                for offset in range(0, total_rows, batch_size):
-                    # Fetch batch of rows
-                    cursor.execute(f"""
-                    SELECT {columns_str}, {column_name} 
-                    FROM {schema_name}.{old_table}
-                    LIMIT %s OFFSET %s
-                    """, (batch_size, offset))
-                    
-                    rows = cursor.fetchall()
-                    
-                    if not rows:
-                        break
-                    
-                    # Process each row
-                    for row in rows:
-                        # Extract values and vector
-                        values = list(row[:-1])
-                        vector = row[-1]
-                        
-                        # Perform dimension reduction if needed
-                        if source_dimension > target_dimension:
-                            # Simple reduction by averaging pairs of elements
-                            reduced_vector = []
-                            for i in range(0, source_dimension, 2):
-                                if i+1 < source_dimension:
-                                    reduced_vector.append((vector[i] + vector[i+1]) / 2)
-                                else:
-                                    reduced_vector.append(vector[i])
-                            
-                            # Ensure exact dimension
-                            if len(reduced_vector) > target_dimension:
-                                reduced_vector = reduced_vector[:target_dimension]
-                            
-                            vector = reduced_vector
-                        
-                        # Convert vector to string for insertion
-                        vector_str = f"[{','.join(map(str, vector))}]"
-                        
-                        # Prepare placeholders for other columns
-                        placeholders = ", ".join(["%s"] * len(values))
-                        
-                        # Insert the row
-                        cursor.execute(f"""
-                        INSERT INTO {schema_name}.{new_table} ({columns_str}, {column_name})
-                        VALUES ({placeholders}, %s::vector)
-                        """, tuple(values) + (vector_str,))
-                        
-                        migrated_rows += 1
-                    
-                    logger.info(f"Migrated {migrated_rows}/{total_rows} rows")
-                
-                logger.info(f"Completed migration of {migrated_rows} rows")
-                return migrated_rows
-    except Exception as e:
-        logger.error(f"Error migrating data: {e}")
-        return 0
-
-def print_help():
-    """Print help information."""
-    print("Vector Dimension Fixer")
-    print("---------------------")
-    print("This script checks and fixes vector dimensions in PostgreSQL pgvector tables.")
-    print("")
-    print("Arguments:")
-    print("  --host         PostgreSQL host (default: localhost)")
-    print("  --port         PostgreSQL port (default: 5432)")
-    print("  --db           PostgreSQL database name")
-    print("  --user         PostgreSQL user")
-    print("  --password     PostgreSQL password")
-    print("  --schema       PostgreSQL schema (default: ai_stitching_platform)")
-    print("  --table        Table name (default: business_terms)")
-    print("  --column       Column name (default: embedding)")
-    print("  --dimension    New dimension (default: determined from embedding model)")
-    print("  --embedding-model Embedding model to use (default: text-embedding-3-small)")
-    print("  --check-only   Only check dimensions, don't make changes")
-    print("  --no-backup    Don't create a backup table")
-    print("  --migrate      Migrate data to new table (only needed for complete implementation)")
-    print("  --help         Show this help message")
-
-def main():
-    # Parse arguments
-    parser = argparse.ArgumentParser(description="Fix vector dimensions in PostgreSQL pgvector tables.")
-    parser.add_argument("--host", default="localhost", help="PostgreSQL host")
-    parser.add_argument("--port", default=5432, type=int, help="PostgreSQL port")
-    parser.add_argument("--db", required=True, help="PostgreSQL database name")
-    parser.add_argument("--user", required=True, help="PostgreSQL user")
-    parser.add_argument("--password", required=True, help="PostgreSQL password")
-    parser.add_argument("--schema", default="ai_stitching_platform", help="PostgreSQL schema")
-    parser.add_argument("--table", default="business_terms", help="Table name")
-    parser.add_argument("--column", default="embedding", help="Column name")
-    parser.add_argument("--dimension", type=int, help="New dimension (default: determined from embedding model)")
-    parser.add_argument("--embedding-model", default="text-embedding-3-small", help="Embedding model to use")
-    parser.add_argument("--check-only", action="store_true", help="Only check dimensions, don't make changes")
-    parser.add_argument("--no-backup", action="store_true", help="Don't create a backup table")
-    parser.add_argument("--migrate", action="store_true", help="Migrate data to new table")
+                doc.embedding = response
+            
+            return doc
+        except Exception as e:
+            logger.error(f"Error generating embeddings (attempt will be retried): {e}")
+            raise
     
-    if "--help" in sys.argv:
-        print_help()
-        sys.exit(0)
+    def batch_generate_embeddings(self, docs: List[MyDocument], batch_size: int = 20, auto_reduce: bool = True) -> List[MyDocument]:
+        """
+        Generate embeddings for multiple documents in batches.
+        
+        Args:
+            docs: List of documents to generate embeddings for
+            batch_size: Number of documents to process in each batch
+            auto_reduce: Whether to automatically reduce dimensions to target
+            
+        Returns:
+            List of documents with embeddings
+        """
+        results = []
+        
+        # Process in batches to avoid rate limits
+        for i in range(0, len(docs), batch_size):
+            batch = docs[i:i + batch_size]
+            
+            for doc in batch:
+                try:
+                    doc_with_embedding = self.generate_embeddings(doc, auto_reduce=auto_reduce)
+                    results.append(doc_with_embedding)
+                except Exception as e:
+                    logger.error(f"Error generating embedding for document {doc.id}: {e}")
+                    # Add the document without embedding
+                    results.append(doc)
+        
+        return results
     
-    args = parser.parse_args()
+    def reduce_dimensions(self, embedding: List[float], target_dim: int) -> List[float]:
+        """
+        Reduce the dimensionality of an embedding vector.
+        
+        Multiple strategies are implemented - the default is uniform sampling.
+        
+        Args:
+            embedding: Original embedding vector
+            target_dim: Target dimension for the reduced vector
+            
+        Returns:
+            Reduced embedding vector
+        """
+        if len(embedding) <= target_dim:
+            return embedding
+        
+        # Strategy: Uniform sampling (take evenly spaced dimensions)
+        # This preserves more of the original information than truncation
+        indices = np.round(np.linspace(0, len(embedding) - 1, target_dim)).astype(int)
+        reduced = [embedding[i] for i in indices]
+        
+        # Alternative strategies (commented out):
+        
+        # Strategy 1: Simple truncation (first N dimensions)
+        # return embedding[:target_dim]
+        
+        # Strategy 2: Average pooling (average groups of dimensions)
+        # chunk_size = len(embedding) / target_dim
+        # reduced = []
+        # for i in range(target_dim):
+        #     start_idx = int(i * chunk_size)
+        #     end_idx = int((i + 1) * chunk_size)
+        #     reduced.append(np.mean(embedding[start_idx:end_idx]))
+        # return reduced
+        
+        # Strategy 3: Principal Component Analysis (PCA)
+        # This would require scikit-learn and keeping state between calls
+        
+        return reduced
     
-    # Connect to the database
-    try:
-        conn = get_connection(
-            host=args.host,
-            port=args.port,
-            dbname=args.db,
-            user=args.user,
-            password=args.password,
-            schema_name=args.schema
-        )
+    def expand_dimensions(self, embedding: List[float], target_dim: int) -> List[float]:
+        """
+        Expand the dimensionality of an embedding vector.
         
-        logger.info(f"Connected to {args.db} on {args.host}:{args.port}")
-    except Exception as e:
-        logger.error(f"Could not connect to database: {e}")
-        sys.exit(1)
+        Args:
+            embedding: Original embedding vector
+            target_dim: Target dimension for the expanded vector
+            
+        Returns:
+            Expanded embedding vector
+        """
+        if len(embedding) >= target_dim:
+            return embedding
+        
+        # Strategy: Zero padding (add zeros to reach target dimension)
+        return embedding + [0.0] * (target_dim - len(embedding))
     
-    try:
-        # Check current dimension
-        current_dim = get_current_vector_dimension(
-            conn=conn,
-            schema_name=args.schema,
-            table_name=args.table,
-            column_name=args.column
-        )
+    def adjust_embedding_dimension(self, embedding: List[float], target_dim: int) -> List[float]:
+        """
+        Adjust embedding vector dimensions to match the target dimension.
+        This handles both reducing and expanding dimensions.
         
-        if current_dim is None:
-            logger.error(f"Could not determine current vector dimension for {args.schema}.{args.table}.{args.column}")
-            sys.exit(1)
+        Args:
+            embedding: Original embedding vector
+            target_dim: Target dimension
         
-        logger.info(f"Current vector dimension is {current_dim}")
+        Returns:
+            Adjusted embedding vector with target dimensions
+        """
+        current_dim = len(embedding)
         
-        # Determine target dimension
-        target_dim = args.dimension
-        if target_dim is None:
-            model_dim = check_embedding_model_dimension(args.embedding_model)
-            if model_dim:
-                target_dim = model_dim
-                logger.info(f"Using dimension {target_dim} from model {args.embedding_model}")
-            else:
-                logger.error(f"Could not determine dimension for model {args.embedding_model}")
-                logger.error(f"Please specify --dimension explicitly")
-                sys.exit(1)
-        
-        # Check if update is needed
         if current_dim == target_dim:
-            logger.info(f"Current dimension ({current_dim}) matches target dimension ({target_dim}). No update needed.")
-            sys.exit(0)
+            return embedding
         
-        logger.info(f"Need to update vector dimension from {current_dim} to {target_dim}")
+        logger.debug(f"Adjusting embedding dimension from {current_dim} to {target_dim}")
         
-        if args.check_only:
-            logger.info("Check-only mode, not making changes")
-            sys.exit(0)
-        
-        # Get confirmation from user
-        proceed = input(f"Proceed with updating vector dimension from {current_dim} to {target_dim}? [y/N] ")
-        if proceed.lower() != 'y':
-            logger.info("Operation cancelled by user")
-            sys.exit(0)
-        
-        # Update the vector dimension
-        success = update_vector_dimension(
-            conn=conn,
-            schema_name=args.schema,
-            table_name=args.table,
-            column_name=args.column,
-            new_dimension=target_dim,
-            backup_table=not args.no_backup
-        )
-        
-        if success:
-            logger.info(f"Successfully updated vector dimension to {target_dim}")
-            
-            # Migrate data if requested
-            if args.migrate:
-                logger.info("Migrating data to new table...")
-                migrated_rows = migrate_data(
-                    conn=conn,
-                    schema_name=args.schema,
-                    old_table=f"{args.table}_old",
-                    new_table=args.table,
-                    column_name=args.column,
-                    source_dimension=current_dim,
-                    target_dimension=target_dim
-                )
-                
-                if migrated_rows > 0:
-                    logger.info(f"Successfully migrated {migrated_rows} rows")
-                else:
-                    logger.error("Failed to migrate data")
-            else:
-                logger.warning("Data migration not performed. The new table is empty!")
-                logger.warning("You need to re-import your data or use --migrate to migrate existing data")
+        if current_dim > target_dim:
+            # Reduce dimensions
+            return self.reduce_dimensions(embedding, target_dim)
         else:
-            logger.error(f"Failed to update vector dimension")
-            sys.exit(1)
+            # Expand dimensions
+            return self.expand_dimensions(embedding, target_dim)
+    
+    # Alias method with more descriptive name - supports both naming conventions
+    def generate_embeddings_for_document(self, doc: MyDocument, auto_reduce: bool = True) -> MyDocument:
+        """Alias for generate_embeddings."""
+        return self.generate_embeddings(doc, auto_reduce=auto_reduce)
+    
+    def compute_similarity(self, embedding1: List[float], embedding2: List[float]) -> float:
+        """
+        Compute the cosine similarity between two embeddings.
         
-    finally:
-        conn.close()
-
-if __name__ == "__main__":
-    main()
+        Args:
+            embedding1: First embedding vector
+            embedding2: Second embedding vector
+            
+        Returns:
+            Similarity score between 0 and 1
+        """
+        if not embedding1 or not embedding2:
+            return 0.0
+            
+        # Make sure embeddings have same dimension
+        if len(embedding1) != len(embedding2):
+            # Adjust to shorter dimension for comparison
+            target_dim = min(len(embedding1), len(embedding2))
+            embedding1 = self.adjust_embedding_dimension(embedding1, target_dim)
+            embedding2 = self.adjust_embedding_dimension(embedding2, target_dim)
+            
+        # Convert to numpy arrays
+        a = np.array(embedding1)
+        b = np.array(embedding2)
+        
+        # Compute cosine similarity
+        dot_product = np.dot(a, b)
+        norm_a = np.linalg.norm(a)
+        norm_b = np.linalg.norm(b)
+        
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+            
+        similarity = dot_product / (norm_a * norm_b)
+        return max(0.0, min(similarity, 1.0))  # Ensure in range [0, 1]
