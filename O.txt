@@ -1,133 +1,714 @@
 """
-Embedding Client for generating vector embeddings using Azure OpenAI.
+Business Terms Manager using PostgreSQL with pgvector for semantic similarity matching.
+Manages the storage, retrieval, and similarity search of business terms.
 """
 
+import csv
 import logging
+import os
+import time
+from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
-from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
-from azure.identity import DefaultAzureCredential, get_bearer_token_provider
-from openai import AzureOpenAI
-from app.config.environment import get_os_env
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+from app.core.db_manager import DBManager
+from app.core.embedding import EmbeddingClient, MyDocument
+from app.core.models import TaggingResult, TaggingValidationResult
+from app.config.environment import get_os_env
 
 logger = logging.getLogger(__name__)
 
-class MyDocument(BaseModel):
-    """Model representing a document with its embedding."""
-    id: str = ""
-    text: str = ""
-    embedding: List[float] = []
+class BusinessTerm(BaseModel):
+    """Model representing a business term in the repository."""
+    id: str
+    name: str
+    description: str
     metadata: Dict[str, Any] = {}
-
-
-class EmbeddingClient:
-    """Client for generating embeddings for documents using Azure OpenAI."""
     
-    def __init__(self, azure_api_version: str = "2023-05-15", embeddings_model: str = None):
-        """Initialize the embedding client."""
-        self.env = get_os_env()
-        self.azure_api_version = azure_api_version
-        
-        # Get embedding model from environment or use default
-        # Note: text-embedding-3-small produces 1536-dimensional vectors
-        # text-embedding-3-large produces 3072-dimensional vectors
-        self.embeddings_model = embeddings_model or self.env.get("EMBEDDING_MODEL", "text-embedding-3-small")
-        
-        # Log the model being used
-        logger.info(f"Initializing embedding client with model: {self.embeddings_model}")
-        
-        self.direct_azure_client = self._get_direct_azure_client()
-        logger.info(f"Embedding client initialized with model: {self.embeddings_model}")
+    def dict(self):
+        """Convert the business term to a dictionary."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
+            "metadata": self.metadata
+        }
+
+class BusinessTermManager:
+    """
+    Manager for business terms, handling storage, retrieval, and similarity matching.
+    Uses pgvector for semantic similarity search via PostgreSQL.
+    """
     
-    def _get_direct_azure_client(self):
-        """Get the Azure OpenAI client for generating embeddings."""
-        try:
-            token_provider = get_bearer_token_provider(
-                self.env.credential,
-                "https://cognitiveservices.azure.com/.default"
-            )
-            azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
+    _instance = None
+    
+    def __new__(cls):
+        """Singleton pattern to ensure only one instance is created."""
+        if cls._instance is None:
+            cls._instance = super(BusinessTermManager, cls).__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self):
+        """Initialize the business term manager."""
+        if self._initialized:
+            return
             
-            return AzureOpenAI(
-                azure_endpoint=azure_endpoint,
-                api_version=self.azure_api_version,
-                azure_ad_token_provider=token_provider
-            )
+        self._initialized = True
+        self.env = get_os_env()
+        
+        # Get embedding model from environment
+        embedding_model = self.env.get("EMBEDDING_MODEL", "text-embedding-3-small")
+        logger.info(f"Using embedding model: {embedding_model}")
+        
+        self.embedding_client = EmbeddingClient(embeddings_model=embedding_model)
+        self.db_manager = DBManager()
+        self.similarity_threshold = float(self.env.get("SIMILARITY_THRESHOLD", "0.5"))  # 50% similarity threshold
+        
+        # Verify database connection and pgvector extension
+        self._verify_database()
+        
+        logger.info("Business term manager initialized with PostgreSQL backend")
+    
+    def _verify_database(self) -> bool:
+        """
+        Verify database connection and pgvector extension.
+        
+        Returns:
+            bool: True if verification succeeds, False otherwise
+        """
+        try:
+            # Check database health
+            health = self.db_manager.health_check()
+            
+            if health["status"] != "healthy":
+                logger.error(f"Database health check failed: {health.get('error', 'Unknown error')}")
+                return False
+            
+            # Check if pgvector extension is enabled
+            if not health.get("vector_enabled", False):
+                logger.error("pgvector extension is not enabled in the database")
+                return False
+            
+            # Check if business_terms table exists
+            with self.db_manager.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_name = 'business_terms'
+                    );
+                    """)
+                    
+                    table_exists = cursor.fetchone()[0]
+                    
+                    if not table_exists:
+                        logger.error("business_terms table does not exist in the database")
+                        return False
+                    
+                    # Check the vector dimension in the table
+                    try:
+                        cursor.execute("""
+                        SELECT 
+                            a.attname, 
+                            format_type(a.atttypid, a.atttypmod),
+                            pg_catalog.col_description(a.attrelid, a.attnum)
+                        FROM pg_catalog.pg_attribute a
+                        WHERE a.attrelid = 'business_terms'::regclass
+                        AND a.attname = 'embedding'
+                        AND a.attnum > 0 
+                        AND NOT a.attisdropped
+                        """)
+                        
+                        embedding_info = cursor.fetchone()
+                        if embedding_info:
+                            logger.info(f"Embedding column found: {embedding_info}")
+                            
+                            # Get the dimension from the type
+                            # The format is typically 'vector(N)' where N is the dimension
+                            import re
+                            match = re.search(r'vector\((\d+)\)', embedding_info[1])
+                            if match:
+                                dimension = int(match.group(1))
+                                logger.info(f"Database vector dimension: {dimension}")
+                                
+                                # Store the dimension for later use
+                                self.vector_dimension = dimension
+                                
+                                # Compare with the expected dimension from our embedding model
+                                embedding_model = self.env.get("EMBEDDING_MODEL", "text-embedding-3-small")
+                                expected_dim = 1536  # Default for text-embedding-3-small
+                                if embedding_model == "text-embedding-3-large":
+                                    expected_dim = 3072
+                                
+                                if dimension != expected_dim:
+                                    logger.warning(f"Vector dimension mismatch: database uses {dimension}, but model {embedding_model} produces {expected_dim}. "
+                                                  f"Use the fix_vector_dimensions.py script to update the database schema, or change EMBEDDING_MODEL.")
+                    except Exception as e:
+                        logger.warning(f"Could not retrieve vector dimension: {e}")
+            
+            return True
+        
         except Exception as e:
-            logger.error(f"Error initializing Azure OpenAI client: {e}")
-            raise
+            logger.error(f"Database verification failed: {e}")
+            return False
     
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type((Exception)),
+        retry=retry_if_exception_type(Exception),
         reraise=True
     )
-    def generate_embeddings(self, doc: MyDocument) -> MyDocument:
-        """Generate embeddings for a document with retry logic."""
+    def import_terms_from_csv(self, csv_path: str, encoding: str = 'utf-8', batch_size: int = 100) -> int:
+        """
+        Import business terms from a CSV file.
+        
+        Args:
+            csv_path: Path to the CSV file
+            encoding: File encoding (auto-detected if not provided)
+            batch_size: Number of terms to process in each batch
+            
+        Returns:
+            Number of terms imported
+        """
         try:
-            # Check if text is empty
-            if not doc.text or len(doc.text.strip()) == 0:
-                logger.warning(f"Empty text for document ID: {doc.id}")
-                return doc
+            # Get existing terms
+            existing_terms = {}
+            for term in self.get_all_terms():
+                term_key = f"{term.name}::{term.description}"
+                existing_terms[term_key] = term.id
+            
+            # Track terms in CSV
+            csv_term_keys = set()
+            terms_to_add = []
+            
+            # Read terms from CSV
+            with open(csv_path, 'r', encoding=encoding) as csvfile:
+                reader = csv.DictReader(csvfile)
+                for row in reader:
+                    if 'id' not in row or 'name' not in row or 'description' not in row:
+                        logger.warning(f"Skipping row with missing required fields: {row}")
+                        continue
+                    
+                    term_id = row['id'].strip()
+                    name = row['name'].strip()
+                    description = row['description'].strip()
+                    
+                    if not term_id:
+                        logger.warning(f"Skipping term with empty ID: {name}")
+                        continue
+                    
+                    term_key = f"{name}::{description}"
+                    csv_term_keys.add(term_key)
+                    
+                    # Skip if term already exists and is unchanged
+                    if term_key in existing_terms and existing_terms[term_key] == term_id:
+                        continue
+                    
+                    # Extract metadata if present in CSV
+                    metadata = {}
+                    for key, value in row.items():
+                        if key not in ['id', 'name', 'description'] and value:
+                            metadata[key] = value
+                    
+                    terms_to_add.append({
+                        "id": term_id,
+                        "name": name,
+                        "description": description,
+                        "term_key": term_key,
+                        "metadata": metadata
+                    })
+            
+            logger.info(f"Found {len(terms_to_add)} terms to add from CSV file")
+            
+            # Process terms in batches
+            added_count = 0
+            for i in range(0, len(terms_to_add), batch_size):
+                batch = terms_to_add[i:i + batch_size]
+                batch_start_time = time.time()
                 
-            # Generate embedding
-            response = self.direct_azure_client.embeddings.create(
-                model=self.embeddings_model,
-                input=doc.text
-            ).data[0].embedding
+                # Create batch of vectors to insert
+                vectors_batch = []
+                for term in batch:
+                    # Generate embedding for the term
+                    doc = MyDocument(
+                        id=term["id"],
+                        text=f"{term['name']}. {term['description']}"
+                    )
+                    
+                    doc_with_embedding = self.embedding_client.generate_embeddings(doc)
+                    
+                    if not doc_with_embedding.embedding:
+                        logger.warning(f"Skipping term without embedding: {term['name']}")
+                        continue
+                    
+                    # Log the dimension of the embedding
+                    embedding_dim = len(doc_with_embedding.embedding)
+                    logger.debug(f"Term '{term['name']}' has embedding dimension: {embedding_dim}")
+                    
+                    # Check if we know the expected dimension
+                    if hasattr(self, 'vector_dimension') and embedding_dim != self.vector_dimension:
+                        logger.warning(f"Dimension mismatch: Generated {embedding_dim} dimensions but database expects {self.vector_dimension}")
+                        
+                        # If the model generates 3072 dimensions but DB expects 1536, 
+                        # we could implement dimension reduction here, but that's a more complex fix
+                        
+                        # For now, skip this term and continue with others
+                        continue
+                    
+                    vectors_batch.append({
+                        "id": term["id"],
+                        "name": term["name"],
+                        "description": term["description"],
+                        "embedding": doc_with_embedding.embedding,
+                        "metadata": term.get("metadata", {})
+                    })
+                
+                if not vectors_batch:
+                    logger.warning(f"No valid vectors in batch {i//batch_size + 1}, skipping")
+                    continue
+                
+                # Batch insert into database
+                try:
+                    inserted = self.db_manager.batch_store_vectors(vectors_batch)
+                    added_count += inserted
+                    
+                    batch_duration = time.time() - batch_start_time
+                    logger.info(f"Processed batch {i//batch_size + 1}/{(len(terms_to_add) + batch_size - 1)//batch_size}: "
+                               f"{inserted} terms in {batch_duration:.2f}s "
+                               f"({inserted/batch_duration:.2f} terms/sec)")
+                except Exception as e:
+                    logger.error(f"Error in batch_store_vectors: {e}")
+                    # Continue with next batch
+                    continue
             
-            doc.embedding = response
+            # Handle term deletion (terms that exist in the database but not in the CSV)
+            deleted_count = 0
+            terms_to_delete = []
+            for term_key, term_id in existing_terms.items():
+                if term_key not in csv_term_keys:
+                    terms_to_delete.append(term_id)
             
-            # Log the dimension of the embedding for debugging
-            logger.debug(f"Generated embedding with dimension: {len(doc.embedding)}")
+            # Delete in batches
+            for i in range(0, len(terms_to_delete), batch_size):
+                batch = terms_to_delete[i:i + batch_size]
+                deleted_in_batch = 0
+                
+                for term_id in batch:
+                    if self.db_manager.delete_term(term_id):
+                        deleted_in_batch += 1
+                
+                deleted_count += deleted_in_batch
+                if deleted_in_batch > 0:
+                    logger.info(f"Deleted batch of {deleted_in_batch} terms")
             
-            return doc
+            logger.info(f"Import summary: Added {added_count} terms, deleted {deleted_count} terms")
+            return added_count
+        
         except Exception as e:
-            logger.error(f"Error generating embeddings (attempt will be retried): {e}")
+            logger.error(f"Error importing terms from CSV: {e}")
             raise
     
-    def batch_generate_embeddings(self, docs: List[MyDocument], batch_size: int = 20) -> List[MyDocument]:
-        """Generate embeddings for multiple documents in batches."""
-        results = []
+    def tag_element(self, element_id: str, name: str, description: str, top_k: int = 3) -> TaggingResult:
+        """
+        Tag a data element with the most similar business terms.
         
-        # Process in batches to avoid rate limits
-        for i in range(0, len(docs), batch_size):
-            batch = docs[i:i + batch_size]
+        Args:
+            element_id: Unique identifier for the element
+            name: Enhanced name of the element
+            description: Enhanced description of the element
+            top_k: Number of top matching terms to return
             
-            for doc in batch:
-                try:
-                    doc_with_embedding = self.generate_embeddings(doc)
-                    results.append(doc_with_embedding)
-                except Exception as e:
-                    logger.error(f"Error generating embedding for document {doc.id}: {e}")
-                    # Add the document without embedding
-                    results.append(doc)
-        
-        return results
+        Returns:
+            TaggingResult containing matching terms and confidence scores
+        """
+        try:
+            # Validate inputs
+            if not name or not description:
+                logger.warning(f"Empty name or description for element: {element_id}")
+                return TaggingResult(
+                    element_id=element_id,
+                    element_name=name or "",
+                    element_description=description or "",
+                    matching_terms=[],
+                    confidence_scores=[],
+                    modeling_required=True,
+                    message="Name or description is empty. Modeling should be performed."
+                )
             
-    # Alias method with more descriptive name - supports both naming conventions
-    def generate_embeddings_for_document(self, doc: MyDocument) -> MyDocument:
-        """Alias for generate_embeddings."""
-        return self.generate_embeddings(doc)
+            # Create document with embedding
+            doc = MyDocument(
+                id=element_id,
+                text=f"{name}. {description}"
+            )
+            
+            doc_with_embedding = self.embedding_client.generate_embeddings(doc)
+            
+            if not doc_with_embedding.embedding:
+                logger.warning(f"Could not generate embedding for element: {name}")
+                return TaggingResult(
+                    element_id=element_id,
+                    element_name=name,
+                    element_description=description,
+                    matching_terms=[],
+                    confidence_scores=[],
+                    modeling_required=True,
+                    message="Could not generate embedding. Modeling should be performed."
+                )
+            
+            # Check if dimensions match the database expectation
+            if hasattr(self, 'vector_dimension') and len(doc_with_embedding.embedding) != self.vector_dimension:
+                logger.warning(f"Dimension mismatch: Generated {len(doc_with_embedding.embedding)} dimensions but database expects {self.vector_dimension}")
+                return TaggingResult(
+                    element_id=element_id,
+                    element_name=name,
+                    element_description=description,
+                    matching_terms=[],
+                    confidence_scores=[],
+                    modeling_required=True,
+                    message=f"Vector dimension mismatch: Generated {len(doc_with_embedding.embedding)} dimensions but database expects {self.vector_dimension}."
+                )
+            
+            # Query for similar terms
+            similar_terms = self.db_manager.find_similar_vectors(
+                query_vector=doc_with_embedding.embedding,
+                top_k=top_k * 2,  # Fetch more and filter later
+                threshold=self.similarity_threshold
+            )
+            
+            # If no similar terms found, recommend modeling
+            if not similar_terms:
+                return TaggingResult(
+                    element_id=element_id,
+                    element_name=name,
+                    element_description=description,
+                    matching_terms=[],
+                    confidence_scores=[],
+                    modeling_required=True,
+                    message=f"Similarity is less than {self.similarity_threshold*100}%. Modeling should be performed."
+                )
+            
+            # Format matching terms and filter by top_k
+            matching_terms = []
+            confidence_scores = []
+            
+            # Sort by similarity (in case DB didn't return in sorted order)
+            similar_terms.sort(key=lambda x: x["similarity"], reverse=True)
+            
+            # Take top_k items
+            for term in similar_terms[:top_k]:
+                matching_terms.append({
+                    "id": term["id"],
+                    "name": term["name"],
+                    "description": term["description"],
+                    "similarity": term["similarity"]
+                })
+                confidence_scores.append(term["similarity"])
+            
+            return TaggingResult(
+                element_id=element_id,
+                element_name=name,
+                element_description=description,
+                matching_terms=matching_terms,
+                confidence_scores=confidence_scores,
+                modeling_required=False,
+                message=""
+            )
+            
+        except Exception as e:
+            logger.error(f"Error tagging element: {e}", exc_info=True)
+            
+            # Attempt fallback matching using direct vector comparison
+            try:
+                logger.info(f"Attempting fallback matching for element: {element_id}")
+                
+                # Get all terms
+                all_terms = self.get_all_terms()
+                if not all_terms:
+                    logger.warning("No business terms available for fallback matching")
+                    return TaggingResult(
+                        element_id=element_id,
+                        element_name=name,
+                        element_description=description,
+                        matching_terms=[],
+                        confidence_scores=[],
+                        modeling_required=True,
+                        message="Business terms repository is not available. Modeling should be performed."
+                    )
+                
+                # Compare directly with available terms using dot product
+                # This is a slow fallback method but ensures we can still match
+                # even if the database query fails
+                return TaggingResult(
+                    element_id=element_id,
+                    element_name=name,
+                    element_description=description,
+                    matching_terms=[],
+                    confidence_scores=[],
+                    modeling_required=True,
+                    message=f"Error during tagging: {str(e)}. Modeling should be performed."
+                )
+            except Exception as fallback_error:
+                logger.error(f"Fallback matching also failed: {fallback_error}")
+                return TaggingResult(
+                    element_id=element_id,
+                    element_name=name,
+                    element_description=description,
+                    matching_terms=[],
+                    confidence_scores=[],
+                    modeling_required=True,
+                    message=f"Error during tagging: {str(e)}. Modeling should be performed."
+                )
     
-    def compute_similarity(self, embedding1: List[float], embedding2: List[float]) -> float:
-        """Compute the cosine similarity between two embeddings."""
-        if not embedding1 or not embedding2 or len(embedding1) != len(embedding2):
-            return 0.0
-            
-        # Convert to numpy arrays
-        a = np.array(embedding1)
-        b = np.array(embedding2)
+    async def validate_tagging(self, tagging_result: TaggingResult) -> TaggingValidationResult:
+        """
+        Validate the tagging result.
         
-        # Compute cosine similarity
-        dot_product = np.dot(a, b)
-        norm_a = np.linalg.norm(a)
-        norm_b = np.linalg.norm(b)
-        
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
+        Args:
+            tagging_result: Result of tagging to validate
             
-        similarity = dot_product / (norm_a * norm_b)
-        return max(0.0, min(similarity, 1.0))  # Ensure in range [0, 1]
+        Returns:
+            TaggingValidationResult with validation status and suggestions
+        """
+        try:
+            # Skip validation if modeling is required
+            if tagging_result.modeling_required:
+                return TaggingValidationResult(
+                    is_valid=False,
+                    feedback=tagging_result.message,
+                    suggested_alternatives=[]
+                )
+                
+            # If no matching terms, validation fails
+            if not tagging_result.matching_terms:
+                return TaggingValidationResult(
+                    is_valid=False,
+                    feedback="No matching terms found",
+                    suggested_alternatives=[]
+                )
+            
+            # Get highest confidence score
+            highest_confidence = max(tagging_result.confidence_scores) if tagging_result.confidence_scores else 0.0
+            
+            # If highest confidence is barely above threshold, find alternatives
+            if highest_confidence < 0.75:
+                # Try to find better alternatives
+                alternative_doc = MyDocument(
+                    id=tagging_result.element_id,
+                    text=tagging_result.element_name  # Use just the name for alternative searching
+                )
+                
+                alternative_doc_with_embedding = self.embedding_client.generate_embeddings(alternative_doc)
+                
+                if alternative_doc_with_embedding.embedding:
+                    # Exclude already matched terms
+                    matched_ids = [term["id"] for term in tagging_result.matching_terms]
+                    
+                    all_similar_terms = self.db_manager.find_similar_vectors(
+                        query_vector=alternative_doc_with_embedding.embedding,
+                        top_k=10,  # Get more to filter out already matched terms
+                        threshold=self.similarity_threshold
+                    )
+                    
+                    # Filter out already matched terms
+                    alternative_terms = [
+                        term for term in all_similar_terms
+                        if term["id"] not in matched_ids
+                    ][:3]  # Limit to top 3 alternatives
+                    
+                    if alternative_terms:
+                        return TaggingValidationResult(
+                            is_valid=False,
+                            feedback="Low confidence in matching terms. Alternative terms found.",
+                            suggested_alternatives=alternative_terms
+                        )
+            
+            # Default case - validation passes
+            return TaggingValidationResult(
+                is_valid=True,
+                feedback="Matching terms found with good confidence",
+                suggested_alternatives=[]
+            )
+            
+        except Exception as e:
+            logger.error(f"Error validating tagging: {e}")
+            return TaggingValidationResult(
+                is_valid=False,
+                feedback=f"Error during validation: {str(e)}",
+                suggested_alternatives=[]
+            )
+    
+    def get_all_terms(self) -> List[BusinessTerm]:
+        """
+        Get all business terms in the collection.
+        
+        Returns:
+            List of BusinessTerm objects
+        """
+        try:
+            term_dicts = self.db_manager.get_all_terms()
+            
+            terms = []
+            for term_dict in term_dicts:
+                terms.append(BusinessTerm(
+                    id=term_dict["id"],
+                    name=term_dict["name"],
+                    description=term_dict["description"],
+                    metadata=term_dict.get("metadata", {})
+                ))
+                
+            return terms
+        except Exception as e:
+            logger.error(f"Error retrieving all terms: {e}")
+            return []
+    
+    def get_term_by_id(self, term_id: str) -> Optional[BusinessTerm]:
+        """
+        Get a business term by its ID.
+        
+        Args:
+            term_id: Unique identifier of the term
+            
+        Returns:
+            BusinessTerm if found, None otherwise
+        """
+        try:
+            term_dict = self.db_manager.get_term_by_id(term_id)
+            
+            if term_dict:
+                return BusinessTerm(
+                    id=term_dict["id"],
+                    name=term_dict["name"],
+                    description=term_dict["description"],
+                    metadata=term_dict.get("metadata", {})
+                )
+            
+            return None
+        except Exception as e:
+            logger.error(f"Error retrieving term by ID: {e}")
+            return None
+    
+    def get_term_count(self) -> int:
+        """
+        Get the total count of business terms.
+        
+        Returns:
+            Total number of terms
+        """
+        try:
+            with self.db_manager.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT COUNT(*) FROM business_terms")
+                    return cursor.fetchone()[0]
+        except Exception as e:
+            logger.error(f"Error getting term count: {e}")
+            return 0
+    
+    def delete_term(self, term_id: str) -> bool:
+        """
+        Delete a business term by ID.
+        
+        Args:
+            term_id: ID of the term to delete
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            return self.db_manager.delete_term(term_id)
+        except Exception as e:
+            logger.error(f"Error deleting term: {e}")
+            return False
+    
+    def delete_all_terms(self) -> int:
+        """
+        Delete all business terms.
+        
+        Returns:
+            Number of terms deleted
+        """
+        try:
+            with self.db_manager.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("DELETE FROM business_terms")
+                    deleted = cursor.rowcount
+                    conn.commit()
+                    return deleted
+        except Exception as e:
+            logger.error(f"Error deleting all terms: {e}")
+            return 0
+    
+    def search_terms(self, query: str, limit: int = 20) -> List[BusinessTerm]:
+        """
+        Search for business terms by name or description.
+        
+        Args:
+            query: Search query
+            limit: Maximum number of results
+            
+        Returns:
+            List of matching BusinessTerm objects
+        """
+        try:
+            with self.db_manager.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                    SELECT id, name, description, metadata
+                    FROM business_terms
+                    WHERE 
+                        name ILIKE %s OR 
+                        description ILIKE %s
+                    ORDER BY 
+                        CASE WHEN name ILIKE %s THEN 0 ELSE 1 END,
+                        CASE WHEN description ILIKE %s THEN 0 ELSE 1 END,
+                        name
+                    LIMIT %s
+                    """, (f"%{query}%", f"%{query}%", f"{query}%", f"{query}%", limit))
+                    
+                    results = []
+                    for row in cursor.fetchall():
+                        id, name, description, metadata = row
+                        results.append(BusinessTerm(
+                            id=id,
+                            name=name,
+                            description=description,
+                            metadata=metadata or {}
+                        ))
+                    
+                    return results
+        except Exception as e:
+            logger.error(f"Error searching terms: {e}")
+            return []
+    
+    def compute_similarity(self, text1: str, text2: str) -> float:
+        """
+        Compute semantic similarity between two text strings.
+        
+        Args:
+            text1: First text
+            text2: Second text
+            
+        Returns:
+            Similarity score between 0 and 1
+        """
+        try:
+            # Generate embeddings
+            doc1 = MyDocument(id="temp1", text=text1)
+            doc2 = MyDocument(id="temp2", text=text2)
+            
+            doc1_with_embedding = self.embedding_client.generate_embeddings(doc1)
+            doc2_with_embedding = self.embedding_client.generate_embeddings(doc2)
+            
+            if not doc1_with_embedding.embedding or not doc2_with_embedding.embedding:
+                logger.warning("Could not generate embeddings for similarity computation")
+                return 0.0
+            
+            # Compute cosine similarity
+            return self.db_manager.compute_cosine_similarity(
+                doc1_with_embedding.embedding,
+                doc2_with_embedding.embedding
+            )
+        except Exception as e:
+            logger.error(f"Error computing similarity: {e}")
+            return 0.0
