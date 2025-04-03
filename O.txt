@@ -193,8 +193,12 @@ class EmbeddingClient:
         )
         azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
         
-        # Using positional parameter for token_provider as in original code
-        return AzureOpenAI(token_provider, self.azure_api_version)
+        # Use named parameters instead of positional parameters
+        return AzureOpenAI(
+            azure_endpoint=azure_endpoint,
+            api_version=self.azure_api_version,
+            azure_ad_token_provider=token_provider
+        )
     
     def generate_embeddings(self, doc: MyDocument)->MyDocument:
         try:
@@ -410,7 +414,7 @@ def process_next_project(state: AgentState, chatbot: AzureChatbot, top_k: int = 
     current_project = state.projects[state.current_project_index]
     logger.info(f"Processing project {current_project.case_id}: {current_project.overview[:50]}...")
     
-    # Step 1: Use similarity search to find candidate purposes (top-k)
+    # Step 1: Calculate similarity for ALL purposes
     similarities = []
     for purpose in state.purposes:
         similarity = cosine_similarity(current_project.embedding, purpose.embedding)
@@ -419,16 +423,29 @@ def process_next_project(state: AgentState, chatbot: AzureChatbot, top_k: int = 
     # Sort by similarity score (descending)
     similarities.sort(key=lambda x: x[1], reverse=True)
     
-    # Get top-k purposes as candidates (or all if less than k)
-    candidate_purposes = similarities[:min(top_k, len(similarities))]
-    
     # Step 2: Use LLM to evaluate which purposes match the project
+    # Send ALL purposes to ensure we get at least one match
     project_mapping = evaluate_purposes_with_llm(
         chatbot, 
         current_project, 
-        candidate_purposes, 
-        state.purposes
+        similarities, 
+        state.purposes,
+        require_match=True  # Ensure at least one match
     )
+    
+    # If we still have no matches (unlikely due to require_match=True),
+    # add the highest similarity purpose as a fallback
+    if len(project_mapping.matches) == 0 and len(similarities) > 0:
+        top_purpose, top_score = similarities[0]
+        fallback_reasoning = f"This is a low confidence match based on semantic similarity. The project may be related to {top_purpose.name} with a similarity score of {top_score:.4f}."
+        
+        project_mapping.matches.append(PurposeMatch(
+            purpose_id=top_purpose.id,
+            purpose_name=top_purpose.name,
+            matching_score=top_score,
+            reasoning=fallback_reasoning
+        ))
+        logger.warning(f"Using fallback matching for project {current_project.case_id}")
     
     state.results.append(project_mapping)
     state.current_project_index += 1
@@ -439,8 +456,9 @@ def process_next_project(state: AgentState, chatbot: AzureChatbot, top_k: int = 
     return state
 
 def evaluate_purposes_with_llm(chatbot: AzureChatbot, project: Project, 
-                              candidate_purposes: List[Tuple[Purpose, float]], 
-                              all_purposes: List[Purpose]) -> ProjectMapping:
+                              all_similarities: List[Tuple[Purpose, float]], 
+                              all_purposes: List[Purpose],
+                              require_match: bool = False) -> ProjectMapping:
     """Use LLM to evaluate which purposes match the project and generate reasoning."""
     # Create a mapping for the current project
     project_mapping = ProjectMapping(
@@ -452,16 +470,17 @@ def evaluate_purposes_with_llm(chatbot: AzureChatbot, project: Project,
     # Prepare the list of all purposes for the prompt
     all_purposes_text = "\n".join([f"{i+1}. {purpose.name}" for i, purpose in enumerate(all_purposes)])
     
-    # Prepare the list of candidate purposes (from similarity search)
+    # Prepare the list of top candidate purposes (for efficiency)
+    top_candidates = all_similarities[:min(10, len(all_similarities))]
     candidate_purposes_text = "\n".join([
         f"{all_purposes.index(purpose)+1}. {purpose.name} (Similarity: {similarity:.4f})"
-        for purpose, similarity in candidate_purposes
+        for purpose, similarity in top_candidates
     ])
     
     # Create a prompt for the LLM to evaluate which purposes match
     system_content = """You are an expert analyst tasked with mapping project overviews to their most relevant purposes. 
-    Analyze the provided project overview and determine which purposes it aligns with from the candidate list.
-    You should select ONLY the purposes that genuinely match the project's intent and scope.
+    Analyze the provided project overview and determine which purposes it aligns with.
+    You should select ALL purposes that relate to the project's intent and scope.
     For each selected purpose, provide clear, specific reasoning explaining why it matches.
     Your analysis should be factual and objective, based solely on the content of the project overview."""
     
@@ -471,14 +490,14 @@ def evaluate_purposes_with_llm(chatbot: AzureChatbot, project: Project,
 # All Available Purposes
 {all_purposes_text}
 
-# Candidate Purposes (from initial similarity search)
+# Top Candidate Purposes (from initial similarity search)
 {candidate_purposes_text}
 
 # Instructions
 1. Review the project overview carefully
-2. Evaluate each candidate purpose and determine if it genuinely matches the project
-3. You may also select purposes not in the candidate list if they're clearly relevant
-4. For each matching purpose, explain your reasoning
+2. Evaluate each purpose and determine if it relates to the project
+3. You MUST select at least one purpose that best matches the project
+4. For each matching purpose, explain your reasoning in detail
 5. Format your response as follows:
 
 MATCHING PURPOSES:
@@ -489,7 +508,7 @@ MATCHING PURPOSES:
 - Purpose ID: [next matching purpose number]
   ...
 
-If no purposes match, state "NO MATCHING PURPOSES" and explain why."""
+Important: You MUST identify at least one matching purpose. If none seem to be a perfect match, select the most relevant one(s) and explain the partial match."""
     
     # Get the LLM's evaluation using direct messages
     messages = [
@@ -501,9 +520,22 @@ If no purposes match, state "NO MATCHING PURPOSES" and explain why."""
     response_text = result.content
     
     # Parse the LLM's response to extract matching purposes and reasoning
-    if "NO MATCHING PURPOSES" in response_text:
-        # No matching purposes found
-        logger.info(f"No matching purposes found for project {project.case_id}")
+    if "NO MATCHING PURPOSES" in response_text or "MATCHING PURPOSES:" not in response_text:
+        # No matching purposes found or unexpected format - force a match if required
+        if require_match and all_similarities:
+            # Use the top match and generate a basic reasoning
+            top_purpose, top_score = all_similarities[0]
+            purpose_id = all_purposes.index(top_purpose)
+            purpose_match = PurposeMatch(
+                purpose_id=top_purpose.id,
+                purpose_name=top_purpose.name,
+                matching_score=top_score,
+                reasoning=f"This project has the highest similarity with the '{top_purpose.name}' purpose. While not a perfect match, there is some semantic relationship between the project overview and this purpose."
+            )
+            project_mapping.matches.append(purpose_match)
+            logger.warning(f"Using forced match for project {project.case_id} due to no matches found in LLM response")
+        else:
+            logger.info(f"No matching purposes found for project {project.case_id}")
         return project_mapping
     
     # Extract matching purposes and reasoning using regex
@@ -517,8 +549,8 @@ If no purposes match, state "NO MATCHING PURPOSES" and explain why."""
         
         # Find the similarity score if this was a candidate purpose
         similarity = 0.0
-        for purpose, score in candidate_purposes:
-            if purpose.id == str(purpose_id):
+        for purpose, score in all_similarities:
+            if all_purposes.index(purpose) == purpose_id:
                 similarity = score
                 break
         
@@ -531,6 +563,19 @@ If no purposes match, state "NO MATCHING PURPOSES" and explain why."""
                 reasoning=reasoning
             )
             project_mapping.matches.append(purpose_match)
+    
+    # If we still don't have matches and require_match is True, use the top similarity
+    if require_match and len(project_mapping.matches) == 0 and all_similarities:
+        top_purpose, top_score = all_similarities[0]
+        purpose_id = all_purposes.index(top_purpose)
+        purpose_match = PurposeMatch(
+            purpose_id=top_purpose.id,
+            purpose_name=top_purpose.name,
+            matching_score=top_score,
+            reasoning=f"This is a default match based on semantic similarity. The project has some textual relationship with the '{top_purpose.name}' purpose, though the connection may be subtle."
+        )
+        project_mapping.matches.append(purpose_match)
+        logger.warning(f"Using fallback similarity match for project {project.case_id}")
     
     return project_mapping
 
