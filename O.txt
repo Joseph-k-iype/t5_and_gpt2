@@ -1,237 +1,532 @@
-import argparse
-import logging
 import os
 import sys
-from fastapi import FastAPI, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-import uvicorn
-from app.api.routes.enhancement import router as enhancement_router
-from app.api.routes.tagging import router as tagging_router
-from app.api.routes.settings import router as settings_router
-from app.api.routes.dashboard import router as dashboard_router
-from app.config.environment import get_os_env, str_to_bool
-from app.core.system_monitor import start_monitoring, stop_monitoring
-from app.core.db_manager import DBManager
+import uuid
+import json
+import logging
+import chardet
+import pandas as pd
+import networkx as nx
+import numpy as np
+from typing import Optional, Any, Dict, List, Union, Tuple, Callable
+from pathlib import Path
+from dotenv import dotenv_values
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider, ClientSecretCredential
+from openai import AzureOpenAI
+from pydantic import BaseModel, Field
+from langchain.chat_models import AzureChatOpenAI
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationChain, LLMChain
+from langchain.docstore import Document as LC_DOCUMENT
+from langchain.embeddings.base import Embeddings
+from langchain.vectorstores import Chroma
+from langchain.prompts import PromptTemplate, ChatPromptTemplate, HumanMessagePromptTemplate
+from langchain.schema import HumanMessage, AIMessage, SystemMessage
+from chromadb.config import Settings
+from chromadb.utils import embedding_functions
+from collections import namedtuple
+import re
+from pydantic import BaseModel, ValidationError, field_validator
+import langgraph.graph
+from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint import MemorySaver
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler()
-    ]
-)
-
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-# Make sure psutil is installed
-try:
-    import psutil
-except ImportError:
-    logger.warning("psutil not installed. Installing...")
-    import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "psutil"])
-    import psutil
+ENV_DIR = "env"
+CONFIG_PATH = f"{ENV_DIR}/config.env"
+CREDS_PATH = f"{ENV_DIR}/credentials.env"
+CERT_PATH = f"{ENV_DIR}/cacert.pem"
 
-def create_application(proxy_enabled: bool = None, monitoring_interval: int = 300) -> FastAPI:
-    """
-    Create the FastAPI application.
-    
-    Args:
-        proxy_enabled: Whether to use proxy for API connections
-        monitoring_interval: Interval in seconds for system monitoring (0 to disable)
-    
-    Returns:
-        FastAPI: The application instance
-    """
-    # Initialize environment with proxy setting
-    env = get_os_env(proxy_enabled=proxy_enabled)
-    
-    # Initialize database connection
-    db_manager = DBManager()
-    db_health = db_manager.health_check()
-    if db_health["status"] == "healthy":
-        logger.info(f"Database connection successful - PostgreSQL {db_health.get('version', '').split()[1] if 'version' in db_health else 'unknown'}")
-        logger.info(f"pgvector extension: {'Enabled' if db_health.get('vector_enabled', False) else 'Disabled'}")
+Triple = namedtuple("Triple", ["subject", "predicate", "object"])
+
+## utility functions
+def is_file_readable(filepath: str)->bool:
+    """Check if a file is readable."""
+    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
+        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
+    return True
+
+def str_to_bool(s: str)->bool:
+    """Convert a string to a boolean."""
+    if s== 'True':
+        return True
+    elif s== 'False':
+        return False
     else:
-        logger.error(f"Database connection failed: {db_health.get('error', 'Unknown error')}")
-    
-    # Create FastAPI app
-    app = FastAPI(
-        title="Data Element Enhancement and Tagging API",
-        description="API for enhancing data element names and descriptions based on ISO/IEC 11179 standards, and tagging with preferred business terms",
-        version="1.0.0",
-    )
-    
-    # Configure CORS
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],  # Restrict in production
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-    
-    # Include routers
-    app.include_router(enhancement_router)
-    app.include_router(tagging_router)
-    app.include_router(settings_router)
-    app.include_router(dashboard_router, prefix="/api")
-    
-    # Add static files directory for dashboard assets
-    static_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
-    os.makedirs(static_dir, exist_ok=True)
-    app.mount("/static", StaticFiles(directory=static_dir), name="static")
-    
-    # Start system monitoring if enabled
-    if monitoring_interval > 0:
-        logger.info(f"Starting system monitoring with {monitoring_interval}s interval")
-        start_monitoring(interval=monitoring_interval)
-    
-    @app.get("/health")
-    async def health_check():
-        """Health check endpoint."""
-        db_status = db_manager.health_check()
-        return {
-            "status": "healthy",
-            "proxy_enabled": str_to_bool(env.get("PROXY_ENABLED", "False")),
-            "azure_endpoint": env.get("AZURE_ENDPOINT", ""),
-            "model": env.get("MODEL_NAME", "gpt-4o"),
-            "database": {
-                "status": db_status["status"],
-                "host": env.get("PG_HOST", "localhost"),
-                "port": env.get("PG_PORT", "5432"),
-                "db": env.get("PG_DB", "metadata_db")
-            }
-        }
-    
-    @app.get("/")
-    async def root():
-        """Root endpoint with basic information."""
-        return {
-            "application": "Data Element Enhancement and Tagging API",
-            "version": "1.0.0",
-            "status": "running",
-            "documentation": "/docs",
-            "dashboard": "/api/dashboard",
-            "proxy_enabled": str_to_bool(env.get("PROXY_ENABLED", "False")),
-            "database": env.get("PG_DB", "metadata_db")
-        }
-    
-    # Register shutdown event to stop monitoring
-    @app.on_event("shutdown")
-    def shutdown_event():
-        """Shutdown event handler to clean up resources."""
-        logger.info("Application shutting down...")
+        raise ValueError(f"Invalid boolean value: {s}")
+
+## OSEnv class
+
+class OSEnv:
+    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
+        self.var_list = []
+        self.bulk_set(config_file, True)
+        self.bulk_set(creds_file, False)
+        self.set_certificate_path(certificate_path)
+        if str_to_bool(self.get("PROXY_ENABLED", "False")):
+            self.set_proxy()
         
-        # Stop system monitoring
-        stop_monitoring()
+        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
+            self.token = self.get_azure_token()
+        else:
+            self.token = None
+        
+        self.credential = self._get_credential()
     
-    return app
+    def _get_credential(self):
+        if str_to_bool(self.get("USE_MANAGED_IDENTITY", "False")):
+            return DefaultAzureCredential()
+        else:
+            return ClientSecretCredential(tenant_id=self.get("AZURE_TENANT_ID"), client_id=self.get("AZURE_CLIENT_ID"), client_secret=self.get("AZURE_CLIENT_SECRET"))
+    
+    def set_certificate_path(self, path: str):
+        try:
+            if not os.path.isabs(path):
+                path = os.path.abspath(path)
+            if not is_file_readable(path):
+                raise FileNotFoundError(f"The file '{path}' does not exist or is not readable")
+            
+            self.set("REQUESTS_CA_BUNDLE", path)
+            self.set("SSL_CERT_FILE", path)
+            self.set("CURL_CA_BUNDLE", path)
+        except Exception as e:
+            logger.error(f"Error setting certificate path: {e}")
+            raise
+    
+    def bulk_set(self, dotenvfile: str, print_val: bool = False)->None:
+        try:
+            if not os.path.isabs(dotenvfile):
+                dotenvfile = os.path.abspath(dotenvfile)
+            if not is_file_readable(dotenvfile):
+                raise FileNotFoundError(f"The file '{dotenvfile}' does not exist or is not readable")
+            temp_dict = dotenv_values(dotenvfile)
+            for key, value in temp_dict.items():
+                self.set(key, value, print_val)
+            del temp_dict
+        except Exception as e:
+            logger.error(f"Error loading environment variables from {dotenvfile}: {e}")
+            raise
+    
+    def set(self, key: str, value: str, print_val: bool = False)->None:
+        try:
+            os.environ[key] = value
+            if key not in self.var_list:
+                self.var_list.append(key)
+            if print_val:
+                logger.info(f"{key}: {value}")
+        except Exception as e:
+            logger.error(f"Error setting environment variable {key}: {e}")
+            raise
+    
+    def get(self, key: str, default: Optional[str] = None)->str:
+        try:
+            return os.environ.get(key, default)
+        except Exception as e:
+            logger.error(f"Error getting environment variable {key}: {e}")
+            raise
+    
+    def set_proxy(self) -> None:
+        try:
+            ad_username = self.get("AD_USERNAME")
+            ad_password = self.get("AD_USER_PW")
+            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
+            if not all([ad_username, ad_password, proxy_domain]):
+                raise ValueError("Proxy settings are incomplete")
+            proxy_url = f"https://{ad_username}:{ad_password}@{proxy_domain}"
+            self.set("HTTP_PROXY", proxy_url, print_val=False)
+            self.set("HTTPS_PROXY", proxy_url, print_val=False)
+            no_proxy_domains = [
+                'cognitiveservices.azure.com',
+                'search.windows.net',
+                'openai.azure.com',
+                'core.windows.net',
+                'azurewebsites.net'
+            ]
+            self.set("NO_PROXY", ",".join(no_proxy_domains), print_val=False)
+        except Exception as e:
+            logger.error(f"Error setting proxy: {e}")
+            raise
+    
+    def get_azure_token(self) -> str:
+        try:
+            credential = ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID"),
+                client_id=self.get("AZURE_CLIENT_ID"),
+                client_secret=self.get("AZURE_CLIENT_SECRET")
+            )
+            token = credential.get_token("https://cognitiveservices.azure.com/.default")
+            self.set("AZURE_TOKEN", token.token, print_val=False)
+            logger.info("Azure token set")
+            return token.token
+        except Exception as e:
+            logger.error(f"Error retrieving Azure token: {e}")
+            return None
+    
+    def list_env_vars(self)->None:
+        for var in self.var_list:
+            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET'}:
+                logger.info(f"{var}: [REDACTED]")
+            else:
+                logger.info(f"{var}: {os.getenv(var)}")
 
-def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="ISO/IEC 11179 Data Enhancement API")
-    parser.add_argument("--proxy", dest="proxy_enabled", action="store_true", 
-                        help="Enable proxy for API connections")
-    parser.add_argument("--no-proxy", dest="proxy_enabled", action="store_false", 
-                        help="Disable proxy for API connections")
-    parser.add_argument("--host", type=str, default="0.0.0.0", 
-                        help="Host to bind the server to")
-    parser.add_argument("--port", type=int, default=8000, 
-                        help="Port to bind the server to")
-    parser.add_argument("--reload", action="store_true", 
-                        help="Enable auto-reload for development")
-    parser.add_argument("--config", type=str, default="env/config.env", 
-                        help="Path to configuration file")
-    parser.add_argument("--creds", type=str, default="env/credentials.env", 
-                        help="Path to credentials file")
-    parser.add_argument("--cert", type=str, default="env/cacert.pem", 
-                        help="Path to SSL certificate file")
-    parser.add_argument("--monitoring-interval", type=int, default=300,
-                        help="Interval in seconds for system monitoring (0 to disable)")
-    
-    # PostgreSQL settings
-    parser.add_argument("--pg-host", type=str, help="PostgreSQL host")
-    parser.add_argument("--pg-port", type=int, help="PostgreSQL port")
-    parser.add_argument("--pg-user", type=str, help="PostgreSQL user")
-    parser.add_argument("--pg-password", type=str, help="PostgreSQL password")
-    parser.add_argument("--pg-db", type=str, help="PostgreSQL database name")
-    
-    parser.set_defaults(proxy_enabled=None)  # Default values
-    
-    return parser.parse_args()
 
-# Create a simple app instance for module import cases
-app = create_application(monitoring_interval=0)  # Disable monitoring for imported app
+## embedding class + Document class
+
+class MyDocument(BaseModel):
+    id: str = ""
+    text: str = ""
+    embedding: List[float] = []
+    metadata: Dict[str, Any] = {}
+
+class EmbeddingClient:
+    def __init__(self, env: OSEnv, azure_api_version: str = "2023-05-15", embeddings_model: str = "text-embedding-3-large"):
+        self.azure_api_version = azure_api_version
+        self.embeddings_model = embeddings_model
+        self.env = env
+        self.direct_azure_client = self._get_direct_azure_client()
+    
+    def _get_direct_azure_client(self):
+        token_provider = get_bearer_token_provider(
+            self.env.credential,
+            "https://cognitiveservices.azure.com/.default"
+        )
+        azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
+        api_key = self.env.get("AZURE_API_KEY", None)
+        
+        if api_key:
+            return AzureOpenAI(
+                api_key=api_key,
+                api_version=self.azure_api_version,
+                azure_endpoint=azure_endpoint
+            )
+        else:
+            return AzureOpenAI(
+                azure_endpoint=azure_endpoint,
+                api_version=self.azure_api_version,
+                azure_ad_token=self.env.token
+            )
+    
+    def generate_embeddings(self, doc: MyDocument)->MyDocument:
+        try:
+            response = self.direct_azure_client.embeddings.create(
+                model=self.embeddings_model,
+                input=doc.text
+            ).data[0].embedding
+            doc.embedding = response
+            return doc
+        except Exception as e:
+            logger.error(f"Error generating embeddings: {e}")
+            return doc
+    
+    def generate_batch_embeddings(self, docs: List[MyDocument]) -> List[MyDocument]:
+        try:
+            texts = [doc.text for doc in docs]
+            response = self.direct_azure_client.embeddings.create(
+                model=self.embeddings_model,
+                input=texts
+            )
+            
+            for i, doc in enumerate(docs):
+                doc.embedding = response.data[i].embedding
+            
+            return docs
+        except Exception as e:
+            logger.error(f"Error generating batch embeddings: {e}")
+            return docs
+
+class AzureChatbot:
+    def __init__(self, env: OSEnv):
+        self.env = env
+        self.llm = self._setup_chat_model()
+        self.memory = ConversationBufferMemory()
+        self.conversation = ConversationChain(llm=self.llm, memory=self.memory, verbose=True)
+    
+    def _setup_chat_model(self):
+        try:
+            token_provider = get_bearer_token_provider(
+                self.env.credential,
+                "https://cognitiveservices.azure.com/.default"
+            )
+            model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
+            temperature = float(self.env.get("TEMPERATURE", "0.7"))
+            max_tokens = int(self.env.get("MAX_TOKENS", "800"))
+            api_version = self.env.get("API_VERSION", "2023-05-15")
+            azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
+            
+            if self.env.token:
+                llm = AzureChatOpenAI(
+                    deployment_name=model_name,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    api_version=api_version,
+                    azure_endpoint=azure_endpoint,
+                    azure_ad_token_provider=token_provider
+                )
+            else:
+                api_key = self.env.get("AZURE_API_KEY", "")
+                llm = AzureChatOpenAI(
+                    deployment_name=model_name,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    api_version=api_version,
+                    azure_endpoint=azure_endpoint,
+                    api_key=api_key
+                )
+            
+            return llm
+        except Exception as e:
+            logger.error(f"Error setting up chatbot: {e}")
+            raise
+    
+    def generate_reasoning(self, project_overview: str, purpose: str) -> str:
+        prompt = ChatPromptTemplate.from_messages([
+            SystemMessage(content="You are an AI assistant that helps categorize project overviews based on their purposes. Please provide clear, concise reasoning for why a project matches a particular purpose."),
+            HumanMessage(content=f"Project Overview: {project_overview}\n\nPurpose: {purpose}\n\nExplain why this project overview matches (or doesn't match) this purpose. Keep your reasoning brief but specific.")
+        ])
+        
+        result = self.llm.invoke(prompt)
+        return result.content
+
+# Data models for LangGraph
+class Purpose(BaseModel):
+    id: str
+    name: str
+    embedding: List[float] = Field(default_factory=list)
+
+class Project(BaseModel):
+    case_id: str
+    overview: str
+    embedding: List[float] = Field(default_factory=list)
+
+class PurposeMatch(BaseModel):
+    purpose_id: str
+    purpose_name: str
+    matching_score: float
+    reasoning: str = ""
+
+class ProjectMapping(BaseModel):
+    case_id: str
+    overview: str
+    matches: List[PurposeMatch] = Field(default_factory=list)
+
+class AgentState(BaseModel):
+    purposes: List[Purpose] = Field(default_factory=list)
+    projects: List[Project] = Field(default_factory=list)
+    current_project_index: int = 0
+    results: List[ProjectMapping] = Field(default_factory=list)
+    status: str = "initializing"
+
+# File processing functions
+def load_purposes_file(file_path: str) -> List[Purpose]:
+    """Load the purposes from an Excel file."""
+    try:
+        df = pd.read_excel(file_path)
+        purposes = []
+        for i, col in enumerate(df.columns):
+            purpose = Purpose(id=str(i), name=col)
+            purposes.append(purpose)
+        return purposes
+    except Exception as e:
+        logger.error(f"Error loading purposes file: {e}")
+        raise
+
+def load_projects_file(file_path: str) -> List[Project]:
+    """Load the projects from a CSV file."""
+    try:
+        df = pd.read_csv(file_path)
+        projects = []
+        for _, row in df.iterrows():
+            project = Project(case_id=str(row['case id']), overview=row['project overview'])
+            projects.append(project)
+        return projects
+    except Exception as e:
+        logger.error(f"Error loading projects file: {e}")
+        raise
+
+def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
+    """Calculate cosine similarity between two vectors."""
+    dot_product = sum(a * b for a, b in zip(vec1, vec2))
+    norm1 = sum(a * a for a in vec1) ** 0.5
+    norm2 = sum(b * b for b in vec2) ** 0.5
+    return dot_product / (norm1 * norm2)
+
+# LangGraph Agent Functions
+def initialize(state: AgentState) -> AgentState:
+    """Initialize the agent state with purposes and projects."""
+    logger.info("Initializing agent...")
+    state.status = "loading_data"
+    return state
+
+def load_data(state: AgentState, purposes_file: str, projects_file: str, env: OSEnv) -> AgentState:
+    """Load data from files and generate embeddings."""
+    try:
+        logger.info("Loading purposes and projects data...")
+        state.purposes = load_purposes_file(purposes_file)
+        state.projects = load_projects_file(projects_file)
+        
+        embedding_client = EmbeddingClient(env)
+        
+        # Generate embeddings for purposes
+        purpose_docs = [MyDocument(id=p.id, text=p.name) for p in state.purposes]
+        purpose_docs = embedding_client.generate_batch_embeddings(purpose_docs)
+        
+        for i, doc in enumerate(purpose_docs):
+            state.purposes[i].embedding = doc.embedding
+        
+        # Generate embeddings for projects
+        project_docs = [MyDocument(id=p.case_id, text=p.overview) for p in state.projects]
+        project_docs = embedding_client.generate_batch_embeddings(project_docs)
+        
+        for i, doc in enumerate(project_docs):
+            state.projects[i].embedding = doc.embedding
+        
+        state.status = "processing"
+        return state
+    except Exception as e:
+        logger.error(f"Error in load_data: {e}")
+        state.status = "error"
+        return state
+
+def process_next_project(state: AgentState, threshold: float = 0.75) -> AgentState:
+    """Process the next project in the queue."""
+    if state.current_project_index >= len(state.projects):
+        state.status = "completed"
+        return state
+    
+    current_project = state.projects[state.current_project_index]
+    logger.info(f"Processing project {current_project.case_id}: {current_project.overview[:50]}...")
+    
+    project_mapping = ProjectMapping(
+        case_id=current_project.case_id,
+        overview=current_project.overview,
+        matches=[]
+    )
+    
+    # Find matching purposes based on embedding similarity
+    for purpose in state.purposes:
+        similarity = cosine_similarity(current_project.embedding, purpose.embedding)
+        
+        if similarity >= threshold:
+            match = PurposeMatch(
+                purpose_id=purpose.id,
+                purpose_name=purpose.name,
+                matching_score=similarity
+            )
+            project_mapping.matches.append(match)
+    
+    state.results.append(project_mapping)
+    state.current_project_index += 1
+    
+    if state.current_project_index >= len(state.projects):
+        state.status = "generating_reasoning"
+    
+    return state
+
+def generate_reasoning(state: AgentState, chatbot: AzureChatbot) -> AgentState:
+    """Generate reasoning for each project-purpose match."""
+    logger.info("Generating reasoning for matches...")
+    
+    for project_mapping in state.results:
+        for match in project_mapping.matches:
+            match.reasoning = chatbot.generate_reasoning(
+                project_mapping.overview, 
+                match.purpose_name
+            )
+    
+    state.status = "completed"
+    return state
+
+def save_results(state: AgentState, output_file: str) -> AgentState:
+    """Save the results to a file."""
+    logger.info(f"Saving results to {output_file}...")
+    
+    results = []
+    for project_mapping in state.results:
+        for match in project_mapping.matches:
+            results.append({
+                "case_id": project_mapping.case_id,
+                "project_overview": project_mapping.overview,
+                "purpose": match.purpose_name,
+                "matching_score": match.matching_score,
+                "reasoning": match.reasoning
+            })
+    
+    df = pd.DataFrame(results)
+    df.to_csv(output_file, index=False)
+    logger.info(f"Results saved to {output_file}")
+    
+    state.status = "saved"
+    return state
+
+def should_continue_processing(state: AgentState) -> Union[Literal["process_next"], Literal["generate_reasoning"]]:
+    """Determine the next step in the workflow."""
+    if state.status == "processing":
+        return "process_next"
+    elif state.status == "generating_reasoning":
+        return "generate_reasoning"
+    else:
+        return END
+
+# Main function to run the pipeline
+def main(purposes_file: str, projects_file: str, output_file: str, config_path: str = CONFIG_PATH, creds_path: str = CREDS_PATH, cert_path: str = CERT_PATH):
+    # Initialize environment
+    env = OSEnv(config_path, creds_path, cert_path)
+    chatbot = AzureChatbot(env)
+    
+    # Define the workflow graph
+    workflow = StateGraph(AgentState)
+    
+    # Add nodes to the graph
+    workflow.add_node("initialize", lambda state: initialize(state))
+    workflow.add_node("load_data", lambda state: load_data(state, purposes_file, projects_file, env))
+    workflow.add_node("process_next", lambda state: process_next_project(state))
+    workflow.add_node("generate_reasoning", lambda state: generate_reasoning(state, chatbot))
+    workflow.add_node("save_results", lambda state: save_results(state, output_file))
+    
+    # Add edges to the graph
+    workflow.add_edge("initialize", "load_data")
+    workflow.add_edge("load_data", "process_next")
+    workflow.add_conditional_edges(
+        "process_next",
+        should_continue_processing,
+        {
+            "process_next": "process_next",
+            "generate_reasoning": "generate_reasoning"
+        }
+    )
+    workflow.add_edge("generate_reasoning", "save_results")
+    workflow.add_edge("save_results", END)
+    
+    # Compile the graph
+    app = workflow.compile()
+    
+    # Execute the graph
+    logger.info("Starting project-purpose mapping workflow...")
+    result = app.invoke({"purposes": [], "projects": [], "current_project_index": 0, "results": [], "status": "initializing"})
+    
+    logger.info(f"Workflow completed with status: {result.status}")
+    return result
 
 if __name__ == "__main__":
-    # For local development with command line arguments
-    args = parse_args()
+    # Parse command line arguments
+    import argparse
+    parser = argparse.ArgumentParser(description='Map projects to purposes using AI')
+    parser.add_argument('--purposes', required=True, help='Path to the Excel file containing purposes')
+    parser.add_argument('--projects', required=True, help='Path to the CSV file containing projects')
+    parser.add_argument('--output', required=True, help='Path to save the output CSV file')
+    parser.add_argument('--config', default=CONFIG_PATH, help='Path to the config file')
+    parser.add_argument('--creds', default=CREDS_PATH, help='Path to the credentials file')
+    parser.add_argument('--cert', default=CERT_PATH, help='Path to the certificate file')
+    args = parser.parse_args()
     
-    # Set environment variables from command line arguments
-    os.environ["ENV_CONFIG_PATH"] = args.config
-    os.environ["ENV_CREDS_PATH"] = args.creds
-    os.environ["ENV_CERT_PATH"] = args.cert
-    
-    # Set PostgreSQL environment variables if provided
-    if args.pg_host:
-        os.environ["PG_HOST"] = args.pg_host
-    if args.pg_port:
-        os.environ["PG_PORT"] = str(args.pg_port)
-    if args.pg_user:
-        os.environ["PG_USER"] = args.pg_user
-    if args.pg_password:
-        os.environ["PG_PASSWORD"] = args.pg_password
-    if args.pg_db:
-        os.environ["PG_DB"] = args.pg_db
-    
-    # Log startup configuration
-    logger.info(f"Starting server with configuration:")
-    logger.info(f"  Host: {args.host}")
-    logger.info(f"  Port: {args.port}")
-    logger.info(f"  Proxy: {args.proxy_enabled}")
-    logger.info(f"  Config file: {args.config}")
-    logger.info(f"  Credentials file: {args.creds}")
-    logger.info(f"  Certificate file: {args.cert}")
-    logger.info(f"  Auto-reload: {args.reload}")
-    logger.info(f"  Monitoring interval: {args.monitoring_interval}s")
-    
-    if args.pg_host:
-        logger.info(f"  PostgreSQL host: {args.pg_host}")
-        logger.info(f"  PostgreSQL port: {args.pg_port}")
-        logger.info(f"  PostgreSQL database: {args.pg_db}")
-        logger.info(f"  PostgreSQL user: {args.pg_user}")
-    
-    # Override the default app with command line configured one
-    app = create_application(
-        proxy_enabled=args.proxy_enabled, 
-        monitoring_interval=args.monitoring_interval
+    # Run the main function
+    main(
+        purposes_file=args.purposes,
+        projects_file=args.projects,
+        output_file=args.output,
+        config_path=args.config,
+        creds_path=args.creds,
+        cert_path=args.cert
     )
-    
-    # Run application directly to avoid module import issues with reload
-    if args.reload:
-        # For reload mode, use string-based import but with proper error handling
-        try:
-            uvicorn.run(
-                "main:app",
-                host=args.host,
-                port=args.port,
-                reload=True
-            )
-        except ModuleNotFoundError:
-            logger.error("Could not run with reload mode - check your PYTHONPATH")
-            # Fallback to direct app instance
-            uvicorn.run(
-                app,
-                host=args.host,
-                port=args.port
-            )
-    else:
-        # For normal mode, use direct app instance
-        uvicorn.run(
-            app,
-            host=args.host,
-            port=args.port
-        )
