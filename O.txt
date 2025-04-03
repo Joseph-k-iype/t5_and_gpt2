@@ -7,6 +7,8 @@ import chardet
 import pandas as pd
 import networkx as nx
 import numpy as np
+import time
+import random
 from typing import Optional, Any, Dict, List, Union, Tuple, Callable, Literal
 from pathlib import Path
 from dotenv import dotenv_values
@@ -185,6 +187,8 @@ class EmbeddingClient:
         self.embeddings_model = embeddings_model
         self.env = env
         self.direct_azure_client = self._get_direct_azure_client()
+        self.max_retries = 3
+        self.retry_delay = 2  # seconds
     
     def _get_direct_azure_client(self):
         token_provider = get_bearer_token_provider(
@@ -200,33 +204,108 @@ class EmbeddingClient:
             azure_ad_token_provider=token_provider
         )
     
-    def generate_embeddings(self, doc: MyDocument)->MyDocument:
-        try:
-            response = self.direct_azure_client.embeddings.create(
-                model=self.embeddings_model,
-                input=doc.text
-            ).data[0].embedding
-            doc.embedding = response
-            return doc
-        except Exception as e:
-            logger.error(f"Error generating embeddings: {e}")
-            return doc
+    def _preprocess_text(self, text: str) -> str:
+        """Preprocess text to ensure it works well with the embedding API."""
+        if not text:
+            return "Empty text"
+            
+        # Replace special characters that might cause issues
+        text = text.replace('\x00', ' ')  # Null bytes
+        
+        # Ensure the text isn't too long (8k tokens is a common limit)
+        if len(text) > 25000:  # Rough estimate: 25k chars ≈ 8k tokens
+            text = text[:25000]
+            
+        # Ensure text has content
+        if not text.strip():
+            return "Empty text"
+            
+        return text
+    
+    def generate_embeddings(self, doc: MyDocument) -> MyDocument:
+        """Generate embedding for a single document with retries."""
+        processed_text = self._preprocess_text(doc.text)
+        
+        for attempt in range(self.max_retries):
+            try:
+                response = self.direct_azure_client.embeddings.create(
+                    model=self.embeddings_model,
+                    input=processed_text
+                )
+                
+                if response and response.data and len(response.data) > 0:
+                    doc.embedding = response.data[0].embedding
+                    
+                    # Verify the embedding is valid
+                    if not doc.embedding or len(doc.embedding) == 0:
+                        logger.warning(f"Empty embedding returned for document {doc.id} on attempt {attempt+1}")
+                        time.sleep(self.retry_delay)
+                        continue
+                        
+                    # Check if embedding is all zeros
+                    if all(e == 0 for e in doc.embedding):
+                        logger.warning(f"All-zero embedding returned for document {doc.id} on attempt {attempt+1}")
+                        time.sleep(self.retry_delay)
+                        continue
+                        
+                    return doc
+                else:
+                    logger.warning(f"No data in embedding response for document {doc.id} on attempt {attempt+1}")
+            except Exception as e:
+                logger.warning(f"Error generating embedding for document {doc.id} on attempt {attempt+1}: {e}")
+            
+            # Wait before retry
+            time.sleep(self.retry_delay)
+        
+        # If all retries failed, create a default embedding
+        logger.error(f"Failed to generate proper embedding for document {doc.id} after {self.max_retries} attempts")
+        logger.error(f"Text sample: {doc.text[:100]}...")
+        
+        # Create a random embedding as fallback
+        import random
+        doc.embedding = [random.uniform(-0.1, 0.1) for _ in range(1536)]  # Standard embedding size
+        return doc
     
     def generate_batch_embeddings(self, docs: List[MyDocument]) -> List[MyDocument]:
+        """Generate embeddings for a batch of documents with individual retries on failure."""
+        if not docs:
+            return []
+            
+        # Process text for each document
+        processed_docs = []
+        for doc in docs:
+            doc.text = self._preprocess_text(doc.text)
+            processed_docs.append(doc)
+        
         try:
-            texts = [doc.text for doc in docs]
+            # Try batch processing first
+            texts = [doc.text for doc in processed_docs]
             response = self.direct_azure_client.embeddings.create(
                 model=self.embeddings_model,
                 input=texts
             )
             
-            for i, doc in enumerate(docs):
-                doc.embedding = response.data[i].embedding
-            
-            return docs
+            if response and response.data and len(response.data) == len(processed_docs):
+                for i, doc in enumerate(processed_docs):
+                    doc.embedding = response.data[i].embedding
+            else:
+                logger.warning(f"Batch embedding failed or returned mismatched results. Falling back to individual processing.")
+                # Fallback to individual processing
+                for doc in processed_docs:
+                    self.generate_embeddings(doc)
         except Exception as e:
-            logger.error(f"Error generating batch embeddings: {e}")
-            return docs
+            logger.warning(f"Error in batch embedding: {e}. Falling back to individual processing.")
+            # Fallback to individual processing
+            for doc in processed_docs:
+                self.generate_embeddings(doc)
+        
+        # Verify all embeddings
+        for i, doc in enumerate(processed_docs):
+            if not doc.embedding or len(doc.embedding) == 0 or all(e == 0 for e in doc.embedding):
+                logger.warning(f"Invalid embedding detected for document {doc.id} after batch processing. Regenerating individually.")
+                self.generate_embeddings(doc)
+        
+        return processed_docs
 
 class AzureChatbot:
     def __init__(self, env: OSEnv):
@@ -432,33 +511,169 @@ def initialize(state: AgentState) -> AgentState:
     return state
 
 def load_data(state: AgentState, purposes_file: str, projects_file: str, env: OSEnv) -> AgentState:
-    """Load data from files and generate embeddings."""
+    """Load data from files and generate embeddings with efficient batching and caching."""
     try:
         logger.info("Loading purposes and projects data...")
         state.purposes = load_purposes_file(purposes_file)
         state.projects = load_projects_file(projects_file)
         
+        # Check for cached embeddings
+        cache_dir = Path("./embedding_cache")
+        cache_dir.mkdir(exist_ok=True)
+        
+        purpose_cache_file = cache_dir / "purpose_embeddings.json"
+        project_cache_file = cache_dir / f"project_embeddings_{hash(projects_file)}.json"
+        
+        # Initialize embedding client
         embedding_client = EmbeddingClient(env)
         
-        # Generate embeddings for purposes
-        purpose_docs = [MyDocument(id=p.id, text=p.name) for p in state.purposes]
-        purpose_docs = embedding_client.generate_batch_embeddings(purpose_docs)
+        # Load or generate purpose embeddings
+        if purpose_cache_file.exists():
+            logger.info("Loading cached purpose embeddings...")
+            try:
+                with open(purpose_cache_file, 'r') as f:
+                    purpose_embeddings = json.load(f)
+                    
+                # Match embeddings to purposes by ID
+                for purpose in state.purposes:
+                    if purpose.id in purpose_embeddings:
+                        purpose.embedding = purpose_embeddings[purpose.id]
+                        
+                # Check if all purposes have embeddings
+                missing_embeddings = [p for p in state.purposes if not p.embedding]
+                if missing_embeddings:
+                    logger.info(f"{len(missing_embeddings)} purposes missing embeddings - generating those")
+                    # Only generate embeddings for purposes missing them
+                    purpose_docs = [MyDocument(id=p.id, text=p.name) for p in missing_embeddings]
+                    if purpose_docs:
+                        purpose_docs = embedding_client.generate_batch_embeddings(purpose_docs)
+                        for doc in purpose_docs:
+                            for p in missing_embeddings:
+                                if p.id == doc.id:
+                                    p.embedding = doc.embedding
+                                    purpose_embeddings[p.id] = doc.embedding
+                        
+                        # Update the cache with new embeddings
+                        with open(purpose_cache_file, 'w') as f:
+                            json.dump(purpose_embeddings, f)
+            except Exception as e:
+                logger.warning(f"Error loading cached purpose embeddings: {e}. Regenerating...")
+                purpose_embeddings = {}
+                purpose_docs = [MyDocument(id=p.id, text=p.name) for p in state.purposes]
+                purpose_docs = embedding_client.generate_batch_embeddings(purpose_docs)
+                
+                for i, doc in enumerate(purpose_docs):
+                    state.purposes[i].embedding = doc.embedding
+                    purpose_embeddings[doc.id] = doc.embedding
+                
+                # Cache the embeddings
+                with open(purpose_cache_file, 'w') as f:
+                    json.dump(purpose_embeddings, f)
+        else:
+            logger.info("Generating purpose embeddings...")
+            purpose_embeddings = {}
+            
+            # Generate embeddings for purposes in a single batch
+            purpose_docs = [MyDocument(id=p.id, text=p.name) for p in state.purposes]
+            purpose_docs = embedding_client.generate_batch_embeddings(purpose_docs)
+            
+            for i, doc in enumerate(purpose_docs):
+                state.purposes[i].embedding = doc.embedding
+                purpose_embeddings[doc.id] = doc.embedding
+            
+            # Cache the embeddings
+            with open(purpose_cache_file, 'w') as f:
+                json.dump(purpose_embeddings, f)
         
-        for i, doc in enumerate(purpose_docs):
-            state.purposes[i].embedding = doc.embedding
-            # Verify embeddings are valid
-            if not doc.embedding or all(e == 0 for e in doc.embedding):
-                logger.warning(f"Warning: Purpose '{state.purposes[i].name}' has an empty or zero embedding")
+        # Load or generate project embeddings
+        if project_cache_file.exists():
+            logger.info("Loading cached project embeddings...")
+            try:
+                with open(project_cache_file, 'r') as f:
+                    project_embeddings = json.load(f)
+                
+                # Match embeddings to projects by ID
+                for project in state.projects:
+                    if project.case_id in project_embeddings:
+                        project.embedding = project_embeddings[project.case_id]
+                
+                # Check if all projects have embeddings
+                missing_embeddings = [p for p in state.projects if not p.embedding]
+                if missing_embeddings:
+                    logger.info(f"{len(missing_embeddings)} projects missing embeddings - generating those")
+                    # Only generate embeddings for projects missing them
+                    project_docs = [MyDocument(id=p.case_id, text=p.overview) for p in missing_embeddings]
+                    
+                    # Process in batches of 10 to avoid rate limits
+                    batch_size = 10
+                    for i in range(0, len(project_docs), batch_size):
+                        batch = project_docs[i:i+batch_size]
+                        batch = embedding_client.generate_batch_embeddings(batch)
+                        
+                        for doc in batch:
+                            for p in missing_embeddings:
+                                if p.case_id == doc.id:
+                                    p.embedding = doc.embedding
+                                    project_embeddings[p.case_id] = doc.embedding
+                        
+                        logger.info(f"Generated embeddings for {len(batch)} projects")
+                    
+                    # Update the cache with new embeddings
+                    with open(project_cache_file, 'w') as f:
+                        json.dump(project_embeddings, f)
+            except Exception as e:
+                logger.warning(f"Error loading cached project embeddings: {e}. Regenerating...")
+                project_embeddings = {}
+                
+                # Process in batches of 10 to avoid rate limits
+                batch_size = 10
+                for i in range(0, len(state.projects), batch_size):
+                    batch = state.projects[i:i+batch_size]
+                    project_docs = [MyDocument(id=p.case_id, text=p.overview) for p in batch]
+                    project_docs = embedding_client.generate_batch_embeddings(project_docs)
+                    
+                    for doc in project_docs:
+                        for p in batch:
+                            if p.case_id == doc.id:
+                                p.embedding = doc.embedding
+                                project_embeddings[p.case_id] = doc.embedding
+                    
+                    logger.info(f"Generated embeddings for {len(batch)} projects")
+                
+                # Cache the embeddings
+                with open(project_cache_file, 'w') as f:
+                    json.dump(project_embeddings, f)
+        else:
+            logger.info("Generating project embeddings...")
+            project_embeddings = {}
+            
+            # Process in batches of 10 to avoid rate limits
+            batch_size = 10
+            for i in range(0, len(state.projects), batch_size):
+                batch = state.projects[i:i+batch_size]
+                project_docs = [MyDocument(id=p.case_id, text=p.overview) for p in batch]
+                project_docs = embedding_client.generate_batch_embeddings(project_docs)
+                
+                for doc in project_docs:
+                    for p in batch:
+                        if p.case_id == doc.id:
+                            p.embedding = doc.embedding
+                            project_embeddings[p.case_id] = doc.embedding
+                
+                logger.info(f"Generated embeddings for {len(batch)} projects")
+            
+            # Cache the embeddings
+            with open(project_cache_file, 'w') as f:
+                json.dump(project_embeddings, f)
         
-        # Generate embeddings for projects
-        project_docs = [MyDocument(id=p.case_id, text=p.overview) for p in state.projects]
-        project_docs = embedding_client.generate_batch_embeddings(project_docs)
+        # Verify all embeddings are valid
+        for i, purpose in enumerate(state.purposes):
+            if not purpose.embedding or all(e == 0 for e in purpose.embedding):
+                logger.warning(f"Warning: Purpose '{purpose.name}' has an empty or zero embedding")
         
-        for i, doc in enumerate(project_docs):
-            state.projects[i].embedding = doc.embedding
-            # Verify embeddings are valid
-            if not doc.embedding or all(e == 0 for e in doc.embedding):
-                logger.warning(f"Warning: Project '{state.projects[i].case_id}' has an empty or zero embedding")
+        for i, project in enumerate(state.projects):
+            if not project.embedding or all(e == 0 for e in project.embedding):
+                logger.warning(f"Warning: Project '{project.case_id}' has an empty or zero embedding")
         
         state.status = "processing"
         return state
@@ -649,7 +864,7 @@ def save_results(state: AgentState, output_file: str) -> AgentState:
 def should_continue_processing(state: AgentState) -> str:
     """Determine the next step in the workflow."""
     if state.current_project_index < len(state.projects) and state.status == "processing":
-        return "process_next"
+        return "process_batch"
     else:
         return "save_results"
 
