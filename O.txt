@@ -5,11 +5,10 @@ import json
 import logging
 import chardet
 import pandas as pd
-import networkx as nx
 import numpy as np
 import time
 import random
-from typing import Optional, Any, Dict, List, Union, Tuple, Callable, Literal
+from typing import Optional, Any, Dict, List, Union, Tuple, Callable
 from pathlib import Path
 from dotenv import dotenv_values
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider, ClientSecretCredential
@@ -21,6 +20,7 @@ from langchain.chains import ConversationChain, LLMChain
 from langchain.schema.document import Document as LC_DOCUMENT
 from langchain.embeddings.base import Embeddings
 from langchain_community.vectorstores import Chroma
+from langchain.prompts import PromptTemplate
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from chromadb.config import Settings
@@ -28,9 +28,6 @@ from chromadb.utils import embedding_functions
 from collections import namedtuple
 import re
 from pydantic import BaseModel, ValidationError, field_validator
-import langgraph.graph
-from langgraph.graph import StateGraph, END, START
-from langgraph.prebuilt import ToolNode
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -178,8 +175,8 @@ class OSEnv:
 class MyDocument(BaseModel):
     id: str = ""
     text: str = ""
-    embedding: List[float] = []
-    metadata: Dict[str, Any] = {}
+    embedding: List[float] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 class EmbeddingClient:
     def __init__(self, env: OSEnv, azure_api_version: str = "2023-05-15", embeddings_model: str = "text-embedding-3-large"):
@@ -262,7 +259,6 @@ class EmbeddingClient:
         logger.error(f"Text sample: {doc.text[:100]}...")
         
         # Create a random embedding as fallback
-        import random
         doc.embedding = [random.uniform(-0.1, 0.1) for _ in range(1536)]  # Standard embedding size
         return doc
     
@@ -326,8 +322,7 @@ class AzureChatbot:
             api_version = self.env.get("API_VERSION", "2023-05-15")
             azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
             
-            # Using model_deployment_name instead of model_name - this is the key parameter
-            # for AzureChatOpenAI in newer versions
+            # Using deployment_name instead of model_name
             self.llm = AzureChatOpenAI(
                 deployment_name=model_name,
                 temperature=temperature,
@@ -351,7 +346,7 @@ class AzureChatbot:
         result = self.llm.invoke(messages)
         return result.content
 
-# Data models for LangGraph
+# Data models for the pipeline
 class Purpose(BaseModel):
     id: str
     name: str
@@ -503,9 +498,9 @@ def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
         
     return dot_product / (norm1 * norm2)
 
-# LangGraph Agent Functions
+# Pipeline functions
 def initialize(state: AgentState) -> AgentState:
-    """Initialize the agent state with purposes and projects."""
+    """Initialize the agent state."""
     logger.info("Initializing agent...")
     state.status = "loading_data"
     return state
@@ -682,61 +677,6 @@ def load_data(state: AgentState, purposes_file: str, projects_file: str, env: OS
         state.status = "error"
         return state
 
-def process_next_project(state: AgentState, chatbot: AzureChatbot, min_matches: int = 3) -> AgentState:
-    """Process the next project in the queue using LLM-enhanced matching with minimum number of matches."""
-    if state.current_project_index >= len(state.projects):
-        state.status = "completed"
-        return state
-    
-    current_project = state.projects[state.current_project_index]
-    logger.info(f"Processing project {current_project.case_id}: {current_project.overview[:50]}...")
-    
-    # Step 1: Calculate similarity for ALL purposes
-    similarities = []
-    for purpose in state.purposes:
-        similarity = cosine_similarity(current_project.embedding, purpose.embedding)
-        similarities.append((purpose, similarity))
-    
-    # Sort by similarity score (descending)
-    similarities.sort(key=lambda x: x[1], reverse=True)
-    
-    # Step 2: Use LLM to evaluate which purposes match the project
-    # Request at least the minimum number of matches
-    project_mapping = evaluate_purposes_with_llm(
-        chatbot, 
-        current_project, 
-        similarities, 
-        state.purposes,
-        min_matches=min_matches  # Ensure at least min_matches matches
-    )
-    
-    # Step 3: If we still don't have enough matches, add the top similarity matches as fallbacks
-    if len(project_mapping.matches) < min_matches:
-        # Get the IDs of purposes already matched to avoid duplicates
-        matched_purpose_ids = {match.purpose_id for match in project_mapping.matches}
-        
-        # Add top similarity purposes not already matched until we reach min_matches
-        for purpose, score in similarities:
-            if purpose.id not in matched_purpose_ids and len(project_mapping.matches) < min_matches:
-                fallback_reasoning = f"This is an automated match based on semantic similarity. The project shares some terminology or concepts with '{purpose.name}' with a similarity score of {score:.4f}."
-                
-                project_mapping.matches.append(PurposeMatch(
-                    purpose_id=purpose.id,
-                    purpose_name=purpose.name,
-                    matching_score=score,
-                    reasoning=fallback_reasoning
-                ))
-                matched_purpose_ids.add(purpose.id)
-                logger.info(f"Added fallback match '{purpose.name}' for project {current_project.case_id}")
-    
-    state.results.append(project_mapping)
-    state.current_project_index += 1
-    
-    if state.current_project_index >= len(state.projects):
-        state.status = "completed"
-    
-    return state
-
 def evaluate_purposes_with_llm(chatbot: AzureChatbot, project: Project, 
                               all_similarities: List[Tuple[Purpose, float]], 
                               all_purposes: List[Purpose],
@@ -837,7 +777,208 @@ Important: You MUST identify at least {min_matches} matching purposes if possibl
     # The calling function will add additional matches if needed
     return project_mapping
 
-# This function is no longer needed as reasoning is now generated during the evaluation process
+def process_projects_batch(state: AgentState, chatbot: AzureChatbot, batch_size: int = 5, min_matches: int = 3) -> AgentState:
+    """Process multiple projects in a batch to reduce API calls."""
+    if state.current_project_index >= len(state.projects):
+        state.status = "completed"
+        return state
+    
+    # Determine the batch of projects to process
+    end_index = min(state.current_project_index + batch_size, len(state.projects))
+    batch = state.projects[state.current_project_index:end_index]
+    
+    logger.info(f"Processing batch of {len(batch)} projects (index {state.current_project_index} to {end_index-1})...")
+    
+    # Create batch prompt to evaluate purposes for all projects in batch
+    system_content = """You are an expert analyst tasked with mapping project overviews to their most relevant purposes. 
+    For EACH project overview provided, determine which purposes it aligns with from the list.
+    For each project, select the TOP 3 purposes that relate to that project's intent and scope.
+    For each selected purpose, provide clear, specific reasoning explaining why it matches.
+    Your analysis should be factual and objective, based solely on the content of each project overview."""
+    
+    # Prepare the list of all purposes
+    all_purposes_text = "\n".join([f"{i+1}. {purpose.name}" for i, purpose in enumerate(state.purposes)])
+    
+    user_content = f"""# Available Purposes
+{all_purposes_text}
+
+# Projects to Analyze
+"""
+    
+    # Add each project to the prompt
+    for i, project in enumerate(batch):
+        user_content += f"""
+PROJECT {i+1}: {project.case_id}
+{project.overview}
+"""
+    
+    user_content += """
+# Instructions
+1. Review each project overview carefully
+2. For EACH project, identify the TOP 3 most relevant purposes
+3. For each matching purpose, explain your reasoning in detail
+4. Format your response as follows:
+
+RESULTS FOR PROJECT 1:
+- Purpose ID: [purpose number from the list]
+  Name: [purpose name]
+  Reasoning: [clear explanation of why this purpose matches]
+  
+- Purpose ID: [next matching purpose number]
+  ...
+
+RESULTS FOR PROJECT 2:
+...
+
+Important: You MUST identify at least one matching purpose for each project. If no purpose seems to be a perfect match, select the most relevant ones and explain the partial match."""
+    
+    # Get the LLM's evaluation using direct messages
+    messages = [
+        SystemMessage(content=system_content),
+        HumanMessage(content=user_content)
+    ]
+    
+    try:
+        result = chatbot.llm.invoke(messages)
+        response_text = result.content
+        
+        # Process each project's results
+        for i, project in enumerate(batch):
+            project_idx = i + 1
+            project_section = f"RESULTS FOR PROJECT {project_idx}:"
+            
+            project_mapping = ProjectMapping(
+                case_id=project.case_id,
+                overview=project.overview,
+                matches=[]
+            )
+            
+            # Find the section for this project
+            if project_section in response_text:
+                section_start = response_text.find(project_section)
+                section_end = response_text.find(f"RESULTS FOR PROJECT {project_idx + 1}:", section_start)
+                if section_end == -1:  # If this is the last project
+                    section_end = len(response_text)
+                
+                section_text = response_text[section_start:section_end]
+                
+                # Extract matches using regex
+                pattern = r"Purpose ID: (\d+)[\s\n]+Name: (.+?)[\s\n]+Reasoning: (.+?)(?=\n\n-|\Z)"
+                matches = re.finditer(pattern, section_text, re.DOTALL)
+                
+                for match in matches:
+                    purpose_id = int(match.group(1)) - 1  # Convert to 0-based index
+                    purpose_name = match.group(2).strip()
+                    reasoning = match.group(3).strip()
+                    
+                    # Find the similarity score
+                    similarity = 0.0
+                    if 0 <= purpose_id < len(state.purposes):
+                        similarity = cosine_similarity(project.embedding, state.purposes[purpose_id].embedding)
+                    
+                    # Add to the project mapping
+                    if 0 <= purpose_id < len(state.purposes):
+                        purpose_match = PurposeMatch(
+                            purpose_id=state.purposes[purpose_id].id,
+                            purpose_name=purpose_name,
+                            matching_score=similarity,
+                            reasoning=reasoning
+                        )
+                        project_mapping.matches.append(purpose_match)
+            
+            # If we don't have enough matches, add fallbacks based on similarity
+            if len(project_mapping.matches) < min_matches:
+                # Calculate similarities
+                similarities = []
+                for purpose in state.purposes:
+                    similarity = cosine_similarity(project.embedding, purpose.embedding)
+                    similarities.append((purpose, similarity))
+                
+                # Sort by similarity score (descending)
+                similarities.sort(key=lambda x: x[1], reverse=True)
+                
+                # Get the IDs of purposes already matched to avoid duplicates
+                matched_purpose_ids = {match.purpose_id for match in project_mapping.matches}
+                
+                # Add top similarity purposes not already matched until we reach min_matches
+                for purpose, score in similarities:
+                    if purpose.id not in matched_purpose_ids and len(project_mapping.matches) < min_matches:
+                        fallback_reasoning = f"This is an automated match based on semantic similarity. The project shares some terminology or concepts with '{purpose.name}' with a similarity score of {score:.4f}."
+                        
+                        project_mapping.matches.append(PurposeMatch(
+                            purpose_id=purpose.id,
+                            purpose_name=purpose.name,
+                            matching_score=score,
+                            reasoning=fallback_reasoning
+                        ))
+                        matched_purpose_ids.add(purpose.id)
+                        logger.info(f"Added fallback match '{purpose.name}' for project {project.case_id}")
+            
+            state.results.append(project_mapping)
+        
+        # Update the current project index
+        state.current_project_index = end_index
+        
+        if state.current_project_index >= len(state.projects):
+            state.status = "completed"
+        
+        return state
+    except Exception as e:
+        logger.error(f"Error processing batch: {e}")
+        # Process projects individually as fallback
+        logger.info("Falling back to individual project processing")
+        
+        for project in batch:
+            process_single_project(state, chatbot, project, min_matches)
+            state.current_project_index += 1
+        
+        if state.current_project_index >= len(state.projects):
+            state.status = "completed"
+        
+        return state
+
+def process_single_project(state: AgentState, chatbot: AzureChatbot, project: Project, min_matches: int = 3) -> None:
+    """Process a single project (fallback method)."""
+    logger.info(f"Processing project {project.case_id}: {project.overview[:50]}...")
+    
+    # Calculate similarities
+    similarities = []
+    for purpose in state.purposes:
+        similarity = cosine_similarity(project.embedding, purpose.embedding)
+        similarities.append((purpose, similarity))
+    
+    # Sort by similarity score (descending)
+    similarities.sort(key=lambda x: x[1], reverse=True)
+    
+    # Get project mapping using regular approach
+    project_mapping = evaluate_purposes_with_llm(
+        chatbot, 
+        project, 
+        similarities, 
+        state.purposes,
+        min_matches=min_matches
+    )
+    
+    # Add fallbacks if needed
+    if len(project_mapping.matches) < min_matches:
+        # Get the IDs of purposes already matched to avoid duplicates
+        matched_purpose_ids = {match.purpose_id for match in project_mapping.matches}
+        
+        # Add top similarity purposes not already matched until we reach min_matches
+        for purpose, score in similarities:
+            if purpose.id not in matched_purpose_ids and len(project_mapping.matches) < min_matches:
+                fallback_reasoning = f"This is an automated match based on semantic similarity. The project shares some terminology or concepts with '{purpose.name}' with a similarity score of {score:.4f}."
+                
+                project_mapping.matches.append(PurposeMatch(
+                    purpose_id=purpose.id,
+                    purpose_name=purpose.name,
+                    matching_score=score,
+                    reasoning=fallback_reasoning
+                ))
+                matched_purpose_ids.add(purpose.id)
+                logger.info(f"Added fallback match '{purpose.name}' for project {project.case_id}")
+    
+    state.results.append(project_mapping)
 
 def save_results(state: AgentState, output_file: str) -> AgentState:
     """Save the results to a file."""
@@ -861,69 +1002,50 @@ def save_results(state: AgentState, output_file: str) -> AgentState:
     state.status = "saved"
     return state
 
-def should_continue_processing(state: AgentState) -> str:
-    """Determine the next step in the workflow."""
-    if state.current_project_index < len(state.projects) and state.status == "processing":
-        return "process_batch"
-    else:
-        return "save_results"
-
-# Main function to run the pipeline
-def main(purposes_file: str, projects_file: str, output_file: str, config_path: str = CONFIG_PATH, creds_path: str = CREDS_PATH, cert_path: str = CERT_PATH):
-    # Initialize environment
-    env = OSEnv(config_path, creds_path, cert_path)
-    chatbot = AzureChatbot(env)
-    
-    # Define the workflow graph
-    workflow = StateGraph(AgentState)
-    
-    # Add nodes to the graph
-    workflow.add_node("initialize", lambda state: initialize(state))
-    workflow.add_node("load_data", lambda state: load_data(state, purposes_file, projects_file, env))
-    workflow.add_node("process_next", lambda state: process_next_project(state, chatbot))
-    workflow.add_node("save_results", lambda state: save_results(state, output_file))
-    
-    # Add edges to the graph
-    workflow.add_edge(START, "initialize")
-    workflow.add_edge("initialize", "load_data")
-    workflow.add_edge("load_data", "process_next")
-    workflow.add_conditional_edges(
-        "process_next",
-        should_continue_processing,
-        {
-            "process_next": "process_next",
-            "save_results": "save_results"
-        }
-    )
-    # Make save_results the end node
-    # In some versions, we need to explicitly connect to END
+# Direct pipeline function
+def run_pipeline(purposes_file: str, projects_file: str, output_file: str, config_path: str = CONFIG_PATH, creds_path: str = CREDS_PATH, cert_path: str = CERT_PATH):
+    """Run the pipeline directly without using LangGraph to avoid any framework issues."""
     try:
-        workflow.add_edge("save_results", END)
+        # Initialize environment
+        env = OSEnv(config_path, creds_path, cert_path)
+        chatbot = AzureChatbot(env)
+        
+        # Create initial state
+        state = AgentState(
+            purposes=[], 
+            projects=[], 
+            current_project_index=0, 
+            results=[], 
+            status="initializing"
+        )
+        
+        # Step 1: Initialize
+        logger.info("Initializing...")
+        state = initialize(state)
+        
+        # Step 2: Load Data
+        logger.info("Loading data...")
+        state = load_data(state, purposes_file, projects_file, env)
+        
+        # Step 3: Process Projects
+        logger.info("Processing projects...")
+        batch_size = 5
+        while state.current_project_index < len(state.projects):
+            remaining = len(state.projects) - state.current_project_index
+            logger.info(f"Processing batch of projects. Progress: {state.current_project_index}/{len(state.projects)} ({remaining} remaining)")
+            state = process_projects_batch(state, chatbot, batch_size=batch_size)
+        
+        # Step 4: Save Results
+        logger.info("Saving results...")
+        state = save_results(state, output_file)
+        
+        logger.info(f"Pipeline completed successfully. {len(state.results)} projects processed.")
+        return state
     except Exception as e:
-        logger.warning(f"Could not add edge to END: {e}")
-        # In this case, save_results will implicitly be an end node since
-        # no outgoing edges are defined
-    
-    # Compile the graph
-    app = workflow.compile()
-    
-    # Execute the graph
-    logger.info("Starting project-purpose mapping workflow...")
-    result = app.invoke({"purposes": [], "projects": [], "current_project_index": 0, "results": [], "status": "initializing"})
-    
-    # Check the result structure to access the final state
-    try:
-        if hasattr(result, 'status'):
-            logger.info(f"Workflow completed with status: {result.status}")
-        elif isinstance(result, dict) and 'status' in result:
-            logger.info(f"Workflow completed with status: {result['status']}")
-        else:
-            logger.info("Workflow completed. Check the output file for results.")
-    except Exception as e:
-        logger.warning(f"Could not access status in result: {e}")
-        logger.info("Workflow execution completed. Check the output file for results.")
-    
-    return result
+        logger.error(f"Error in pipeline: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise
 
 if __name__ == "__main__":
     # Parse command line arguments
@@ -937,8 +1059,8 @@ if __name__ == "__main__":
     parser.add_argument('--cert', default=CERT_PATH, help='Path to the certificate file')
     args = parser.parse_args()
     
-    # Run the pipeline directly (avoiding LangGraph issues)
-    run_pipeline_directly(
+    # Run the pipeline directly
+    run_pipeline(
         purposes_file=args.purposes,
         projects_file=args.projects,
         output_file=args.output,
