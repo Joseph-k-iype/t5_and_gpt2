@@ -1,235 +1,683 @@
 """
-Settings API - Endpoints for retrieving and updating application settings.
+Business Terms Manager - Core component for managing and matching business terms.
 
-This module provides API endpoints for managing application settings such as
-proxy configuration, database connections, and vector database selection.
+This module provides functionality for storing, retrieving, and matching business terms
+using vector similarity search with support for multiple vector database backends.
 """
 
+import csv
 import logging
 import os
-from typing import Dict, Any, List, Optional
-from fastapi import APIRouter, HTTPException, Depends, Query
-from app.config.environment import get_os_env, str_to_bool
-from app.config.settings import get_llm, get_vector_db_type, get_vector_store, get_app_settings
-from app.core.db_manager import DBManager
+import time
+from typing import List, Dict, Any, Optional, Tuple, Union
+import numpy as np
 from pydantic import BaseModel, Field
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+from app.core.db_manager import DBManager
+from app.core.embedding import EmbeddingClient, MyDocument
+from app.core.models import TaggingResult, TaggingValidationResult
+from app.config.environment import get_os_env
+from app.config.settings import get_vector_store
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/v1/settings", tags=["settings"])
 
-class ProxySettings(BaseModel):
-    """Model for proxy settings."""
-    enabled: bool = Field(..., description="Whether proxy is enabled")
-    domain: Optional[str] = Field(None, description="Proxy domain (for display only)")
-
-
-class DatabaseSettings(BaseModel):
-    """Model for database connection settings."""
-    host: str = Field(..., description="PostgreSQL host")
-    port: int = Field(..., description="PostgreSQL port")
-    database: str = Field(..., description="PostgreSQL database name")
-    user: str = Field(..., description="PostgreSQL user")
-    schema: str = Field(..., description="PostgreSQL schema")
-    min_connections: int = Field(..., description="Minimum number of connections")
-    max_connections: int = Field(..., description="Maximum number of connections")
-
-
-class VectorDatabaseSettings(BaseModel):
-    """Model for vector database settings."""
-    type: str = Field(..., description="Vector database type (postgresql or chroma)")
-    chroma_persist_dir: Optional[str] = Field(None, description="ChromaDB persist directory")
-    chroma_collection: Optional[str] = Field(None, description="ChromaDB collection name")
-    chroma_server_port: Optional[int] = Field(None, description="ChromaDB server port")
-
-
-class AppSettings(BaseModel):
-    """Model for application settings."""
-    vector_database: VectorDatabaseSettings = Field(..., description="Vector database settings")
-    database: DatabaseSettings = Field(..., description="Database settings")
-    model: Dict[str, Any] = Field(..., description="Model settings")
-    proxy: ProxySettings = Field(..., description="Proxy settings")
-    monitoring_interval: int = Field(..., description="System monitoring interval in seconds")
-    similarity_threshold: float = Field(..., description="Similarity threshold for term matching")
-
-
-@router.get("/proxy", response_model=ProxySettings)
-async def get_proxy_settings():
-    """Get the current proxy settings."""
-    try:
-        env = get_os_env()
-        proxy_enabled = str_to_bool(env.get("PROXY_ENABLED", "False"))
-        
-        return ProxySettings(
-            enabled=proxy_enabled,
-            domain=env.get("HTTPS_PROXY_DOMAIN", "")
-        )
-    except Exception as e:
-        logger.error(f"Error retrieving proxy settings: {e}")
-        raise HTTPException(status_code=500, detail=f"Error retrieving proxy settings: {str(e)}")
-
-
-@router.post("/proxy", response_model=ProxySettings)
-async def update_proxy_settings(settings: ProxySettings):
-    """
-    Update the proxy settings.
+class BusinessTerm(BaseModel):
+    """Model representing a business term in the repository."""
+    id: str = Field(..., description="Unique identifier for the term")
+    name: str = Field(..., description="Name of the business term")
+    description: str = Field(..., description="Description of the business term")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata for the term")
     
-    Args:
-        settings: New proxy settings
-        
-    Returns:
-        Updated proxy settings
+    def dict(self) -> Dict[str, Any]:
+        """Convert the business term to a dictionary."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
+            "metadata": self.metadata
+        }
+
+class BusinessTermManager:
     """
-    try:
-        # Update the environment with new proxy setting
-        env = get_os_env(proxy_enabled=settings.enabled)
+    Manager for business terms, handling storage, retrieval, and similarity matching.
+    
+    Supports multiple vector database backends for semantic similarity search,
+    currently including pgvector (PostgreSQL) and ChromaDB.
+    """
+    
+    _instance = None
+    
+    def __new__(cls):
+        """Singleton pattern to ensure only one instance is created."""
+        if cls._instance is None:
+            cls._instance = super(BusinessTermManager, cls).__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self):
+        """Initialize the business term manager."""
+        if self._initialized:
+            return
+            
+        self._initialized = True
+        self.env = get_os_env()
+        self.embedding_client = EmbeddingClient()
+        self.db_manager = DBManager()  # Keep for job storage
+        self.similarity_threshold = float(self.env.get("SIMILARITY_THRESHOLD", "0.5"))  # 50% similarity threshold
         
-        # Force recreation of LLM client with new proxy settings
-        _ = get_llm(proxy_enabled=settings.enabled)
+        # Get vector store based on configuration
+        self.vector_store = get_vector_store()
         
-        logger.info(f"Proxy settings updated: enabled={settings.enabled}")
+        # Get the vector database type
+        self.vector_db_type = self.env.get("VECTOR_DB_TYPE", "postgresql").lower()
         
-        return ProxySettings(
-            enabled=settings.enabled,
-            domain=env.get("HTTPS_PROXY_DOMAIN", "")
-        )
-    except Exception as e:
-        logger.error(f"Error updating proxy settings: {e}")
-        raise HTTPException(status_code=500, detail=f"Error updating proxy settings: {str(e)}")
-
-
-@router.get("/database", response_model=DatabaseSettings)
-async def get_database_settings():
-    """Get the current database connection settings."""
-    try:
-        env = get_os_env()
+        # Only verify PostgreSQL database connection if we're using that backend
+        if self.vector_db_type in ["postgresql", "postgres"]:
+            self._verify_database()
         
-        return DatabaseSettings(
-            host=env.get("PG_HOST", "localhost"),
-            port=int(env.get("PG_PORT", "5432")),
-            database=env.get("PG_DB", "metadata_db"),
-            user=env.get("PG_USER", "postgres"),
-            schema=env.get("PG_SCHEMA", "ai_stitching_platform"),
-            min_connections=int(env.get("PG_MIN_CONNECTIONS", "2")),
-            max_connections=int(env.get("PG_MAX_CONNECTIONS", "10"))
-        )
-    except Exception as e:
-        logger.error(f"Error retrieving database settings: {e}")
-        raise HTTPException(status_code=500, detail=f"Error retrieving database settings: {str(e)}")
-
-
-@router.get("/vector-database", response_model=VectorDatabaseSettings)
-async def get_vector_database_settings():
-    """Get the current vector database settings."""
-    try:
-        env = get_os_env()
-        vector_db_type = env.get("VECTOR_DB_TYPE", "postgresql").lower()
+        logger.info(f"Business term manager initialized with {self.vector_db_type} backend")
+    
+    def _verify_database(self) -> bool:
+        """
+        Verify database connection and pgvector extension.
         
-        if vector_db_type == "chroma":
-            return VectorDatabaseSettings(
-                type=vector_db_type,
-                chroma_persist_dir=env.get("CHROMA_PERSIST_DIR", "./data/chroma_db"),
-                chroma_collection=env.get("CHROMA_COLLECTION", "business_terms"),
-                chroma_server_port=int(env.get("CHROMA_SERVER_PORT", "8001"))
+        Returns:
+            bool: True if verification succeeds, False otherwise
+        """
+        try:
+            # Check database health
+            health = self.db_manager.health_check()
+            
+            if health["status"] != "healthy":
+                logger.error(f"Database health check failed: {health.get('error', 'Unknown error')}")
+                return False
+            
+            # Check if pgvector extension is enabled
+            if not health.get("vector_enabled", False):
+                logger.error("pgvector extension is not enabled in the database")
+                return False
+            
+            # Check if business_terms table exists
+            with self.db_manager.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    schema_name = self.db_manager.schema_name
+                    cursor.execute(f"""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_schema = '{schema_name}' AND table_name = 'business_terms'
+                    );
+                    """)
+                    
+                    table_exists = cursor.fetchone()[0]
+                    
+                    if not table_exists:
+                        logger.error(f"{schema_name}.business_terms table does not exist in the database")
+                        return False
+            
+            return True
+        
+        except Exception as e:
+            logger.error(f"Database verification failed: {e}")
+            return False
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type(Exception),
+        reraise=True
+    )
+    def import_terms_from_csv(self, csv_path: str, encoding: str = 'utf-8', batch_size: int = 100) -> int:
+        """
+        Import business terms from a CSV file.
+        
+        Args:
+            csv_path: Path to the CSV file
+            encoding: File encoding (auto-detected if not provided)
+            batch_size: Number of terms to process in each batch
+            
+        Returns:
+            Number of terms imported
+            
+        Raises:
+            ValueError: If CSV file is missing required columns
+            IOError: If file cannot be read
+        """
+        try:
+            # Get existing terms
+            existing_terms = {}
+            for term in self.get_all_terms():
+                term_key = f"{term.name}::{term.description}"
+                existing_terms[term_key] = term.id
+            
+            # Track terms in CSV
+            csv_term_keys = set()
+            terms_to_add = []
+            
+            # Read terms from CSV
+            with open(csv_path, 'r', encoding=encoding) as csvfile:
+                reader = csv.DictReader(csvfile)
+                
+                # Verify required columns
+                required_columns = ['id', 'name', 'description']
+                if not all(col in reader.fieldnames for col in required_columns):
+                    missing = [col for col in required_columns if col not in reader.fieldnames]
+                    raise ValueError(f"CSV file missing required columns: {', '.join(missing)}")
+                
+                for row in reader:
+                    if 'id' not in row or 'name' not in row or 'description' not in row:
+                        logger.warning(f"Skipping row with missing required fields: {row}")
+                        continue
+                    
+                    term_id = row['id'].strip()
+                    name = row['name'].strip()
+                    description = row['description'].strip()
+                    
+                    if not term_id:
+                        logger.warning(f"Skipping term with empty ID: {name}")
+                        continue
+                    
+                    term_key = f"{name}::{description}"
+                    csv_term_keys.add(term_key)
+                    
+                    # Skip if term already exists and is unchanged
+                    if term_key in existing_terms and existing_terms[term_key] == term_id:
+                        continue
+                    
+                    # Extract metadata if present in CSV
+                    metadata = {}
+                    for key, value in row.items():
+                        if key not in ['id', 'name', 'description'] and value:
+                            metadata[key] = value
+                    
+                    terms_to_add.append({
+                        "id": term_id,
+                        "name": name,
+                        "description": description,
+                        "term_key": term_key,
+                        "metadata": metadata
+                    })
+            
+            # Process terms in batches
+            added_count = 0
+            for i in range(0, len(terms_to_add), batch_size):
+                batch = terms_to_add[i:i + batch_size]
+                batch_start_time = time.time()
+                
+                # Create batch of vectors to insert
+                vectors_batch = []
+                for term in batch:
+                    # Generate embedding for the term
+                    doc = MyDocument(
+                        id=term["id"],
+                        text=f"{term['name']}. {term['description']}"
+                    )
+                    
+                    doc_with_embedding = self.embedding_client.generate_embeddings(doc)
+                    
+                    if not doc_with_embedding.embedding:
+                        logger.warning(f"Skipping term without embedding: {term['name']}")
+                        continue
+                    
+                    vectors_batch.append({
+                        "id": term["id"],
+                        "name": term["name"],
+                        "description": term["description"],
+                        "embedding": doc_with_embedding.embedding,
+                        "metadata": term.get("metadata", {})
+                    })
+                
+                # Batch insert into vector store
+                if vectors_batch:
+                    inserted = self.vector_store.batch_store_vectors(vectors_batch)
+                    added_count += inserted
+                    
+                    batch_duration = time.time() - batch_start_time
+                    logger.info(f"Processed batch {i//batch_size + 1}/{(len(terms_to_add) + batch_size - 1)//batch_size}: "
+                               f"{inserted} terms in {batch_duration:.2f}s "
+                               f"({inserted/batch_duration:.2f} terms/sec)")
+            
+            # Handle term deletion (terms that exist in the database but not in the CSV)
+            deleted_count = 0
+            terms_to_delete = []
+            for term_key, term_id in existing_terms.items():
+                if term_key not in csv_term_keys:
+                    terms_to_delete.append(term_id)
+            
+            # Delete in batches
+            for i in range(0, len(terms_to_delete), batch_size):
+                batch = terms_to_delete[i:i + batch_size]
+                deleted_in_batch = 0
+                
+                for term_id in batch:
+                    if self.vector_store.delete_term(term_id):
+                        deleted_in_batch += 1
+                
+                deleted_count += deleted_in_batch
+                if deleted_in_batch > 0:
+                    logger.info(f"Deleted batch of {deleted_in_batch} terms")
+            
+            logger.info(f"Import summary: Added {added_count} terms, deleted {deleted_count} terms")
+            return added_count
+        
+        except Exception as e:
+            logger.error(f"Error importing terms from CSV: {e}")
+            raise
+    
+    def tag_element(self, element_id: str, name: str, description: str, top_k: int = 3) -> TaggingResult:
+        """
+        Tag a data element with the most similar business terms.
+        
+        Args:
+            element_id: Unique identifier for the element
+            name: Enhanced name of the element
+            description: Enhanced description of the element
+            top_k: Number of top matching terms to return
+            
+        Returns:
+            TaggingResult containing matching terms and confidence scores
+        """
+        try:
+            # Validate inputs
+            if not name or not description:
+                logger.warning(f"Empty name or description for element: {element_id}")
+                return TaggingResult(
+                    element_id=element_id,
+                    element_name=name or "",
+                    element_description=description or "",
+                    matching_terms=[],
+                    confidence_scores=[],
+                    modeling_required=True,
+                    message="Name or description is empty. Modeling should be performed."
+                )
+            
+            # Create document with embedding
+            doc = MyDocument(
+                id=element_id,
+                text=f"{name}. {description}"
             )
-        else:
-            return VectorDatabaseSettings(
-                type=vector_db_type
+            
+            doc_with_embedding = self.embedding_client.generate_embeddings(doc)
+            
+            if not doc_with_embedding.embedding:
+                logger.warning(f"Could not generate embedding for element: {name}")
+                return TaggingResult(
+                    element_id=element_id,
+                    element_name=name,
+                    element_description=description,
+                    matching_terms=[],
+                    confidence_scores=[],
+                    modeling_required=True,
+                    message="Could not generate embedding. Modeling should be performed."
+                )
+            
+            # Query for similar terms using vector store
+            similar_terms = self.vector_store.find_similar_vectors(
+                query_vector=doc_with_embedding.embedding,
+                top_k=top_k * 2,  # Fetch more and filter later
+                threshold=self.similarity_threshold
             )
-    except Exception as e:
-        logger.error(f"Error retrieving vector database settings: {e}")
-        raise HTTPException(status_code=500, detail=f"Error retrieving vector database settings: {str(e)}")
-
-
-@router.post("/vector-database", response_model=VectorDatabaseSettings)
-async def update_vector_database_settings(settings: VectorDatabaseSettings):
-    """
-    Update the vector database settings.
+            
+            # If no similar terms found, recommend modeling
+            if not similar_terms:
+                return TaggingResult(
+                    element_id=element_id,
+                    element_name=name,
+                    element_description=description,
+                    matching_terms=[],
+                    confidence_scores=[],
+                    modeling_required=True,
+                    message=f"Similarity is less than {self.similarity_threshold*100}%. Modeling should be performed."
+                )
+            
+            # Format matching terms and filter by top_k
+            matching_terms = []
+            confidence_scores = []
+            
+            # Sort by similarity (in case DB didn't return in sorted order)
+            similar_terms.sort(key=lambda x: x["similarity"], reverse=True)
+            
+            # Take top_k items
+            for term in similar_terms[:top_k]:
+                matching_terms.append({
+                    "id": term["id"],
+                    "name": term["name"],
+                    "description": term["description"],
+                    "similarity": term["similarity"]
+                })
+                confidence_scores.append(term["similarity"])
+            
+            return TaggingResult(
+                element_id=element_id,
+                element_name=name,
+                element_description=description,
+                matching_terms=matching_terms,
+                confidence_scores=confidence_scores,
+                modeling_required=False,
+                message=""
+            )
+            
+        except Exception as e:
+            logger.error(f"Error tagging element: {e}", exc_info=True)
+            
+            # Attempt fallback matching using direct vector comparison
+            try:
+                logger.info(f"Attempting fallback matching for element: {element_id}")
+                
+                # Get all terms
+                all_terms = self.get_all_terms()
+                if not all_terms:
+                    logger.warning("No business terms available for fallback matching")
+                    return TaggingResult(
+                        element_id=element_id,
+                        element_name=name,
+                        element_description=description,
+                        matching_terms=[],
+                        confidence_scores=[],
+                        modeling_required=True,
+                        message="Business terms repository is not available. Modeling should be performed."
+                    )
+                
+                # Compare directly with available terms using dot product
+                # This is a slow fallback method but ensures we can still match
+                # even if the database query fails
+                return TaggingResult(
+                    element_id=element_id,
+                    element_name=name,
+                    element_description=description,
+                    matching_terms=[],
+                    confidence_scores=[],
+                    modeling_required=True,
+                    message=f"Error during tagging: {str(e)}. Modeling should be performed."
+                )
+            except Exception as fallback_error:
+                logger.error(f"Fallback matching also failed: {fallback_error}")
+                return TaggingResult(
+                    element_id=element_id,
+                    element_name=name,
+                    element_description=description,
+                    matching_terms=[],
+                    confidence_scores=[],
+                    modeling_required=True,
+                    message=f"Error during tagging: {str(e)}. Modeling should be performed."
+                )
     
-    Args:
-        settings: New vector database settings
+    async def validate_tagging(self, tagging_result: TaggingResult) -> TaggingValidationResult:
+        """
+        Validate the tagging result.
         
-    Returns:
-        Updated vector database settings
-    """
-    try:
-        # Set the vector database type
-        os.environ["VECTOR_DB_TYPE"] = settings.type
-        
-        if settings.type == "chroma":
-            # Set ChromaDB settings
-            if settings.chroma_persist_dir:
-                os.environ["CHROMA_PERSIST_DIR"] = settings.chroma_persist_dir
-            if settings.chroma_collection:
-                os.environ["CHROMA_COLLECTION"] = settings.chroma_collection
-            if settings.chroma_server_port:
-                os.environ["CHROMA_SERVER_PORT"] = str(settings.chroma_server_port)
-        
-        logger.info(f"Vector database settings updated: type={settings.type}")
-        
-        # Return updated settings
-        env = get_os_env()
-        return await get_vector_database_settings()
-    except Exception as e:
-        logger.error(f"Error updating vector database settings: {e}")
-        raise HTTPException(status_code=500, detail=f"Error updating vector database settings: {str(e)}")
-
-
-@router.get("/database/health", response_model=Dict[str, Any])
-async def get_database_health(db: DBManager = Depends(lambda: DBManager())):
-    """Get the database health status."""
-    try:
-        health = db.health_check()
-        
-        return health
-    except Exception as e:
-        logger.error(f"Error retrieving database health: {e}")
-        raise HTTPException(status_code=500, detail=f"Error retrieving database health: {str(e)}")
-
-
-@router.get("/vector-database/health", response_model=Dict[str, Any])
-async def get_vector_database_health():
-    """Get the vector database health status."""
-    try:
-        vector_store = get_vector_store()
-        health = vector_store.health_check()
-        
-        return health
-    except Exception as e:
-        logger.error(f"Error retrieving vector database health: {e}")
-        raise HTTPException(status_code=500, detail=f"Error retrieving vector database health: {str(e)}")
-
-
-@router.get("/status", response_model=Dict[str, Any])
-async def get_system_status(db: DBManager = Depends(lambda: DBManager())):
-    """Get the system status and configuration."""
-    try:
-        env = get_os_env()
-        
-        # Get all settings at once
-        return get_app_settings()
-    except Exception as e:
-        logger.error(f"Error retrieving system status: {e}")
-        raise HTTPException(status_code=500, detail=f"Error retrieving system status: {str(e)}")
-
-
-@router.get("/stats", response_model=List[Dict[str, Any]])
-async def get_system_stats(limit: int = Query(24, ge=1, le=1000), 
-                         db: DBManager = Depends(lambda: DBManager())):
-    """
-    Get historical system statistics.
+        Args:
+            tagging_result: Result of tagging to validate
+            
+        Returns:
+            TaggingValidationResult with validation status and suggestions
+        """
+        try:
+            # Skip validation if modeling is required
+            if tagging_result.modeling_required:
+                return TaggingValidationResult(
+                    is_valid=False,
+                    feedback=tagging_result.message,
+                    suggested_alternatives=[]
+                )
+                
+            # If no matching terms, validation fails
+            if not tagging_result.matching_terms:
+                return TaggingValidationResult(
+                    is_valid=False,
+                    feedback="No matching terms found",
+                    suggested_alternatives=[]
+                )
+            
+            # Get highest confidence score
+            highest_confidence = max(tagging_result.confidence_scores) if tagging_result.confidence_scores else 0.0
+            
+            # If highest confidence is barely above threshold, find alternatives
+            if highest_confidence < 0.75:
+                # Try to find better alternatives
+                alternative_doc = MyDocument(
+                    id=tagging_result.element_id,
+                    text=tagging_result.element_name  # Use just the name for alternative searching
+                )
+                
+                alternative_doc_with_embedding = self.embedding_client.generate_embeddings(alternative_doc)
+                
+                if alternative_doc_with_embedding.embedding:
+                    # Exclude already matched terms
+                    matched_ids = [term["id"] for term in tagging_result.matching_terms]
+                    
+                    all_similar_terms = self.vector_store.find_similar_vectors(
+                        query_vector=alternative_doc_with_embedding.embedding,
+                        top_k=10,  # Get more to filter out already matched terms
+                        threshold=self.similarity_threshold
+                    )
+                    
+                    # Filter out already matched terms
+                    alternative_terms = [
+                        term for term in all_similar_terms
+                        if term["id"] not in matched_ids
+                    ][:3]  # Limit to top 3 alternatives
+                    
+                    if alternative_terms:
+                        return TaggingValidationResult(
+                            is_valid=False,
+                            feedback="Low confidence in matching terms. Alternative terms found.",
+                            suggested_alternatives=alternative_terms
+                        )
+            
+            # Default case - validation passes
+            return TaggingValidationResult(
+                is_valid=True,
+                feedback="Matching terms found with good confidence",
+                suggested_alternatives=[]
+            )
+            
+        except Exception as e:
+            logger.error(f"Error validating tagging: {e}")
+            return TaggingValidationResult(
+                is_valid=False,
+                feedback=f"Error during validation: {str(e)}",
+                suggested_alternatives=[]
+            )
     
-    Args:
-        limit: Number of records to return (1-1000)
-        db: Database manager instance
+    def get_all_terms(self) -> List[BusinessTerm]:
+        """
+        Get all business terms from the collection.
         
-    Returns:
-        List of system statistics records
-    """
-    try:
-        # Get stats from database
-        stats = db.get_system_stats(limit=limit)
+        Returns:
+            List of BusinessTerm objects
+        """
+        try:
+            term_dicts = self.vector_store.get_all_terms()
+            
+            terms = []
+            for term_dict in term_dicts:
+                terms.append(BusinessTerm(
+                    id=term_dict["id"],
+                    name=term_dict["name"],
+                    description=term_dict["description"],
+                    metadata=term_dict.get("metadata", {})
+                ))
+                
+            return terms
+        except Exception as e:
+            logger.error(f"Error retrieving all terms: {e}")
+            return []
+    
+    def get_term_by_id(self, term_id: str) -> Optional[BusinessTerm]:
+        """
+        Get a business term by its ID.
         
-        return stats
-    except Exception as e:
-        logger.error(f"Error retrieving system stats: {e}")
-        raise HTTPException(status_code=500, detail=f"Error retrieving system stats: {str(e)}")
+        Args:
+            term_id: Unique identifier of the term
+            
+        Returns:
+            BusinessTerm if found, None otherwise
+        """
+        try:
+            term_dict = self.vector_store.get_term_by_id(term_id)
+            
+            if term_dict:
+                return BusinessTerm(
+                    id=term_dict["id"],
+                    name=term_dict["name"],
+                    description=term_dict["description"],
+                    metadata=term_dict.get("metadata", {})
+                )
+            
+            return None
+        except Exception as e:
+            logger.error(f"Error retrieving term by ID: {e}")
+            return None
+    
+    def get_term_count(self) -> int:
+        """
+        Get the total count of business terms.
+        
+        Returns:
+            Total number of terms
+        """
+        try:
+            terms = self.vector_store.get_all_terms()
+            return len(terms)
+        except Exception as e:
+            logger.error(f"Error getting term count: {e}")
+            return 0
+    
+    def delete_term(self, term_id: str) -> bool:
+        """
+        Delete a business term by ID.
+        
+        Args:
+            term_id: ID of the term to delete
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            return self.vector_store.delete_term(term_id)
+        except Exception as e:
+            logger.error(f"Error deleting term: {e}")
+            return False
+    
+    def delete_all_terms(self) -> int:
+        """
+        Delete all business terms.
+        
+        Returns:
+            Number of terms deleted
+        """
+        try:
+            return self.vector_store.delete_all_terms()
+        except Exception as e:
+            logger.error(f"Error deleting all terms: {e}")
+            return 0
+    
+    def search_terms(self, query: str, limit: int = 20) -> List[BusinessTerm]:
+        """
+        Search for business terms by name or description.
+        
+        Args:
+            query: Search query
+            limit: Maximum number of results
+            
+        Returns:
+            List of matching BusinessTerm objects
+        """
+        try:
+            term_dicts = self.vector_store.search_terms(query, limit)
+            
+            results = []
+            for term_dict in term_dicts:
+                results.append(BusinessTerm(
+                    id=term_dict["id"],
+                    name=term_dict["name"],
+                    description=term_dict["description"],
+                    metadata=term_dict.get("metadata", {})
+                ))
+            
+            return results
+        except Exception as e:
+            logger.error(f"Error searching terms: {e}")
+            return []
+    
+    def compute_similarity(self, text1: str, text2: str) -> float:
+        """
+        Compute semantic similarity between two text strings.
+        
+        Args:
+            text1: First text
+            text2: Second text
+            
+        Returns:
+            Similarity score between 0 and 1
+        """
+        try:
+            # Generate embeddings
+            doc1 = MyDocument(id="temp1", text=text1)
+            doc2 = MyDocument(id="temp2", text=text2)
+            
+            doc1_with_embedding = self.embedding_client.generate_embeddings(doc1)
+            doc2_with_embedding = self.embedding_client.generate_embeddings(doc2)
+            
+            if not doc1_with_embedding.embedding or not doc2_with_embedding.embedding:
+                logger.warning("Could not generate embeddings for similarity computation")
+                return 0.0
+            
+            # Compute cosine similarity using vector store
+            return self.vector_store.compute_cosine_similarity(
+                doc1_with_embedding.embedding,
+                doc2_with_embedding.embedding
+            )
+        except Exception as e:
+            logger.error(f"Error computing similarity: {e}")
+            return 0.0
+    
+    def get_vector_store_info(self) -> Dict[str, Any]:
+        """
+        Get information about the current vector store.
+        
+        Returns:
+            Dict containing vector store information
+        """
+        try:
+            # Get vector store health check
+            health = self.vector_store.health_check()
+            
+            # Add vector store type
+            info = {
+                "type": self.vector_db_type,
+                "status": health.get("status", "unknown"),
+                "term_count": health.get("term_count", 0)
+            }
+            
+            # Add database-specific details
+            if self.vector_db_type == "postgresql":
+                # Get PostgreSQL details
+                db_health = self.db_manager.health_check()
+                info.update({
+                    "database": {
+                        "host": self.env.get("PG_HOST", "localhost"),
+                        "port": int(self.env.get("PG_PORT", "5432")),
+                        "db": self.env.get("PG_DB", "metadata_db"),
+                        "schema": self.db_manager.schema_name,
+                        "pgvector_enabled": db_health.get("vector_enabled", False),
+                        "version": db_health.get("version", "unknown")
+                    }
+                })
+            elif self.vector_db_type == "chroma":
+                info.update({
+                    "chroma": {
+                        "persist_dir": self.env.get("CHROMA_PERSIST_DIR", "./data/chroma_db"),
+                        "collection": self.env.get("CHROMA_COLLECTION", "business_terms")
+                    }
+                })
+            
+            return info
+        except Exception as e:
+            logger.error(f"Error getting vector store info: {e}")
+            return {
+                "type": self.vector_db_type,
+                "status": "error",
+                "error": str(e)
+            }
