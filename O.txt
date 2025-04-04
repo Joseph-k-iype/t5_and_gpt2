@@ -1,29 +1,23 @@
 #!/usr/bin/env python
 """
-Migration Utility - Tool for migrating data between ChromaDB and PostgreSQL vector stores.
+Database Initialization Script - Creates and initializes the PostgreSQL database schema.
 
-This script provides utilities for migrating business terms and their embeddings
-between ChromaDB and PostgreSQL vector stores in either direction.
+This script sets up the required PostgreSQL database, schema, and tables for the application,
+including the pgvector extension for vector similarity search.
 
 Usage:
-    python migrate_from_chroma.py --direction [chroma_to_pg | pg_to_chroma] 
-                                 [--chroma-dir ./data/chroma_db] 
-                                 [--chroma-collection business_terms]
-                                 [--batch-size 100]
-                                 [--pg-host localhost]
-                                 [--pg-port 5432]
-                                 [--pg-user postgres]
-                                 [--pg-password postgres]
-                                 [--pg-db metadata_db]
+    python init_db.py [--drop-existing] [--pg-host localhost] [--pg-port 5432] 
+                     [--pg-user postgres] [--pg-password postgres] [--pg-db metadata_db]
+                     [--schema ai_stitching_platform]
 """
 
 import os
 import sys
 import argparse
 import logging
-import time
-import json
-from typing import List, Dict, Any, Optional
+import psycopg2
+from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+from typing import Dict, Any, Optional
 
 # Configure logging
 logging.basicConfig(
@@ -31,7 +25,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('migration.log')
+        logging.FileHandler('db_init.log')
     ]
 )
 
@@ -40,242 +34,318 @@ logger = logging.getLogger(__name__)
 # Add the parent directory to path for importing modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-def set_environment_variables(args):
-    """
-    Set environment variables from command line arguments.
-    
-    Args:
-        args: Command line arguments
-    """
-    # Set PostgreSQL environment variables if provided
-    if args.pg_host:
-        os.environ["PG_HOST"] = args.pg_host
-    if args.pg_port:
-        os.environ["PG_PORT"] = str(args.pg_port)
-    if args.pg_user:
-        os.environ["PG_USER"] = args.pg_user
-    if args.pg_password:
-        os.environ["PG_PASSWORD"] = args.pg_password
-    if args.pg_db:
-        os.environ["PG_DB"] = args.pg_db
-    
-    # Set ChromaDB environment variables
-    os.environ["CHROMA_PERSIST_DIR"] = args.chroma_dir
-    os.environ["CHROMA_COLLECTION"] = args.chroma_collection
+# SQL to create pgvector extension
+CREATE_EXTENSION_SQL = """
+CREATE EXTENSION IF NOT EXISTS vector;
+"""
 
-def migrate_from_chroma_to_postgres(args):
+# SQL to create schema
+CREATE_SCHEMA_SQL = """
+CREATE SCHEMA IF NOT EXISTS {schema};
+"""
+
+# SQL to create business_terms table with vector support
+CREATE_BUSINESS_TERMS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS {schema}.business_terms (
+    id VARCHAR(255) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    description TEXT NOT NULL,
+    embedding vector(1536),  -- Assuming OpenAI embeddings with 1536 dimensions
+    metadata JSONB DEFAULT '{{}}'::jsonb,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Create index for vector similarity search
+CREATE INDEX IF NOT EXISTS business_terms_embedding_idx 
+ON {schema}.business_terms 
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
+"""
+
+# SQL to create jobs table for job tracking
+CREATE_JOBS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS {schema}.jobs (
+    id VARCHAR(255) PRIMARY KEY,
+    job_type VARCHAR(50) NOT NULL,
+    status VARCHAR(50) NOT NULL,
+    data JSONB DEFAULT '{{}}'::jsonb,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS jobs_job_type_idx ON {schema}.jobs (job_type);
+CREATE INDEX IF NOT EXISTS jobs_status_idx ON {schema}.jobs (status);
+CREATE INDEX IF NOT EXISTS jobs_created_at_idx ON {schema}.jobs (created_at);
+"""
+
+# SQL to create system_stats table for monitoring
+CREATE_SYSTEM_STATS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS {schema}.system_stats (
+    id SERIAL PRIMARY KEY,
+    timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    cpu_usage FLOAT NOT NULL,
+    memory_usage FLOAT NOT NULL,
+    db_size BIGINT NOT NULL,
+    active_connections INTEGER NOT NULL,
+    enhancement_jobs_count INTEGER NOT NULL,
+    tagging_jobs_count INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS system_stats_timestamp_idx ON {schema}.system_stats (timestamp);
+"""
+
+def create_database(args: argparse.Namespace) -> None:
     """
-    Migrate data from ChromaDB to PostgreSQL.
+    Create database if it doesn't exist.
     
     Args:
         args: Command line arguments
     """
-    from app.core.vector_store_chroma import ChromaDBVectorStore
-    from app.core.vector_store_pg import PostgreSQLVectorStore
-    from app.core.embedding import EmbeddingClient, MyDocument
-    
-    logger.info(f"Starting migration from ChromaDB to PostgreSQL")
-    logger.info(f"ChromaDB directory: {args.chroma_dir}")
-    logger.info(f"ChromaDB collection: {args.chroma_collection}")
-    logger.info(f"PostgreSQL host: {os.environ.get('PG_HOST', 'localhost')}")
-    logger.info(f"PostgreSQL database: {os.environ.get('PG_DB', 'metadata_db')}")
-    
-    # Initialize vector stores
-    chroma_store = ChromaDBVectorStore(
-        collection_name=args.chroma_collection,
-        persist_dir=args.chroma_dir
-    )
-    pg_store = PostgreSQLVectorStore()
-    
-    # Get all terms from ChromaDB
-    terms = chroma_store.get_all_terms()
-    total_terms = len(terms)
-    logger.info(f"Found {total_terms} terms in ChromaDB")
-    
-    if not terms:
-        logger.warning("No terms found in ChromaDB, nothing to migrate")
-        return
-    
-    # Get embedding client
-    embedding_client = EmbeddingClient()
-    
-    # Process in batches
-    batch_size = args.batch_size
-    total_migrated = 0
-    
-    for batch_start in range(0, total_terms, batch_size):
-        batch_end = min(batch_start + batch_size, total_terms)
-        current_batch = terms[batch_start:batch_end]
-        logger.info(f"Processing batch {batch_start//batch_size + 1}/{(total_terms + batch_size - 1)//batch_size} ({len(current_batch)} terms)")
+    conn = None
+    try:
+        # Connect to default database to create new database
+        conn = psycopg2.connect(
+            host=args.pg_host,
+            port=args.pg_port,
+            user=args.pg_user,
+            password=args.pg_password,
+            dbname="postgres"
+        )
+        conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
         
-        # Prepare batch data for PostgreSQL
-        batch = []
-        for term in current_batch:
-            term_id = term["id"]
-            name = term["name"]
-            description = term["description"]
-            metadata = term.get("metadata", {})
+        with conn.cursor() as cursor:
+            # Check if database exists
+            cursor.execute("SELECT 1 FROM pg_database WHERE datname = %s", (args.pg_db,))
+            exists = cursor.fetchone()
             
-            # Generate embedding (needed explicitly for PostgreSQL)
-            doc = MyDocument(
-                id=term_id,
-                text=f"{name}. {description}"
+            if not exists:
+                logger.info(f"Creating database: {args.pg_db}")
+                cursor.execute(f"CREATE DATABASE {args.pg_db} ENCODING 'UTF8'")
+                logger.info(f"Database created: {args.pg_db}")
+            else:
+                logger.info(f"Database already exists: {args.pg_db}")
+                
+                # Drop if requested
+                if args.drop_existing:
+                    logger.warning(f"Dropping existing database: {args.pg_db}")
+                    
+                    # Close connections to the database
+                    cursor.execute(f"""
+                    SELECT pg_terminate_backend(pid)
+                    FROM pg_stat_activity
+                    WHERE pg_stat_activity.datname = %s
+                        AND pid <> pg_backend_pid()
+                    """, (args.pg_db,))
+                    
+                    cursor.execute(f"DROP DATABASE {args.pg_db}")
+                    logger.info(f"Database dropped: {args.pg_db}")
+                    
+                    # Create new database
+                    cursor.execute(f"CREATE DATABASE {args.pg_db} ENCODING 'UTF8'")
+                    logger.info(f"Database recreated: {args.pg_db}")
+    
+    except Exception as e:
+        logger.error(f"Error creating database: {e}", exc_info=True)
+        raise
+    finally:
+        if conn:
+            conn.close()
+
+def init_database(args: argparse.Namespace) -> None:
+    """
+    Initialize database schema and tables.
+    
+    Args:
+        args: Command line arguments
+    """
+    conn = None
+    try:
+        # Connect to the database
+        conn = psycopg2.connect(
+            host=args.pg_host,
+            port=args.pg_port,
+            user=args.pg_user,
+            password=args.pg_password,
+            dbname=args.pg_db
+        )
+        conn.autocommit = True
+        
+        with conn.cursor() as cursor:
+            # Create pgvector extension
+            logger.info("Creating pgvector extension")
+            cursor.execute(CREATE_EXTENSION_SQL)
+            
+            # Create schema
+            logger.info(f"Creating schema: {args.schema}")
+            cursor.execute(CREATE_SCHEMA_SQL.format(schema=args.schema))
+            
+            # Create business_terms table
+            logger.info("Creating business_terms table")
+            cursor.execute(CREATE_BUSINESS_TERMS_TABLE_SQL.format(schema=args.schema))
+            
+            # Create jobs table
+            logger.info("Creating jobs table")
+            cursor.execute(CREATE_JOBS_TABLE_SQL.format(schema=args.schema))
+            
+            # Create system_stats table
+            logger.info("Creating system_stats table")
+            cursor.execute(CREATE_SYSTEM_STATS_TABLE_SQL.format(schema=args.schema))
+            
+            # Verify tables were created
+            cursor.execute(f"""
+            SELECT table_name 
+            FROM information_schema.tables 
+            WHERE table_schema = %s 
+            ORDER BY table_name
+            """, (args.schema,))
+            
+            tables = cursor.fetchall()
+            logger.info(f"Tables in schema {args.schema}:")
+            for table in tables:
+                logger.info(f"  - {table[0]}")
+            
+            # Check pgvector extension
+            cursor.execute("SELECT * FROM pg_extension WHERE extname = 'vector'")
+            pgvector_enabled = cursor.fetchone() is not None
+            logger.info(f"pgvector extension: {'Enabled' if pgvector_enabled else 'Not enabled'}")
+            
+            if not pgvector_enabled:
+                logger.warning("pgvector extension is not enabled. Vector similarity search will not work.")
+            
+            logger.info("Database initialization completed successfully")
+    
+    except Exception as e:
+        logger.error(f"Error initializing database: {e}", exc_info=True)
+        raise
+    finally:
+        if conn:
+            conn.close()
+
+def verify_database(args: argparse.Namespace) -> bool:
+    """
+    Verify database connectivity and required extensions.
+    
+    Args:
+        args: Command line arguments
+        
+    Returns:
+        bool: True if verification succeeds, False otherwise
+    """
+    conn = None
+    try:
+        # Connect to the database
+        conn = psycopg2.connect(
+            host=args.pg_host,
+            port=args.pg_port,
+            user=args.pg_user,
+            password=args.pg_password,
+            dbname=args.pg_db
+        )
+        
+        with conn.cursor() as cursor:
+            # Check PostgreSQL version
+            cursor.execute("SELECT version()")
+            version = cursor.fetchone()[0]
+            logger.info(f"PostgreSQL version: {version}")
+            
+            # Check pgvector extension
+            cursor.execute("SELECT * FROM pg_extension WHERE extname = 'vector'")
+            pgvector_enabled = cursor.fetchone() is not None
+            logger.info(f"pgvector extension: {'Enabled' if pgvector_enabled else 'Not enabled'}")
+            
+            # Check schema existence
+            cursor.execute(
+                "SELECT schema_name FROM information_schema.schemata WHERE schema_name = %s",
+                (args.schema,)
             )
+            schema_exists = cursor.fetchone() is not None
+            logger.info(f"Schema '{args.schema}': {'Exists' if schema_exists else 'Does not exist'}")
             
-            doc_with_embedding = embedding_client.generate_embeddings(doc)
+            # Check required tables if schema exists
+            if schema_exists:
+                required_tables = ["business_terms", "jobs", "system_stats"]
+                for table in required_tables:
+                    cursor.execute(
+                        """
+                        SELECT table_name 
+                        FROM information_schema.tables 
+                        WHERE table_schema = %s AND table_name = %s
+                        """,
+                        (args.schema, table)
+                    )
+                    table_exists = cursor.fetchone() is not None
+                    logger.info(f"Table '{args.schema}.{table}': {'Exists' if table_exists else 'Does not exist'}")
             
-            if not doc_with_embedding.embedding:
-                logger.warning(f"Skipping term without embedding: {name}")
-                continue
-            
-            batch.append({
-                "id": term_id,
-                "name": name,
-                "description": description,
-                "embedding": doc_with_embedding.embedding,
-                "metadata": metadata
-            })
+            return pgvector_enabled and schema_exists
         
-        # Store batch in PostgreSQL
-        if batch:
-            start_time = time.time()
-            try:
-                inserted = pg_store.batch_store_vectors(batch)
-                total_migrated += inserted
-                duration = time.time() - start_time
-                logger.info(f"Migrated {inserted} terms in {duration:.2f}s ({inserted/duration:.2f} terms/sec)")
-            except Exception as e:
-                logger.error(f"Error migrating batch: {e}")
-        
-    logger.info(f"Migration summary: {total_migrated}/{total_terms} terms migrated from ChromaDB to PostgreSQL")
+    except Exception as e:
+        logger.error(f"Database verification failed: {e}", exc_info=True)
+        return False
+    finally:
+        if conn:
+            conn.close()
 
-def migrate_from_postgres_to_chroma(args):
-    """
-    Migrate data from PostgreSQL to ChromaDB.
-    
-    Args:
-        args: Command line arguments
-    """
-    from app.core.vector_store_chroma import ChromaDBVectorStore
-    from app.core.vector_store_pg import PostgreSQLVectorStore
-    from app.core.embedding import EmbeddingClient, MyDocument
-    
-    logger.info(f"Starting migration from PostgreSQL to ChromaDB")
-    logger.info(f"PostgreSQL host: {os.environ.get('PG_HOST', 'localhost')}")
-    logger.info(f"PostgreSQL database: {os.environ.get('PG_DB', 'metadata_db')}")
-    logger.info(f"ChromaDB directory: {args.chroma_dir}")
-    logger.info(f"ChromaDB collection: {args.chroma_collection}")
-    
-    # Initialize vector stores
-    chroma_store = ChromaDBVectorStore(
-        collection_name=args.chroma_collection,
-        persist_dir=args.chroma_dir
-    )
-    pg_store = PostgreSQLVectorStore()
-    
-    # Get all terms from PostgreSQL
-    terms = pg_store.get_all_terms()
-    total_terms = len(terms)
-    logger.info(f"Found {total_terms} terms in PostgreSQL")
-    
-    if not terms:
-        logger.warning("No terms found in PostgreSQL, nothing to migrate")
-        return
-    
-    # Get embedding client
-    embedding_client = EmbeddingClient()
-    
-    # Process in batches
-    batch_size = args.batch_size
-    total_migrated = 0
-    
-    for batch_start in range(0, total_terms, batch_size):
-        batch_end = min(batch_start + batch_size, total_terms)
-        current_batch = terms[batch_start:batch_end]
-        logger.info(f"Processing batch {batch_start//batch_size + 1}/{(total_terms + batch_size - 1)//batch_size} ({len(current_batch)} terms)")
-        
-        # Prepare batch data for ChromaDB
-        batch = []
-        for term in current_batch:
-            term_id = term["id"]
-            name = term["name"]
-            description = term["description"]
-            metadata = term.get("metadata", {})
-            
-            # Generate embedding for ChromaDB
-            doc = MyDocument(
-                id=term_id,
-                text=f"{name}. {description}"
-            )
-            
-            doc_with_embedding = embedding_client.generate_embeddings(doc)
-            
-            if not doc_with_embedding.embedding:
-                logger.warning(f"Skipping term without embedding: {name}")
-                continue
-            
-            batch.append({
-                "id": term_id,
-                "name": name,
-                "description": description,
-                "embedding": doc_with_embedding.embedding,
-                "metadata": metadata
-            })
-        
-        # Store batch in ChromaDB
-        if batch:
-            start_time = time.time()
-            try:
-                inserted = chroma_store.batch_store_vectors(batch)
-                total_migrated += inserted
-                duration = time.time() - start_time
-                logger.info(f"Migrated {inserted} terms in {duration:.2f}s ({inserted/duration:.2f} terms/sec)")
-            except Exception as e:
-                logger.error(f"Error migrating batch: {e}")
-    
-    logger.info(f"Migration summary: {total_migrated}/{total_terms} terms migrated from PostgreSQL to ChromaDB")
-
-def parse_args():
+def parse_args() -> argparse.Namespace:
     """
     Parse command line arguments.
     
     Returns:
         argparse.Namespace: Parsed arguments
     """
-    parser = argparse.ArgumentParser(description="Migrate vector data between ChromaDB and PostgreSQL")
-    parser.add_argument("--direction", choices=["pg_to_chroma", "chroma_to_pg"], required=True,
-                       help="Migration direction")
-    parser.add_argument("--chroma-dir", default="./data/chroma_db",
-                       help="ChromaDB persistent directory")
-    parser.add_argument("--chroma-collection", default="business_terms",
-                       help="ChromaDB collection name")
-    parser.add_argument("--batch-size", type=int, default=100,
-                       help="Batch size for processing terms")
-    
-    # PostgreSQL settings
-    parser.add_argument("--pg-host", type=str, help="PostgreSQL host")
-    parser.add_argument("--pg-port", type=int, help="PostgreSQL port")
-    parser.add_argument("--pg-user", type=str, help="PostgreSQL user")
-    parser.add_argument("--pg-password", type=str, help="PostgreSQL password")
-    parser.add_argument("--pg-db", type=str, help="PostgreSQL database name")
+    parser = argparse.ArgumentParser(description="Initialize PostgreSQL database with pgvector")
+    parser.add_argument("--drop-existing", action="store_true", 
+                        help="Drop existing database before creating")
+    parser.add_argument("--pg-host", type=str, default="localhost",
+                        help="PostgreSQL host")
+    parser.add_argument("--pg-port", type=int, default=5432,
+                        help="PostgreSQL port")
+    parser.add_argument("--pg-user", type=str, default="postgres",
+                        help="PostgreSQL user")
+    parser.add_argument("--pg-password", type=str, default="postgres",
+                        help="PostgreSQL password")
+    parser.add_argument("--pg-db", type=str, default="metadata_db",
+                        help="PostgreSQL database name")
+    parser.add_argument("--schema", type=str, default="ai_stitching_platform",
+                        help="Database schema name")
+    parser.add_argument("--verify-only", action="store_true",
+                        help="Only verify database without making changes")
     
     return parser.parse_args()
 
-def main():
-    """Main entry point for the migration script."""
+def main() -> None:
+    """Main entry point for the database initialization script."""
     args = parse_args()
     
-    # Set environment variables
-    set_environment_variables(args)
+    logger.info(f"Database initialization started")
+    logger.info(f"PostgreSQL host: {args.pg_host}")
+    logger.info(f"PostgreSQL port: {args.pg_port}")
+    logger.info(f"PostgreSQL database: {args.pg_db}")
+    logger.info(f"PostgreSQL user: {args.pg_user}")
+    logger.info(f"Schema: {args.schema}")
     
     try:
-        # Run migration based on direction
-        if args.direction == "pg_to_chroma":
-            migrate_from_postgres_to_chroma(args)
+        if args.verify_only:
+            logger.info("Verifying database configuration")
+            if verify_database(args):
+                logger.info("Database verification successful")
+                sys.exit(0)
+            else:
+                logger.error("Database verification failed")
+                sys.exit(1)
+        
+        # Create and initialize database
+        create_database(args)
+        init_database(args)
+        
+        # Verify database
+        if verify_database(args):
+            logger.info("Database setup and verification successful")
         else:
-            migrate_from_chroma_to_postgres(args)
+            logger.warning("Database setup completed but verification found issues")
+    
     except Exception as e:
-        logger.error(f"Migration failed: {e}", exc_info=True)
+        logger.error(f"Database initialization failed: {e}", exc_info=True)
         sys.exit(1)
 
 if __name__ == "__main__":
