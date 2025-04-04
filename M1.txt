@@ -25,7 +25,7 @@ from chromadb.utils import embedding_functions
 from collections import namedtuple
 import re
 from pydantic import BaseModel, ValidationError, field_validator
-from langchain.agents import AgentExecutor, create_react_agent
+from langchain.agents import AgentExecutor, create_react_agent, AgentType, initialize_agent
 from langchain.tools import Tool
 from langchain.schema import HumanMessage, SystemMessage
 from langchain.schema.runnable import RunnablePassthrough
@@ -581,75 +581,15 @@ class AgentMapper:
                 )
             ]
             
-            # Define the agent prompt with the required variables
-            system_message = """
-            You are an expert data quality analyst. Your task is to analyze IT incidents and identify which data quality dimensions are most relevant to each incident. 
-            
-            You have access to the following tools:
-            
-            {tools}
-            
-            IMPORTANT: You must ALWAYS follow this EXACT format:
-            
-            Question: the input question you must answer
-            Thought: you should always think about what to do
-            Action: the action to take, should be one of [{tool_names}]
-            Action Input: the input to the action
-            Observation: the result of the action
-            ... (this Thought/Action/Action Input/Observation can repeat N times)
-            Thought: I now know the final answer
-            Final Answer: the final answer to the original input question
-            
-            AFTER EVERY THOUGHT, YOU MUST INCLUDE AN ACTION.
-            AFTER EVERY ACTION, YOU MUST INCLUDE AN ACTION INPUT.
-            NEVER SKIP OR COMBINE THESE STEPS.
-            
-            For a given incident ID, you will:
-            1. Use the incident_info_tool to retrieve information about the incident
-            2. Use the list_all_dimensions_tool to review all available dimensions
-            3. Use the dimension_info_tool to get more details about specific dimensions if needed
-            4. Analyze the incident and determine which dimension(s) apply, with detailed reasoning
-            
-            Your final output should be in JSON format with this structure:
-            ```json
-            {{
-                "incident_id": "The incident ID",
-                "selected_dimensions": [
-                    {{
-                        "dimension": "Name of Dimension 1",
-                        "reasoning": "Detailed explanation of why this dimension applies to the incident"
-                    }},
-                    {{
-                        "dimension": "Name of Dimension 2",
-                        "reasoning": "Detailed explanation of why this dimension applies to the incident"
-                    }}
-                ]
-            }}
-            ```
-            
-            Be thorough in your analysis. You can select multiple dimensions if appropriate, but only select dimensions that are truly relevant to the incident.
-            
-            Begin!
-            
-            {agent_scratchpad}
-            """
-            
-            # Create the prompt with the required variables
-            prompt = ChatPromptTemplate.from_template(system_message)
-            
-            # Create the agent
-            agent = create_react_agent(
+            # Use the initialize_agent method instead with the REACT type
+            self.agent_executor = initialize_agent(
+                tools=tools,
                 llm=self.chatbot.llm,
-                tools=tools,
-                prompt=prompt
-            )
-            
-            # Create the agent executor
-            self.agent_executor = AgentExecutor(
-                agent=agent,
-                tools=tools,
+                agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
                 verbose=True,
-                handle_parsing_errors=True
+                handle_parsing_errors=True,
+                max_iterations=10,
+                early_stopping_method="generate"
             )
             
             logger.info("Agent setup completed successfully")
@@ -660,61 +600,148 @@ class AgentMapper:
     def map_incident_to_dimensions(self, incident_id: str) -> Dict:
         """Map a single incident to appropriate dimensions using the agent."""
         try:
-            # Run the agent with a more explicit instruction
-            agent_input = f"Analyze incident with ID {incident_id} and determine the most appropriate data quality dimensions. Make sure to follow the exact Thought/Action/Action Input format."
+            # Run the agent with a more explicit instruction and formatting requirements
+            agent_input = (
+                f"Analyze incident with ID {incident_id} and determine the most appropriate data quality dimensions.\n\n"
+                f"IMPORTANT: Your final answer must be a valid JSON object with this structure:\n"
+                f"```json\n"
+                f"{{\n"
+                f'  "incident_id": "{incident_id}",\n'
+                f'  "selected_dimensions": [\n'
+                f'    {{\n'
+                f'      "dimension": "Name of Dimension",\n'
+                f'      "reasoning": "Detailed explanation of why this dimension applies"\n'
+                f'    }}\n'
+                f'  ]\n'
+                f"}}\n"
+                f"```\n"
+                f"Follow the format EXACTLY. Make sure to include quotation marks around all keys and string values."
+            )
             
-            # Add a maximum number of retries
+            # Execute the agent with retries
             max_retries = 3
             for attempt in range(max_retries):
                 try:
                     result = self.agent_executor.invoke({"input": agent_input})
                     output = result.get("output", "")
                     
-                    # Try to extract JSON - look for both {} and also JSON inside ```json ``` blocks
-                    json_match = re.search(r'```json\s*(.*?)\s*```', output, re.DOTALL)
-                    if not json_match:
-                        json_match = re.search(r'({.*})', output.replace('\n', ' '), re.DOTALL)
+                    # Look for JSON in various formats (code block or raw)
+                    json_content = None
                     
-                    if not json_match:
+                    # First try to find JSON within code blocks
+                    json_match = re.search(r'```(?:json)?\s*({\s*"incident_id".*})\s*```', output, re.DOTALL | re.IGNORECASE)
+                    if json_match:
+                        json_content = json_match.group(1)
+                    else:
+                        # Then try to find raw JSON object
+                        json_match = re.search(r'({[\s\S]*?"incident_id"[\s\S]*?})', output)
+                        if json_match:
+                            json_content = json_match.group(1)
+                    
+                    if not json_content:
                         if attempt < max_retries - 1:
                             logger.warning(f"Attempt {attempt+1}: Could not extract JSON, retrying...")
                             continue
                         logger.warning(f"Could not extract JSON from agent output for incident {incident_id}")
-                        return {"incident_id": incident_id, "selected_dimensions": []}
+                        return self._create_fallback_response(incident_id, output)
                     
-                    json_str = json_match.group(1)
-                    # Clean up any escaped characters that might cause parsing issues
-                    json_str = json_str.replace('\\n', ' ').replace('\\', '')
-                    parsed_result = json.loads(json_str)
+                    # Clean up the extracted JSON
+                    json_content = self._clean_json_string(json_content)
                     
-                    # Validate the structure
-                    if "incident_id" not in parsed_result or "selected_dimensions" not in parsed_result:
+                    # Parse the JSON
+                    try:
+                        parsed_result = json.loads(json_content)
+                        
+                        # Validate the structure
+                        if not self._validate_json_structure(parsed_result):
+                            if attempt < max_retries - 1:
+                                logger.warning(f"Attempt {attempt+1}: Invalid JSON structure, retrying...")
+                                continue
+                            logger.warning(f"Invalid JSON structure for incident {incident_id}")
+                            return self._create_fallback_response(incident_id, output)
+                        
+                        return parsed_result
+                    except json.JSONDecodeError as e:
                         if attempt < max_retries - 1:
-                            logger.warning(f"Attempt {attempt+1}: Invalid JSON structure, retrying...")
+                            logger.warning(f"Attempt {attempt+1}: JSON decode error ({e}), retrying...")
                             continue
-                        raise ValueError("Missing required fields in result")
-                    
-                    return parsed_result
-                    
-                except json.JSONDecodeError:
-                    if attempt < max_retries - 1:
-                        logger.warning(f"Attempt {attempt+1}: JSON decode error, retrying...")
-                    else:
-                        logger.warning(f"Invalid JSON in agent output for incident {incident_id}")
-                        return {"incident_id": incident_id, "selected_dimensions": []}
+                        logger.warning(f"Invalid JSON in agent output for incident {incident_id}: {e}")
+                        return self._create_fallback_response(incident_id, output)
                 except Exception as e:
                     if attempt < max_retries - 1:
                         logger.warning(f"Attempt {attempt+1}: Error: {str(e)}, retrying...")
-                    else:
-                        raise
+                        continue
+                    logger.error(f"Unhandled error in agent execution for incident {incident_id}: {str(e)}")
+                    return self._create_fallback_response(incident_id, str(e))
             
-            # If we've exhausted retries, return a default response
+            # If we've exhausted retries
+            logger.warning(f"All retries exhausted for incident {incident_id}")
             return {"incident_id": incident_id, "selected_dimensions": []}
-            
         except Exception as e:
             logger.error(f"Error mapping incident {incident_id}: {str(e)}")
-            # Fallback mechanism - create a basic structure
             return {"incident_id": incident_id, "selected_dimensions": []}
+    
+    def _clean_json_string(self, json_str: str) -> str:
+        """Clean up a JSON string to make it more parseable."""
+        # Replace escaped quotes
+        json_str = json_str.replace('\\"', '"')
+        # Replace actual newlines and tabs with spaces
+        json_str = json_str.replace('\n', ' ').replace('\t', ' ')
+        # Remove backslashes before normal characters (common issue in some outputs)
+        json_str = re.sub(r'\\([^"\\/bfnrtu])', r'\1', json_str)
+        # Fix cases where quotes might be missing around keys
+        json_str = re.sub(r'([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', json_str)
+        return json_str
+    
+    def _validate_json_structure(self, json_obj: Dict) -> bool:
+        """Validate the structure of the parsed JSON."""
+        if "incident_id" not in json_obj:
+            return False
+        if "selected_dimensions" not in json_obj:
+            return False
+        if not isinstance(json_obj["selected_dimensions"], list):
+            return False
+        
+        # Check each dimension entry
+        for dim in json_obj["selected_dimensions"]:
+            if not isinstance(dim, dict):
+                return False
+            if "dimension" not in dim or "reasoning" not in dim:
+                return False
+        
+        return True
+    
+    def _create_fallback_response(self, incident_id: str, output: str) -> Dict:
+        """Create a fallback response when JSON parsing fails."""
+        # Try to extract dimension information from the text output
+        dimensions = []
+        
+        # Look for dimension mentions
+        if "dimension" in output.lower():
+            # Check for dimensions in the available list
+            for _, dim_row in self.dimensions_df.iterrows():
+                dim_name = dim_row['Dimension']
+                if dim_name.lower() in output.lower():
+                    # Try to find reasoning nearby
+                    dim_index = output.lower().find(dim_name.lower())
+                    context = output[max(0, dim_index - 100):min(len(output), dim_index + 300)]
+                    dimensions.append({
+                        "dimension": dim_name,
+                        "reasoning": f"Extracted from agent output: {context.strip()}"
+                    })
+        
+        # If we found dimensions, return them
+        if dimensions:
+            return {
+                "incident_id": incident_id,
+                "selected_dimensions": dimensions
+            }
+        
+        # Otherwise return empty dimensions
+        return {
+            "incident_id": incident_id,
+            "selected_dimensions": []
+        }
     
     def process_all_incidents(self) -> None:
         """Process all incidents and create mapping results."""
