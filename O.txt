@@ -1,1070 +1,169 @@
-import os
-import sys
-import uuid
-import json
-import logging
-import chardet
-import pandas as pd
-import numpy as np
-import time
-import random
-from typing import Optional, Any, Dict, List, Union, Tuple, Callable
-from pathlib import Path
-from dotenv import dotenv_values
-from azure.identity import DefaultAzureCredential, get_bearer_token_provider, ClientSecretCredential
-from openai import AzureOpenAI
-from pydantic import BaseModel, Field
-from langchain_openai import AzureChatOpenAI
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationChain, LLMChain
-from langchain.schema.document import Document as LC_DOCUMENT
-from langchain.embeddings.base import Embeddings
-from langchain_community.vectorstores import Chroma
-from langchain.prompts import PromptTemplate
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from chromadb.config import Settings
-from chromadb.utils import embedding_functions
-from collections import namedtuple
-import re
-from pydantic import BaseModel, ValidationError, field_validator
-
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-logger = logging.getLogger(__name__)
-
-ENV_DIR = "env"
-CONFIG_PATH = f"{ENV_DIR}/config.env"
-CREDS_PATH = f"{ENV_DIR}/credentials.env"
-CERT_PATH = f"{ENV_DIR}/cacert.pem"
-
-Triple = namedtuple("Triple", ["subject", "predicate", "object"])
-
-## utility functions
-def is_file_readable(filepath: str)->bool:
-    """Check if a file is readable."""
-    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
-        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
-    return True
-
-def str_to_bool(s: str)->bool:
-    """Convert a string to a boolean."""
-    if s== 'True':
-        return True
-    elif s== 'False':
-        return False
-    else:
-        raise ValueError(f"Invalid boolean value: {s}")
-
-## OSEnv class
-
-class OSEnv:
-    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
-        self.var_list = []
-        self.bulk_set(config_file, True)
-        self.bulk_set(creds_file, False)
-        self.set_certificate_path(certificate_path)
-        if str_to_bool(self.get("PROXY_ENABLED", "False")):
-            self.set_proxy()
-        
-        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
-            self.token = self.get_azure_token()
-        else:
-            self.token = None
-        
-        self.credential = self._get_credential()
-    
-    def _get_credential(self):
-        if str_to_bool(self.get("USE_MANAGED_IDENTITY", "False")):
-            return DefaultAzureCredential()
-        else:
-            return ClientSecretCredential(tenant_id=self.get("AZURE_TENANT_ID"), client_id=self.get("AZURE_CLIENT_ID"), client_secret=self.get("AZURE_CLIENT_SECRET"))
-    
-    def set_certificate_path(self, path: str):
-        try:
-            if not os.path.isabs(path):
-                path = os.path.abspath(path)
-            if not is_file_readable(path):
-                raise FileNotFoundError(f"The file '{path}' does not exist or is not readable")
-            
-            self.set("REQUESTS_CA_BUNDLE", path)
-            self.set("SSL_CERT_FILE", path)
-            self.set("CURL_CA_BUNDLE", path)
-        except Exception as e:
-            logger.error(f"Error setting certificate path: {e}")
-            raise
-    
-    def bulk_set(self, dotenvfile: str, print_val: bool = False)->None:
-        try:
-            if not os.path.isabs(dotenvfile):
-                dotenvfile = os.path.abspath(dotenvfile)
-            if not is_file_readable(dotenvfile):
-                raise FileNotFoundError(f"The file '{dotenvfile}' does not exist or is not readable")
-            temp_dict = dotenv_values(dotenvfile)
-            for key, value in temp_dict.items():
-                self.set(key, value, print_val)
-            del temp_dict
-        except Exception as e:
-            logger.error(f"Error loading environment variables from {dotenvfile}: {e}")
-            raise
-    
-    def set(self, key: str, value: str, print_val: bool = False)->None:
-        try:
-            os.environ[key] = value
-            if key not in self.var_list:
-                self.var_list.append(key)
-            if print_val:
-                logger.info(f"{key}: {value}")
-        except Exception as e:
-            logger.error(f"Error setting environment variable {key}: {e}")
-            raise
-    
-    def get(self, key: str, default: Optional[str] = None)->str:
-        try:
-            return os.environ.get(key, default)
-        except Exception as e:
-            logger.error(f"Error getting environment variable {key}: {e}")
-            raise
-    
-    def set_proxy(self) -> None:
-        try:
-            ad_username = self.get("AD_USERNAME")
-            ad_password = self.get("AD_USER_PW")
-            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
-            if not all([ad_username, ad_password, proxy_domain]):
-                raise ValueError("Proxy settings are incomplete")
-            proxy_url = f"https://{ad_username}:{ad_password}@{proxy_domain}"
-            self.set("HTTP_PROXY", proxy_url, print_val=False)
-            self.set("HTTPS_PROXY", proxy_url, print_val=False)
-            no_proxy_domains = [
-                'cognitiveservices.azure.com',
-                'search.windows.net',
-                'openai.azure.com',
-                'core.windows.net',
-                'azurewebsites.net'
-            ]
-            self.set("NO_PROXY", ",".join(no_proxy_domains), print_val=False)
-        except Exception as e:
-            logger.error(f"Error setting proxy: {e}")
-            raise
-    
-    def get_azure_token(self) -> str:
-        try:
-            credential = ClientSecretCredential(
-                tenant_id=self.get("AZURE_TENANT_ID"),
-                client_id=self.get("AZURE_CLIENT_ID"),
-                client_secret=self.get("AZURE_CLIENT_SECRET")
-            )
-            token = credential.get_token("https://cognitiveservices.azure.com/.default")
-            self.set("AZURE_TOKEN", token.token, print_val=False)
-            logger.info("Azure token set")
-            return token.token
-        except Exception as e:
-            logger.error(f"Error retrieving Azure token: {e}")
-            return None
-    
-    def list_env_vars(self)->None:
-        for var in self.var_list:
-            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET'}:
-                logger.info(f"{var}: [REDACTED]")
-            else:
-                logger.info(f"{var}: {os.getenv(var)}")
-
-
-## embedding class + Document class
-
-class MyDocument(BaseModel):
-    id: str = ""
-    text: str = ""
-    embedding: List[float] = Field(default_factory=list)
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-
-class EmbeddingClient:
-    def __init__(self, env: OSEnv, azure_api_version: str = "2023-05-15", embeddings_model: str = "text-embedding-3-large"):
-        self.azure_api_version = azure_api_version
-        self.embeddings_model = embeddings_model
-        self.env = env
-        self.direct_azure_client = self._get_direct_azure_client()
-        self.max_retries = 3
-        self.retry_delay = 2  # seconds
-    
-    def _get_direct_azure_client(self):
-        token_provider = get_bearer_token_provider(
-            self.env.credential,
-            "https://cognitiveservices.azure.com/.default"
-        )
-        azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
-        
-        # Use named parameters instead of positional parameters
-        return AzureOpenAI(
-            azure_endpoint=azure_endpoint,
-            api_version=self.azure_api_version,
-            azure_ad_token_provider=token_provider
-        )
-    
-    def _preprocess_text(self, text: str) -> str:
-        """Preprocess text to ensure it works well with the embedding API."""
-        if not text:
-            return "Empty text"
-            
-        # Replace special characters that might cause issues
-        text = text.replace('\x00', ' ')  # Null bytes
-        
-        # Ensure the text isn't too long (8k tokens is a common limit)
-        if len(text) > 25000:  # Rough estimate: 25k chars ≈ 8k tokens
-            text = text[:25000]
-            
-        # Ensure text has content
-        if not text.strip():
-            return "Empty text"
-            
-        return text
-    
-    def generate_embeddings(self, doc: MyDocument) -> MyDocument:
-        """Generate embedding for a single document with retries."""
-        processed_text = self._preprocess_text(doc.text)
-        
-        for attempt in range(self.max_retries):
-            try:
-                response = self.direct_azure_client.embeddings.create(
-                    model=self.embeddings_model,
-                    input=processed_text
-                )
-                
-                if response and response.data and len(response.data) > 0:
-                    doc.embedding = response.data[0].embedding
-                    
-                    # Verify the embedding is valid
-                    if not doc.embedding or len(doc.embedding) == 0:
-                        logger.warning(f"Empty embedding returned for document {doc.id} on attempt {attempt+1}")
-                        time.sleep(self.retry_delay)
-                        continue
-                        
-                    # Check if embedding is all zeros
-                    if all(e == 0 for e in doc.embedding):
-                        logger.warning(f"All-zero embedding returned for document {doc.id} on attempt {attempt+1}")
-                        time.sleep(self.retry_delay)
-                        continue
-                        
-                    return doc
-                else:
-                    logger.warning(f"No data in embedding response for document {doc.id} on attempt {attempt+1}")
-            except Exception as e:
-                logger.warning(f"Error generating embedding for document {doc.id} on attempt {attempt+1}: {e}")
-            
-            # Wait before retry
-            time.sleep(self.retry_delay)
-        
-        # If all retries failed, create a default embedding
-        logger.error(f"Failed to generate proper embedding for document {doc.id} after {self.max_retries} attempts")
-        logger.error(f"Text sample: {doc.text[:100]}...")
-        
-        # Create a random embedding as fallback
-        doc.embedding = [random.uniform(-0.1, 0.1) for _ in range(1536)]  # Standard embedding size
-        return doc
-    
-    def generate_batch_embeddings(self, docs: List[MyDocument]) -> List[MyDocument]:
-        """Generate embeddings for a batch of documents with individual retries on failure."""
-        if not docs:
-            return []
-            
-        # Process text for each document
-        processed_docs = []
-        for doc in docs:
-            doc.text = self._preprocess_text(doc.text)
-            processed_docs.append(doc)
-        
-        try:
-            # Try batch processing first
-            texts = [doc.text for doc in processed_docs]
-            response = self.direct_azure_client.embeddings.create(
-                model=self.embeddings_model,
-                input=texts
-            )
-            
-            if response and response.data and len(response.data) == len(processed_docs):
-                for i, doc in enumerate(processed_docs):
-                    doc.embedding = response.data[i].embedding
-            else:
-                logger.warning(f"Batch embedding failed or returned mismatched results. Falling back to individual processing.")
-                # Fallback to individual processing
-                for doc in processed_docs:
-                    self.generate_embeddings(doc)
-        except Exception as e:
-            logger.warning(f"Error in batch embedding: {e}. Falling back to individual processing.")
-            # Fallback to individual processing
-            for doc in processed_docs:
-                self.generate_embeddings(doc)
-        
-        # Verify all embeddings
-        for i, doc in enumerate(processed_docs):
-            if not doc.embedding or len(doc.embedding) == 0 or all(e == 0 for e in doc.embedding):
-                logger.warning(f"Invalid embedding detected for document {doc.id} after batch processing. Regenerating individually.")
-                self.generate_embeddings(doc)
-        
-        return processed_docs
-
-class AzureChatbot:
-    def __init__(self, env: OSEnv):
-        self.env = env
-        self.llm = self._setup_chat_model()
-        self.memory = ConversationBufferMemory()
-        self.conversation = ConversationChain(llm=self.llm, memory=self.memory, verbose=True)
-    
-    def _setup_chat_model(self):
-        try:
-            token_provider = get_bearer_token_provider(
-                self.env.credential,
-                "https://cognitiveservices.azure.com/.default"
-            )
-            model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
-            temperature = float(self.env.get("TEMPERATURE", "0.7"))
-            max_tokens = int(self.env.get("MAX_TOKENS", "800"))
-            api_version = self.env.get("API_VERSION", "2023-05-15")
-            azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
-            
-            # Using deployment_name instead of model_name
-            self.llm = AzureChatOpenAI(
-                deployment_name=model_name,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                api_version=api_version,
-                azure_endpoint=azure_endpoint,
-                azure_ad_token_provider=token_provider
-            )
-            
-            return self.llm
-        except Exception as e:
-            logger.error(f"Error setting up chatbot: {e}")
-            raise
-    
-    def generate_reasoning(self, project_overview: str, purpose: str) -> str:
-        messages = [
-            SystemMessage(content="You are an AI assistant that helps categorize project overviews based on their purposes. Please provide clear, concise reasoning for why a project matches a particular purpose."),
-            HumanMessage(content=f"Project Overview: {project_overview}\n\nPurpose: {purpose}\n\nExplain why this project overview matches (or doesn't match) this purpose. Keep your reasoning brief but specific.")
-        ]
-        
-        result = self.llm.invoke(messages)
-        return result.content
-
-# Data models for the pipeline
-class Purpose(BaseModel):
-    id: str
-    name: str
-    embedding: List[float] = Field(default_factory=list)
-
-class Project(BaseModel):
-    case_id: str
-    overview: str
-    embedding: List[float] = Field(default_factory=list)
-
-class PurposeMatch(BaseModel):
-    purpose_id: str
-    purpose_name: str
-    matching_score: float
-    reasoning: str = ""
-
-class ProjectMapping(BaseModel):
-    case_id: str
-    overview: str
-    matches: List[PurposeMatch] = Field(default_factory=list)
-
-class AgentState(BaseModel):
-    purposes: List[Purpose] = Field(default_factory=list)
-    projects: List[Project] = Field(default_factory=list)
-    current_project_index: int = 0
-    results: List[ProjectMapping] = Field(default_factory=list)
-    status: str = "initializing"
-
-# File processing functions
-def load_purposes_file(file_path: str) -> List[Purpose]:
-    """Load the purposes from an Excel file with robust encoding handling."""
-    try:
-        # Try to read the Excel file
-        try:
-            df = pd.read_excel(file_path)
-        except Exception as e:
-            logger.warning(f"Error reading Excel file with default settings: {e}")
-            # Try with a different engine
-            try:
-                df = pd.read_excel(file_path, engine='openpyxl')
-                logger.info("Successfully read Excel file with openpyxl engine")
-            except Exception as e2:
-                logger.warning(f"Error reading Excel file with openpyxl engine: {e2}")
-                # Last resort - try with xlrd engine for xls files
-                df = pd.read_excel(file_path, engine='xlrd')
-                logger.info("Successfully read Excel file with xlrd engine")
-        
-        purposes = []
-        for i, col in enumerate(df.columns):
-            try:
-                # Handle different types of column names
-                if col and not pd.isna(col):  # Make sure column name is valid
-                    # Convert to string and handle encoding issues
-                    try:
-                        purpose_name = str(col)
-                    except UnicodeEncodeError:
-                        # If normal string conversion fails, use a more permissive approach
-                        purpose_name = str(col.encode('utf-8', errors='replace').decode('utf-8', errors='replace'))
-                    
-                    if purpose_name.strip():  # Ensure the name is not just whitespace
-                        purpose = Purpose(id=str(i), name=purpose_name)
-                        purposes.append(purpose)
-            except Exception as e:
-                logger.warning(f"Error processing column {i}: {e}. Skipping this column.")
-        
-        if not purposes:
-            logger.warning("No valid purposes found in the Excel file.")
-        else:
-            logger.info(f"Successfully loaded {len(purposes)} purposes: {[p.name for p in purposes]}")
-            
-        return purposes
-    except Exception as e:
-        logger.error(f"Error loading purposes file: {e}")
-        raise
-
-def load_projects_file(file_path: str) -> List[Project]:
-    """Load the projects from a CSV file using chardet to determine the encoding."""
-    try:
-        # Detect the file encoding using chardet
-        with open(file_path, 'rb') as file:
-            raw_data = file.read()
-            encoding_result = chardet.detect(raw_data)
-            encoding = encoding_result['encoding']
-            confidence = encoding_result['confidence']
-            
-        logger.info(f"Detected encoding: {encoding} with confidence: {confidence:.2f}")
-        
-        # Use the detected encoding
-        try:
-            df = pd.read_csv(file_path, encoding=encoding, on_bad_lines='warn')
-            logger.info(f"Successfully loaded CSV with detected encoding: {encoding}")
-        except Exception as e:
-            logger.warning(f"Failed to load with detected encoding ({encoding}): {e}")
-            logger.warning("Falling back to latin-1 encoding (permissive)")
-            df = pd.read_csv(file_path, encoding='latin-1', on_bad_lines='warn')
-        
-        required_columns = ['case id', 'project overview']
-        
-        # Verify that required columns exist
-        for col in required_columns:
-            if col not in df.columns:
-                raise ValueError(f"Required column '{col}' not found in CSV file.")
-        
-        projects = []
-        for idx, row in df.iterrows():
-            try:
-                case_id = str(row['case id'])
-                
-                # Handle potentially problematic overview text
-                if pd.isna(row['project overview']):
-                    overview = ""
-                else:
-                    # Convert to string and handle encoding issues
-                    try:
-                        overview = str(row['project overview'])
-                    except UnicodeEncodeError:
-                        # If normal string conversion fails, use a more permissive approach
-                        overview = str(row['project overview'].encode('utf-8', errors='replace').decode('utf-8', errors='replace'))
-                
-                # Skip rows with empty overviews
-                if not overview.strip():
-                    logger.warning(f"Skipping project with case ID {case_id} due to empty overview.")
-                    continue
-                
-                project = Project(case_id=case_id, overview=overview)
-                projects.append(project)
-            except Exception as e:
-                logger.warning(f"Error processing row {idx}: {e}. Skipping this row.")
-        
-        if not projects:
-            logger.warning("No valid projects found in the CSV file.")
-        else:
-            logger.info(f"Successfully loaded {len(projects)} projects.")
-            
-        return projects
-    except Exception as e:
-        logger.error(f"Error loading projects file: {e}")
-        raise
-
-def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
-    """Calculate cosine similarity between two vectors."""
-    dot_product = sum(a * b for a, b in zip(vec1, vec2))
-    norm1 = sum(a * a for a in vec1) ** 0.5
-    norm2 = sum(b * b for b in vec2) ** 0.5
-    
-    # Handle zero division case
-    if norm1 == 0 or norm2 == 0:
-        return 0.0
-        
-    return dot_product / (norm1 * norm2)
-
-# Pipeline functions
-def initialize(state: AgentState) -> AgentState:
-    """Initialize the agent state."""
-    logger.info("Initializing agent...")
-    state.status = "loading_data"
-    return state
-
-def load_data(state: AgentState, purposes_file: str, projects_file: str, env: OSEnv) -> AgentState:
-    """Load data from files and generate embeddings with efficient batching and caching."""
-    try:
-        logger.info("Loading purposes and projects data...")
-        state.purposes = load_purposes_file(purposes_file)
-        state.projects = load_projects_file(projects_file)
-        
-        # Check for cached embeddings
-        cache_dir = Path("./embedding_cache")
-        cache_dir.mkdir(exist_ok=True)
-        
-        purpose_cache_file = cache_dir / "purpose_embeddings.json"
-        project_cache_file = cache_dir / f"project_embeddings_{hash(projects_file)}.json"
-        
-        # Initialize embedding client
-        embedding_client = EmbeddingClient(env)
-        
-        # Load or generate purpose embeddings
-        if purpose_cache_file.exists():
-            logger.info("Loading cached purpose embeddings...")
-            try:
-                with open(purpose_cache_file, 'r') as f:
-                    purpose_embeddings = json.load(f)
-                    
-                # Match embeddings to purposes by ID
-                for purpose in state.purposes:
-                    if purpose.id in purpose_embeddings:
-                        purpose.embedding = purpose_embeddings[purpose.id]
-                        
-                # Check if all purposes have embeddings
-                missing_embeddings = [p for p in state.purposes if not p.embedding]
-                if missing_embeddings:
-                    logger.info(f"{len(missing_embeddings)} purposes missing embeddings - generating those")
-                    # Only generate embeddings for purposes missing them
-                    purpose_docs = [MyDocument(id=p.id, text=p.name) for p in missing_embeddings]
-                    if purpose_docs:
-                        purpose_docs = embedding_client.generate_batch_embeddings(purpose_docs)
-                        for doc in purpose_docs:
-                            for p in missing_embeddings:
-                                if p.id == doc.id:
-                                    p.embedding = doc.embedding
-                                    purpose_embeddings[p.id] = doc.embedding
-                        
-                        # Update the cache with new embeddings
-                        with open(purpose_cache_file, 'w') as f:
-                            json.dump(purpose_embeddings, f)
-            except Exception as e:
-                logger.warning(f"Error loading cached purpose embeddings: {e}. Regenerating...")
-                purpose_embeddings = {}
-                purpose_docs = [MyDocument(id=p.id, text=p.name) for p in state.purposes]
-                purpose_docs = embedding_client.generate_batch_embeddings(purpose_docs)
-                
-                for i, doc in enumerate(purpose_docs):
-                    state.purposes[i].embedding = doc.embedding
-                    purpose_embeddings[doc.id] = doc.embedding
-                
-                # Cache the embeddings
-                with open(purpose_cache_file, 'w') as f:
-                    json.dump(purpose_embeddings, f)
-        else:
-            logger.info("Generating purpose embeddings...")
-            purpose_embeddings = {}
-            
-            # Generate embeddings for purposes in a single batch
-            purpose_docs = [MyDocument(id=p.id, text=p.name) for p in state.purposes]
-            purpose_docs = embedding_client.generate_batch_embeddings(purpose_docs)
-            
-            for i, doc in enumerate(purpose_docs):
-                state.purposes[i].embedding = doc.embedding
-                purpose_embeddings[doc.id] = doc.embedding
-            
-            # Cache the embeddings
-            with open(purpose_cache_file, 'w') as f:
-                json.dump(purpose_embeddings, f)
-        
-        # Load or generate project embeddings
-        if project_cache_file.exists():
-            logger.info("Loading cached project embeddings...")
-            try:
-                with open(project_cache_file, 'r') as f:
-                    project_embeddings = json.load(f)
-                
-                # Match embeddings to projects by ID
-                for project in state.projects:
-                    if project.case_id in project_embeddings:
-                        project.embedding = project_embeddings[project.case_id]
-                
-                # Check if all projects have embeddings
-                missing_embeddings = [p for p in state.projects if not p.embedding]
-                if missing_embeddings:
-                    logger.info(f"{len(missing_embeddings)} projects missing embeddings - generating those")
-                    # Only generate embeddings for projects missing them
-                    project_docs = [MyDocument(id=p.case_id, text=p.overview) for p in missing_embeddings]
-                    
-                    # Process in batches of 10 to avoid rate limits
-                    batch_size = 10
-                    for i in range(0, len(project_docs), batch_size):
-                        batch = project_docs[i:i+batch_size]
-                        batch = embedding_client.generate_batch_embeddings(batch)
-                        
-                        for doc in batch:
-                            for p in missing_embeddings:
-                                if p.case_id == doc.id:
-                                    p.embedding = doc.embedding
-                                    project_embeddings[p.case_id] = doc.embedding
-                        
-                        logger.info(f"Generated embeddings for {len(batch)} projects")
-                    
-                    # Update the cache with new embeddings
-                    with open(project_cache_file, 'w') as f:
-                        json.dump(project_embeddings, f)
-            except Exception as e:
-                logger.warning(f"Error loading cached project embeddings: {e}. Regenerating...")
-                project_embeddings = {}
-                
-                # Process in batches of 10 to avoid rate limits
-                batch_size = 10
-                for i in range(0, len(state.projects), batch_size):
-                    batch = state.projects[i:i+batch_size]
-                    project_docs = [MyDocument(id=p.case_id, text=p.overview) for p in batch]
-                    project_docs = embedding_client.generate_batch_embeddings(project_docs)
-                    
-                    for doc in project_docs:
-                        for p in batch:
-                            if p.case_id == doc.id:
-                                p.embedding = doc.embedding
-                                project_embeddings[p.case_id] = doc.embedding
-                    
-                    logger.info(f"Generated embeddings for {len(batch)} projects")
-                
-                # Cache the embeddings
-                with open(project_cache_file, 'w') as f:
-                    json.dump(project_embeddings, f)
-        else:
-            logger.info("Generating project embeddings...")
-            project_embeddings = {}
-            
-            # Process in batches of 10 to avoid rate limits
-            batch_size = 10
-            for i in range(0, len(state.projects), batch_size):
-                batch = state.projects[i:i+batch_size]
-                project_docs = [MyDocument(id=p.case_id, text=p.overview) for p in batch]
-                project_docs = embedding_client.generate_batch_embeddings(project_docs)
-                
-                for doc in project_docs:
-                    for p in batch:
-                        if p.case_id == doc.id:
-                            p.embedding = doc.embedding
-                            project_embeddings[p.case_id] = doc.embedding
-                
-                logger.info(f"Generated embeddings for {len(batch)} projects")
-            
-            # Cache the embeddings
-            with open(project_cache_file, 'w') as f:
-                json.dump(project_embeddings, f)
-        
-        # Verify all embeddings are valid
-        for i, purpose in enumerate(state.purposes):
-            if not purpose.embedding or all(e == 0 for e in purpose.embedding):
-                logger.warning(f"Warning: Purpose '{purpose.name}' has an empty or zero embedding")
-        
-        for i, project in enumerate(state.projects):
-            if not project.embedding or all(e == 0 for e in project.embedding):
-                logger.warning(f"Warning: Project '{project.case_id}' has an empty or zero embedding")
-        
-        state.status = "processing"
-        return state
-    except Exception as e:
-        logger.error(f"Error in load_data: {e}")
-        state.status = "error"
-        return state
-
-def evaluate_purposes_with_llm(chatbot: AzureChatbot, project: Project, 
-                              all_similarities: List[Tuple[Purpose, float]], 
-                              all_purposes: List[Purpose],
-                              min_matches: int = 3) -> ProjectMapping:
-    """Use LLM to evaluate which purposes match the project and generate reasoning."""
-    # Create a mapping for the current project
-    project_mapping = ProjectMapping(
-        case_id=project.case_id,
-        overview=project.overview,
-        matches=[]
-    )
-    
-    # Prepare the list of all purposes for the prompt
-    all_purposes_text = "\n".join([f"{i+1}. {purpose.name}" for i, purpose in enumerate(all_purposes)])
-    
-    # Prepare the list of top candidate purposes (for efficiency)
-    top_candidates = all_similarities[:min(10, len(all_similarities))]
-    candidate_purposes_text = "\n".join([
-        f"{all_purposes.index(purpose)+1}. {purpose.name} (Similarity: {similarity:.4f})"
-        for purpose, similarity in top_candidates
-    ])
-    
-    # Create a prompt for the LLM to evaluate which purposes match
-    system_content = """You are an expert analyst tasked with mapping project overviews to their most relevant purposes. 
-    Analyze the provided project overview and determine which purposes it aligns with.
-    You should select the TOP 3 purposes that relate to the project's intent and scope.
-    For each selected purpose, provide clear, specific reasoning explaining why it matches.
-    Your analysis should be factual and objective, based solely on the content of the project overview."""
-    
-    user_content = f"""# Project Overview
-{project.overview}
-
-# All Available Purposes
-{all_purposes_text}
-
-# Top Candidate Purposes (from initial similarity search)
-{candidate_purposes_text}
-
-# Instructions
-1. Review the project overview carefully
-2. Evaluate each purpose and determine if it relates to the project
-3. You MUST select the TOP 3 most relevant purposes that match the project (or as many as possible if fewer than 3 make sense)
-4. For each matching purpose, explain your reasoning in detail
-5. Format your response as follows:
-
-MATCHING PURPOSES:
-- Purpose ID: [purpose number from the list]
-  Name: [purpose name]
-  Reasoning: [clear explanation of why this purpose matches]
-  
-- Purpose ID: [next matching purpose number]
-  ...
-
-Important: You MUST identify at least {min_matches} matching purposes if possible. Rank them from most relevant to least relevant. If fewer purposes seem relevant, explain why."""
-    
-    # Get the LLM's evaluation using direct messages
-    messages = [
-        SystemMessage(content=system_content),
-        HumanMessage(content=user_content)
-    ]
-    
-    result = chatbot.llm.invoke(messages)
-    response_text = result.content
-    
-    # Parse the LLM's response to extract matching purposes and reasoning
-    if "NO MATCHING PURPOSES" in response_text or "MATCHING PURPOSES:" not in response_text:
-        # No matching purposes found or unexpected format - add default matches
-        logger.warning(f"No matching purposes found in LLM response for project {project.case_id}")
-        # We'll handle this in the calling function
-        return project_mapping
-    
-    # Extract matching purposes and reasoning using regex
-    pattern = r"Purpose ID: (\d+)[\s\n]+Name: (.+?)[\s\n]+Reasoning: (.+?)(?=\n\n-|\Z)"
-    matches = re.finditer(pattern, response_text, re.DOTALL)
-    
-    for match in matches:
-        purpose_id = int(match.group(1)) - 1  # Convert to 0-based index
-        purpose_name = match.group(2).strip()
-        reasoning = match.group(3).strip()
-        
-        # Find the similarity score if this was a candidate purpose
-        similarity = 0.0
-        for purpose, score in all_similarities:
-            if all_purposes.index(purpose) == purpose_id:
-                similarity = score
-                break
-        
-        # Add to the project mapping
-        if 0 <= purpose_id < len(all_purposes):
-            purpose_match = PurposeMatch(
-                purpose_id=all_purposes[purpose_id].id,
-                purpose_name=purpose_name,
-                matching_score=similarity,
-                reasoning=reasoning
-            )
-            project_mapping.matches.append(purpose_match)
-    
-    # The calling function will add additional matches if needed
-    return project_mapping
-
-def process_projects_batch(state: AgentState, chatbot: AzureChatbot, batch_size: int = 5, min_matches: int = 3) -> AgentState:
-    """Process multiple projects in a batch to reduce API calls."""
-    if state.current_project_index >= len(state.projects):
-        state.status = "completed"
-        return state
-    
-    # Determine the batch of projects to process
-    end_index = min(state.current_project_index + batch_size, len(state.projects))
-    batch = state.projects[state.current_project_index:end_index]
-    
-    logger.info(f"Processing batch of {len(batch)} projects (index {state.current_project_index} to {end_index-1})...")
-    
-    # Create batch prompt to evaluate purposes for all projects in batch
-    system_content = """You are an expert analyst tasked with mapping project overviews to their most relevant purposes. 
-    For EACH project overview provided, determine which purposes it aligns with from the list.
-    For each project, select the TOP 3 purposes that relate to that project's intent and scope.
-    For each selected purpose, provide clear, specific reasoning explaining why it matches.
-    Your analysis should be factual and objective, based solely on the content of each project overview."""
-    
-    # Prepare the list of all purposes
-    all_purposes_text = "\n".join([f"{i+1}. {purpose.name}" for i, purpose in enumerate(state.purposes)])
-    
-    user_content = f"""# Available Purposes
-{all_purposes_text}
-
-# Projects to Analyze
 """
-    
-    # Add each project to the prompt
-    for i, project in enumerate(batch):
-        user_content += f"""
-PROJECT {i+1}: {project.case_id}
-{project.overview}
+Vector Store Interface - Abstract base class defining the interface for vector storage backends.
+
+This module provides a common interface that all vector storage implementations must follow,
+allowing the application to switch between different vector database backends seamlessly.
 """
-    
-    user_content += """
-# Instructions
-1. Review each project overview carefully
-2. For EACH project, identify the TOP 3 most relevant purposes
-3. For each matching purpose, explain your reasoning in detail
-4. Format your response as follows:
 
-RESULTS FOR PROJECT 1:
-- Purpose ID: [purpose number from the list]
-  Name: [purpose name]
-  Reasoning: [clear explanation of why this purpose matches]
-  
-- Purpose ID: [next matching purpose number]
-  ...
+from abc import ABC, abstractmethod
+from typing import List, Dict, Any, Optional, Union
 
-RESULTS FOR PROJECT 2:
-...
-
-Important: You MUST identify at least one matching purpose for each project. If no purpose seems to be a perfect match, select the most relevant ones and explain the partial match."""
+class VectorStore(ABC):
+    """
+    Abstract base class for vector storage and retrieval operations.
     
-    # Get the LLM's evaluation using direct messages
-    messages = [
-        SystemMessage(content=system_content),
-        HumanMessage(content=user_content)
-    ]
+    This interface defines the methods that any vector store implementation must provide,
+    allowing the application to work with different vector database backends without
+    changing the business logic.
+    """
     
-    try:
-        result = chatbot.llm.invoke(messages)
-        response_text = result.content
+    @abstractmethod
+    def store_vector(self, id: str, name: str, description: str, embedding: List[float], metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        Store a single vector in the database.
         
-        # Process each project's results
-        for i, project in enumerate(batch):
-            project_idx = i + 1
-            project_section = f"RESULTS FOR PROJECT {project_idx}:"
+        Args:
+            id: Unique identifier for the term
+            name: Name of the term
+            description: Description of the term
+            embedding: Vector embedding as a list of floats
+            metadata: Additional metadata as a dictionary
             
-            project_mapping = ProjectMapping(
-                case_id=project.case_id,
-                overview=project.overview,
-                matches=[]
-            )
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        pass
+    
+    @abstractmethod
+    def batch_store_vectors(self, items: List[Dict[str, Any]]) -> int:
+        """
+        Store multiple vectors in the database.
+        
+        Args:
+            items: List of dictionaries with id, name, description, embedding, and optional metadata
             
-            # Find the section for this project
-            if project_section in response_text:
-                section_start = response_text.find(project_section)
-                section_end = response_text.find(f"RESULTS FOR PROJECT {project_idx + 1}:", section_start)
-                if section_end == -1:  # If this is the last project
-                    section_end = len(response_text)
-                
-                section_text = response_text[section_start:section_end]
-                
-                # Extract matches using regex
-                pattern = r"Purpose ID: (\d+)[\s\n]+Name: (.+?)[\s\n]+Reasoning: (.+?)(?=\n\n-|\Z)"
-                matches = re.finditer(pattern, section_text, re.DOTALL)
-                
-                for match in matches:
-                    purpose_id = int(match.group(1)) - 1  # Convert to 0-based index
-                    purpose_name = match.group(2).strip()
-                    reasoning = match.group(3).strip()
-                    
-                    # Find the similarity score
-                    similarity = 0.0
-                    if 0 <= purpose_id < len(state.purposes):
-                        similarity = cosine_similarity(project.embedding, state.purposes[purpose_id].embedding)
-                    
-                    # Add to the project mapping
-                    if 0 <= purpose_id < len(state.purposes):
-                        purpose_match = PurposeMatch(
-                            purpose_id=state.purposes[purpose_id].id,
-                            purpose_name=purpose_name,
-                            matching_score=similarity,
-                            reasoning=reasoning
-                        )
-                        project_mapping.matches.append(purpose_match)
+        Returns:
+            int: Number of items successfully stored
+        """
+        pass
+    
+    @abstractmethod
+    def find_similar_vectors(self, query_vector: List[float], top_k: int = 5, threshold: float = 0.5) -> List[Dict[str, Any]]:
+        """
+        Find similar vectors in the database.
+        
+        Args:
+            query_vector: Vector to compare against
+            top_k: Number of results to return
+            threshold: Minimum similarity threshold (0-1)
             
-            # If we don't have enough matches, add fallbacks based on similarity
-            if len(project_mapping.matches) < min_matches:
-                # Calculate similarities
-                similarities = []
-                for purpose in state.purposes:
-                    similarity = cosine_similarity(project.embedding, purpose.embedding)
-                    similarities.append((purpose, similarity))
-                
-                # Sort by similarity score (descending)
-                similarities.sort(key=lambda x: x[1], reverse=True)
-                
-                # Get the IDs of purposes already matched to avoid duplicates
-                matched_purpose_ids = {match.purpose_id for match in project_mapping.matches}
-                
-                # Add top similarity purposes not already matched until we reach min_matches
-                for purpose, score in similarities:
-                    if purpose.id not in matched_purpose_ids and len(project_mapping.matches) < min_matches:
-                        fallback_reasoning = f"This is an automated match based on semantic similarity. The project shares some terminology or concepts with '{purpose.name}' with a similarity score of {score:.4f}."
-                        
-                        project_mapping.matches.append(PurposeMatch(
-                            purpose_id=purpose.id,
-                            purpose_name=purpose.name,
-                            matching_score=score,
-                            reasoning=fallback_reasoning
-                        ))
-                        matched_purpose_ids.add(purpose.id)
-                        logger.info(f"Added fallback match '{purpose.name}' for project {project.case_id}")
+        Returns:
+            List of dictionaries with id, name, description, similarity, and metadata
+        """
+        pass
+    
+    @abstractmethod
+    def get_all_terms(self) -> List[Dict[str, Any]]:
+        """
+        Get all business terms from the database.
+        
+        Returns:
+            List of dictionaries with id, name, description, and metadata
+        """
+        pass
+    
+    @abstractmethod
+    def get_term_by_id(self, term_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get a specific business term by ID.
+        
+        Args:
+            term_id: ID of the term to retrieve
             
-            state.results.append(project_mapping)
-        
-        # Update the current project index
-        state.current_project_index = end_index
-        
-        if state.current_project_index >= len(state.projects):
-            state.status = "completed"
-        
-        return state
-    except Exception as e:
-        logger.error(f"Error processing batch: {e}")
-        # Process projects individually as fallback
-        logger.info("Falling back to individual project processing")
-        
-        for project in batch:
-            process_single_project(state, chatbot, project, min_matches)
-            state.current_project_index += 1
-        
-        if state.current_project_index >= len(state.projects):
-            state.status = "completed"
-        
-        return state
-
-def process_single_project(state: AgentState, chatbot: AzureChatbot, project: Project, min_matches: int = 3) -> None:
-    """Process a single project (fallback method)."""
-    logger.info(f"Processing project {project.case_id}: {project.overview[:50]}...")
+        Returns:
+            Dictionary with term details or None if not found
+        """
+        pass
     
-    # Calculate similarities
-    similarities = []
-    for purpose in state.purposes:
-        similarity = cosine_similarity(project.embedding, purpose.embedding)
-        similarities.append((purpose, similarity))
-    
-    # Sort by similarity score (descending)
-    similarities.sort(key=lambda x: x[1], reverse=True)
-    
-    # Get project mapping using regular approach
-    project_mapping = evaluate_purposes_with_llm(
-        chatbot, 
-        project, 
-        similarities, 
-        state.purposes,
-        min_matches=min_matches
-    )
-    
-    # Add fallbacks if needed
-    if len(project_mapping.matches) < min_matches:
-        # Get the IDs of purposes already matched to avoid duplicates
-        matched_purpose_ids = {match.purpose_id for match in project_mapping.matches}
+    @abstractmethod
+    def delete_term(self, term_id: str) -> bool:
+        """
+        Delete a business term from the database.
         
-        # Add top similarity purposes not already matched until we reach min_matches
-        for purpose, score in similarities:
-            if purpose.id not in matched_purpose_ids and len(project_mapping.matches) < min_matches:
-                fallback_reasoning = f"This is an automated match based on semantic similarity. The project shares some terminology or concepts with '{purpose.name}' with a similarity score of {score:.4f}."
-                
-                project_mapping.matches.append(PurposeMatch(
-                    purpose_id=purpose.id,
-                    purpose_name=purpose.name,
-                    matching_score=score,
-                    reasoning=fallback_reasoning
-                ))
-                matched_purpose_ids.add(purpose.id)
-                logger.info(f"Added fallback match '{purpose.name}' for project {project.case_id}")
+        Args:
+            term_id: ID of the term to delete
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        pass
     
-    state.results.append(project_mapping)
-
-def save_results(state: AgentState, output_file: str) -> AgentState:
-    """Save the results to a file."""
-    logger.info(f"Saving results to {output_file}...")
+    @abstractmethod
+    def compute_cosine_similarity(self, vector1: List[float], vector2: List[float]) -> float:
+        """
+        Compute cosine similarity between two vectors.
+        
+        Args:
+            vector1: First vector
+            vector2: Second vector
+            
+        Returns:
+            float: Cosine similarity between 0 and 1
+        """
+        pass
     
-    results = []
-    for project_mapping in state.results:
-        for match in project_mapping.matches:
-            results.append({
-                "case_id": project_mapping.case_id,
-                "project_overview": project_mapping.overview,
-                "purpose": match.purpose_name,
-                "matching_score": match.matching_score,
-                "reasoning": match.reasoning
-            })
+    @abstractmethod
+    def search_terms(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """
+        Search for terms by text query.
+        
+        Args:
+            query: Search query
+            limit: Maximum number of results
+            
+        Returns:
+            List of matching terms
+        """
+        pass
     
-    df = pd.DataFrame(results)
-    df.to_csv(output_file, index=False)
-    logger.info(f"Results saved to {output_file}")
+    @abstractmethod
+    def delete_all_terms(self) -> int:
+        """
+        Delete all terms in the store.
+        
+        Returns:
+            int: Number of terms deleted
+        """
+        pass
     
-    state.status = "saved"
-    return state
-
-# Direct pipeline function
-def run_pipeline(purposes_file: str, projects_file: str, output_file: str, config_path: str = CONFIG_PATH, creds_path: str = CREDS_PATH, cert_path: str = CERT_PATH):
-    """Run the pipeline directly without using LangGraph to avoid any framework issues."""
-    try:
-        # Initialize environment
-        env = OSEnv(config_path, creds_path, cert_path)
-        chatbot = AzureChatbot(env)
+    @property
+    def store_type(self) -> str:
+        """
+        Get the type of vector store.
         
-        # Create initial state
-        state = AgentState(
-            purposes=[], 
-            projects=[], 
-            current_project_index=0, 
-            results=[], 
-            status="initializing"
-        )
-        
-        # Step 1: Initialize
-        logger.info("Initializing...")
-        state = initialize(state)
-        
-        # Step 2: Load Data
-        logger.info("Loading data...")
-        state = load_data(state, purposes_file, projects_file, env)
-        
-        # Step 3: Process Projects
-        logger.info("Processing projects...")
-        batch_size = 5
-        while state.current_project_index < len(state.projects):
-            remaining = len(state.projects) - state.current_project_index
-            logger.info(f"Processing batch of projects. Progress: {state.current_project_index}/{len(state.projects)} ({remaining} remaining)")
-            state = process_projects_batch(state, chatbot, batch_size=batch_size)
-        
-        # Step 4: Save Results
-        logger.info("Saving results...")
-        state = save_results(state, output_file)
-        
-        logger.info(f"Pipeline completed successfully. {len(state.results)} projects processed.")
-        return state
-    except Exception as e:
-        logger.error(f"Error in pipeline: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise
-
-if __name__ == "__main__":
-    # Parse command line arguments
-    import argparse
-    parser = argparse.ArgumentParser(description='Map projects to purposes using AI')
-    parser.add_argument('--purposes', required=True, help='Path to the Excel file containing purposes')
-    parser.add_argument('--projects', required=True, help='Path to the CSV file containing projects')
-    parser.add_argument('--output', required=True, help='Path to save the output CSV file')
-    parser.add_argument('--config', default=CONFIG_PATH, help='Path to the config file')
-    parser.add_argument('--creds', default=CREDS_PATH, help='Path to the credentials file')
-    parser.add_argument('--cert', default=CERT_PATH, help='Path to the certificate file')
-    args = parser.parse_args()
+        Returns:
+            str: Type of vector store (e.g., "postgresql", "chroma")
+        """
+        return self.__class__.__name__.lower().replace("vectorstore", "")
     
-    # Run the pipeline directly
-    run_pipeline(
-        purposes_file=args.purposes,
-        projects_file=args.projects,
-        output_file=args.output,
-        config_path=args.config,
-        creds_path=args.creds,
-        cert_path=args.cert
-    )
+    def health_check(self) -> Dict[str, Any]:
+        """
+        Check the health of the vector store.
+        
+        Returns:
+            Dict with health status and details
+        """
+        try:
+            # Attempt to get all terms as a basic check
+            terms = self.get_all_terms()
+            return {
+                "status": "healthy",
+                "type": self.store_type,
+                "term_count": len(terms)
+            }
+        except Exception as e:
+            return {
+                "status": "unhealthy",
+                "type": self.store_type,
+                "error": str(e)
+            }
