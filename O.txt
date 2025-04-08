@@ -1,268 +1,564 @@
-import re
+"""
+Tagging Agent with LangGraph - Smart business term tagging agent using ReAct pattern with LangGraph.
+
+This module implements an intelligent tagging agent that uses LangGraph for workflow orchestration
+and the ReAct pattern for improved reasoning about business term matches.
+"""
+
 import logging
-from typing import Dict, Any, List, Optional, Tuple
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+import re
+import json
+from enum import Enum
+from typing import Dict, List, Any, Optional, Union, Tuple, TypedDict, Annotated, Literal
+from pydantic import BaseModel, Field
+from langgraph.graph import StateGraph, END
+from langchain_core.prompts import PromptTemplate, ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
+from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage, AIMessage
 from langchain_openai import AzureChatOpenAI
-from app.core.models import EnhancementResult, TaggingResult, DataElement
+
+from app.core.models import TaggingResult
+from app.core.embedding import EmbeddingClient, MyDocument
+from app.core.business_terms import BusinessTermManager
+from app.config.settings import get_llm
 
 logger = logging.getLogger(__name__)
 
-class ConfidenceEvaluator:
-    """Evaluates confidence scores for enhancement and tagging results."""
+# Constants
+DEFAULT_TOP_K = 3
+SIMILARITY_THRESHOLD = 0.1  # Low threshold to catch more potential matches
+MIN_CONFIDENCE_THRESHOLD = 0.5  # Minimum confidence for a valid match
+
+# Define workflow state
+class TaggingState(TypedDict):
+    """State for the tagging workflow."""
+    element_id: str
+    element_name: str
+    element_description: str
+    potential_terms: List[Dict[str, Any]]
+    candidate_terms: List[Dict[str, Any]]
+    similarity_scores: List[float]
+    modeling_required: bool
+    reasoning: str
+    analysis_status: str
+    error: Optional[str]
+    selected_terms: List[Dict[str, Any]]
+    selected_scores: List[float]
+    final_message: str
+
+# Tools for the agent to use
+@tool
+def search_similar_terms(query: str, top_k: int = 10, threshold: float = SIMILARITY_THRESHOLD) -> List[Dict[str, Any]]:
+    """
+    Search for business terms similar to the given query.
     
-    def __init__(self, llm: AzureChatOpenAI):
-        self.llm = llm
-        self._setup_evaluation_chain()
-    
-    def _setup_evaluation_chain(self):
-        template = """
-        You are an expert in data governance and ISO/IEC 11179 metadata standards. Your task is to evaluate 
-        the confidence in the enhancement and tagging of data elements.
+    Args:
+        query: Text to search for
+        top_k: Maximum number of results to return
+        threshold: Minimum similarity threshold
         
-        Data Element:
-        - ID: {id}
-        - Original Name: {original_name}
-        - Original Description: {original_description}
-        - Enhanced Name: {enhanced_name}
-        - Enhanced Description: {enhanced_description}
+    Returns:
+        List of similar business terms with similarity scores
+    """
+    try:
+        # Get the business term manager
+        business_term_manager = BusinessTermManager()
         
-        Enhancement Feedback: {enhancement_feedback}
-        Validation Feedback: {validation_feedback}
+        # Create embedding for query
+        embedding_client = EmbeddingClient()
+        doc = MyDocument(id="query", text=query)
+        doc_with_embedding = embedding_client.generate_embeddings(doc)
         
-        ISO/IEC 11179 standards for data element names (adapted for business-friendly format):
-        - Names MUST be in lowercase with spaces between words.
-        - Names MUST NOT use technical formatting like camelCase, snake_case or PascalCase
-        - Names MUST NOT contain underscores, hyphens, or special characters
-        - Names should be clear, unambiguous and self-describing
-        - Names should not use acronyms or abbreviations unless they are universally understood
-        - Names should be concise yet descriptive
-        - Names should use standard terminology in the domain
-        - Names should use business language that non-technical users can understand
+        if not doc_with_embedding.embedding:
+            return []
         
-        ISO/IEC 11179 standards for data element descriptions:
-        - Descriptions should clearly define what the data element represents
-        - Descriptions should be complete, covering the concept fully
-        - Descriptions should be precise, specific enough to distinguish from other concepts
-        - Descriptions should be objective and factual, not opinion-based
-        - Descriptions should use complete sentences with proper grammar and punctuation
-        - Descriptions should be written in business language, not technical jargon
+        # Find similar terms
+        similar_terms = business_term_manager.vector_store.find_similar_vectors(
+            query_vector=doc_with_embedding.embedding,
+            top_k=top_k,
+            threshold=threshold
+        )
         
-        Based on the ISO/IEC 11179 standards, evaluate the confidence in the enhancement.
-        
-        Provide your evaluation as follows:
-        1. Overall confidence score (0.0-1.0): [provide a confidence score, must be between 0.0 and 1.0]
-        2. Detailed justification for the score: [explain your reasoning]
-        """
-        
-        self.evaluation_prompt = PromptTemplate(
-            input_variables=["id", "original_name", "original_description", "enhanced_name", 
-                           "enhanced_description", "enhancement_feedback", "validation_feedback"],
-            template=template)
-        self.evaluation_chain = self.evaluation_prompt | self.llm | StrOutputParser()
-        
-        # Setup tagging evaluation chain
-        tagging_template = """
-        You are an expert in data governance and business terminology. Your task is to evaluate 
-        the confidence in the tagging of data elements to business terms.
-        
-        Data Element:
-        - ID: {id}
-        - Name: {name}
-        - Description: {description}
-        
-        Matched Business Terms:
-        {matched_terms}
-        
-        Matching Confidence Scores:
-        {confidence_scores}
-        
-        Based on the data element and matched business terms, evaluate the confidence in the tagging.
-        Consider whether the business terms accurately represent the data element's semantics.
-        
-        Provide your evaluation as follows:
-        1. Overall confidence score (0.0-1.0): [provide a confidence score, must be between 0.0 and 1.0]
-        2. Detailed justification for the score: [explain your reasoning]
-        """
-        
-        self.tagging_evaluation_prompt = PromptTemplate(
-            input_variables=["id", "name", "description", "matched_terms", "confidence_scores"],
-            template=tagging_template)
-        self.tagging_evaluation_chain = self.tagging_evaluation_prompt | self.llm | StrOutputParser()
-    
-    def _parse_evaluation_result(self, result: str) -> float:
-        lines = result.strip().split("\n")
-        confidence = 0.5  # Default confidence
-        
-        for line in lines:
-            if "confidence score" in line.lower():
-                # Extract the confidence score
-                match = re.search(r"\d+\.\d+", line)
-                if match:
-                    try:
-                        confidence = float(match.group(0))
-                        confidence = max(0.0, min(1.0, confidence))  # Ensure within bounds
-                    except ValueError:
-                        logger.warning(f"Could not parse confidence score from line: {line}")
-                        pass
-        
-        return confidence
-    
-    async def evaluate_enhancement(self, 
-                                 original_element: DataElement, 
-                                 enhanced_result: EnhancementResult,
-                                 validation_feedback: str) -> float:
-        """Evaluate the confidence in the enhancement."""
-        try:
-            result = await self.evaluation_chain.ainvoke({
-                "id": original_element.id,
-                "original_name": original_element.existing_name,
-                "original_description": original_element.existing_description,
-                "enhanced_name": enhanced_result.enhanced_name,
-                "enhanced_description": enhanced_result.enhanced_description,
-                "enhancement_feedback": enhanced_result.feedback,
-                "validation_feedback": validation_feedback
+        # Format results
+        results = []
+        for term in similar_terms:
+            results.append({
+                "id": term["id"],
+                "name": term["name"],
+                "description": term["description"],
+                "similarity": term["similarity"]
             })
-            
-            return self._parse_evaluation_result(result)
-        except Exception as e:
-            logger.error(f"Error evaluating enhancement confidence: {e}")
-            return 0.5  # Default confidence in case of error
+        
+        return results
+    except Exception as e:
+        logger.error(f"Error searching similar terms: {e}")
+        return []
+
+@tool
+def get_all_business_terms(limit: int = 100) -> List[Dict[str, Any]]:
+    """
+    Get all business terms from the repository.
     
-    async def evaluate_tagging(self, tagging_result: TaggingResult) -> float:
-        """Evaluate the confidence in the tagging."""
-        try:
-            # Skip evaluation if modeling is required
-            if tagging_result.modeling_required:
-                return 0.0
-                
-            matched_terms_str = ""
-            for i, term in enumerate(tagging_result.matching_terms):
-                matched_terms_str += f"{i+1}. Term: {term['name']}\n   Description: {term['description']}\n"
-            
-            confidence_scores_str = ", ".join([f"{score:.2f}" for score in tagging_result.confidence_scores])
-            
-            result = await self.tagging_evaluation_chain.ainvoke({
-                "id": tagging_result.element_id,
-                "name": tagging_result.element_name,
-                "description": tagging_result.element_description,
-                "matched_terms": matched_terms_str,
-                "confidence_scores": confidence_scores_str
+    Args:
+        limit: Maximum number of terms to return
+        
+    Returns:
+        List of business terms
+    """
+    try:
+        # Get the business term manager
+        business_term_manager = BusinessTermManager()
+        
+        # Get all terms
+        all_terms = business_term_manager.get_all_terms()
+        
+        # Format results
+        results = []
+        for term in all_terms[:limit]:
+            results.append({
+                "id": term.id,
+                "name": term.name,
+                "description": term.description
             })
-            
-            return self._parse_evaluation_result(result)
-        except Exception as e:
-            logger.error(f"Error evaluating tagging confidence: {e}")
-            return 0.5  # Default confidence in case of error
+        
+        return results
+    except Exception as e:
+        logger.error(f"Error getting all business terms: {e}")
+        return []
+
+@tool
+def compute_similarity_between_texts(text1: str, text2: str) -> float:
+    """
+    Compute the semantic similarity between two texts.
     
-    async def evaluate_tagging_with_reasoning(self, tagging_result: TaggingResult) -> Tuple[float, str]:
+    Args:
+        text1: First text
+        text2: Second text
+        
+    Returns:
+        Similarity score between 0 and 1
+    """
+    try:
+        # Get the business term manager
+        business_term_manager = BusinessTermManager()
+        
+        # Compute similarity
+        similarity = business_term_manager.compute_similarity(text1, text2)
+        
+        return similarity
+    except Exception as e:
+        logger.error(f"Error computing similarity: {e}")
+        return 0.0
+
+@tool
+def explain_semantic_match(element_name: str, element_description: str, term_name: str, term_description: str) -> Dict[str, Any]:
+    """
+    Analyze and explain the semantic match between a data element and a business term.
+    
+    Args:
+        element_name: Name of the data element
+        element_description: Description of the data element
+        term_name: Name of the business term
+        term_description: Description of the business term
+        
+    Returns:
+        Dictionary with match score and explanation
+    """
+    try:
+        # Get the LLM
+        llm = get_llm()
+        
+        # Create prompt
+        prompt = PromptTemplate.from_template("""
+        You are an expert in data governance and business terminology. Analyze the semantic match between this data element and business term.
+        
+        DATA ELEMENT:
+        Name: {element_name}
+        Description: {element_description}
+        
+        BUSINESS TERM:
+        Name: {term_name}
+        Description: {term_description}
+        
+        Consider:
+        1. Conceptual alignment - do they represent the same real-world concept?
+        2. Coverage - does the business term fully capture the data element's meaning?
+        3. Specificity - is the match at the right level of specificity?
+        
+        Provide a semantic match score from 0.0 to 1.0 and detailed explanation.
+        
+        Output as JSON with these fields:
+        - score: (float between 0.0 and 1.0)
+        - explanation: (detailed reasoning for the score)
+        """)
+        
+        # Create chain
+        chain = prompt | llm | StrOutputParser()
+        
+        # Run chain
+        result = chain.invoke({
+            "element_name": element_name,
+            "element_description": element_description,
+            "term_name": term_name,
+            "term_description": term_description
+        })
+        
+        # Parse JSON result
+        try:
+            json_result = json.loads(result)
+            # Ensure the structure is correct
+            if "score" not in json_result or "explanation" not in json_result:
+                return {
+                    "score": 0.5,
+                    "explanation": "Error parsing explanation result. " + result
+                }
+            return json_result
+        except Exception as json_error:
+            logger.error(f"Error parsing explanation result: {json_error}")
+            # Try to extract score with regex as fallback
+            match = re.search(r"\"score\":\s*(\d+\.\d+)", result)
+            if match:
+                score = float(match.group(1))
+            else:
+                score = 0.5
+            
+            return {
+                "score": score,
+                "explanation": "Error parsing JSON, but extracted explanation: " + result
+            }
+            
+    except Exception as e:
+        logger.error(f"Error explaining semantic match: {e}")
+        return {
+            "score": 0.0,
+            "explanation": f"Error analyzing match: {str(e)}"
+        }
+
+# LangGraph Agent for Tagging
+class TaggingAgent:
+    """LangGraph agent for tagging data elements with business terms."""
+    
+    def __init__(self, llm: Optional[AzureChatOpenAI] = None):
         """
-        Evaluate the confidence in the tagging with detailed reasoning.
+        Initialize the tagging agent.
         
         Args:
-            tagging_result: Tagging result to evaluate
+            llm: Language model to use
+        """
+        self.llm = llm or get_llm()
+        self.graph = self._build_graph()
+        self.business_term_manager = BusinessTermManager()
+        
+    def _build_graph(self) -> StateGraph:
+        """Build the LangGraph workflow."""
+        # Define nodes
+        workflow = StateGraph(TaggingState)
+        
+        # Add nodes
+        workflow.add_node("initial_search", self._initial_search)
+        workflow.add_node("analyze_candidates", self._analyze_candidates)
+        workflow.add_node("select_best_terms", self._select_best_terms)
+        workflow.add_node("finalize_tagging", self._finalize_tagging)
+        
+        # Add edges
+        workflow.add_edge("initial_search", "analyze_candidates")
+        workflow.add_edge("analyze_candidates", "select_best_terms")
+        workflow.add_edge("select_best_terms", "finalize_tagging")
+        workflow.add_edge("finalize_tagging", END)
+        
+        # Set entrypoint
+        workflow.set_entry_point("initial_search")
+        
+        return workflow.compile()
+    
+    async def _initial_search(self, state: TaggingState) -> TaggingState:
+        """Find potential business terms for the data element."""
+        try:
+            logger.info(f"Searching for potential terms for element: {state['element_id']}")
             
-        Returns:
-            Tuple containing (confidence_score, reasoning)
+            # Create the query from name and description
+            query = f"{state['element_name']}. {state['element_description']}"
+            
+            # Search for similar terms with low threshold to get more candidates
+            potential_terms = search_similar_terms(query, top_k=10, threshold=SIMILARITY_THRESHOLD)
+            
+            if not potential_terms:
+                logger.info(f"No potential terms found for element: {state['element_id']}")
+                state["modeling_required"] = True
+                state["reasoning"] = "No potential terms found in the business term repository."
+                state["potential_terms"] = []
+                state["candidate_terms"] = []
+                state["similarity_scores"] = []
+                state["analysis_status"] = "completed"
+                state["final_message"] = "No matching terms found in the business term repository. Modeling should be performed."
+                return state
+            
+            # Store potential terms
+            state["potential_terms"] = potential_terms
+            
+            # Sort by similarity
+            sorted_terms = sorted(potential_terms, key=lambda x: x["similarity"], reverse=True)
+            
+            # Take the top candidates
+            top_terms = sorted_terms[:DEFAULT_TOP_K]
+            state["candidate_terms"] = top_terms
+            state["similarity_scores"] = [term["similarity"] for term in top_terms]
+            state["analysis_status"] = "pending"
+            
+            return state
+        except Exception as e:
+            logger.error(f"Error in initial search: {e}")
+            state["error"] = f"Error searching for terms: {str(e)}"
+            state["modeling_required"] = True
+            state["reasoning"] = f"Error occurred during term search: {str(e)}"
+            state["analysis_status"] = "error"
+            state["final_message"] = f"Error occurred during tagging process: {str(e)}. Modeling is recommended."
+            return state
+    
+    async def _analyze_candidates(self, state: TaggingState) -> TaggingState:
+        """
+        Analyze candidate terms using the ReAct pattern for improved reasoning.
+        This step uses an agent that can think step-by-step about the semantic match.
         """
         try:
-            # Skip evaluation if modeling is required
-            if tagging_result.modeling_required:
-                return 0.0, "Modeling is required as no suitable matches were found."
+            if state["analysis_status"] != "pending" or not state["candidate_terms"]:
+                return state
                 
-            # If no matches, return zero confidence
-            if not tagging_result.matching_terms:
-                return 0.0, "No matching terms were found. Modeling is required."
+            logger.info(f"Analyzing {len(state['candidate_terms'])} candidate terms for element: {state['element_id']}")
             
-            # Create a detailed prompt for better reasoning
-            matched_terms_str = ""
-            for i, term in enumerate(tagging_result.matching_terms):
-                confidence = tagging_result.confidence_scores[i] if i < len(tagging_result.confidence_scores) else 0
-                matched_terms_str += f"{i+1}. Term: {term['name']}\n"
-                matched_terms_str += f"   Description: {term['description']}\n"
-                matched_terms_str += f"   Similarity Score: {confidence:.2f}\n\n"
+            # Create a React-style agent to analyze the matches
+            react_prompt = ChatPromptTemplate.from_messages([
+                ("system", """You are an expert data governance agent specializing in matching business terms to data elements.
+                
+                Think step-by-step to analyze the semantic match between the data element and each candidate business term.
+                You have access to several tools to help with your analysis.
+                
+                For each candidate term:
+                1. Carefully read and understand the data element and business term
+                2. Consider conceptual alignment, coverage, and specificity
+                3. Use tools to help with your analysis when needed
+                4. Explain your reasoning for each candidate term
+                5. Assign a confidence score from 0.0 to 1.0 for each term
+                
+                After analyzing all terms, recommend the best match(es) or suggest creating a new term.
+                
+                YOUR FINAL ANSWER MUST BE IN THE FORMAT:
+                ```json
+                {
+                    "analysis": [
+                        {
+                            "term_id": "...",
+                            "term_name": "...",
+                            "confidence": 0.0-1.0,
+                            "explanation": "..."
+                        },
+                        ...
+                    ],
+                    "best_matches": ["term_id1", "term_id2", ...],
+                    "modeling_required": true/false,
+                    "reasoning": "..."
+                }
+                ```
+                """),
+                ("human", """I need to find the best business term match for this data element:
+                
+                DATA ELEMENT:
+                ID: {element_id}
+                Name: {element_name}
+                Description: {element_description}
+                
+                CANDIDATE BUSINESS TERMS:
+                {candidate_terms}
+                
+                Please analyze each candidate term and determine if any are good semantic matches.
+                """),
+                MessagesPlaceholder(variable_name="agent_scratchpad"),
+            ])
             
-            # Create an evaluation prompt with reasoning requirements
-            tagging_evaluation_template = """
-            You are an expert in data governance and business terminology. Your task is to evaluate 
-            the appropriateness of tagging a data element with business terms.
+            # Format candidate terms for prompt
+            candidate_terms_str = ""
+            for i, term in enumerate(state["candidate_terms"]):
+                candidate_terms_str += f"{i+1}. ID: {term['id']}\n"
+                candidate_terms_str += f"   Name: {term['name']}\n"
+                candidate_terms_str += f"   Description: {term['description']}\n"
+                candidate_terms_str += f"   Vector Similarity: {term['similarity']:.2f}\n\n"
             
-            Data Element:
-            - ID: {element_id}
-            - Name: {element_name}
-            - Description: {element_description}
+            # Create the agent
+            from langchain_core.agents import AgentExecutor, create_react_agent
             
-            Matched Business Terms:
-            {matched_terms}
+            tools = [
+                search_similar_terms,
+                get_all_business_terms,
+                compute_similarity_between_texts,
+                explain_semantic_match
+            ]
             
-            Instructions:
-            1. Analyze the semantic match between the data element and each business term
-            2. Consider conceptual alignment, completeness of coverage, and appropriate specificity
-            3. Determine if ANY of the business terms are appropriate for this data element
-            4. If none are appropriate, explain why new term modeling is needed
+            agent = create_react_agent(self.llm, tools, react_prompt)
+            agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
             
-            Evaluation steps:
-            1. CAREFULLY examine the data element name and description
-            2. CAREFULLY examine each business term name and description
-            3. For each term, assess if it accurately represents the data element's semantics
-            4. Provide detailed reasoning about the semantic appropriateness of each match
-            5. Give an overall assessment of whether any terms are good matches
-            
-            Provide your evaluation in this format:
-            1. Overall confidence score (0.0-1.0): [provide a confidence score]
-            2. Detailed justification for the score:
-               [provide your reasoning and analysis for each term]
-            3. Final recommendation: [indicate whether modeling is needed or which term is best]
-            """
-            
-            # Create tagging evaluation prompt
-            evaluation_prompt = PromptTemplate(
-                input_variables=["element_id", "element_name", "element_description", "matched_terms"],
-                template=tagging_evaluation_template)
-            
-            # Run evaluation
-            evaluation_chain = evaluation_prompt | self.llm | StrOutputParser()
-            
-            result = await evaluation_chain.ainvoke({
-                "element_id": tagging_result.element_id,
-                "element_name": tagging_result.element_name,
-                "element_description": tagging_result.element_description,
-                "matched_terms": matched_terms_str
+            # Run the agent
+            result = await agent_executor.ainvoke({
+                "element_id": state["element_id"],
+                "element_name": state["element_name"],
+                "element_description": state["element_description"],
+                "candidate_terms": candidate_terms_str,
+                "agent_scratchpad": []
             })
             
-            # Parse the confidence score
-            confidence = 0.0
-            for line in result.strip().split("\n"):
-                if "confidence score" in line.lower():
-                    # Extract the confidence score
-                    match = re.search(r"\d+\.\d+", line)
-                    if match:
-                        try:
-                            confidence = float(match.group(0))
-                            confidence = max(0.0, min(1.0, confidence))  # Ensure within bounds
-                        except ValueError:
-                            logger.warning(f"Could not parse confidence score from line: {line}")
-                            pass
+            # Parse the result
+            try:
+                # Extract JSON from the response
+                json_match = re.search(r"```json\s*(.*?)\s*```", result["output"], re.DOTALL)
+                if json_match:
+                    analysis_result = json.loads(json_match.group(1))
+                else:
+                    # Try direct JSON parsing as a fallback
+                    try:
+                        analysis_result = json.loads(result["output"])
+                    except:
+                        # If no JSON, use regex to get key parts
+                        best_matches = re.findall(r"best_matches.*?[\[\"]([^\]\"]*)[\]\"]", result["output"])
+                        modeling_required = "true" in re.search(r"modeling_required.*?(true|false)", result["output"]).group(1).lower() if re.search(r"modeling_required.*?(true|false)", result["output"]) else True
+                        reasoning = re.search(r"reasoning.*?[\"']([^\"']*)[\"']", result["output"])
+                        reasoning = reasoning.group(1) if reasoning else "Analysis complete, but no structured reasoning found."
+                        
+                        analysis_result = {
+                            "analysis": [],
+                            "best_matches": best_matches if best_matches else [],
+                            "modeling_required": modeling_required,
+                            "reasoning": reasoning
+                        }
+                        
+                # Update state with analysis result
+                selected_terms = []
+                selected_scores = []
+                
+                for term_id in analysis_result.get("best_matches", []):
+                    for candidate in state["candidate_terms"]:
+                        if candidate["id"] == term_id:
+                            selected_terms.append(candidate)
+                            # Find the confidence score from the analysis
+                            confidence = 0.5  # Default
+                            for analysis in analysis_result.get("analysis", []):
+                                if analysis.get("term_id") == term_id:
+                                    confidence = analysis.get("confidence", candidate["similarity"])
+                                    break
+                            selected_scores.append(confidence)
+                            break
+                
+                state["selected_terms"] = selected_terms
+                state["selected_scores"] = selected_scores
+                state["modeling_required"] = analysis_result.get("modeling_required", True)
+                state["reasoning"] = analysis_result.get("reasoning", "Analysis complete, but no structured reasoning found.")
+                state["analysis_status"] = "completed"
+                
+            except Exception as parse_error:
+                logger.error(f"Error parsing agent result: {parse_error}, response: {result['output']}")
+                # Fallback handling
+                state["selected_terms"] = state["candidate_terms"][:1] if state["candidate_terms"] else []
+                state["selected_scores"] = state["similarity_scores"][:1] if state["similarity_scores"] else []
+                state["modeling_required"] = not state["selected_terms"] or all(score < MIN_CONFIDENCE_THRESHOLD for score in state["selected_scores"])
+                state["reasoning"] = f"Error analyzing terms: {str(parse_error)}. Using fallback selection."
+                state["analysis_status"] = "partial"
             
-            # Extract reasoning - keep everything after the confidence score line
-            reasoning = ""
-            in_reasoning_section = False
-            for line in result.strip().split("\n"):
-                if "confidence score" in line.lower():
-                    in_reasoning_section = True
-                    continue
-                if in_reasoning_section:
-                    reasoning += line + "\n"
-            
-            if not reasoning:
-                reasoning = result  # Fallback to the full result
-            
-            # Determine if modeling is required based on confidence
-            if confidence < 0.5:
-                reasoning += "\n\nBased on the low confidence score, modeling a new term is recommended."
-            
-            return confidence, reasoning.strip()
-        
+            return state
         except Exception as e:
-            logger.error(f"Error evaluating tagging confidence with reasoning: {e}")
-            return 0.5, f"Error evaluating tagging confidence: {e}"
+            logger.error(f"Error in analyze_candidates: {e}")
+            state["error"] = f"Error analyzing candidate terms: {str(e)}"
+            state["modeling_required"] = True
+            state["reasoning"] = f"Error occurred during term analysis: {str(e)}"
+            state["analysis_status"] = "error"
+            state["final_message"] = f"Error occurred during tagging analysis: {str(e)}. Modeling is recommended."
+            return state
+    
+    async def _select_best_terms(self, state: TaggingState) -> TaggingState:
+        """Select the best terms based on analysis and set final state."""
+        try:
+            # If no selected terms or all scores are low, mark as modeling required
+            if not state["selected_terms"] or (state["selected_scores"] and all(score < MIN_CONFIDENCE_THRESHOLD for score in state["selected_scores"])):
+                state["modeling_required"] = True
+                if not state["reasoning"]:
+                    state["reasoning"] = "No suitable terms found or all confidence scores are below threshold."
+            
+            # Create final message
+            if state["modeling_required"]:
+                if state["selected_terms"]:
+                    state["final_message"] = f"Low confidence in matches. {state['reasoning']} Modeling is recommended."
+                else:
+                    state["final_message"] = f"No suitable matches found. {state['reasoning']} Modeling should be performed."
+            else:
+                # Format the reasoning to explain why the selected terms are good matches
+                state["final_message"] = f"Found {len(state['selected_terms'])} suitable business term(s). {state['reasoning']}"
+            
+            return state
+        except Exception as e:
+            logger.error(f"Error in select_best_terms: {e}")
+            state["error"] = f"Error selecting best terms: {str(e)}"
+            state["modeling_required"] = True
+            state["final_message"] = f"Error occurred during term selection: {str(e)}. Modeling is recommended."
+            return state
+    
+    async def _finalize_tagging(self, state: TaggingState) -> TaggingState:
+        """Finalize the tagging result."""
+        # No additional processing needed, just return the state
+        return state
+    
+    async def tag_element(self, element_id: str, name: str, description: str, top_k: int = 3) -> TaggingResult:
+        """
+        Tag a data element with business terms using LangGraph.
+        
+        Args:
+            element_id: Element ID
+            name: Element name
+            description: Element description
+            top_k: Number of terms to return
+            
+        Returns:
+            TaggingResult with matching terms and reasoning
+        """
+        try:
+            # Initialize state
+            initial_state: TaggingState = {
+                "element_id": element_id,
+                "element_name": name,
+                "element_description": description,
+                "potential_terms": [],
+                "candidate_terms": [],
+                "similarity_scores": [],
+                "modeling_required": False,
+                "reasoning": "",
+                "analysis_status": "pending",
+                "error": None,
+                "selected_terms": [],
+                "selected_scores": [],
+                "final_message": ""
+            }
+            
+            # Run the graph
+            result = await self.graph.ainvoke(initial_state)
+            
+            # Convert to TaggingResult
+            matching_terms = result["selected_terms"] if result["selected_terms"] else []
+            confidence_scores = result["selected_scores"] if result["selected_scores"] else []
+            
+            return TaggingResult(
+                element_id=element_id,
+                element_name=name,
+                element_description=description,
+                matching_terms=matching_terms,
+                confidence_scores=confidence_scores,
+                modeling_required=result["modeling_required"],
+                message=result["final_message"]
+            )
+        except Exception as e:
+            logger.error(f"Error in tag_element: {e}")
+            return TaggingResult(
+                element_id=element_id,
+                element_name=name,
+                element_description=description,
+                matching_terms=[],
+                confidence_scores=[],
+                modeling_required=True,
+                message=f"Error during tagging process: {str(e)}. Modeling should be performed."
+            )
