@@ -1,190 +1,475 @@
 """
-Application Settings - Configuration settings and utilities for the API.
+ChromaDB Vector Store - Implementation of vector storage using ChromaDB.
 
-This module provides functions to retrieve and manage application settings, 
-including language model configuration, vector database selection, and other
-global settings.
+This module provides a ChromaDB-based implementation of the VectorStore interface,
+utilizing the ChromaDB library for efficient vector similarity search with local persistence.
 """
 
 import logging
 import os
-from typing import Optional, Union, Dict, Any, TYPE_CHECKING
-from langchain_openai import AzureChatOpenAI
-from azure.identity import get_bearer_token_provider
-from app.config.environment import get_os_env
-from utils.auth_helper import get_azure_token_manual  # Import the manual token helper
+from typing import List, Dict, Any, Optional, Tuple, Union
+import numpy as np
+import chromadb
+from chromadb.config import Settings
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-# TYPE_CHECKING is used to avoid circular imports during type checking
-if TYPE_CHECKING:
-    from app.core.vector_store import VectorStore
+from app.core.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
 
-def get_vector_db_type() -> str:
+class ChromaDBVectorStore(VectorStore):
     """
-    Get the vector database type from environment settings.
+    Vector store implementation using ChromaDB.
     
-    Returns:
-        str: Vector database type (always "chroma" to avoid pgvector issues)
+    This class provides vector storage and similarity search using ChromaDB,
+    a lightweight vector database designed for embeddings and semantic search.
     """
-    # Always return "chroma" regardless of environment settings
-    # This ensures we always use ChromaDB and avoid proxy issues with pgvector
-    return "chroma"
-
-def get_vector_store(vector_db_type: Optional[str] = None) -> 'VectorStore':
-    """
-    Get the vector store implementation based on settings.
     
-    Args:
-        vector_db_type: Override the vector database type from environment
-    
-    Returns:
-        VectorStore: The vector store implementation (always ChromaDB)
-    """
-    from app.core.vector_store import VectorStore
-    
-    # Always use ChromaDB regardless of input parameter
-    from app.core.vector_store_chroma import ChromaDBVectorStore
-    persist_dir = os.environ.get("CHROMA_PERSIST_DIR", "./data/chroma_db")
-    collection_name = os.environ.get("CHROMA_COLLECTION", "business_terms")
-    logger.info(f"Using ChromaDB as vector store with collection '{collection_name}' in '{persist_dir}'")
-    return ChromaDBVectorStore(collection_name=collection_name, persist_dir=persist_dir)
-
-def get_llm(proxy_enabled: Optional[bool] = True) -> AzureChatOpenAI:
-    """
-    Get the language model for the application.
-    
-    Args:
-        proxy_enabled: Override the PROXY_ENABLED setting in the config file (default: True)
-    
-    Returns:
-        AzureChatOpenAI: The language model
-    """
-    # Get environment with proxy setting override if provided
-    env = get_os_env(proxy_enabled=proxy_enabled)
-    
-    logger.info(f"Setting up Azure OpenAI client with proxy enabled: {env.get('PROXY_ENABLED', 'True')}")
-    
-    try:
-        # First try the standard token provider approach
-        token_provider = get_bearer_token_provider(
-            env.credential,
-            "https://cognitiveservices.azure.com/.default"
-        )
-    except Exception as e:
-        logger.warning(f"Standard token provider failed: {e}. Trying manual approach.")
+    def __init__(self, collection_name: str = "business_terms", persist_dir: str = "./data/chroma_db"):
+        """
+        Initialize the ChromaDB vector store.
         
-        # Fall back to manual token approach if the standard approach fails
+        Args:
+            collection_name: Name of the ChromaDB collection
+            persist_dir: Directory for persistent storage
+        """
+        self.persist_dir = persist_dir
+        self.collection_name = collection_name
+        
+        # Ensure the persist directory exists
+        os.makedirs(self.persist_dir, exist_ok=True)
+        
+        # Create ChromaDB client with telemetry disabled
+        self.client = self._create_client()
+        
+        # Get or create collection
+        self.collection = self._get_or_create_collection()
+    
+    def _create_client(self):
+        """
+        Create a ChromaDB client with appropriate settings.
+        
+        Returns:
+            ChromaDB client instance
+        """
         try:
-            token = get_azure_token_manual(
-                tenant_id=env.get("AZURE_TENANT_ID", ""),
-                client_id=env.get("AZURE_CLIENT_ID", ""),
-                client_secret=env.get("AZURE_CLIENT_SECRET", ""),
-                scope="https://cognitiveservices.azure.com/.default"
+            return chromadb.PersistentClient(
+                path=self.persist_dir,
+                settings=Settings(
+                    anonymized_telemetry=False,  # Disable telemetry for privacy
+                    allow_reset=False,  # Safety measure for production
+                )
+            )
+        except Exception as e:
+            logger.error(f"Error creating ChromaDB client: {e}")
+            raise
+    
+    def _get_or_create_collection(self):
+        """
+        Get or create the ChromaDB collection, handling compatibility issues.
+        
+        Returns:
+            ChromaDB collection
+        """
+        try:
+            # Try to get existing collection
+            try:
+                collection = self.client.get_collection(name=self.collection_name)
+                logger.info(f"Using existing ChromaDB collection: {self.collection_name}")
+                return collection
+            except ValueError:
+                # Collection doesn't exist, create it
+                # Try with HNSW config if supported
+                try:
+                    # Attempt to create with full HNSW configuration
+                    collection = self.client.create_collection(
+                        name=self.collection_name,
+                        metadata={"description": "Business terms collection"},
+                        embedding_function=None  # Let embeddings be provided directly
+                    )
+                    logger.info(f"Created new ChromaDB collection: {self.collection_name}")
+                    return collection
+                except TypeError as e:
+                    # If HNSW config not supported, try without it
+                    logger.warning(f"Creating collection without HNSW config: {e}")
+                    collection = self.client.create_collection(
+                        name=self.collection_name,
+                        metadata={"description": "Business terms collection"}
+                    )
+                    logger.info(f"Created new ChromaDB collection without HNSW config: {self.collection_name}")
+                    return collection
+        except Exception as e:
+            logger.error(f"Error initializing ChromaDB collection: {e}")
+            raise
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type((Exception,)),
+        reraise=True
+    )
+    def store_vector(self, id: str, name: str, description: str, embedding: List[float], metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        Store a vector in the ChromaDB collection.
+        
+        Args:
+            id: Unique identifier for the term
+            name: Name of the term
+            description: Description of the term
+            embedding: Vector embedding as a list of floats
+            metadata: Additional metadata as a dictionary
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            if metadata is None:
+                metadata = {}
+            
+            # Prepare metadata with name and description
+            full_metadata = {
+                "name": name,
+                "description": description,
+                **metadata
+            }
+            
+            # Check if the term already exists
+            try:
+                existing = self.collection.get(ids=[id], include=["metadatas"])
+                if existing["ids"]:
+                    # Update the existing term
+                    self.collection.update(
+                        ids=[id],
+                        embeddings=[embedding],
+                        metadatas=[full_metadata]
+                    )
+                    return True
+            except Exception as e:
+                logger.debug(f"Term not found for update: {e}")
+            
+            # Add the new term
+            self.collection.add(
+                ids=[id],
+                embeddings=[embedding],
+                metadatas=[full_metadata]
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error storing vector: {e}")
+            return False
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type((Exception,)),
+        reraise=True
+    )
+    def batch_store_vectors(self, items: List[Dict[str, Any]]) -> int:
+        """
+        Store multiple vectors in the ChromaDB collection.
+        
+        Args:
+            items: List of dictionaries with id, name, description, embedding, and optional metadata
+            
+        Returns:
+            int: Number of items successfully stored
+        """
+        try:
+            # Prepare batch data
+            ids = []
+            embeddings = []
+            metadatas = []
+            
+            for item in items:
+                ids.append(item['id'])
+                embeddings.append(item['embedding'])
+                
+                # Combine name, description with metadata
+                metadata = {
+                    "name": item['name'],
+                    "description": item['description'],
+                    **(item.get('metadata', {}))
+                }
+                metadatas.append(metadata)
+            
+            # Use upsert method to add/update
+            self.collection.upsert(
+                ids=ids,
+                embeddings=embeddings,
+                metadatas=metadatas
             )
             
-            if token:
-                logger.info("Successfully obtained Azure token using manual method")
-                # Create a simple callable token provider
-                token_provider = lambda: token
-            else:
-                logger.error("Failed to obtain Azure token using manual method")
-                # Return a mock LLM object that will log errors instead of making API calls
-                return MockLLM()
-        except Exception as e2:
-            logger.error(f"Manual token acquisition also failed: {e2}")
-            return MockLLM()
+            return len(items)
+        except Exception as e:
+            logger.error(f"Error batch storing vectors: {e}")
+            return 0
     
-    # Get model configuration
-    model_name = env.get("MODEL_NAME", "gpt-4o")
-    temperature = float(env.get("TEMPERATURE", "0.3"))  # Lower temperature for more deterministic outputs
-    max_tokens = int(env.get("MAX_TOKENS", "2000"))
-    api_version = env.get("API_VERSION", "2023-05-15")
-    azure_endpoint = env.get("AZURE_ENDPOINT", "")
+    def find_similar_vectors(self, query_vector: List[float], top_k: int = 5, threshold: float = 0.5) -> List[Dict[str, Any]]:
+        """
+        Find similar vectors in the ChromaDB collection.
+        
+        Args:
+            query_vector: Vector to compare against
+            top_k: Number of results to return
+            threshold: Minimum similarity threshold (0-1)
+            
+        Returns:
+            List of dictionaries with id, name, description, similarity, and metadata
+        """
+        try:
+            # Request more results than needed to ensure we have enough after filtering
+            fetch_k = min(top_k * 4, 100)
+            
+            # Remove query_params argument - not supported in older versions
+            result = self.collection.query(
+                query_embeddings=[query_vector],
+                n_results=fetch_k,
+                include=["metadatas", "distances"]
+            )
+            
+            # Process results
+            similar_items = []
+            if not result or not result["ids"] or not result["ids"][0]:
+                return []
+                
+            for i, id_val in enumerate(result["ids"][0]):
+                # ChromaDB returns distance, not similarity
+                # Convert to similarity score (1 - distance)
+                distance = result["distances"][0][i]
+                similarity = 1.0 - distance
+                
+                # Filter by threshold
+                if similarity >= threshold:
+                    metadata = result["metadatas"][0][i]
+                    
+                    # Extract name and description from metadata
+                    name = metadata.get("name", "")
+                    description = metadata.get("description", "")
+                    
+                    # Remove name and description from metadata
+                    clean_metadata = {k: v for k, v in metadata.items() 
+                                    if k not in ["name", "description"]}
+                    
+                    similar_items.append({
+                        "id": id_val,
+                        "name": name,
+                        "description": description,
+                        "similarity": similarity,
+                        "metadata": clean_metadata
+                    })
+            
+            # Sort by similarity (highest first)
+            similar_items.sort(key=lambda x: x["similarity"], reverse=True)
+            
+            # Return only up to top_k items
+            return similar_items[:top_k]
+        except Exception as e:
+            logger.error(f"Error finding similar vectors: {e}")
+            return []
     
-    logger.info(f"Using model: {model_name}, temperature: {temperature}, max_tokens: {max_tokens}")
+    def get_all_terms(self) -> List[Dict[str, Any]]:
+        """
+        Get all business terms from the ChromaDB collection.
+        
+        Returns:
+            List of dictionaries with id, name, description, and metadata
+        """
+        try:
+            # Get all items from the collection
+            result = self.collection.get(include=["metadatas"])
+            
+            terms = []
+            for i, id_val in enumerate(result["ids"]):
+                metadata = result["metadatas"][i]
+                
+                # Extract name and description from metadata
+                name = metadata.get("name", "")
+                description = metadata.get("description", "")
+                
+                # Remove name and description from metadata
+                clean_metadata = {k: v for k, v in metadata.items() 
+                                if k not in ["name", "description"]}
+                
+                terms.append({
+                    "id": id_val,
+                    "name": name,
+                    "description": description,
+                    "metadata": clean_metadata
+                })
+            
+            return terms
+        except Exception as e:
+            logger.error(f"Error getting all terms: {e}")
+            return []
     
-    # Create and return the LLM
-    return AzureChatOpenAI(
-        model_name=model_name,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        api_version=api_version,
-        azure_endpoint=azure_endpoint,
-        azure_ad_token_provider=token_provider
-    )
-
-# Mock LLM class for fallback when authentication fails
-class MockLLM:
-    """Mock LLM that logs errors instead of making API calls."""
+    def get_term_by_id(self, term_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get a specific business term by ID from ChromaDB.
+        
+        Args:
+            term_id: ID of the term to retrieve
+            
+        Returns:
+            Dictionary with term details or None if not found
+        """
+        try:
+            result = self.collection.get(ids=[term_id], include=["metadatas"])
+            
+            if not result["ids"]:
+                return None
+                
+            metadata = result["metadatas"][0]
+            
+            # Extract name and description from metadata
+            name = metadata.get("name", "")
+            description = metadata.get("description", "")
+            
+            # Remove name and description from metadata
+            clean_metadata = {k: v for k, v in metadata.items() 
+                            if k not in ["name", "description"]}
+            
+            return {
+                "id": term_id,
+                "name": name,
+                "description": description,
+                "metadata": clean_metadata
+            }
+        except Exception as e:
+            logger.error(f"Error getting term by ID: {e}")
+            return None
     
-    def __init__(self):
-        self.error_message = "Azure authentication failed. Using mock LLM."
-        logger.error(self.error_message)
+    def delete_term(self, term_id: str) -> bool:
+        """
+        Delete a business term from the ChromaDB collection.
+        
+        Args:
+            term_id: ID of the term to delete
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            self.collection.delete(ids=[term_id])
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting term: {e}")
+            return False
     
-    def invoke(self, *args, **kwargs):
-        logger.error(f"Cannot invoke LLM: {self.error_message}")
-        return "Azure authentication failed. Please check your proxy settings and credentials."
+    def compute_cosine_similarity(self, vector1: List[float], vector2: List[float]) -> float:
+        """
+        Compute cosine similarity between two vectors.
+        
+        Args:
+            vector1: First vector
+            vector2: Second vector
+            
+        Returns:
+            float: Cosine similarity between 0 and 1
+        """
+        try:
+            # Convert to numpy arrays
+            a = np.array(vector1)
+            b = np.array(vector2)
+            
+            # Compute cosine similarity
+            dot_product = np.dot(a, b)
+            norm_a = np.linalg.norm(a)
+            norm_b = np.linalg.norm(b)
+            
+            if norm_a == 0 or norm_b == 0:
+                return 0.0
+            
+            similarity = dot_product / (norm_a * norm_b)
+            return max(0.0, min(similarity, 1.0))  # Ensure in range [0, 1]
+        except Exception as e:
+            logger.error(f"Error computing similarity: {e}")
+            return 0.0
     
-    async def ainvoke(self, *args, **kwargs):
-        logger.error(f"Cannot invoke LLM asynchronously: {self.error_message}")
-        return "Azure authentication failed. Please check your proxy settings and credentials."
-
-def get_app_settings() -> Dict[str, Any]:
-    """
-    Get all application settings.
+    def search_terms(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """
+        Search for terms by text query in ChromaDB collection.
+        
+        Args:
+            query: Search query
+            limit: Maximum number of results
+            
+        Returns:
+            List of matching terms
+        """
+        try:
+            # Get all terms first (ChromaDB doesn't have a direct text search)
+            all_terms = self.get_all_terms()
+            
+            # Filter by query
+            matching_terms = []
+            for term in all_terms:
+                name = term.get("name", "").lower()
+                description = term.get("description", "").lower()
+                query_lower = query.lower()
+                
+                if query_lower in name or query_lower in description:
+                    matching_terms.append(term)
+            
+            # Sort by relevance (exact matches first)
+            matching_terms.sort(key=lambda x: (
+                0 if x.get("name", "").lower().startswith(query.lower()) else 1,
+                0 if query.lower() in x.get("name", "").lower() else 1,
+                x.get("name", "").lower()
+            ))
+            
+            # Limit results
+            return matching_terms[:limit]
+        except Exception as e:
+            logger.error(f"Error searching terms: {e}")
+            return []
     
-    Returns:
-        Dict[str, Any]: Dictionary containing all application settings
-    """
-    env = get_os_env()
-    
-    # Vector database settings - always use ChromaDB
-    vector_db_type = "chroma"  # Force ChromaDB
-    vector_db_settings = {
-        "type": vector_db_type,
-        "persist_dir": env.get("CHROMA_PERSIST_DIR", "./data/chroma_db"),
-        "collection": env.get("CHROMA_COLLECTION", "business_terms")
-    }
-    
-    # PostgreSQL settings
-    pg_settings = {
-        "host": env.get("PG_HOST", "localhost"),
-        "port": int(env.get("PG_PORT", "5432")),
-        "database": env.get("PG_DB", "metadata_db"),
-        "user": env.get("PG_USER", "postgres"),
-        "db_schema": env.get("PG_SCHEMA", "ai_stitching_platform"),  # Changed from 'schema' to 'db_schema'
-        "min_connections": int(env.get("PG_MIN_CONNECTIONS", "2")),
-        "max_connections": int(env.get("PG_MAX_CONNECTIONS", "10"))
-    }
-    
-    # OpenAI model settings
-    model_settings = {
-        "model": env.get("MODEL_NAME", "gpt-4o"),
-        "temperature": float(env.get("TEMPERATURE", "0.3")),
-        "max_tokens": int(env.get("MAX_TOKENS", "2000")),
-        "api_version": env.get("API_VERSION", "2023-05-15"),
-        "azure_endpoint": env.get("AZURE_ENDPOINT", "")
-    }
-    
-    # Proxy settings - default to enabled
-    proxy_settings = {
-        "enabled": env.get("PROXY_ENABLED", "True").lower() in ("true", "t", "1", "yes", "y"),
-        "domain": env.get("HTTPS_PROXY_DOMAIN", "")
-    }
-    
-    # General settings
-    general_settings = {
-        "similarity_threshold": float(env.get("SIMILARITY_THRESHOLD", "0.5")),
-        "monitoring_interval": int(env.get("MONITORING_INTERVAL", "300")),
-        "secured_endpoints": env.get("SECURED_ENDPOINTS", "False").lower() in ("true", "t", "1", "yes", "y")
-    }
-    
-    return {
-        "version": "1.0.0",
-        "vector_database": vector_db_settings,
-        "postgresql": pg_settings,
-        "model": model_settings,
-        "proxy": proxy_settings,
-        "general": general_settings
-    }
+    def delete_all_terms(self) -> int:
+        """
+        Delete all terms in the ChromaDB collection.
+        
+        Returns:
+            int: Number of terms deleted
+        """
+        try:
+            # Get current count
+            all_terms = self.get_all_terms()
+            count = len(all_terms)
+            
+            # Delete all
+            self.collection.delete(where={})
+            return count
+        except Exception as e:
+            logger.error(f"Error deleting all terms: {e}")
+            return 0
+            
+    def health_check(self) -> Dict[str, Any]:
+        """
+        Perform a health check of the ChromaDB vector store.
+        
+        Returns:
+            Dict with health status and details
+        """
+        try:
+            # Try to get collection info and count
+            collection_info = {
+                "name": self.collection_name,
+                "persist_dir": self.persist_dir,
+            }
+            
+            # Get term count
+            terms = self.get_all_terms()
+            
+            return {
+                "status": "healthy",
+                "type": "chroma",
+                "details": {
+                    **collection_info,
+                    "term_count": len(terms)
+                }
+            }
+        except Exception as e:
+            return {
+                "status": "unhealthy",
+                "type": "chroma",
+                "error": str(e)
+            }
