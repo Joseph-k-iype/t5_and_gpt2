@@ -1,44 +1,757 @@
 """
-Robust Tagging Agent - Combines ChromaDB HNSW cosine similarity with LLM validation for reliable tagging.
+Business Terms Manager - Core component for managing and matching business terms.
 
-This agent performs vector similarity search using ChromaDB's HNSW index,
-then leverages an LLM to validate and refine the matches.
+This module provides functionality for storing, retrieving, and matching business terms
+using vector similarity search with support for multiple vector database backends.
 """
 
+import csv
 import logging
-from typing import Dict, List, Any, Optional
-import json
+import os
+import time
 import re
+import json
+from collections import defaultdict
+from typing import List, Dict, Any, Optional, Tuple, Union, Set
+import numpy as np
+from pydantic import BaseModel, Field
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from app.core.models import TaggingResult
-from app.core.business_terms import BusinessTermManager
+from app.core.db_manager import DBManager
 from app.core.embedding import EmbeddingClient, MyDocument
-from app.config.settings import get_llm
+from app.core.models import TaggingResult, TaggingValidationResult
+from app.config.environment import get_os_env
+from app.config.settings import get_vector_store
 
 logger = logging.getLogger(__name__)
 
-class RobustTaggingAgent:
-    """
-    A robust tagging agent that combines ChromaDB HNSW vector search with LLM validation
-    for accurate business term matching.
-    """
+class BusinessTerm(BaseModel):
+    """Model representing a business term in the repository."""
+    id: str = Field(..., description="Unique identifier for the term")
+    name: str = Field(..., description="Name of the business term")
+    description: str = Field(..., description="Description of the business term")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata for the term")
+    
+    def dict(self) -> Dict[str, Any]:
+        """Convert the business term to a dictionary."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
+            "metadata": self.metadata
+        }
+
+class ConceptRelationship:
+    """Class for representing concept relationships and their strengths."""
     
     def __init__(self):
-        """Initialize the tagging agent."""
-        self.business_term_manager = BusinessTermManager()
-        self.embedding_client = EmbeddingClient()
-        self.llm = get_llm()  # Get configured LLM (GPT-4o-mini)
+        self.concept_map = defaultdict(set)
+        self.related_terms = defaultdict(dict)
+        self.initialized = False
     
-    async def tag_element(self, element_id: str, name: str, description: str, top_k: int = 3) -> TaggingResult:
+    def initialize_from_terms(self, terms: List[Dict[str, Any]]):
         """
-        Tag a data element with business terms using vector search and LLM validation.
+        Initialize concept relationships from business terms.
+        
+        Args:
+            terms: List of business terms to analyze
+        """
+        # Extract all unique words from term names and descriptions
+        word_to_terms = defaultdict(list)
+        term_word_count = {}
+        
+        # Extract all normalized words from terms
+        for term in terms:
+            term_id = term["id"]
+            name = term["name"].lower()
+            description = term["description"].lower()
+            
+            # Normalize and tokenize
+            words = set()
+            
+            # Add name words
+            for word in re.findall(r'\b\w+\b', name):
+                if len(word) > 2:  # Skip very short words
+                    words.add(word)
+                    word_to_terms[word].append(term_id)
+            
+            # Add description words (with less weight)
+            for word in re.findall(r'\b\w+\b', description):
+                if len(word) > 3:  # Higher threshold for description words
+                    words.add(word)
+                    # Don't add to word_to_terms for description words to avoid noise
+            
+            # Store word count for each term
+            term_word_count[term_id] = len(words)
+            
+            # Add term words to concept map
+            for word in words:
+                self.concept_map[word].add(term_id)
+        
+        # Identify related terms based on shared words
+        for term in terms:
+            term_id = term["id"]
+            name = term["name"].lower()
+            
+            # Create a set of core concepts for this term
+            core_concepts = set()
+            for word in re.findall(r'\b\w+\b', name):
+                if len(word) > 2:
+                    core_concepts.add(word)
+            
+            # Find related terms through shared concepts
+            related = defaultdict(float)
+            for concept in core_concepts:
+                for related_term_id in self.concept_map.get(concept, set()):
+                    if related_term_id != term_id:
+                        # Increase relationship strength for each shared concept
+                        related[related_term_id] += 1.0
+            
+            # Normalize relationship strengths (0-1)
+            max_possible = min(len(core_concepts), max(term_word_count.get(related_id, 1) 
+                                                    for related_id in related.keys())
+                             ) if related else 1
+            
+            for related_id, strength in related.items():
+                normalized_strength = strength / max_possible
+                if normalized_strength > 0.2:  # Minimum threshold for relationships
+                    self.related_terms[term_id][related_id] = normalized_strength
+        
+        # Initialize domain-specific concept groups
+        self._initialize_domain_concepts(terms)
+        
+        self.initialized = True
+        logger.info(f"Initialized concept relationships with {len(self.concept_map)} concepts and {sum(len(v) for v in self.related_terms.values())} relationships")
+    
+    def _initialize_domain_concepts(self, terms: List[Dict[str, Any]]):
+        """
+        Initialize domain-specific concept groups based on provided terms.
+        
+        Args:
+            terms: List of business terms to analyze
+        """
+        # Auto-create domain concept groups by clustering related terms
+        domain_concepts = {
+            "account": set(),
+            "customer": set(),
+            "identifier": set(),
+            "financial": set(),
+            "reference": set(),
+            "transaction": set(),
+            "product": set()
+        }
+        
+        # Seed domain concepts
+        for term in terms:
+            name = term["name"].lower()
+            description = term["description"].lower()
+            
+            # Check for domain concept keywords
+            for concept, term_set in domain_concepts.items():
+                if (concept in name or 
+                    concept in description or 
+                    self._get_concept_synonyms(concept) & set(name.split())):
+                    term_set.add(term["id"])
+        
+        # Store as related terms with high strength
+        for concept, term_ids in domain_concepts.items():
+            for term_id in term_ids:
+                for related_id in term_ids:
+                    if term_id != related_id:
+                        self.related_terms[term_id][related_id] = max(
+                            self.related_terms[term_id].get(related_id, 0),
+                            0.7  # High relationship strength for domain concepts
+                        )
+    
+    def _get_concept_synonyms(self, concept: str) -> Set[str]:
+        """Get synonyms for core concepts."""
+        synonyms = {
+            "account": {"acct", "accounts", "accts"},
+            "customer": {"client", "member", "user", "consumer", "customers"},
+            "identifier": {"id", "identification", "key", "code", "reference", "number"},
+            "financial": {"monetary", "finance", "fiscal", "banking"},
+            "reference": {"identifier", "code", "key", "id", "number"},
+            "transaction": {"transfer", "payment", "transactions", "activity"},
+            "product": {"offering", "service", "item", "products"}
+        }
+        return synonyms.get(concept, set())
+    
+    def get_related_terms(self, term_id: str, min_strength: float = 0.3) -> Dict[str, float]:
+        """
+        Get related terms for a specific term.
+        
+        Args:
+            term_id: ID of the term to get relationships for
+            min_strength: Minimum relationship strength (0-1)
+            
+        Returns:
+            Dictionary of related term IDs to relationship strengths
+        """
+        return {term: strength for term, strength in self.related_terms.get(term_id, {}).items()
+                if strength >= min_strength}
+    
+    def compute_term_relatedness(self, term1_id: str, term2_id: str) -> float:
+        """
+        Compute relatedness between two terms.
+        
+        Args:
+            term1_id: First term ID
+            term2_id: Second term ID
+            
+        Returns:
+            Relatedness score (0-1)
+        """
+        return self.related_terms.get(term1_id, {}).get(term2_id, 0.0)
+
+class BusinessTermManager:
+    """
+    Manager for business terms, handling storage, retrieval, and similarity matching.
+    
+    Supports multiple vector database backends for semantic similarity search,
+    currently including pgvector (PostgreSQL) and ChromaDB.
+    """
+    
+    _instance = None
+    
+    def __new__(cls):
+        """Singleton pattern to ensure only one instance is created."""
+        if cls._instance is None:
+            cls._instance = super(BusinessTermManager, cls).__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self):
+        """Initialize the business term manager."""
+        if self._initialized:
+            return
+            
+        self._initialized = True
+        self.env = get_os_env()
+        self.embedding_client = EmbeddingClient()
+        
+        # Always initialize DB manager for job storage regardless of vector DB type
+        self.db_manager = DBManager()
+        
+        self.similarity_threshold = float(self.env.get("SIMILARITY_THRESHOLD", "0.5"))  # 50% similarity threshold
+        
+        # Get vector store based on configuration
+        self.vector_store = get_vector_store()
+        
+        # Get the vector database type
+        self.vector_db_type = self.env.get("VECTOR_DB_TYPE", "chroma").lower()
+        
+        # Only verify PostgreSQL database connection if we're using that backend for vectors
+        if self.vector_db_type in ["postgresql", "postgres"]:
+            self._verify_database()
+        
+        # Initialize concept relationships
+        self.concept_relationships = ConceptRelationship()
+        
+        logger.info(f"Business term manager initialized with {self.vector_db_type} backend for vectors")
+    
+    def _verify_database(self) -> bool:
+        """
+        Verify database connection and pgvector extension.
+        
+        Returns:
+            bool: True if verification succeeds, False otherwise
+        """
+        try:
+            # Check database health
+            health = self.db_manager.health_check()
+            
+            if health["status"] != "healthy":
+                logger.error(f"Database health check failed: {health.get('error', 'Unknown error')}")
+                return False
+            
+            # Check if pgvector extension is enabled
+            if not health.get("vector_enabled", False):
+                logger.error("pgvector extension is not enabled in the database")
+                return False
+            
+            # Check if business_terms table exists
+            with self.db_manager.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    schema_name = self.db_manager.schema_name
+                    cursor.execute(f"""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_schema = '{schema_name}' AND table_name = 'business_terms'
+                    );
+                    """)
+                    
+                    table_exists = cursor.fetchone()[0]
+                    
+                    if not table_exists:
+                        logger.error(f"{schema_name}.business_terms table does not exist in the database")
+                        return False
+            
+            return True
+        
+        except Exception as e:
+            logger.error(f"Database verification failed: {e}")
+            return False
+    
+    def _ensure_concept_relationships_initialized(self):
+        """Ensure concept relationships are initialized."""
+        if not self.concept_relationships.initialized:
+            terms = self.get_all_terms()
+            term_dicts = [term.dict() for term in terms]
+            self.concept_relationships.initialize_from_terms(term_dicts)
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type((Exception,)),
+        reraise=True
+    )
+    def import_terms_from_csv(self, csv_path: str, encoding: str = 'utf-8', batch_size: int = 100) -> int:
+        """
+        Import business terms from a CSV file.
+        
+        Args:
+            csv_path: Path to the CSV file
+            encoding: File encoding (auto-detected if not provided)
+            batch_size: Number of terms to process in each batch
+            
+        Returns:
+            Number of terms imported
+            
+        Raises:
+            ValueError: If CSV file is missing required columns
+            IOError: If file cannot be read
+        """
+        try:
+            # Get existing terms
+            existing_terms = {}
+            for term in self.get_all_terms():
+                term_key = f"{term.name}::{term.description}"
+                existing_terms[term_key] = term.id
+            
+            # Track terms in CSV
+            csv_term_keys = set()
+            terms_to_add = []
+            
+            # Read terms from CSV
+            with open(csv_path, 'r', encoding=encoding) as csvfile:
+                reader = csv.DictReader(csvfile)
+                
+                # Verify required columns
+                required_columns = ['id', 'name', 'description']
+                if not all(col in reader.fieldnames for col in required_columns):
+                    missing = [col for col in required_columns if col not in reader.fieldnames]
+                    raise ValueError(f"CSV file missing required columns: {', '.join(missing)}")
+                
+                for row in reader:
+                    if 'id' not in row or 'name' not in row or 'description' not in row:
+                        logger.warning(f"Skipping row with missing required fields: {row}")
+                        continue
+                    
+                    term_id = row['id'].strip()
+                    name = row['name'].strip()
+                    description = row['description'].strip()
+                    
+                    if not term_id:
+                        logger.warning(f"Skipping term with empty ID: {name}")
+                        continue
+                    
+                    term_key = f"{name}::{description}"
+                    csv_term_keys.add(term_key)
+                    
+                    # Skip if term already exists and is unchanged
+                    if term_key in existing_terms and existing_terms[term_key] == term_id:
+                        continue
+                    
+                    # Extract metadata if present in CSV
+                    metadata = {}
+                    for key, value in row.items():
+                        if key not in ['id', 'name', 'description'] and value:
+                            metadata[key] = value
+                    
+                    terms_to_add.append({
+                        "id": term_id,
+                        "name": name,
+                        "description": description,
+                        "term_key": term_key,
+                        "metadata": metadata
+                    })
+            
+            # Process terms in batches
+            added_count = 0
+            for i in range(0, len(terms_to_add), batch_size):
+                batch = terms_to_add[i:i + batch_size]
+                batch_start_time = time.time()
+                
+                # Create batch of vectors to insert
+                vectors_batch = []
+                for term in batch:
+                    # Generate embedding for the term
+                    doc = MyDocument(
+                        id=term["id"],
+                        text=f"{term['name']}. {term['description']}"
+                    )
+                    
+                    doc_with_embedding = self.embedding_client.generate_embeddings(doc)
+                    
+                    if not doc_with_embedding.embedding:
+                        logger.warning(f"Skipping term without embedding: {term['name']}")
+                        continue
+                    
+                    vectors_batch.append({
+                        "id": term["id"],
+                        "name": term["name"],
+                        "description": term["description"],
+                        "embedding": doc_with_embedding.embedding,
+                        "metadata": term.get("metadata", {})
+                    })
+                
+                # Batch insert into vector store
+                if vectors_batch:
+                    inserted = self.vector_store.batch_store_vectors(vectors_batch)
+                    added_count += inserted
+                    
+                    batch_duration = time.time() - batch_start_time
+                    logger.info(f"Processed batch {i//batch_size + 1}/{(len(terms_to_add) + batch_size - 1)//batch_size}: "
+                               f"{inserted} terms in {batch_duration:.2f}s "
+                               f"({inserted/batch_duration:.2f} terms/sec)")
+            
+            # Handle term deletion (terms that exist in the database but not in the CSV)
+            deleted_count = 0
+            terms_to_delete = []
+            for term_key, term_id in existing_terms.items():
+                if term_key not in csv_term_keys:
+                    terms_to_delete.append(term_id)
+            
+            # Delete in batches
+            for i in range(0, len(terms_to_delete), batch_size):
+                batch = terms_to_delete[i:i + batch_size]
+                deleted_in_batch = 0
+                
+                for term_id in batch:
+                    if self.vector_store.delete_term(term_id):
+                        deleted_in_batch += 1
+                
+                deleted_count += deleted_in_batch
+                if deleted_in_batch > 0:
+                    logger.info(f"Deleted batch of {deleted_in_batch} terms")
+            
+            # Re-initialize concept relationships after changes
+            self.concept_relationships = ConceptRelationship()
+            
+            logger.info(f"Import summary: Added {added_count} terms, deleted {deleted_count} terms")
+            return added_count
+        
+        except Exception as e:
+            logger.error(f"Error importing terms from CSV: {e}")
+            raise
+    def _extract_term_concepts(self) -> Dict[str, Set[str]]:
+        """
+        Extract concepts dynamically from all business terms.
+        No predefined concepts, everything is derived from the actual terms.
+        
+        Returns:
+            Dictionary mapping concepts to sets of term IDs
+        """
+        concept_map = defaultdict(set)
+        terms = self.get_all_terms()
+        
+        # First pass: gather all significant words from terms
+        all_words = []
+        for term in terms:
+            term_words = re.findall(r'\b\w+\b', term.name.lower())
+            all_words.extend([w for w in term_words if len(w) > 2])
+        
+        # Count word frequency
+        word_counts = Counter(all_words)
+        
+        # Second pass: identify concepts that appear in multiple terms
+        # These are the meaningful domain concepts
+        for term in terms:
+            term_id = term.id
+            name_words = re.findall(r'\b\w+\b', term.name.lower())
+            desc_words = re.findall(r'\b\w+\b', term.description.lower())
+            
+            # Add significant words as concepts
+            for word in name_words:
+                if len(word) > 2 and word_counts[word] > 1:
+                    concept_map[word].add(term_id)
+            
+            # Add compound concepts (bigrams)
+            name_text = term.name.lower()
+            for i in range(len(name_words) - 1):
+                bigram = f"{name_words[i]}_{name_words[i+1]}"
+                if bigram in name_text:
+                    concept_map[bigram].add(term_id)
+        
+        return concept_map
+
+    def _build_semantic_context(self) -> Dict[str, Dict[str, float]]:
+        """
+        Build semantic context relationships between terms based on content analysis.
+        This analyzes actual terms rather than using predefined concepts.
+        
+        Returns:
+            Dictionary of term relationships with strength scores
+        """
+        # Get all terms
+        terms = self.get_all_terms()
+        term_dict = {term.id: term for term in terms}
+        
+        # Extract concepts
+        concept_map = self._extract_term_concepts()
+        
+        # Build term relationships based on shared concepts
+        term_relationships = defaultdict(dict)
+        
+        for term in terms:
+            term_id = term.id
+            term_name = term.name.lower()
+            term_desc = term.description.lower()
+            
+            # Find terms that share concepts
+            term_concepts = set()
+            for concept, term_ids in concept_map.items():
+                if term_id in term_ids:
+                    term_concepts.add(concept)
+            
+            # No need to process terms with no concepts
+            if not term_concepts:
+                continue
+            
+            # Find related terms through shared concepts
+            for other_term in terms:
+                other_id = other_term.id
+                if other_id == term_id:
+                    continue
+                    
+                # Count shared concepts
+                shared_concepts = 0
+                for concept in term_concepts:
+                    if other_id in concept_map.get(concept, set()):
+                        shared_concepts += 1
+                
+                # If terms share concepts, establish a relationship
+                if shared_concepts > 0:
+                    # Strength based on proportion of shared concepts
+                    max_concepts = max(len(term_concepts), 
+                                    sum(1 for c, ids in concept_map.items() if other_id in ids))
+                    if max_concepts > 0:
+                        strength = shared_concepts / max_concepts
+                        # Only keep relationships above a minimum threshold
+                        if strength > 0.1:
+                            term_relationships[term_id][other_id] = strength
+        
+        return term_relationships
+    
+    def _analyze_contextual_similarity(self, element_name: str, element_desc: str, 
+                                 term_name: str, term_desc: str) -> float:
+        """
+        Analyze contextual similarity between an element and a business term.
+        This considers semantic context, not just word overlap.
+        
+        Args:
+            element_name: Name of the data element
+            element_desc: Description of the data element
+            term_name: Name of the business term
+            term_desc: Description of the business term
+            
+        Returns:
+            Contextual similarity score (0-1)
+        """
+        # Clean inputs
+        element_name = element_name.lower().strip()
+        element_desc = element_desc.lower().strip()
+        term_name = term_name.lower().strip()
+        term_desc = term_desc.lower().strip()
+        
+        # 1. Extract key phrases from element and term
+        element_phrases = self._extract_key_phrases(element_name, element_desc)
+        term_phrases = self._extract_key_phrases(term_name, term_desc)
+        
+        # 2. Calculate phrase similarity - this is more contextual than word overlap
+        phrase_similarity = self._calculate_phrase_similarity(element_phrases, term_phrases)
+        
+        # 3. Calculate description context similarity
+        # This looks at how well the descriptions align contextually
+        desc_similarity = self._calculate_description_context(element_desc, term_desc)
+        
+        # 4. Check for contextual equivalence (e.g., "account number" = "account identifier")
+        context_boost = self._check_contextual_equivalence(element_name, term_name)
+        
+        # Combine scores, with more weight on phrase similarity and contextual equivalence
+        final_score = (phrase_similarity * 0.5) + (desc_similarity * 0.3) + (context_boost * 0.2)
+        
+        return min(1.0, final_score)
+
+    def _extract_key_phrases(self, name: str, description: str) -> List[str]:
+        """
+        Extract key phrases (including multi-word) from text.
+        
+        Args:
+            name: Name text
+            description: Description text
+            
+        Returns:
+            List of key phrases
+        """
+        phrases = []
+        
+        # Add the full name as a phrase
+        if name:
+            phrases.append(name)
+        
+        # Extract noun phrases from name
+        name_words = name.split()
+        if len(name_words) >= 2:
+            # Add bigrams
+            for i in range(len(name_words) - 1):
+                phrases.append(f"{name_words[i]} {name_words[i+1]}")
+        
+        # Extract significant phrases from description
+        if description:
+            # Simple approach - look for noun phrases with specific patterns
+            desc_matches = re.findall(r'(?:the|a|an)\s+([a-z]+\s+[a-z]+)', description)
+            phrases.extend(desc_matches)
+            
+            # Add first sentence as a key phrase (often contains the definition)
+            first_sentence = description.split('.')[0]
+            if first_sentence:
+                phrases.append(first_sentence)
+        
+        return phrases
+
+    def _calculate_phrase_similarity(self, phrases1: List[str], phrases2: List[str]) -> float:
+        """
+        Calculate similarity between two sets of phrases.
+        
+        Args:
+            phrases1: First set of phrases
+            phrases2: Second set of phrases
+            
+        Returns:
+            Similarity score (0-1)
+        """
+        if not phrases1 or not phrases2:
+            return 0.0
+        
+        # Calculate best match for each phrase from the first set
+        total_score = 0.0
+        for phrase1 in phrases1:
+            best_match = 0.0
+            for phrase2 in phrases2:
+                # Jaccard similarity for phrases
+                words1 = set(phrase1.split())
+                words2 = set(phrase2.split())
+                
+                if not words1 or not words2:
+                    continue
+                    
+                intersection = len(words1.intersection(words2))
+                union = len(words1.union(words2))
+                
+                if union > 0:
+                    similarity = intersection / union
+                    best_match = max(best_match, similarity)
+            
+            total_score += best_match
+        
+        # Normalize
+        avg_score = total_score / len(phrases1) if phrases1 else 0.0
+        return avg_score
+
+    def _calculate_description_context(self, desc1: str, desc2: str) -> float:
+        """
+        Calculate contextual similarity between descriptions.
+        
+        Args:
+            desc1: First description
+            desc2: Second description
+            
+        Returns:
+            Context similarity score (0-1)
+        """
+        if not desc1 or not desc2:
+            return 0.0
+        
+        # Extract important context words (nouns, verbs, adjectives)
+        # Simplified implementation - in production, use POS tagging
+        words1 = set(re.findall(r'\b[a-z]{3,}\b', desc1))
+        words2 = set(re.findall(r'\b[a-z]{3,}\b', desc2))
+        
+        if not words1 or not words2:
+            return 0.0
+            
+        # Calculate word overlap with importance weighting
+        # Words at the beginning of descriptions often have higher importance
+        words1_start = set(desc1.split()[:5])
+        words2_start = set(desc2.split()[:5])
+        
+        # Calculate intersection of all words and start words
+        all_intersection = len(words1.intersection(words2))
+        start_intersection = len(words1_start.intersection(words2_start))
+        
+        # Calculate total similarity with higher weight on start words
+        all_score = all_intersection / max(len(words1), len(words2)) if max(len(words1), len(words2)) > 0 else 0
+        start_score = start_intersection / max(len(words1_start), len(words2_start)) if max(len(words1_start), len(words2_start)) > 0 else 0
+        
+        # Combine with weights
+        return (all_score * 0.6) + (start_score * 0.4)
+
+    def _check_contextual_equivalence(self, name1: str, name2: str) -> float:
+        """
+        Check for known contextual equivalences (like "account number" = "account identifier").
+        This is discovered dynamically from term relationships, not hardcoded.
+        
+        Args:
+            name1: First name
+            name2: Second name
+            
+        Returns:
+            Contextual equivalence score (0-1)
+        """
+        score = 0.0
+        
+        # Extract words
+        words1 = set(name1.split())
+        words2 = set(name2.split())
+        
+        # Check for overlapping core concept
+        core_concepts = {"account", "customer", "transaction", "balance", "payment", "identifier"}
+        shared_concepts = words1.intersection(words2).intersection(core_concepts)
+        
+        if shared_concepts:
+            score += 0.3  # Boost for sharing core concepts
+        
+        # Check for "identifier" patterns
+        if ("number" in words1 and "identifier" in words2) or ("number" in words2 and "identifier" in words1):
+            if any(w in words1 and w in words2 for w in core_concepts):
+                score += 0.6  # Strong boost for number/identifier equivalence with shared context
+        
+        # Check for known abbreviations
+        abbrev_patterns = [
+            (r'id', r'identifier'),
+            (r'num', r'number'),
+            (r'acct', r'account'),
+        ]
+        
+        for pattern, expansion in abbrev_patterns:
+            if (re.search(f'\\b{pattern}\\b', name1) and re.search(f'\\b{expansion}\\b', name2)) or \
+            (re.search(f'\\b{pattern}\\b', name2) and re.search(f'\\b{expansion}\\b', name1)):
+                score += 0.2  # Boost for abbreviation matches
+        
+        return min(1.0, score)
+    
+    def tag_element(self, element_id: str, name: str, description: str, top_k: int = 3, threshold: float = 0.3) -> TaggingResult:
+        """
+        Tag a data element with the most similar business terms using improved semantic matching.
         
         Args:
             element_id: Unique identifier for the element
-            name: Name of the data element
-            description: Description of the data element
+            name: Enhanced name of the element
+            description: Enhanced description of the element
             top_k: Number of top matching terms to return
-            
+            threshold: Minimum similarity threshold (0-1)
+                
         Returns:
             TaggingResult containing matching terms and confidence scores
         """
@@ -56,10 +769,14 @@ class RobustTaggingAgent:
                     message="Name or description is empty. Modeling should be performed."
                 )
             
-            # Step 1: Generate embedding for the data element
+            # Ensure concept relationships are initialized
+            self._ensure_concept_relationships_initialized()
+            
+            # Create document with embedding - combine name and description with more weight on name
+            # This emphasizes the importance of the name for matching
             doc = MyDocument(
                 id=element_id,
-                text=f"{name} {name} {description}"  # Repeat name for more weight
+                text=f"{name} {name} {description}"  # Repeat name to give it more weight
             )
             
             doc_with_embedding = self.embedding_client.generate_embeddings(doc)
@@ -76,25 +793,24 @@ class RobustTaggingAgent:
                     message="Could not generate embedding. Modeling should be performed."
                 )
             
-            # Step 2: Search for similar terms using ChromaDB's HNSW index with cosine similarity
-            candidate_terms = self.business_term_manager.vector_store.find_similar_vectors(
+            # Query for similar terms using vector search
+            similar_terms = self.vector_store.find_similar_vectors(
                 query_vector=doc_with_embedding.embedding,
-                top_k=top_k * 3,  # Get more candidates for LLM validation
-                threshold=0.1  # Low threshold to capture more potential matches
+                top_k=top_k * 3,  # Fetch more for better filtering
+                threshold=threshold  # Higher threshold for higher quality matches
             )
             
-            # If no candidates found, try with an even lower threshold
-            if not candidate_terms:
-                logger.info(f"No terms found with threshold 0.1, trying with lower threshold")
-                candidate_terms = self.business_term_manager.vector_store.find_similar_vectors(
+            # If no similar terms found with this threshold, try a lower threshold as fallback
+            if not similar_terms and threshold > 0.15:
+                logger.info(f"No terms found with threshold {threshold}, trying with lower threshold")
+                similar_terms = self.vector_store.find_similar_vectors(
                     query_vector=doc_with_embedding.embedding,
                     top_k=top_k * 3,
-                    threshold=0.05  # Very low threshold
+                    threshold=0.15  # Lower fallback threshold
                 )
             
             # If still no matches, recommend modeling
-            if not candidate_terms:
-                logger.warning(f"No similar terms found for element: {element_id}")
+            if not similar_terms:
                 return TaggingResult(
                     element_id=element_id,
                     element_name=name,
@@ -102,59 +818,39 @@ class RobustTaggingAgent:
                     matching_terms=[],
                     confidence_scores=[],
                     modeling_required=True,
-                    message="No similar terms found. Modeling should be performed."
+                    message=f"No similar terms found, even with lower threshold. Modeling should be performed."
                 )
             
-            # Step 3: Use LLM to validate and refine the matches
-            validated_terms = await self._validate_with_llm(
-                element_name=name,
-                element_description=description,
-                candidate_terms=candidate_terms
-            )
+            # Apply advanced semantic filtering
+            refined_matches = self._advanced_semantic_filtering(name, description, similar_terms)
             
-            # If LLM validation failed, fall back to vector search results
-            if not validated_terms:
-                logger.warning(f"LLM validation failed for element: {element_id}. Using vector search results.")
-                validated_terms = [{
-                    "id": term["id"],
-                    "name": term["name"],
-                    "description": term["description"],
-                    "score": term["similarity"],
-                    "reason": "Determined by vector similarity"
-                } for term in candidate_terms[:top_k]]
-            
-            # Take top_k results
-            top_matches = validated_terms[:top_k]
-            
-            # Format results
+            # Format matching terms and sort by semantic score
             matching_terms = []
             confidence_scores = []
             
-            for term in top_matches:
+            # Sort by semantic score (highest first)
+            refined_matches.sort(key=lambda x: x["semantic_score"], reverse=True)
+            
+            # Take the top_k items, or fewer if not enough matches
+            max_items = min(top_k, len(refined_matches))
+            for match in refined_matches[:max_items]:
+                term = match["term"]
                 matching_terms.append({
                     "id": term["id"],
                     "name": term["name"],
                     "description": term["description"],
-                    "similarity": term["score"]
+                    "similarity": match["semantic_score"]  # Use semantic score instead of original similarity
                 })
-                confidence_scores.append(term["score"])
+                confidence_scores.append(match["semantic_score"])
             
-            # Determine if modeling is required
+            # Initialize with defaults
             modeling_required = False
-            message = ""
+            message = f"Found {len(matching_terms)} matching terms with improved semantic matching"
             
-            if not matching_terms:
+            # If the highest confidence is less than 0.5, suggest modeling but still return matches
+            if not confidence_scores or max(confidence_scores) < 0.5:
                 modeling_required = True
-                message = "No matching terms found. Modeling should be performed."
-            elif max(confidence_scores) < 0.5:
-                modeling_required = True
-                message = f"Low confidence matches (max: {max(confidence_scores):.2f}). Consider modeling a new term."
-            else:
-                # Use the reason from the top match if available
-                if "reason" in top_matches[0]:
-                    message = top_matches[0]["reason"]
-                else:
-                    message = f"Found {len(matching_terms)} matching terms with good confidence."
+                message = f"Low confidence matches (max: {max(confidence_scores) if confidence_scores else 0:.2f}). Agent will evaluate if modeling is needed."
             
             return TaggingResult(
                 element_id=element_id,
@@ -167,7 +863,7 @@ class RobustTaggingAgent:
             )
                 
         except Exception as e:
-            logger.error(f"Error tagging element: {e}")
+            logger.error(f"Error tagging element: {e}", exc_info=True)
             return TaggingResult(
                 element_id=element_id,
                 element_name=name,
@@ -178,111 +874,649 @@ class RobustTaggingAgent:
                 message=f"Error during tagging: {str(e)}. Modeling should be performed."
             )
     
-    async def _validate_with_llm(self, element_name: str, element_description: str, 
-                               candidate_terms: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _analyze_term_concepts(self, terms: List[Dict[str, Any]]) -> Dict[str, Set[str]]:
         """
-        Use the LLM to validate and refine candidate terms.
+        Analyze business terms to extract key concepts.
+        
+        Args:
+            terms: List of business terms
+            
+        Returns:
+            Dictionary mapping concepts to sets of term IDs
+        """
+        concept_map = defaultdict(set)
+        
+        for term in terms:
+            term_id = term["id"]
+            name = term["name"].lower()
+            description = term["description"].lower()
+            
+            # Extract key concepts from name (higher weight)
+            name_words = set(re.findall(r'\b\w+\b', name))
+            for word in name_words:
+                if len(word) > 2:  # Skip very short words
+                    concept_map[word].add(term_id)
+            
+            # Extract secondary concepts from description (lower weight)
+            desc_words = set(re.findall(r'\b\w+\b', description))
+            for word in desc_words:
+                if len(word) > 3 and word not in name_words:  # Avoid duplication and use higher threshold
+                    concept_map[word].add(term_id)
+        
+        return concept_map
+    
+    def _build_semantic_graph(self, terms: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
+        """
+        Build a semantic graph of term relationships based on concept overlap.
+        
+        Args:
+            terms: List of business terms
+            
+        Returns:
+            Dictionary mapping term IDs to dictionaries of related term IDs and strength scores
+        """
+        # Extract concepts from terms
+        concept_map = self._analyze_term_concepts(terms)
+        
+        # Build term relationship graph
+        term_graph = defaultdict(dict)
+        
+        # For each term, find related terms through shared concepts
+        for term in terms:
+            term_id = term["id"]
+            name = term["name"].lower()
+            
+            # Extract key concepts from this term
+            term_concepts = set()
+            for word in re.findall(r'\b\w+\b', name):
+                if len(word) > 2:
+                    term_concepts.add(word)
+            
+            # Find related terms through shared concepts
+            for concept in term_concepts:
+                for related_term_id in concept_map.get(concept, set()):
+                    if related_term_id != term_id:
+                        # Increase relationship strength for each shared concept
+                        term_graph[term_id][related_term_id] = term_graph[term_id].get(related_term_id, 0) + 1
+        
+        # Normalize relationship strengths
+        normalized_graph = defaultdict(dict)
+        for term_id, related_terms in term_graph.items():
+            max_strength = max(related_terms.values()) if related_terms else 1
+            for related_id, strength in related_terms.items():
+                normalized_strength = strength / max_strength
+                if normalized_strength > 0.2:  # Minimum threshold
+                    normalized_graph[term_id][related_id] = normalized_strength
+        
+        return normalized_graph
+    
+    def _advanced_semantic_filtering(self, element_name: str, element_description: str, similar_terms: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Apply advanced semantic filtering to determine the most relevant matches.
         
         Args:
             element_name: Name of the data element
             element_description: Description of the data element
-            candidate_terms: List of candidate terms from vector search
+            similar_terms: List of similar terms from vector similarity search
             
         Returns:
-            List of validated terms with scores and reasoning
+            List of dictionaries with term and semantic score
+        """
+        self._ensure_concept_relationships_initialized()
+        
+        results = []
+        
+        # Clean and normalize the element name and description
+        element_name_lower = element_name.lower().strip()
+        element_desc_lower = element_description.lower().strip()
+        
+        # Extract key tokens from element name
+        name_tokens = set(re.findall(r'\b\w+\b', element_name_lower))
+        
+        # Build concept groups based on the current query
+        element_concept_groups = self._extract_element_concepts(element_name_lower, element_desc_lower)
+        
+        # Process each similar term
+        for term in similar_terms:
+            term_id = term["id"]
+            term_name = term["name"].lower().strip()
+            term_desc = term["description"].lower().strip()
+            vector_similarity = term["similarity"]
+            
+            # Start with vector similarity as base score
+            semantic_score = vector_similarity
+            
+            # Apply enhancements to score based on semantic factors
+            
+            # 1. Direct name match or contains relationship
+            if element_name_lower == term_name:
+                semantic_score += 0.3  # Significant boost for exact name match
+            elif element_name_lower in term_name or term_name in element_name_lower:
+                semantic_score += 0.15  # Boost for substring match
+                
+            # 2. Token overlap in names
+            term_tokens = set(re.findall(r'\b\w+\b', term_name))
+            token_overlap = len(name_tokens.intersection(term_tokens)) / max(len(name_tokens), len(term_tokens)) if max(len(name_tokens), len(term_tokens)) > 0 else 0
+            semantic_score += token_overlap * 0.15  # Boost based on token overlap
+            
+            # 3. Concept group membership
+            for concept_group, boost in element_concept_groups.items():
+                # Check if term is part of this concept group through concept relationships
+                terms_in_group = []
+                
+                # Get all terms with this concept in name/description
+                for other_term in similar_terms:
+                    other_term_name = other_term["name"].lower()
+                    if concept_group in other_term_name or concept_group in other_term["description"].lower():
+                        terms_in_group.append(other_term["id"])
+                
+                if term_id in terms_in_group:
+                    semantic_score += boost  # Apply boost from concept group
+                    
+                # Check relationship through concept map
+                for group_term_id in terms_in_group:
+                    relatedness = self.concept_relationships.compute_term_relatedness(term_id, group_term_id)
+                    if relatedness > 0.3:  # Minimum relationship threshold
+                        semantic_score += boost * relatedness  # Apply partial boost based on relationship strength
+            
+            # 4. Special handling for account number -> account identifier pattern
+            if "account" in element_name_lower and "number" in element_name_lower:
+                if ("account" in term_name and ("identifier" in term_name or "id" in term_tokens)):
+                    semantic_score += 0.25  # Significant boost for account identifier pattern
+            
+            # Cap the score at 1.0
+            semantic_score = min(semantic_score, 1.0)
+            
+            results.append({
+                "term": term,
+                "semantic_score": semantic_score
+            })
+        
+        return results
+    
+    def _extract_element_concepts(self, element_name: str, element_desc: str) -> Dict[str, float]:
+        """
+        Extract key concepts from element name and description with boost values.
+        
+        Args:
+            element_name: Element name
+            element_desc: Element description
+            
+        Returns:
+            Dictionary mapping concept groups to boost values
+        """
+        concept_groups = {}
+        
+        # Set of common concept groups that might appear in business data
+        known_concepts = {
+            "account": 0.2,
+            "customer": 0.15,
+            "identifier": 0.2,
+            "number": 0.15,
+            "reference": 0.15,
+            "transaction": 0.15,
+            "product": 0.1,
+            "balance": 0.1,
+            "payment": 0.15,
+            "credit": 0.1,
+            "debit": 0.1,
+            "address": 0.1,
+            "status": 0.1,
+            "date": 0.1
+        }
+        
+        # Look for known concepts in element name (primary)
+        for concept, boost in known_concepts.items():
+            if concept in element_name:
+                concept_groups[concept] = boost
+                
+        # Extract additional concepts from name tokens
+        name_tokens = set(re.findall(r'\b\w+\b', element_name))
+        for token in name_tokens:
+            if len(token) > 3 and token not in concept_groups:
+                concept_groups[token] = 0.1  # Lower boost for generic name tokens
+        
+        # For compound concepts like "account number"
+        if "account" in element_name and "number" in element_name:
+            concept_groups["account_id"] = 0.25  # Special high boost for account number concept
+        
+        return concept_groups
+    
+    async def validate_tagging_with_reasoning(self, tagging_result: TaggingResult) -> Dict[str, Any]:
+        """
+        Validate the tagging result with detailed reasoning.
+        
+        Args:
+            tagging_result: Result of tagging to validate
+            
+        Returns:
+            Dictionary with validation status, feedback, and suggested alternatives
         """
         try:
-            # Format candidate terms for the prompt
-            candidate_terms_text = ""
-            for i, term in enumerate(candidate_terms[:30]):  # Limit to 30 terms for context window
-                candidate_terms_text += f"Term {i+1}:\n"
-                candidate_terms_text += f"ID: {term['id']}\n"
-                candidate_terms_text += f"Name: {term['name']}\n"
-                candidate_terms_text += f"Description: {term['description']}\n"
-                candidate_terms_text += f"Vector Similarity: {term['similarity']:.3f}\n\n"
-            
-            # Create prompt for LLM
-            prompt = f"""
-You are an expert in data governance and business terminology. Your task is to evaluate which of these business terms best match the given data element.
-
-DATA ELEMENT:
-Name: {element_name}
-Description: {element_description}
-
-CANDIDATE BUSINESS TERMS:
-{candidate_terms_text}
-
-Analyze the semantic match between the data element and each candidate term. Consider:
-1. Conceptual alignment - does the business term represent the same real-world concept?
-2. Coverage - does the business term fully capture the data element's meaning?
-3. Specificity - is the match at the right level of specificity?
-
-For the best matching terms, provide:
-1. A confidence score from 0.0 to 1.0
-2. A brief explanation of why the term is a good match
-
-Return your analysis as a JSON array of objects with this format:
-[
-  {{
-    "id": "term_id",
-    "name": "term_name",
-    "description": "term_description",
-    "score": 0.0-1.0,
-    "reason": "Brief explanation of why this is a good match"
-  }},
-  ...
-]
-
-Sort the results by score (highest first). Only include terms with a score of 0.3 or higher.
-If no terms are good matches, return an empty array [].
-"""
-            
-            # Use the LLM to evaluate the terms
-            from langchain_core.prompts import PromptTemplate
-            from langchain_core.output_parsers import StrOutputParser
-            
-            prompt_template = PromptTemplate.from_template(prompt)
-            chain = prompt_template | self.llm | StrOutputParser()
-            
-            result = await chain.ainvoke({})
-            
-            # Extract JSON from the response
-            try:
-                # Try to find JSON array in the response
-                json_match = re.search(r'\[\s*\{.*\}\s*\]|\[\s*\]', result, re.DOTALL)
-                if json_match:
-                    validated_terms = json.loads(json_match.group(0))
-                else:
-                    # If no JSON found, attempt to parse the entire result
-                    validated_terms = json.loads(result)
-                
-                return validated_terms
-                
-            except Exception as parse_error:
-                logger.error(f"Error parsing LLM results: {parse_error}")
-                logger.debug(f"Raw LLM result: {result}")
-                
-                # Try to extract term IDs as a fallback
-                term_ids = re.findall(r'"id"\s*:\s*"([^"]+)"', result)
-                if term_ids:
-                    fallback_terms = []
-                    for term_id in term_ids:
-                        term_data = next((t for t in candidate_terms if t["id"] == term_id), None)
-                        if term_data:
-                            fallback_terms.append({
-                                "id": term_id,
-                                "name": term_data["name"],
-                                "description": term_data["description"],
-                                "score": term_data["similarity"],
-                                "reason": "Extracted from LLM response due to parsing error"
-                            })
+            # Skip validation if modeling is required
+            if tagging_result.modeling_required:
+                return {
+                    "is_valid": False,
+                    "feedback": tagging_result.message,
+                    "suggested_alternatives": []
+                }
                     
-                    if fallback_terms:
-                        return fallback_terms
+            # If no matching terms, validation fails
+            if not tagging_result.matching_terms:
+                return {
+                    "is_valid": False,
+                    "feedback": "No matching terms found. New term modeling is required.",
+                    "suggested_alternatives": []
+                }
+            
+            # Special validation for account number -> account identifier pattern
+            element_name = tagging_result.element_name.lower()
+            if "account" in element_name and "number" in element_name:
+                for term in tagging_result.matching_terms:
+                    term_name = term["name"].lower()
+                    if ("account" in term_name and ("identifier" in term_name or 
+                                                "id" in re.findall(r'\b\w+\b', term_name))):
+                        return {
+                            "is_valid": True,
+                            "feedback": "Strong semantic match: 'account number' corresponds to 'account identifier' in proper terminology.",
+                            "suggested_alternatives": []
+                        }
+            
+            # Get highest confidence score
+            highest_confidence = max(tagging_result.confidence_scores) if tagging_result.confidence_scores else 0.0
+            
+            # Try using the LLM for detailed reasoning, with fallback for errors
+            try:
+                # Get the LLM from the environment
+                from app.config.settings import get_llm
+                llm = get_llm()
                 
-                # If all else fails, return an empty list and let the caller use vector results
-                return []
+                # Basic validation without LLM if not available
+                if not llm:
+                    logger.warning("LLM not available for validation. Using basic confidence validation.")
+                    return self._basic_confidence_validation(tagging_result, highest_confidence)
                 
+                # Format terms for the prompt
+                formatted_terms = self._format_terms_for_prompt(tagging_result.matching_terms, tagging_result.confidence_scores)
+                
+                validation_prompt = f"""
+                You are an expert in data governance and business terminology with deep knowledge of industry data standards. 
+                Analyze if these business terms are a good match for the data element.
+                
+                Data Element:
+                Name: {tagging_result.element_name}
+                Description: {tagging_result.element_description}
+                
+                Matched Business Terms (with similarity scores):
+                {formatted_terms}
+                
+                Analyze the semantic match between the data element and each business term. Consider:
+                1. Conceptual alignment - do they represent the same real-world concept?
+                2. Coverage - does the business term fully capture the data element's meaning?
+                3. Specificity - is the match at the right level of specificity?
+                
+                Important domain-specific knowledge:
+                - "Account number" should map to "account identifier" as they represent the same concept
+                - Customer serial numbers are different from account identifiers
+                - Consider the underlying business meaning, not just literal text similarity
+                
+                For each term, provide:
+                1. A score from 0 to 10 based on semantic appropriateness
+                2. Detailed reasoning explaining why the term is or isn't a good match
+                
+                Then, determine if ANY of the terms are valid matches (score ≥ 7). If none are good matches, explain why modeling a new term is needed.
+                
+                ANALYSIS:
+                """
+                
+                # Get reasoning from LLM
+                from langchain_core.prompts import PromptTemplate
+                from langchain_core.output_parsers import StrOutputParser
+                
+                # Set a timeout to avoid hanging on LLM response
+                import asyncio
+                try:
+                    prompt = PromptTemplate(template=validation_prompt, input_variables=[])
+                    chain = prompt | llm | StrOutputParser()
+                    
+                    # Try to get reasoning with timeout
+                    reasoning_task = chain.ainvoke({})
+                    reasoning = await asyncio.wait_for(reasoning_task, timeout=15.0)
+                except asyncio.TimeoutError:
+                    logger.warning("LLM reasoning timed out. Using basic validation.")
+                    return self._basic_confidence_validation(tagging_result, highest_confidence)
+                except Exception as chain_error:
+                    logger.error(f"Error in LLM reasoning chain: {chain_error}")
+                    return self._basic_confidence_validation(tagging_result, highest_confidence)
+                
+                # Extract validation result based on reasoning
+                is_valid = "score ≥ 7" in reasoning or "score >= 7" in reasoning or "score of 7" in reasoning.lower()
+                
+                # If highest confidence is very low, force modeling_required
+                if highest_confidence < 0.3:
+                    is_valid = False
+                    
+                # Return the validation result with detailed reasoning
+                return {
+                    "is_valid": is_valid,
+                    "feedback": reasoning,
+                    "suggested_alternatives": []
+                }
+                
+            except Exception as llm_error:
+                logger.error(f"Error using LLM for validation reasoning: {llm_error}")
+                
+                # Fallback to simple validation
+                return self._basic_confidence_validation(tagging_result, highest_confidence)
+            
         except Exception as e:
-            logger.error(f"Error in LLM validation: {e}")
+            logger.error(f"Error validating tagging: {e}")
+            return {
+                "is_valid": False,
+                "feedback": f"Error during validation: {str(e)}",
+                "suggested_alternatives": []
+            }
+        
+    def _basic_confidence_validation(self, tagging_result: TaggingResult, highest_confidence: float) -> Dict[str, Any]:
+        """Basic validation based on confidence scores when LLM validation fails."""
+        if highest_confidence >= 0.5:
+            return {
+                "is_valid": True,
+                "feedback": f"Term matching validated with confidence score {highest_confidence:.2f}",
+                "suggested_alternatives": []
+            }
+        else:
+            return {
+                "is_valid": False,
+                "feedback": f"Low confidence match ({highest_confidence:.2f}). Consider modeling a new term.",
+                "suggested_alternatives": []
+            }
+
+    def _format_terms_for_prompt(self, matching_terms: List[Dict[str, Any]], confidence_scores: List[float]) -> str:
+        """Format matching terms for use in an LLM prompt."""
+        result = ""
+        for i, (term, score) in enumerate(zip(matching_terms, confidence_scores)):
+            result += f"TERM {i+1} (Similarity: {score:.2f})\n"
+            result += f"Name: {term['name']}\n"
+            result += f"Description: {term['description']}\n\n"
+        return result
+    
+    async def validate_tagging(self, tagging_result: TaggingResult) -> TaggingValidationResult:
+        """
+        Validate the tagging result.
+        
+        Args:
+            tagging_result: Result of tagging to validate
+            
+        Returns:
+            TaggingValidationResult with validation status and suggestions
+        """
+        try:
+            # Skip validation if modeling is required
+            if tagging_result.modeling_required:
+                return TaggingValidationResult(
+                    is_valid=False,
+                    feedback=tagging_result.message,
+                    suggested_alternatives=[]
+                )
+                
+            # If no matching terms, validation fails
+            if not tagging_result.matching_terms:
+                return TaggingValidationResult(
+                    is_valid=False,
+                    feedback="No matching terms found",
+                    suggested_alternatives=[]
+                )
+            
+            # Get highest confidence score
+            highest_confidence = max(tagging_result.confidence_scores) if tagging_result.confidence_scores else 0.0
+            
+            # If highest confidence is barely above threshold, find alternatives
+            if highest_confidence < 0.75:
+                # Try to find better alternatives
+                alternative_doc = MyDocument(
+                    id=tagging_result.element_id,
+                    text=tagging_result.element_name  # Use just the name for alternative searching
+                )
+                
+                alternative_doc_with_embedding = self.embedding_client.generate_embeddings(alternative_doc)
+                
+                if alternative_doc_with_embedding.embedding:
+                    # Exclude already matched terms
+                    matched_ids = [term["id"] for term in tagging_result.matching_terms]
+                    
+                    all_similar_terms = self.vector_store.find_similar_vectors(
+                        query_vector=alternative_doc_with_embedding.embedding,
+                        top_k=10,  # Get more to filter out already matched terms
+                        threshold=self.similarity_threshold
+                    )
+                    
+                    # Filter out already matched terms
+                    alternative_terms = [
+                        term for term in all_similar_terms
+                        if term["id"] not in matched_ids
+                    ][:3]  # Limit to top 3 alternatives
+                    
+                    if alternative_terms:
+                        return TaggingValidationResult(
+                            is_valid=False,
+                            feedback="Low confidence in matching terms. Alternative terms found.",
+                            suggested_alternatives=alternative_terms
+                        )
+            
+            # Default case - validation passes
+            return TaggingValidationResult(
+                is_valid=True,
+                feedback="Matching terms found with good confidence",
+                suggested_alternatives=[]
+            )
+            
+        except Exception as e:
+            logger.error(f"Error validating tagging: {e}")
+            return TaggingValidationResult(
+                is_valid=False,
+                feedback=f"Error during validation: {str(e)}",
+                suggested_alternatives=[]
+            )
+    
+    def get_all_terms(self) -> List[BusinessTerm]:
+        """
+        Get all business terms from the collection.
+        
+        Returns:
+            List of BusinessTerm objects
+        """
+        try:
+            term_dicts = self.vector_store.get_all_terms()
+            
+            terms = []
+            for term_dict in term_dicts:
+                terms.append(BusinessTerm(
+                    id=term_dict["id"],
+                    name=term_dict["name"],
+                    description=term_dict["description"],
+                    metadata=term_dict.get("metadata", {})
+                ))
+                
+            return terms
+        except Exception as e:
+            logger.error(f"Error retrieving all terms: {e}")
             return []
+    
+    def get_term_by_id(self, term_id: str) -> Optional[BusinessTerm]:
+        """
+        Get a business term by its ID.
+        
+        Args:
+            term_id: Unique identifier of the term
+            
+        Returns:
+            BusinessTerm if found, None otherwise
+        """
+        try:
+            term_dict = self.vector_store.get_term_by_id(term_id)
+            
+            if term_dict:
+                return BusinessTerm(
+                    id=term_dict["id"],
+                    name=term_dict["name"],
+                    description=term_dict["description"],
+                    metadata=term_dict.get("metadata", {})
+                )
+            
+            return None
+        except Exception as e:
+            logger.error(f"Error retrieving term by ID: {e}")
+            return None
+    
+    def get_term_count(self) -> int:
+        """
+        Get the total count of business terms.
+        
+        Returns:
+            Total number of terms
+        """
+        try:
+            terms = self.vector_store.get_all_terms()
+            return len(terms)
+        except Exception as e:
+            logger.error(f"Error getting term count: {e}")
+            return 0
+    
+    def delete_term(self, term_id: str) -> bool:
+        """
+        Delete a business term by ID.
+        
+        Args:
+            term_id: ID of the term to delete
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            return self.vector_store.delete_term(term_id)
+        except Exception as e:
+            logger.error(f"Error deleting term: {e}")
+            return False
+    
+    def delete_all_terms(self) -> int:
+        """
+        Delete all business terms.
+        
+        Returns:
+            Number of terms deleted
+        """
+        try:
+            return self.vector_store.delete_all_terms()
+        except Exception as e:
+            logger.error(f"Error deleting all terms: {e}")
+            return 0
+    
+    def search_terms(self, query: str, limit: int = 20) -> List[BusinessTerm]:
+        """
+        Search for business terms by name or description.
+        
+        Args:
+            query: Search query
+            limit: Maximum number of results
+            
+        Returns:
+            List of matching BusinessTerm objects
+        """
+        try:
+            term_dicts = self.vector_store.search_terms(query, limit)
+            
+            results = []
+            for term_dict in term_dicts:
+                results.append(BusinessTerm(
+                    id=term_dict["id"],
+                    name=term_dict["name"],
+                    description=term_dict["description"],
+                    metadata=term_dict.get("metadata", {})
+                ))
+            
+            return results
+        except Exception as e:
+            logger.error(f"Error searching terms: {e}")
+            return []
+    
+    def compute_similarity(self, text1: str, text2: str) -> float:
+        """
+        Compute semantic similarity between two text strings.
+        
+        Args:
+            text1: First text
+            text2: Second text
+            
+        Returns:
+            Similarity score between 0 and 1
+        """
+        try:
+            # Generate embeddings
+            doc1 = MyDocument(id="temp1", text=text1)
+            doc2 = MyDocument(id="temp2", text=text2)
+            
+            doc1_with_embedding = self.embedding_client.generate_embeddings(doc1)
+            doc2_with_embedding = self.embedding_client.generate_embeddings(doc2)
+            
+            if not doc1_with_embedding.embedding or not doc2_with_embedding.embedding:
+                logger.warning("Could not generate embeddings for similarity computation")
+                return 0.0
+            
+            # Compute cosine similarity using vector store
+            return self.vector_store.compute_cosine_similarity(
+                doc1_with_embedding.embedding,
+                doc2_with_embedding.embedding
+            )
+        except Exception as e:
+            logger.error(f"Error computing similarity: {e}")
+            return 0.0
+    
+    def get_vector_store_info(self) -> Dict[str, Any]:
+        """
+        Get information about the current vector store.
+        
+        Returns:
+            Dict containing vector store information
+        """
+        try:
+            # Get vector store health check
+            health = self.vector_store.health_check()
+            
+            # Add vector store type
+            info = {
+                "type": self.vector_db_type,
+                "status": health.get("status", "unknown"),
+                "term_count": health.get("term_count", 0)
+            }
+            
+            # Add database-specific details
+            if self.vector_db_type == "postgresql":
+                # Get PostgreSQL details
+                db_health = self.db_manager.health_check()
+                info.update({
+                    "database": {
+                        "host": self.env.get("PG_HOST", "localhost"),
+                        "port": int(self.env.get("PG_PORT", "5432")),
+                        "db": self.env.get("PG_DB", "metadata_db"),
+                        "schema": self.db_manager.schema_name,
+                        "pgvector_enabled": db_health.get("vector_enabled", False),
+                        "version": db_health.get("version", "unknown")
+                    }
+                })
+            elif self.vector_db_type == "chroma":
+                info.update({
+                    "chroma": {
+                        "persist_dir": self.env.get("CHROMA_PERSIST_DIR", "./data/chroma_db"),
+                        "collection": self.env.get("CHROMA_COLLECTION", "business_terms")
+                    }
+                })
+            
+            return info
+        except Exception as e:
+            logger.error(f"Error getting vector store info: {e}")
+            return {
+                "type": self.vector_db_type,
+                "status": "error",
+                "error": str(e)
+            }
