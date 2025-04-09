@@ -1,439 +1,288 @@
 """
-Tagging API - Routes for tagging data elements with business terms.
+Robust Tagging Agent - Combines ChromaDB HNSW cosine similarity with LLM validation for reliable tagging.
 
-Uses ChromaDB's HNSW cosine similarity search combined with LLM validation
-for accurate business term tagging.
+This agent performs vector similarity search using ChromaDB's HNSW index,
+then leverages an LLM to validate and refine the matches.
 """
 
-import os
 import logging
-import uuid
-import chardet
 from typing import Dict, List, Any, Optional
-from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks, Depends, Query
-from pydantic import BaseModel
+import json
+import re
 
+from app.core.models import TaggingResult
 from app.core.business_terms import BusinessTermManager
-from app.core.db_manager import DBManager
-from app.core.models import EnhancedDataElement, TaggingRequest, TaggingResponse
-from app.agents.robust_tagging_agent import RobustTaggingAgent
+from app.core.embedding import EmbeddingClient, MyDocument
+from app.config.settings import get_llm
 
 logger = logging.getLogger(__name__)
 
-# Create API router
-router = APIRouter(prefix="/api/v1", tags=["business-terms"])
-
-# In-memory cache for tagging jobs
-tagging_jobs: Dict[str, Dict[str, Any]] = {}
-
-# Business Term Manager instance
-business_term_manager = BusinessTermManager()
-
-# Robust Tagging Agent instance
-tagging_agent = RobustTaggingAgent()
-
-def get_db():
-    """Get the database manager."""
-    return DBManager()
-
-class ImportResponse(BaseModel):
-    """Response model for importing business terms."""
-    success: bool
-    message: str
-    imported_count: int
-
-@router.post("/terms/import", response_model=ImportResponse)
-async def import_business_terms(
-    file: UploadFile = File(...),
-    background_tasks: BackgroundTasks = None
-):
+class RobustTaggingAgent:
     """
-    Import business terms from a CSV file.
-    The CSV must have 'id', 'name', and 'description' columns.
+    A robust tagging agent that combines ChromaDB HNSW vector search with LLM validation
+    for accurate business term matching.
+    """
     
-    Additional columns will be imported as metadata.
-    """
-    try:
-        # Create a unique temp file path
-        temp_file_path = f"temp_{uuid.uuid4()}.csv"
+    def __init__(self):
+        """Initialize the tagging agent."""
+        self.business_term_manager = BusinessTermManager()
+        self.embedding_client = EmbeddingClient()
+        self.llm = get_llm()  # Get configured LLM (GPT-4o-mini)
+    
+    async def tag_element(self, element_id: str, name: str, description: str, top_k: int = 3) -> TaggingResult:
+        """
+        Tag a data element with business terms using vector search and LLM validation.
         
-        # Read and save the uploaded file
-        file_content = await file.read()
-        
-        # Detect the encoding
-        detection = chardet.detect(file_content)
-        encoding = detection['encoding'] or 'utf-8'
-        logger.info(f"Detected CSV encoding: {encoding} with confidence {detection['confidence']}")
-        
-        # Save the file with the detected encoding
-        with open(temp_file_path, "wb") as buffer:
-            buffer.write(file_content)
-        
-        # Import terms with encoding information
+        Args:
+            element_id: Unique identifier for the element
+            name: Name of the data element
+            description: Description of the data element
+            top_k: Number of top matching terms to return
+            
+        Returns:
+            TaggingResult containing matching terms and confidence scores
+        """
         try:
-            logger.info(f"Importing terms from {file.filename} with encoding {encoding}")
-            import_count = business_term_manager.import_terms_from_csv(temp_file_path, encoding=encoding)
+            # Validate inputs
+            if not name or not description:
+                logger.warning(f"Empty name or description for element: {element_id}")
+                return TaggingResult(
+                    element_id=element_id,
+                    element_name=name or "",
+                    element_description=description or "",
+                    matching_terms=[],
+                    confidence_scores=[],
+                    modeling_required=True,
+                    message="Name or description is empty. Modeling should be performed."
+                )
             
-            # Clean up the temp file
-            try:
-                if background_tasks:
-                    background_tasks.add_task(os.unlink, temp_file_path)
+            # Step 1: Generate embedding for the data element
+            doc = MyDocument(
+                id=element_id,
+                text=f"{name} {name} {description}"  # Repeat name for more weight
+            )
+            
+            doc_with_embedding = self.embedding_client.generate_embeddings(doc)
+            
+            if not doc_with_embedding.embedding:
+                logger.warning(f"Could not generate embedding for element: {name}")
+                return TaggingResult(
+                    element_id=element_id,
+                    element_name=name,
+                    element_description=description,
+                    matching_terms=[],
+                    confidence_scores=[],
+                    modeling_required=True,
+                    message="Could not generate embedding. Modeling should be performed."
+                )
+            
+            # Step 2: Search for similar terms using ChromaDB's HNSW index with cosine similarity
+            candidate_terms = self.business_term_manager.vector_store.find_similar_vectors(
+                query_vector=doc_with_embedding.embedding,
+                top_k=top_k * 3,  # Get more candidates for LLM validation
+                threshold=0.1  # Low threshold to capture more potential matches
+            )
+            
+            # If no candidates found, try with an even lower threshold
+            if not candidate_terms:
+                logger.info(f"No terms found with threshold 0.1, trying with lower threshold")
+                candidate_terms = self.business_term_manager.vector_store.find_similar_vectors(
+                    query_vector=doc_with_embedding.embedding,
+                    top_k=top_k * 3,
+                    threshold=0.05  # Very low threshold
+                )
+            
+            # If still no matches, recommend modeling
+            if not candidate_terms:
+                logger.warning(f"No similar terms found for element: {element_id}")
+                return TaggingResult(
+                    element_id=element_id,
+                    element_name=name,
+                    element_description=description,
+                    matching_terms=[],
+                    confidence_scores=[],
+                    modeling_required=True,
+                    message="No similar terms found. Modeling should be performed."
+                )
+            
+            # Step 3: Use LLM to validate and refine the matches
+            validated_terms = await self._validate_with_llm(
+                element_name=name,
+                element_description=description,
+                candidate_terms=candidate_terms
+            )
+            
+            # If LLM validation failed, fall back to vector search results
+            if not validated_terms:
+                logger.warning(f"LLM validation failed for element: {element_id}. Using vector search results.")
+                validated_terms = [{
+                    "id": term["id"],
+                    "name": term["name"],
+                    "description": term["description"],
+                    "score": term["similarity"],
+                    "reason": "Determined by vector similarity"
+                } for term in candidate_terms[:top_k]]
+            
+            # Take top_k results
+            top_matches = validated_terms[:top_k]
+            
+            # Format results
+            matching_terms = []
+            confidence_scores = []
+            
+            for term in top_matches:
+                matching_terms.append({
+                    "id": term["id"],
+                    "name": term["name"],
+                    "description": term["description"],
+                    "similarity": term["score"]
+                })
+                confidence_scores.append(term["score"])
+            
+            # Determine if modeling is required
+            modeling_required = False
+            message = ""
+            
+            if not matching_terms:
+                modeling_required = True
+                message = "No matching terms found. Modeling should be performed."
+            elif max(confidence_scores) < 0.5:
+                modeling_required = True
+                message = f"Low confidence matches (max: {max(confidence_scores):.2f}). Consider modeling a new term."
+            else:
+                # Use the reason from the top match if available
+                if "reason" in top_matches[0]:
+                    message = top_matches[0]["reason"]
                 else:
-                    os.unlink(temp_file_path)
-            except Exception as e:
-                logger.warning(f"Error deleting temporary file: {e}")
+                    message = f"Found {len(matching_terms)} matching terms with good confidence."
             
-            # Re-initialize the tagging agent (optional)
-            global tagging_agent
-            tagging_agent = RobustTaggingAgent()
-            
-            return ImportResponse(
-                success=True,
-                message=f"Successfully imported {import_count} business terms from {file.filename}",
-                imported_count=import_count
+            return TaggingResult(
+                element_id=element_id,
+                element_name=name,
+                element_description=description,
+                matching_terms=matching_terms,
+                confidence_scores=confidence_scores,
+                modeling_required=modeling_required,
+                message=message
             )
+                
         except Exception as e:
-            logger.error(f"Error importing terms: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Error importing terms: {str(e)}")
+            logger.error(f"Error tagging element: {e}")
+            return TaggingResult(
+                element_id=element_id,
+                element_name=name,
+                element_description=description,
+                matching_terms=[],
+                confidence_scores=[],
+                modeling_required=True,
+                message=f"Error during tagging: {str(e)}. Modeling should be performed."
+            )
+    
+    async def _validate_with_llm(self, element_name: str, element_description: str, 
+                               candidate_terms: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Use the LLM to validate and refine candidate terms.
+        
+        Args:
+            element_name: Name of the data element
+            element_description: Description of the data element
+            candidate_terms: List of candidate terms from vector search
             
-    except Exception as e:
-        logger.error(f"Error processing file upload: {str(e)}")
-        # Clean up the temp file in case of error
-        if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
+        Returns:
+            List of validated terms with scores and reasoning
+        """
+        try:
+            # Format candidate terms for the prompt
+            candidate_terms_text = ""
+            for i, term in enumerate(candidate_terms[:30]):  # Limit to 30 terms for context window
+                candidate_terms_text += f"Term {i+1}:\n"
+                candidate_terms_text += f"ID: {term['id']}\n"
+                candidate_terms_text += f"Name: {term['name']}\n"
+                candidate_terms_text += f"Description: {term['description']}\n"
+                candidate_terms_text += f"Vector Similarity: {term['similarity']:.3f}\n\n"
+            
+            # Create prompt for LLM
+            prompt = f"""
+You are an expert in data governance and business terminology. Your task is to evaluate which of these business terms best match the given data element.
+
+DATA ELEMENT:
+Name: {element_name}
+Description: {element_description}
+
+CANDIDATE BUSINESS TERMS:
+{candidate_terms_text}
+
+Analyze the semantic match between the data element and each candidate term. Consider:
+1. Conceptual alignment - does the business term represent the same real-world concept?
+2. Coverage - does the business term fully capture the data element's meaning?
+3. Specificity - is the match at the right level of specificity?
+
+For the best matching terms, provide:
+1. A confidence score from 0.0 to 1.0
+2. A brief explanation of why the term is a good match
+
+Return your analysis as a JSON array of objects with this format:
+[
+  {{
+    "id": "term_id",
+    "name": "term_name",
+    "description": "term_description",
+    "score": 0.0-1.0,
+    "reason": "Brief explanation of why this is a good match"
+  }},
+  ...
+]
+
+Sort the results by score (highest first). Only include terms with a score of 0.3 or higher.
+If no terms are good matches, return an empty array [].
+"""
+            
+            # Use the LLM to evaluate the terms
+            from langchain_core.prompts import PromptTemplate
+            from langchain_core.output_parsers import StrOutputParser
+            
+            prompt_template = PromptTemplate.from_template(prompt)
+            chain = prompt_template | self.llm | StrOutputParser()
+            
+            result = await chain.ainvoke({})
+            
+            # Extract JSON from the response
             try:
-                os.unlink(temp_file_path)
-            except Exception as cleanup_error:
-                logger.warning(f"Error cleaning up temporary file: {cleanup_error}")
-        
-        raise HTTPException(status_code=500, detail=f"Error importing terms: {str(e)}")
-
-@router.post("/tag", response_model=TaggingResponse)
-async def tag_element(
-    request: TaggingRequest,
-    db: DBManager = Depends(get_db)
-):
-    """
-    Tag a data element with business terms using ChromaDB HNSW vector search with 
-    cosine similarity, followed by LLM validation.
-    
-    Args:
-        request: The tagging request containing element information
-        db: Database manager
-        
-    Returns:
-        TaggingResponse with matching terms and confidence scores
-    """
-    try:
-        # Check if we already have this job in memory
-        request_id = request.element_id
-        if request_id in tagging_jobs:
-            logger.info(f"Returning existing tagging result from memory for {request_id}")
-            job = tagging_jobs[request_id]
-            return TaggingResponse(
-                request_id=request_id,
-                element_name=job["tagging_result"]["element_name"],
-                matching_terms=job["tagging_result"]["matching_terms"],
-                confidence_scores=job["tagging_result"]["confidence_scores"],
-                validation_result=job.get("validation_result"),
-                modeling_required=job["tagging_result"]["modeling_required"],
-                message=job["tagging_result"]["message"]
-            )
-        
-        # Check if job exists in database
-        db_job = db.get_job(request_id)
-        if db_job is not None and db_job["job_type"] == "tagging":
-            logger.info(f"Returning existing tagging result from database for {request_id}")
-            
-            # Load into memory cache
-            tagging_jobs[request_id] = db_job["data"]
-            
-            return TaggingResponse(
-                request_id=request_id,
-                element_name=db_job["data"]["tagging_result"]["element_name"],
-                matching_terms=db_job["data"]["tagging_result"]["matching_terms"],
-                confidence_scores=db_job["data"]["tagging_result"]["confidence_scores"],
-                validation_result=db_job["data"].get("validation_result"),
-                modeling_required=db_job["data"]["tagging_result"]["modeling_required"],
-                message=db_job["data"]["tagging_result"]["message"]
-            )
-        
-        # Use the robust tagging agent
-        logger.info(f"Tagging element: {request.element_id} - {request.element_name}")
-        tagging_result = await tagging_agent.tag_element(
-            element_id=request.element_id,
-            name=request.element_name,
-            description=request.element_description,
-            top_k=request.top_k
-        )
-        
-        # Create validation result
-        validation_result = {
-            "is_valid": not tagging_result.modeling_required and bool(tagging_result.matching_terms),
-            "feedback": tagging_result.message,
-            "suggested_alternatives": []
-        }
-        
-        # Prepare the job data
-        job_data = {
-            "tagging_result": tagging_result.dict(),
-            "validation_result": validation_result
-        }
-        
-        # Store the result in memory
-        tagging_jobs[request_id] = job_data
-        
-        # Store in database
-        db.store_job(
-            job_id=request_id,
-            job_type="tagging",
-            status="completed",
-            data=job_data
-        )
-        
-        return TaggingResponse(
-            request_id=request_id,
-            element_name=request.element_name,
-            matching_terms=tagging_result.matching_terms,
-            confidence_scores=tagging_result.confidence_scores,
-            validation_result=validation_result,
-            modeling_required=tagging_result.modeling_required,
-            message=tagging_result.message
-        )
-    except Exception as e:
-        logger.error(f"Error tagging element: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error tagging element: {str(e)}")
-
-@router.post("/tag/enhanced", response_model=TaggingResponse)
-async def tag_enhanced_element(
-    element: EnhancedDataElement,
-    db: DBManager = Depends(get_db)
-):
-    """
-    Tag an enhanced data element with business terms.
-    
-    Args:
-        element: Enhanced data element from the enhancement process
-        db: Database manager
-        
-    Returns:
-        TaggingResponse with matching terms and confidence scores
-    """
-    try:
-        # Create a tagging request from the enhanced element
-        request = TaggingRequest(
-            element_id=element.id,
-            element_name=element.enhanced_name,
-            element_description=element.enhanced_description,
-            top_k=3
-        )
-        
-        # Use the main tagging endpoint
-        return await tag_element(request, db)
-    except Exception as e:
-        logger.error(f"Error tagging enhanced element: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error tagging element: {str(e)}")
-
-@router.get("/tag/{element_id}", response_model=TaggingResponse)
-async def get_tagging_result(
-    element_id: str,
-    db: DBManager = Depends(get_db)
-):
-    """
-    Get the result of a tagging request.
-    
-    Args:
-        element_id: ID of the tagged element
-        db: Database manager
-        
-    Returns:
-        TaggingResponse with matching terms and confidence scores
-    """
-    # Check in memory first
-    if element_id in tagging_jobs:
-        job = tagging_jobs[element_id]
-        tagging_result = job["tagging_result"]
-        validation_result = job.get("validation_result")
-        
-        return TaggingResponse(
-            request_id=element_id,
-            element_name=tagging_result["element_name"],
-            matching_terms=tagging_result["matching_terms"],
-            confidence_scores=tagging_result["confidence_scores"],
-            validation_result=validation_result,
-            modeling_required=tagging_result.get("modeling_required", False),
-            message=tagging_result.get("message", "")
-        )
-    
-    # Check in database
-    db_job = db.get_job(element_id)
-    if db_job is None or db_job["job_type"] != "tagging":
-        raise HTTPException(status_code=404, detail=f"Tagging result {element_id} not found")
-    
-    # Load into memory cache
-    tagging_jobs[element_id] = db_job["data"]
-    
-    tagging_result = db_job["data"]["tagging_result"]
-    validation_result = db_job["data"].get("validation_result")
-    
-    return TaggingResponse(
-        request_id=element_id,
-        element_name=tagging_result["element_name"],
-        matching_terms=tagging_result["matching_terms"],
-        confidence_scores=tagging_result["confidence_scores"],
-        validation_result=validation_result,
-        modeling_required=tagging_result.get("modeling_required", False),
-        message=tagging_result.get("message", "")
-    )
-
-@router.delete("/tag/{element_id}", response_model=Dict[str, Any])
-async def delete_tagging_result(
-    element_id: str,
-    db: DBManager = Depends(get_db)
-):
-    """
-    Delete a tagging result from the system.
-    
-    Args:
-        element_id: ID of the tagged element to delete
-        db: Database manager
-        
-    Returns:
-        Dictionary with deletion message
-    """
-    # Check if the job exists
-    if element_id not in tagging_jobs and db.get_job(element_id) is None:
-        raise HTTPException(status_code=404, detail=f"Tagging result {element_id} not found")
-    
-    # Delete from memory
-    if element_id in tagging_jobs:
-        del tagging_jobs[element_id]
-    
-    # Delete from database
-    db.delete_job(element_id)
-    
-    return {"message": f"Tagging result for {element_id} deleted successfully"}
-
-@router.get("/terms", response_model=List[Dict[str, Any]])
-async def get_all_terms(
-    limit: int = Query(100, ge=1, le=1000, description="Maximum number of terms to return"),
-    offset: int = Query(0, ge=0, description="Offset for pagination")
-):
-    """
-    Get all business terms in the collection with pagination.
-    
-    Args:
-        limit: Maximum number of terms to return (1-1000)
-        offset: Offset for pagination
-        
-    Returns:
-        List of business terms
-    """
-    try:
-        terms = business_term_manager.get_all_terms()
-        
-        # Apply pagination
-        paginated_terms = terms[offset:offset + limit]
-        
-        return [term.dict() for term in paginated_terms]
-    except Exception as e:
-        logger.error(f"Error getting terms: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error getting terms: {str(e)}")
-
-@router.get("/terms/search", response_model=List[Dict[str, Any]])
-async def search_terms(
-    query: str = Query(..., description="Search query"),
-    limit: int = Query(20, ge=1, le=100, description="Maximum number of results")
-):
-    """
-    Search for business terms by name or description.
-    
-    Args:
-        query: Search query
-        limit: Maximum number of results to return
-        
-    Returns:
-        List of matching business terms
-    """
-    try:
-        terms = business_term_manager.search_terms(query, limit)
-        return [term.dict() for term in terms]
-    except Exception as e:
-        logger.error(f"Error searching terms: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error searching terms: {str(e)}")
-
-@router.get("/terms/{term_id}", response_model=Dict[str, Any])
-async def get_term(term_id: str):
-    """
-    Get a business term by its ID.
-    
-    Args:
-        term_id: ID of the business term
-        
-    Returns:
-        Business term details
-    """
-    try:
-        term = business_term_manager.get_term_by_id(term_id)
-        if not term:
-            raise HTTPException(status_code=404, detail=f"Term {term_id} not found")
-        return term.dict()
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting term: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error getting term: {str(e)}")
-
-@router.post("/tag/batch", response_model=List[str])
-async def batch_tag_elements(
-    requests: List[TaggingRequest], 
-    background_tasks: BackgroundTasks,
-    db: DBManager = Depends(get_db)
-):
-    """
-    Tag multiple data elements in batch mode.
-    Returns a list of element IDs that can be used to check status.
-    
-    Args:
-        requests: List of tagging requests
-        background_tasks: FastAPI background tasks
-        db: Database manager
-        
-    Returns:
-        List of element IDs for tracking
-    """
-    element_ids = []
-    
-    for request in requests:
-        element_id = request.element_id
-        element_ids.append(element_id)
-        
-        # Skip if already processed
-        if element_id in tagging_jobs:
-            continue
-            
-        # Check if already in database
-        db_job = db.get_job(element_id)
-        if db_job is not None and db_job["job_type"] == "tagging":
-            # Load into memory cache
-            tagging_jobs[element_id] = db_job["data"]
-            continue
-        
-        # Add tagging task to background tasks
-        background_tasks.add_task(tag_element, request, db)
-    
-    return element_ids
-
-@router.get("/terms/count", response_model=Dict[str, int])
-async def get_term_count():
-    """
-    Get the total count of business terms in the repository.
-    
-    Returns:
-        Dictionary with the count of business terms
-    """
-    try:
-        count = business_term_manager.get_term_count()
-        return {"count": count}
-    except Exception as e:
-        logger.error(f"Error getting term count: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error getting term count: {str(e)}")
+                # Try to find JSON array in the response
+                json_match = re.search(r'\[\s*\{.*\}\s*\]|\[\s*\]', result, re.DOTALL)
+                if json_match:
+                    validated_terms = json.loads(json_match.group(0))
+                else:
+                    # If no JSON found, attempt to parse the entire result
+                    validated_terms = json.loads(result)
+                
+                return validated_terms
+                
+            except Exception as parse_error:
+                logger.error(f"Error parsing LLM results: {parse_error}")
+                logger.debug(f"Raw LLM result: {result}")
+                
+                # Try to extract term IDs as a fallback
+                term_ids = re.findall(r'"id"\s*:\s*"([^"]+)"', result)
+                if term_ids:
+                    fallback_terms = []
+                    for term_id in term_ids:
+                        term_data = next((t for t in candidate_terms if t["id"] == term_id), None)
+                        if term_data:
+                            fallback_terms.append({
+                                "id": term_id,
+                                "name": term_data["name"],
+                                "description": term_data["description"],
+                                "score": term_data["similarity"],
+                                "reason": "Extracted from LLM response due to parsing error"
+                            })
+                    
+                    if fallback_terms:
+                        return fallback_terms
+                
+                # If all else fails, return an empty list and let the caller use vector results
+                return []
+                
+        except Exception as e:
+            logger.error(f"Error in LLM validation: {e}")
+            return []
