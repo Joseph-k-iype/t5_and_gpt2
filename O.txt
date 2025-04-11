@@ -1,332 +1,185 @@
-"""
-Robust Tagging Agent - Combines ChromaDB HNSW cosine similarity with LLM validation for reliable tagging.
-
-This agent performs vector similarity search using ChromaDB's HNSW index,
-then leverages an LLM to validate and refine the matches.
-"""
-
-import logging
-from typing import Dict, List, Any, Optional
-import json
+from typing import Dict, Any, List
 import re
-import asyncio
-
-from app.core.models import TaggingResult
-from app.core.business_terms import BusinessTermManager
-from app.core.embedding import EmbeddingClient, MyDocument
-from app.config.settings import get_llm
+import logging
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_openai import AzureChatOpenAI
+from app.core.models import DataElement, ValidationResult, DataQualityStatus
+from app.utils.iso_standards import ISO11179Validator
 
 logger = logging.getLogger(__name__)
 
-class RobustTaggingAgent:
-    """
-    A robust tagging agent that combines ChromaDB HNSW vector search with LLM validation
-    for accurate business term matching.
-    """
+class ValidatorAgent:
     
-    def __init__(self):
-        """Initialize the tagging agent."""
-        self.business_term_manager = BusinessTermManager()
-        self.embedding_client = EmbeddingClient()
-        self.llm = get_llm()  # Get configured LLM (GPT-4o-mini)
+    def __init__(self, llm: AzureChatOpenAI):
+        self.llm = llm
+        self.iso_validator = ISO11179Validator()
+        self._setup_validation_chain()
     
-    async def tag_element(self, element_id: str, name: str, description: str, top_k: int = 3) -> TaggingResult:
-        """
-        Tag a data element with business terms using vector search and LLM validation.
+    def _setup_validation_chain(self):
+        template = """
+        You are an expert in data governance and ISO/IEC 11179 metadata standards. Your task is to evaluate the 
+        given data element name and description against these standards to determine the quality of the metadata.
         
-        Args:
-            element_id: Unique identifier for the element
-            name: Name of the data element
-            description: Description of the data element
-            top_k: Number of top matching terms to return
-            
-        Returns:
-            TaggingResult containing matching terms and confidence scores
+        ISO/IEC 11179 standards for data element names (adapted for business-friendly format):
+        - Names MUST be in lowercase with spaces between words.
+        - Names MUST NOT use technical formatting like camelCase, snake_case or PascalCase
+        - Names MUST NOT contain underscores, hyphens, or special characters
+        - Names should be clear, unambiguous and self-describing
+        - Names should not use acronyms or abbreviations unless they are universally understood
+        - Names should be concise yet descriptive
+        - Names should use standard terminology in the domain
+        - Names should use business language that non-technical users can understand
+        
+        ISO/IEC 11179 standards for data element descriptions:
+        - Descriptions should clearly define what the data element represents
+        - Descriptions should be complete, covering the concept fully
+        - Descriptions should be precise, specific enough to distinguish from other concepts
+        - Descriptions should be objective and factual, not opinion-based
+        - Descriptions should use complete sentences with proper grammar and punctuation
+        - Descriptions should be written in business language, not technical jargon
+        
+        Data Element to Evaluate:
+        - ID: {id}
+        - Current Name: {name}
+        - Current Description: {description}
+        - Example (if provided): {example}
+        - Related Process Name (if provided): {process_name}
+        - Related Process Description (if provided): {process_description}
+        
+        Based on the ISO/IEC 11179 standards, evaluate the quality of this data element.
+        
+        Provide your evaluation as follows:
+        1. Is the name valid according to ISO/IEC 11179 standards? [yes/no]
+        2. Detailed feedback on the name
+        3. Is the description valid according to the standards? [yes/no]
+        4. Detailed feedback on the description
+        5. Overall quality status: "GOOD", "NEEDS_IMPROVEMENT" or "POOR"
+        6. List of specific improvements that could be made
+        
+        Important: Do not use any special formatting characters like asterisks (**) in your response.
+        Please be thorough and specific in your feedback, as it will be used to improve the data element.
         """
+        
+        self.validation_prompt = PromptTemplate(
+            input_variables=["id", "name", "description", "example", "process_name", "process_description"],
+            template=template)
+        self.validation_chain = self.validation_prompt | self.llm | StrOutputParser()
+        
+    def _parse_validation_result(self, result: str) -> ValidationResult:
+        lines = result.strip().split("\n")
+        is_name_valid = False
+        is_desc_valid = False
+        
+        # Check for name validity - more robustly
+        for line in lines:
+            if line.startswith("1.") and "yes" in line.lower():
+                is_name_valid = True
+                break
+        
+        # Check for description validity - more robustly
+        for line in lines:
+            if line.startswith("3.") and "yes" in line.lower():
+                is_desc_valid = True
+                break
+        
+        # Determine quality status more robustly
+        quality_status = DataQualityStatus.POOR  # Default
+        for line in lines:
+            if "Overall quality status:" in line or "5." in line:
+                if "GOOD" in line:
+                    quality_status = DataQualityStatus.GOOD
+                elif "NEEDS_IMPROVEMENT" in line or "NEEDS IMPROVEMENT" in line:
+                    quality_status = DataQualityStatus.NEEDS_IMPROVEMENT
+                break
+                
+        # If both name and description are valid but status wasn't explicitly stated as GOOD,
+        # default to NEEDS_IMPROVEMENT rather than POOR
+        if is_name_valid and is_desc_valid and quality_status == DataQualityStatus.POOR:
+            quality_status = DataQualityStatus.NEEDS_IMPROVEMENT
+        
+        # Extract improvement suggestions more robustly
+        improvements = []
+        improvements_section = False
+        for line in lines:
+            if "6. List of specific improvements" in line or line.startswith("6."):
+                improvements_section = True
+                continue
+            if improvements_section and line.strip() and (line.strip().startswith("- ") or 
+                                                        (line[0].isdigit() and ". " in line) or 
+                                                        line.startswith("* ")):
+                # Clean any ** characters that might appear
+                clean_line = line.replace("**", "").strip()
+                improvements.append(clean_line)
+        
+        # Extract feedback more comprehensively
+        feedback_lines = []
+        for i, line in enumerate(lines):
+            if i > 0 and ("Detailed feedback on the name" in line or 
+                          "Detailed feedback on the description" in line or
+                          line.startswith("2.") or line.startswith("4.")):
+                # Clean any ** characters that might appear
+                clean_line = line.replace("**", "").strip()
+                feedback_lines.append(clean_line)
+            elif i > 0 and line.strip() and not line.startswith("1.") and not line.startswith("3.") and not line.startswith("5.") and not line.startswith("6."):
+                # Only add non-empty, non-header lines
+                if improvements_section and (line.strip().startswith("- ") or 
+                                           (line[0].isdigit() and ". " in line) or
+                                           line.startswith("* ")):
+                    # Skip lines that are already in improvements
+                    continue
+                # Clean any ** characters that might appear
+                clean_line = line.replace("**", "").strip()
+                if clean_line:
+                    feedback_lines.append(clean_line)
+        
+        feedback = "\n".join(feedback_lines)
+        
+        return ValidationResult(
+            is_valid=is_name_valid and is_desc_valid,
+            quality_status=quality_status, 
+            feedback=feedback,
+            suggested_improvements=improvements
+        )
+    
+    async def validate(self, data_element: DataElement) -> ValidationResult:
+        """Validate a data element against ISO/IEC 11179 standards."""
         try:
-            # Validate inputs
-            if not name or not description:
-                logger.warning(f"Empty name or description for element: {element_id}")
-                return TaggingResult(
-                    element_id=element_id,
-                    element_name=name or "",
-                    element_description=description or "",
-                    matching_terms=[],
-                    confidence_scores=[],
-                    modeling_required=True,
-                    message="Name or description is empty. Modeling should be performed."
-                )
+            # First, perform basic validation
+            name_valid, name_feedback = self.iso_validator.validate_name(data_element.existing_name)
+            desc_valid, desc_feedback = self.iso_validator.validate_description(data_element.existing_description)
             
-            # Step 1: Generate embedding for the data element
-            doc = MyDocument(
-                id=element_id,
-                text=f"{name} {name} {description}"  # Repeat name for more weight
-            )
-            
-            doc_with_embedding = self.embedding_client.generate_embeddings(doc)
-            
-            if not doc_with_embedding.embedding:
-                logger.warning(f"Could not generate embedding for element: {name}")
-                return TaggingResult(
-                    element_id=element_id,
-                    element_name=name,
-                    element_description=description,
-                    matching_terms=[],
-                    confidence_scores=[],
-                    modeling_required=True,
-                    message="Could not generate embedding. Modeling should be performed."
-                )
-            
-            # Step 2: Search for similar terms using ChromaDB's HNSW index with cosine similarity
-            candidate_terms = self.business_term_manager.vector_store.find_similar_vectors(
-                query_vector=doc_with_embedding.embedding,
-                top_k=top_k * 3,  # Get more candidates for LLM validation
-                threshold=0.1  # Low threshold to capture more potential matches
-            )
-            
-            # If no candidates found, try with an even lower threshold
-            if not candidate_terms:
-                logger.info(f"No terms found with threshold 0.1, trying with lower threshold")
-                candidate_terms = self.business_term_manager.vector_store.find_similar_vectors(
-                    query_vector=doc_with_embedding.embedding,
-                    top_k=top_k * 3,
-                    threshold=0.05  # Very low threshold
-                )
-            
-            # If still no matches, recommend modeling
-            if not candidate_terms:
-                logger.warning(f"No similar terms found for element: {element_id}")
-                return TaggingResult(
-                    element_id=element_id,
-                    element_name=name,
-                    element_description=description,
-                    matching_terms=[],
-                    confidence_scores=[],
-                    modeling_required=True,
-                    message="No similar terms found. Modeling should be performed."
-                )
-            
-            # Step 3: Use LLM to validate and refine the matches
-            validated_terms = await self._validate_with_llm(
-                element_name=name,
-                element_description=description,
-                candidate_terms=candidate_terms
-            )
-            
-            # If LLM validation failed, fall back to vector search results
-            if not validated_terms:
-                logger.warning(f"LLM validation failed for element: {element_id}. Using vector search results.")
-                validated_terms = [{
-                    "id": term["id"],
-                    "name": term["name"],
-                    "description": term["description"],
-                    "score": term["similarity"],
-                    "reason": "Determined by vector similarity"
-                } for term in candidate_terms[:top_k]]
-            
-            # Take top_k results
-            top_matches = validated_terms[:top_k]
-            
-            # Format results
-            matching_terms = []
-            confidence_scores = []
-            
-            for term in top_matches:
-                matching_terms.append({
-                    "id": term["id"],
-                    "name": term["name"],
-                    "description": term["description"],
-                    "similarity": term["score"]
-                })
-                confidence_scores.append(term["score"])
-            
-            # Determine if modeling is required
-            modeling_required = False
-            message = ""
-            
-            if not matching_terms:
-                modeling_required = True
-                message = "No matching terms found. Modeling should be performed."
-            elif max(confidence_scores) < 0.5:
-                modeling_required = True
-                message = f"Low confidence matches (max: {max(confidence_scores):.2f}). Consider modeling a new term."
-            else:
-                # Use the reason from the top match if available
-                if "reason" in top_matches[0]:
-                    message = top_matches[0]["reason"]
-                else:
-                    message = f"Found {len(matching_terms)} matching terms with good confidence."
-            
-            return TaggingResult(
-                element_id=element_id,
-                element_name=name,
-                element_description=description,
-                matching_terms=matching_terms,
-                confidence_scores=confidence_scores,
-                modeling_required=modeling_required,
-                message=message
-            )
+            if not name_valid or not desc_valid:
+                feedback = ""
+                if not name_valid:
+                    feedback += f"Name validation failed: {name_feedback}\n"
+                if not desc_valid:
+                    feedback += f"Description validation failed: {desc_feedback}"
                 
+                return ValidationResult(
+                    is_valid = False,
+                    quality_status = DataQualityStatus.POOR,
+                    feedback = feedback.strip(),
+                    suggested_improvements = ["Fix basic validation issues before proceeding with deeper analysis"]
+                )
+            
+            # If basic validation passes, perform more detailed evaluation
+            result = await self.validation_chain.ainvoke({
+                "id": data_element.id,
+                "name": data_element.existing_name,
+                "description": data_element.existing_description,
+                "example": data_element.example or "Not provided",
+                "process_name": data_element.process_name or "Not provided",
+                "process_description": data_element.process_description or "Not provided"
+            })
+            
+            return self._parse_validation_result(result)
         except Exception as e:
-            logger.error(f"Error tagging element: {e}")
-            return TaggingResult(
-                element_id=element_id,
-                element_name=name,
-                element_description=description,
-                matching_terms=[],
-                confidence_scores=[],
-                modeling_required=True,
-                message=f"Error during tagging: {str(e)}. Modeling should be performed."
+            logger.error(f"Error validating data element: {e}")
+            # Return a minimal validation result in case of error
+            return ValidationResult(
+                is_valid = False,
+                quality_status = DataQualityStatus.POOR,
+                feedback = f"Error during validation: {str(e)}",
+                suggested_improvements = ["Retry validation after resolving the error"]
             )
-    
-    async def _validate_with_llm(self, element_name: str, element_description: str, 
-                               candidate_terms: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Use the LLM to validate and refine candidate terms.
-        
-        Args:
-            element_name: Name of the data element
-            element_description: Description of the data element
-            candidate_terms: List of candidate terms from vector search
-            
-        Returns:
-            List of validated terms with scores and reasoning
-        """
-        try:
-            # Format candidate terms for the prompt
-            candidate_terms_text = ""
-            for i, term in enumerate(candidate_terms[:30]):  # Limit to 30 terms for context window
-                candidate_terms_text += f"Term {i+1}:\n"
-                candidate_terms_text += f"ID: {term['id']}\n"
-                candidate_terms_text += f"Name: {term['name']}\n"
-                candidate_terms_text += f"Description: {term['description']}\n"
-                candidate_terms_text += f"Vector Similarity: {term['similarity']:.3f}\n\n"
-            
-            # Check if the LLM is properly initialized
-            if not self.llm:
-                logger.warning("LLM not properly initialized, falling back to vector similarities")
-                return self._fallback_to_vector_similarities(candidate_terms)
-                
-            # Create prompt for LLM
-            prompt = f"""
-You are an expert in data governance and business terminology. Your task is to evaluate which of these business terms best match the given data element.
-
-DATA ELEMENT:
-Name: {element_name}
-Description: {element_description}
-
-CANDIDATE BUSINESS TERMS:
-{candidate_terms_text}
-
-Analyze the semantic match between the data element and each candidate term. Consider:
-1. Conceptual alignment - does the business term represent the same real-world concept?
-2. Coverage - does the business term fully capture the data element's meaning?
-3. Specificity - is the match at the right level of specificity?
-
-For the best matching terms, provide:
-1. A confidence score from 0.0 to 1.0
-2. A brief explanation of why the term is a good match
-
-Return your analysis as a JSON array of objects with this format:
-[
-  {{
-    "id": "term_id",
-    "name": "term_name",
-    "description": "term_description",
-    "score": 0.0-1.0,
-    "reason": "Brief explanation of why this is a good match"
-  }},
-  ...
-]
-
-Sort the results by score (highest first). Only include terms with a score of 0.3 or higher.
-If no terms are good matches, return an empty array [].
-"""
-            
-            # Use the LLM to evaluate the terms
-            from langchain_core.output_parsers import StrOutputParser
-            
-            try:
-                # Create a raw string prompt without using a template
-                # This avoids the template variable parsing issues
-                chain = self.llm | StrOutputParser()
-                
-                # Set timeout to prevent hanging
-                result_task = chain.ainvoke(prompt)
-                result = await asyncio.wait_for(result_task, timeout=15.0)
-            except Exception as llm_error:
-                logger.error(f"Error invoking LLM: {llm_error}")
-                return self._fallback_to_vector_similarities(candidate_terms)
-            
-            # Extract JSON from the response
-            try:
-                # Try to find JSON array in the response
-                json_match = re.search(r'\[\s*\{.*\}\s*\]|\[\s*\]', result, re.DOTALL)
-                if json_match:
-                    validated_terms = json.loads(json_match.group(0))
-                else:
-                    # If no JSON found, attempt to parse the entire result
-                    try:
-                        validated_terms = json.loads(result)
-                    except:
-                        # If direct parsing failed, try extracting JSON with a more lenient approach
-                        json_pattern = r'(\[\s*\{.*?\}\s*(?:,\s*\{.*?\}\s*)*\])'
-                        json_match = re.search(json_pattern, result, re.DOTALL)
-                        if json_match:
-                            validated_terms = json.loads(json_match.group(0))
-                        else:
-                            # If still no JSON found, fallback to vector similarities
-                            logger.warning(f"Could not find valid JSON in LLM response")
-                            return self._fallback_to_vector_similarities(candidate_terms)
-                
-                return validated_terms
-                
-            except Exception as parse_error:
-                logger.error(f"Error parsing LLM results: {parse_error}")
-                logger.debug(f"Raw LLM result: {result}")
-                
-                # Try to extract term IDs as a fallback
-                term_ids = re.findall(r'"id"\s*:\s*"([^"]+)"', result)
-                if term_ids:
-                    fallback_terms = []
-                    for term_id in term_ids:
-                        term_data = next((t for t in candidate_terms if t["id"] == term_id), None)
-                        if term_data:
-                            fallback_terms.append({
-                                "id": term_id,
-                                "name": term_data["name"],
-                                "description": term_data["description"],
-                                "score": term_data["similarity"],
-                                "reason": "Extracted from LLM response due to parsing error"
-                            })
-                    
-                    if fallback_terms:
-                        return fallback_terms
-                
-                # If all else fails, fall back to vector similarities
-                return self._fallback_to_vector_similarities(candidate_terms)
-                
-        except Exception as e:
-            logger.error(f"Error in LLM validation: {e}")
-            return self._fallback_to_vector_similarities(candidate_terms)
-            
-    def _fallback_to_vector_similarities(self, candidate_terms: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Fall back to using vector similarities when LLM validation fails."""
-        logger.info(f"Using vector similarities as fallback for LLM validation")
-        
-        # Sort by similarity (highest first)
-        sorted_terms = sorted(candidate_terms, key=lambda x: x["similarity"], reverse=True)
-        
-        # Convert to expected format
-        result = []
-        for term in sorted_terms[:5]:  # Take top 5 terms
-            if term["similarity"] >= 0.3:  # Only include terms with similarity >= 0.3
-                result.append({
-                    "id": term["id"],
-                    "name": term["name"],
-                    "description": term["description"],
-                    "score": term["similarity"],
-                    "reason": "Determined by vector similarity (LLM validation failed)"
-                })
-        
-        return result
