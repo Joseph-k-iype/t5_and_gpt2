@@ -1,277 +1,497 @@
 """
-Tagging Workflow - LangGraph workflow for matching data elements with business terms.
+ChromaDB Vector Store - Implementation of vector storage using ChromaDB.
 
-This module provides a LangGraph-based workflow for the process of tagging data elements
-with appropriate business terms, including vector-based matching and contextual validation.
+This module provides a ChromaDB-based implementation of the VectorStore interface,
+utilizing the ChromaDB library for efficient vector similarity search with local persistence.
 """
 
 import logging
-from typing import Dict, Any, List, Optional, TypedDict, Union
-from pydantic import BaseModel, Field
-from langchain_openai import AzureChatOpenAI
-from langgraph.graph import StateGraph, END
+import os
+from typing import List, Dict, Any, Optional, Tuple, Union
+import numpy as np
+import chromadb
+from chromadb.config import Settings
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from app.core.models import TaggingResult, TaggingValidationResult, EnhancedDataElement
-from app.agents.tagging_agent import TaggingAgent
-from app.core.business_terms import BusinessTermManager
+from app.core.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
 
-# Define workflow state
-class TaggingWorkflowState(TypedDict):
-    """State for the tagging workflow."""
-    element_id: str
-    element_name: str
-    element_description: str
-    matching_terms: List[Dict[str, Any]]
-    confidence_scores: List[float]
-    validation_result: Optional[Dict[str, Any]]
-    is_complete: bool
-    modeling_required: bool
-    error: Optional[str]
-    message: str
-
-class DataTaggingWorkflow:
-    """LangGraph workflow for tagging data elements with business terms."""
+class ChromaDBVectorStore(VectorStore):
+    """
+    Vector store implementation using ChromaDB.
     
-    def __init__(self, llm: AzureChatOpenAI):
+    This class provides vector storage and similarity search using ChromaDB,
+    a lightweight vector database designed for embeddings and semantic search.
+    """
+    
+    def __init__(self, collection_name: str = "business_terms", persist_dir: str = "./data/chroma_db"):
         """
-        Initialize the tagging workflow.
+        Initialize the ChromaDB vector store.
         
         Args:
-            llm: The language model to use for contextual validation
+            collection_name: Name of the ChromaDB collection
+            persist_dir: Directory for persistent storage
         """
-        self.llm = llm
-        self.tagging_agent = TaggingAgent(llm)
-        self.business_term_manager = BusinessTermManager()
-        self.graph = self._build_graph()
-    
-    async def _find_matching_terms(self, state: TaggingWorkflowState) -> TaggingWorkflowState:
-        """
-        Find matching business terms for the data element.
+        self.persist_dir = persist_dir
+        self.collection_name = collection_name
         
-        Args:
-            state: The current workflow state
-            
+        # Ensure the persist directory exists
+        os.makedirs(self.persist_dir, exist_ok=True)
+        
+        # Create ChromaDB client with telemetry disabled
+        self.client = self._create_client()
+        
+        # Get or create collection
+        self.collection = self._get_or_create_collection()
+    
+    def _create_client(self):
+        """
+        Create a ChromaDB client with appropriate settings.
+        
         Returns:
-            Updated workflow state
+            ChromaDB client instance
         """
         try:
-            # Call the business term manager to find matching terms
-            result = self.business_term_manager.tag_element(
-                element_id=state["element_id"],
-                name=state["element_name"],
-                description=state["element_description"],
-                top_k=5  # Get more for contextual validation
+            return chromadb.PersistentClient(
+                path=self.persist_dir,
+                settings=Settings(
+                    anonymized_telemetry=False,  # Disable telemetry for privacy
+                    allow_reset=False,  # Safety measure for production
+                )
             )
-            
-            # Update state with the results
-            state["matching_terms"] = result.matching_terms
-            state["confidence_scores"] = result.confidence_scores
-            state["modeling_required"] = result.modeling_required
-            state["message"] = result.message
-            
-            return state
         except Exception as e:
-            logger.error(f"Error finding matching terms: {e}")
-            state["error"] = f"Error finding matching terms: {str(e)}"
-            state["is_complete"] = True
-            return state
+            logger.error(f"Error creating ChromaDB client: {e}")
+            raise
     
-    async def _validate_contextual_match(self, state: TaggingWorkflowState) -> TaggingWorkflowState:
+    def _get_or_create_collection(self):
         """
-        Validate the contextual appropriateness of the matched terms.
+        Get or create the ChromaDB collection with HNSW index.
         
-        Args:
-            state: The current workflow state
-            
         Returns:
-            Updated workflow state
+            ChromaDB collection
         """
         try:
-            # Skip if no matching terms found or modeling is required
-            if not state["matching_terms"] or state["modeling_required"]:
-                state["is_complete"] = True
-                return state
+            # Try to get existing collection
+            try:
+                collection = self.client.get_collection(name=self.collection_name)
+                logger.info(f"Using existing ChromaDB collection: {self.collection_name}")
+                return collection
+            except ValueError:
+                # Collection doesn't exist, create it with HNSW configuration
+                try:
+                    # Configure HNSW index for fast approximate nearest neighbor search
+                    hnsw_params = {
+                        "hnsw:space": "cosine",  # Use cosine similarity 
+                        "hnsw:construction_ef": 200,  # Higher values provide better index quality but slower construction
+                        "hnsw:search_ef": 100,  # Higher values provide more accurate search but slower queries
+                        "hnsw:M": 16  # Number of bi-directional links per node (8-64 is typical)
+                    }
+                    
+                    collection = self.client.create_collection(
+                        name=self.collection_name,
+                        metadata={"description": "Business terms collection with HNSW indexing"},
+                        embedding_function=None,  # Let embeddings be provided directly
+                        **hnsw_params
+                    )
+                    
+                    logger.info(f"Created new ChromaDB collection with HNSW indexing: {self.collection_name}")
+                    return collection
+                    
+                except TypeError as e:
+                    # If HNSW config not supported in this ChromaDB version, create without it
+                    logger.warning(f"Creating collection without HNSW config due to error: {e}")
+                    collection = self.client.create_collection(
+                        name=self.collection_name,
+                        metadata={"description": "Business terms collection"}
+                    )
+                    logger.info(f"Created new ChromaDB collection without HNSW config: {self.collection_name}")
+                    return collection
+        except Exception as e:
+            logger.error(f"Error initializing ChromaDB collection: {e}")
+            raise
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type((Exception,)),
+        reraise=True
+    )
+    def store_vector(self, id: str, name: str, description: str, embedding: List[float], metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        Store a vector in the ChromaDB collection.
+        
+        Args:
+            id: Unique identifier for the term
+            name: Name of the term
+            description: Description of the term
+            embedding: Vector embedding as a list of floats
+            metadata: Additional metadata as a dictionary
             
-            # Recreate the tagging result for validation
-            tagging_result = TaggingResult(
-                element_id=state["element_id"],
-                element_name=state["element_name"],
-                element_description=state["element_description"],
-                matching_terms=state["matching_terms"],
-                confidence_scores=state["confidence_scores"],
-                modeling_required=state["modeling_required"],
-                message=state["message"]
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            if metadata is None:
+                metadata = {}
+            
+            # Prepare metadata with name and description
+            full_metadata = {
+                "name": name,
+                "description": description,
+                **metadata
+            }
+            
+            # Check if the term already exists
+            try:
+                existing = self.collection.get(ids=[id], include=["metadatas"])
+                if existing["ids"]:
+                    # Update the existing term
+                    self.collection.update(
+                        ids=[id],
+                        embeddings=[embedding],
+                        metadatas=[full_metadata]
+                    )
+                    return True
+            except Exception as e:
+                logger.debug(f"Term not found for update: {e}")
+            
+            # Add the new term
+            self.collection.add(
+                ids=[id],
+                embeddings=[embedding],
+                metadatas=[full_metadata]
             )
+            return True
+        except Exception as e:
+            logger.error(f"Error storing vector: {e}")
+            return False
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type((Exception,)),
+        reraise=True
+    )
+    def batch_store_vectors(self, items: List[Dict[str, Any]]) -> int:
+        """
+        Store multiple vectors in the ChromaDB collection.
+        
+        Args:
+            items: List of dictionaries with id, name, description, embedding, and optional metadata
             
-            # Perform contextual validation
-            validation_result = await self.tagging_agent._validate_contextual_match(
-                element_name=state["element_name"],
-                element_description=state["element_description"],
-                term_name=state["matching_terms"][0]["name"],
-                term_description=state["matching_terms"][0]["description"],
-                term_category=state["matching_terms"][0].get("category", "Not specified"),
-                similarity_score=state["matching_terms"][0]["similarity"],
-                other_terms=self._format_other_terms(state["matching_terms"][1:])
-            )
+        Returns:
+            int: Number of items successfully stored
+        """
+        try:
+            # Prepare batch data
+            ids = []
+            embeddings = []
+            metadatas = []
             
-            # Update state with validation result
-            state["validation_result"] = validation_result.dict()
-            
-            # If the match is not contextually appropriate, try to find a better match
-            if not validation_result.is_match and validation_result.suggested_term_id:
-                state["message"] = f"Original match not contextually appropriate. {validation_result.reasoning}"
+            for item in items:
+                ids.append(item['id'])
+                embeddings.append(item['embedding'])
                 
-                # Find the suggested term in the matching terms
-                for i, term in enumerate(state["matching_terms"]):
-                    if term["id"] == validation_result.suggested_term_id:
-                        # Swap with the top match
-                        if i > 0:
-                            state["matching_terms"][0], state["matching_terms"][i] = state["matching_terms"][i], state["matching_terms"][0]
-                            state["confidence_scores"][0], state["confidence_scores"][i] = state["confidence_scores"][i], state["confidence_scores"][0]
-                        
-                        # Update the confidence score
-                        state["confidence_scores"][0] = validation_result.confidence
-                        state["matching_terms"][0]["similarity"] = validation_result.confidence
-                        state["message"] += f" Found better match: {state['matching_terms'][0]['name']}"
-                        break
+                # Combine name, description with metadata
+                metadata = {
+                    "name": item['name'],
+                    "description": item['description'],
+                    **(item.get('metadata', {}))
+                }
+                metadatas.append(metadata)
             
-            return state
-        except Exception as e:
-            logger.error(f"Error validating contextual match: {e}")
-            state["error"] = f"Error validating contextual match: {str(e)}"
-            state["is_complete"] = True
-            return state
-    
-    def _format_other_terms(self, terms: List[Dict[str, Any]]) -> str:
-        """Format other terms for the contextual validation prompt."""
-        if not terms:
-            return "No other potential terms available."
-        
-        result = ""
-        for i, term in enumerate(terms):
-            result += f"Term {i+1}:\n"
-            result += f"- ID: {term['id']}\n"
-            result += f"- Name: {term['name']}\n"
-            result += f"- Description: {term['description']}\n"
-            result += f"- Similarity: {term['similarity']:.2f}\n\n"
-        
-        return result
-    
-    async def _determine_modeling_need(self, state: TaggingWorkflowState) -> TaggingWorkflowState:
-        """
-        Determine if a new business term needs to be modeled.
-        
-        Args:
-            state: The current workflow state
-            
-        Returns:
-            Updated workflow state
-        """
-        # Skip if no matching terms or error
-        if state.get("error") or not state["matching_terms"]:
-            state["modeling_required"] = True
-            state["is_complete"] = True
-            return state
-        
-        # Get the highest confidence score
-        highest_confidence = max(state["confidence_scores"]) if state["confidence_scores"] else 0.0
-        
-        # Check confidence threshold for modeling
-        if highest_confidence < 0.4:
-            state["modeling_required"] = True
-            state["message"] = f"Low confidence match ({highest_confidence:.2f}). Consider modeling a new term."
-        else:
-            state["modeling_required"] = False
-            state["message"] = f"Found appropriate match with confidence {highest_confidence:.2f}"
-        
-        state["is_complete"] = True
-        return state
-    
-    def _build_graph(self) -> StateGraph:
-        """Build the LangGraph workflow."""
-        workflow = StateGraph(TaggingWorkflowState)
-        
-        # Add nodes
-        workflow.add_node("find_matching_terms", self._find_matching_terms)
-        workflow.add_node("validate_contextual_match", self._validate_contextual_match)
-        workflow.add_node("determine_modeling_need", self._determine_modeling_need)
-        
-        # Add edges
-        workflow.add_edge("find_matching_terms", "validate_contextual_match")
-        workflow.add_edge("validate_contextual_match", "determine_modeling_need")
-        workflow.add_edge("determine_modeling_need", END)
-        
-        # Set entrypoint
-        workflow.set_entry_point("find_matching_terms")
-        
-        return workflow.compile()
-    
-    async def run(self, element_id: str, element_name: str, element_description: str) -> TaggingResult:
-        """
-        Run the tagging workflow on a data element.
-        
-        Args:
-            element_id: Unique identifier for the element
-            element_name: Name of the element
-            element_description: Description of the element
-        
-        Returns:
-            TaggingResult containing matching terms and confidence scores
-        """
-        logger.info(f"Starting tagging workflow for element: {element_id}")
-        
-        initial_state: TaggingWorkflowState = {
-            "element_id": element_id,
-            "element_name": element_name,
-            "element_description": element_description,
-            "matching_terms": [],
-            "confidence_scores": [],
-            "validation_result": None,
-            "is_complete": False,
-            "modeling_required": False,
-            "error": None,
-            "message": ""
-        }
-        
-        # Run the workflow
-        result = await self.graph.ainvoke(initial_state)
-        
-        if result.get("error"):
-            logger.error(f"Workflow error: {result['error']}")
-            return TaggingResult(
-                element_id=element_id,
-                element_name=element_name,
-                element_description=element_description,
-                matching_terms=[],
-                confidence_scores=[],
-                modeling_required=True,
-                message=result["error"]
+            # Use upsert method to add/update
+            self.collection.upsert(
+                ids=ids,
+                embeddings=embeddings,
+                metadatas=metadatas
             )
-        
-        return TaggingResult(
-            element_id=result["element_id"],
-            element_name=result["element_name"],
-            element_description=result["element_description"],
-            matching_terms=result["matching_terms"],
-            confidence_scores=result["confidence_scores"],
-            modeling_required=result["modeling_required"],
-            message=result["message"]
-        )
-        
-    async def tag_enhanced_element(self, enhanced_element: EnhancedDataElement) -> TaggingResult:
+            
+            return len(items)
+        except Exception as e:
+            logger.error(f"Error batch storing vectors: {e}")
+            return 0
+    
+    def find_similar_vectors(self, query_vector: List[float], top_k: int = 5, threshold: float = 0.5) -> List[Dict[str, Any]]:
         """
-        Tag an enhanced data element with appropriate business terms.
+        Find similar vectors in the ChromaDB collection using HNSW indexing.
         
         Args:
-            enhanced_element: The enhanced data element
+            query_vector: Vector to compare against
+            top_k: Number of results to return
+            threshold: Minimum similarity threshold (0-1)
             
         Returns:
-            TaggingResult with matching terms and confidence scores
+            List of dictionaries with id, name, description, similarity, and metadata
         """
-        return await self.run(
-            element_id=enhanced_element.id,
-            element_name=enhanced_element.enhanced_name,
-            element_description=enhanced_element.enhanced_description
-        )
+        try:
+            # Request more results than needed to ensure we have enough after filtering
+            fetch_k = min(top_k * 4, 100)
+            
+            # Add query parameters if supported by this ChromaDB version
+            try:
+                result = self.collection.query(
+                    query_embeddings=[query_vector],
+                    n_results=fetch_k,
+                    include=["metadatas", "distances"],
+                    # Add HNSW-specific parameters (if supported)
+                    query_params={
+                        "hnsw:ef": 100  # Controls search accuracy (higher = more accurate but slower)
+                    }
+                )
+            except TypeError:
+                # Fall back to simpler query if query_params not supported
+                result = self.collection.query(
+                    query_embeddings=[query_vector],
+                    n_results=fetch_k,
+                    include=["metadatas", "distances"]
+                )
+            
+            # Process results
+            similar_items = []
+            if not result or not result["ids"] or not result["ids"][0]:
+                return []
+                
+            for i, id_val in enumerate(result["ids"][0]):
+                # ChromaDB returns distance, not similarity
+                # Convert to similarity score (1 - distance)
+                distance = result["distances"][0][i]
+                similarity = 1.0 - distance
+                
+                # Filter by threshold
+                if similarity >= threshold:
+                    metadata = result["metadatas"][0][i]
+                    
+                    # Extract name and description from metadata
+                    name = metadata.get("name", "")
+                    description = metadata.get("description", "")
+                    
+                    # Copy the remaining metadata (excluding name and description)
+                    clean_metadata = {k: v for k, v in metadata.items() 
+                                    if k not in ["name", "description"]}
+                    
+                    similar_items.append({
+                        "id": id_val,
+                        "name": name,
+                        "description": description,
+                        "similarity": similarity,
+                        "metadata": clean_metadata
+                    })
+            
+            # Sort by similarity (highest first)
+            similar_items.sort(key=lambda x: x["similarity"], reverse=True)
+            
+            # Return only up to top_k items
+            return similar_items[:top_k]
+        except Exception as e:
+            logger.error(f"Error finding similar vectors: {e}")
+            return []
+    
+    def get_all_terms(self) -> List[Dict[str, Any]]:
+        """
+        Get all business terms from the ChromaDB collection.
+        
+        Returns:
+            List of dictionaries with id, name, description, and metadata
+        """
+        try:
+            # Get all items from the collection
+            result = self.collection.get(include=["metadatas"])
+            
+            terms = []
+            for i, id_val in enumerate(result["ids"]):
+                metadata = result["metadatas"][i]
+                
+                # Extract name and description from metadata
+                name = metadata.get("name", "")
+                description = metadata.get("description", "")
+                
+                # Remove name and description from metadata
+                clean_metadata = {k: v for k, v in metadata.items() 
+                                if k not in ["name", "description"]}
+                
+                terms.append({
+                    "id": id_val,
+                    "name": name,
+                    "description": description,
+                    "metadata": clean_metadata
+                })
+            
+            return terms
+        except Exception as e:
+            logger.error(f"Error getting all terms: {e}")
+            return []
+    
+    def get_term_by_id(self, term_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get a specific business term by ID from ChromaDB.
+        
+        Args:
+            term_id: ID of the term to retrieve
+            
+        Returns:
+            Dictionary with term details or None if not found
+        """
+        try:
+            result = self.collection.get(ids=[term_id], include=["metadatas"])
+            
+            if not result["ids"]:
+                return None
+                
+            metadata = result["metadatas"][0]
+            
+            # Extract name and description from metadata
+            name = metadata.get("name", "")
+            description = metadata.get("description", "")
+            
+            # Remove name and description from metadata
+            clean_metadata = {k: v for k, v in metadata.items() 
+                            if k not in ["name", "description"]}
+            
+            return {
+                "id": term_id,
+                "name": name,
+                "description": description,
+                "metadata": clean_metadata
+            }
+        except Exception as e:
+            logger.error(f"Error getting term by ID: {e}")
+            return None
+    
+    def delete_term(self, term_id: str) -> bool:
+        """
+        Delete a business term from the ChromaDB collection.
+        
+        Args:
+            term_id: ID of the term to delete
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            self.collection.delete(ids=[term_id])
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting term: {e}")
+            return False
+    
+    def compute_cosine_similarity(self, vector1: List[float], vector2: List[float]) -> float:
+        """
+        Compute cosine similarity between two vectors.
+        
+        Args:
+            vector1: First vector
+            vector2: Second vector
+            
+        Returns:
+            float: Cosine similarity between 0 and 1
+        """
+        try:
+            # Convert to numpy arrays
+            a = np.array(vector1)
+            b = np.array(vector2)
+            
+            # Compute cosine similarity
+            dot_product = np.dot(a, b)
+            norm_a = np.linalg.norm(a)
+            norm_b = np.linalg.norm(b)
+            
+            if norm_a == 0 or norm_b == 0:
+                return 0.0
+            
+            similarity = dot_product / (norm_a * norm_b)
+            return max(0.0, min(similarity, 1.0))  # Ensure in range [0, 1]
+        except Exception as e:
+            logger.error(f"Error computing similarity: {e}")
+            return 0.0
+    
+    def search_terms(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """
+        Search for terms by text query in ChromaDB collection.
+        
+        Args:
+            query: Search query
+            limit: Maximum number of results
+            
+        Returns:
+            List of matching terms
+        """
+        try:
+            # Get all terms first (ChromaDB doesn't have a direct text search)
+            all_terms = self.get_all_terms()
+            
+            # Filter by query
+            matching_terms = []
+            for term in all_terms:
+                name = term.get("name", "").lower()
+                description = term.get("description", "").lower()
+                query_lower = query.lower()
+                
+                if query_lower in name or query_lower in description:
+                    matching_terms.append(term)
+            
+            # Sort by relevance (exact matches first)
+            matching_terms.sort(key=lambda x: (
+                0 if x.get("name", "").lower().startswith(query.lower()) else 1,
+                0 if query.lower() in x.get("name", "").lower() else 1,
+                x.get("name", "").lower()
+            ))
+            
+            # Limit results
+            return matching_terms[:limit]
+        except Exception as e:
+            logger.error(f"Error searching terms: {e}")
+            return []
+    
+    def delete_all_terms(self) -> int:
+        """
+        Delete all terms in the ChromaDB collection.
+        
+        Returns:
+            int: Number of terms deleted
+        """
+        try:
+            # Get current count
+            all_terms = self.get_all_terms()
+            count = len(all_terms)
+            
+            # Delete all
+            self.collection.delete(where={})
+            return count
+        except Exception as e:
+            logger.error(f"Error deleting all terms: {e}")
+            return 0
+            
+    def health_check(self) -> Dict[str, Any]:
+        """
+        Perform a health check of the ChromaDB vector store.
+        
+        Returns:
+            Dict with health status and details
+        """
+        try:
+            # Try to get collection info and count
+            collection_info = {
+                "name": self.collection_name,
+                "persist_dir": self.persist_dir,
+            }
+            
+            # Get term count
+            terms = self.get_all_terms()
+            
+            return {
+                "status": "healthy",
+                "type": "chroma",
+                "term_count": len(terms),
+                "details": {
+                    **collection_info,
+                    "term_count": len(terms)
+                }
+            }
+        except Exception as e:
+            return {
+                "status": "unhealthy",
+                "type": "chroma",
+                "error": str(e)
+            }
