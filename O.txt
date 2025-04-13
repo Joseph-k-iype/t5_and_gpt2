@@ -1,478 +1,323 @@
-"""
-Tagging Agent - Matches enhanced data elements with business terms.
-This module provides functionality to semantically match data elements with appropriate
-business terms using both LLM-based semantic matching and vector similarity search.
-"""
-
+import os
+import sys
+import uuid
+import json
 import logging
-from typing import Dict, Any, List, Optional, Tuple
-from pydantic import BaseModel, Field
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_openai import AzureChatOpenAI
-from app.core.models import TaggingResult, TaggingValidationResult
-from app.core.business_terms import BusinessTermManager
+import chardet
+import pandas as pd
+import networkx as nx
+import numpy as np
+import instructor
+from typing import Optional, Any, Dict, List, Union, TypeVar, Generic, Type
+from pathlib import Path
+from dotenv import dotenv_values
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider, ClientSecretCredential
+from openai import AzureOpenAI
+from pydantic import BaseModel
+from langchain.chat_models import AzureChatOpenAI
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationChain, LLMChain
+from langchain.docstore import Document as LC_DOCUMENT
+from langchain.embeddings.base import Embeddings
+from langchain.vectorstores import Chroma
+from langchain.prompts import PromptTemplate
+from chromadb.config import Settings
+from chromadb.utils import embedding_functions
+from collections import namedtuple
+import re
+from pydantic import BaseModel, ValidationError, field_validator
 
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-class MatchedTerm(BaseModel):
-    """Model representing a matched business term."""
-    id: str = Field(..., description="Unique identifier for the business term")
-    name: str = Field(..., description="Name of the business term")
-    description: str = Field(..., description="Description of the business term")
-    confidence: float = Field(..., description="Confidence score of the match")
-    category: Optional[str] = Field(None, description="Category of the business term")
-    
-    def dict(self) -> Dict[str, Any]:
-        """Convert to dictionary with non-None values."""
-        result = {
-            "id": self.id,
-            "name": self.name,
-            "description": self.description,
-            "confidence": self.confidence
-        }
-        if self.category:
-            result["category"] = self.category
-        return result
+ENV_DIR = "env"
+CONFIG_PATH = f"{ENV_DIR}/config.env"
+CREDS_PATH = f"{ENV_DIR}/credentials.env"
+CERT_PATH = f"{ENV_DIR}/cacert.pem"
 
-class ContextualMatchResult(BaseModel):
-    """Model representing the result of contextual matching."""
-    is_match: bool = Field(..., description="Whether the match is contextually correct")
-    confidence: float = Field(..., description="Confidence score for the match")
-    reasoning: str = Field(..., description="Reasoning for the decision")
-    suggested_term_id: Optional[str] = Field(None, description="ID of a better match if any")
+Triple = namedtuple("Triple", ["subject", "predicate", "object"])
 
-class TaggingAgent:
-    """Agent for matching data elements with business terms based on LLM matching and vector similarity."""
+## utility functions
+def is_file_readable(filepath: str)->bool:
+    """Check if a file is readable."""
+    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
+        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
+    return True
+
+def str_to_bool(s: str)->bool:
+    """Convert a string to a boolean."""
+    if s== 'True':
+        return True
+    elif s== 'False':
+        return False
+    else:
+        raise ValueError(f"Invalid boolean value: {s}")
+
+## OSEnv class
+
+class OSEnv:
+    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
+        self.var_list = []
+        self.bulk_set(config_file, True)
+        self.bulk_set(creds_file, False)
+        self.set_certificate_path(certificate_path)
+        if str_to_bool(self.get("PROXY_ENABLED", "False")):
+            self.set_proxy()
+        
+        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
+            self.token = self.get_azure_token()
+        else:
+            self.token = None
+        
+        self.credential = self._get_credential()
     
-    def __init__(self, llm: AzureChatOpenAI):
-        """Initialize the tagging agent with a language model."""
-        self.llm = llm
-        self.business_term_manager = BusinessTermManager()
-        self._setup_llm_matching_chain()
-        self._setup_validation_chain()
+    def _get_credential(self):
+        if str_to_bool(self.get("USE_MANAGED_IDENTITY", "False")):
+            return DefaultAzureCredential()
+        else:
+            return ClientSecretCredential(tenant_id=self.get("AZURE_TENANT_ID"), client_id=self.get("AZURE_CLIENT_ID"), client_secret=self.get("AZURE_CLIENT_SECRET"))
     
-    def _setup_llm_matching_chain(self):
-        """Set up the LangChain prompt for LLM-based semantic matching."""
-        llm_matching_template = """
-        You are a data governance expert responsible for matching data elements to standardized business terms.
-        Your task is to find the most semantically appropriate business terms for a given data element.
-        
-        Data Element:
-        - Name: {element_name}
-        - Description: {element_description}
-        
-        Available Business Terms:
-        {business_terms}
-        
-        Your task:
-        1. Analyze the data element's semantic meaning
-        2. Review all available business terms
-        3. Identify the top 3 most semantically appropriate terms for this data element
-        4. For each selected term, provide:
-           - Term ID
-           - Confidence score (0.0-1.0) representing how appropriate the match is
-           - Brief justification for why this term is appropriate
-        
-        Consider:
-        - Conceptual alignment (does the term represent the same real-world concept?)
-        - Specificity (is the match at the right level of detail?)
-        - Domain context (is the term used in the right business context?)
-        - Common patterns (e.g., "account number" often maps to "account identifier")
-        
-        Format your response as follows:
-        MATCH 1:
-        Term ID: [term ID]
-        Confidence: [score between 0.0-1.0]
-        Justification: [brief explanation]
-        
-        MATCH 2:
-        Term ID: [term ID]
-        Confidence: [score between 0.0-1.0]
-        Justification: [brief explanation]
-        
-        MATCH 3:
-        Term ID: [term ID]
-        Confidence: [score between 0.0-1.0]
-        Justification: [brief explanation]
-        """
-        
-        self.llm_matching_prompt = PromptTemplate(
-            input_variables=["element_name", "element_description", "business_terms"],
-            template=llm_matching_template)
-        
-        self.llm_matching_chain = self.llm_matching_prompt | self.llm | StrOutputParser()
-    
-    def _setup_validation_chain(self):
-        """Set up the LangChain prompt for contextual validation."""
-        contextual_validation_template = """
-        You are a data governance expert specializing in matching data elements with standard business terms.
-        Your task is to evaluate whether a suggested business term is contextually appropriate for a given data element.
-        
-        Data Element:
-        - Name: {element_name}
-        - Description: {element_description}
-        
-        Suggested Business Term:
-        - Name: {term_name}
-        - Description: {term_description}
-        - Category: {term_category}
-        - Similarity Score: {similarity_score}
-        
-        Other Potential Terms:
-        {other_terms}
-        
-        Consider the following in your evaluation:
-        1. Semantic meaning - do the element and term refer to the same concept?
-        2. Domain context - are they used in the same business context?
-        3. Level of specificity - is the term at the appropriate level of detail?
-        4. Common usage - would business users recognize this mapping as appropriate?
-        
-        Provide your analysis in the following format:
-        1. Contextual Match: [YES/NO]
-        2. Confidence (0.0-1.0): [score]
-        3. Reasoning: [detailed explanation]
-        4. Better Match (if any): [ID of better term from the list or "None"]
-        
-        Be objective and thorough in your analysis. Focus on business meaning rather than just lexical similarity.
-        """
-        
-        self.contextual_validation_prompt = PromptTemplate(
-            input_variables=["element_name", "element_description", "term_name", "term_description", 
-                            "term_category", "similarity_score", "other_terms"],
-            template=contextual_validation_template)
-        
-        self.validation_chain = self.contextual_validation_prompt | self.llm | StrOutputParser()
-    
-    def _format_business_terms_for_llm(self, terms: List[Dict[str, Any]]) -> str:
-        """Format business terms for LLM prompt."""
-        result = ""
-        for i, term in enumerate(terms):
-            result += f"TERM {i+1}:\n"
-            result += f"ID: {term['id']}\n"
-            result += f"Name: {term['name']}\n"
-            result += f"Description: {term['description']}\n"
-            if term.get('metadata') and term['metadata'].get('category'):
-                result += f"Category: {term['metadata']['category']}\n"
-            result += "\n"
-        return result
-    
-    def _parse_llm_matches(self, response: str) -> List[Dict[str, Any]]:
-        """Parse the LLM response to extract matched terms."""
-        matches = []
-        current_match = {}
-        
-        lines = response.strip().split('\n')
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-                
-            if line.startswith("MATCH"):
-                # Save previous match if exists
-                if current_match and 'id' in current_match and 'confidence' in current_match:
-                    matches.append(current_match)
-                # Start new match
-                current_match = {}
-            elif "Term ID:" in line:
-                current_match['id'] = line.split("Term ID:")[1].strip()
-            elif "Confidence:" in line:
-                try:
-                    confidence = float(line.split("Confidence:")[1].strip())
-                    current_match['confidence'] = max(0.0, min(1.0, confidence))  # Clamp between 0 and 1
-                except ValueError:
-                    current_match['confidence'] = 0.5  # Default if parsing fails
-            elif "Justification:" in line:
-                current_match['justification'] = line.split("Justification:")[1].strip()
-        
-        # Add the last match if it exists
-        if current_match and 'id' in current_match and 'confidence' in current_match:
-            matches.append(current_match)
-        
-        return matches
-    
-    async def llm_tag_element(self, element_id: str, element_name: str, 
-                             element_description: str, top_k: int = 3) -> TaggingResult:
-        """
-        Match a data element with business terms using LLM-based semantic matching.
-        
-        Args:
-            element_id: Unique identifier for the element
-            element_name: Enhanced name of the element
-            element_description: Enhanced description of the element
-            top_k: Number of top matching terms to return
-            
-        Returns:
-            TaggingResult with matching terms and confidence scores
-        """
+    def set_certificate_path(self, path: str):
         try:
-            # Get all available business terms
-            all_terms = self.business_term_manager.get_all_terms()
+            if not os.path.isabs(path):
+                path = os.path.abspath(path)
+            if not is_file_readable(path):
+                raise FileNotFoundError(f"The file '{path}' does not exist or is not readable")
             
-            if not all_terms:
-                logger.warning("No business terms found in the repository")
-                return TaggingResult(
-                    element_id=element_id,
-                    element_name=element_name,
-                    element_description=element_description,
-                    matching_terms=[],
-                    confidence_scores=[],
-                    modeling_required=True,
-                    message="No business terms found in the repository"
-                )
-            
-            # Convert to list of dictionaries
-            term_dicts = [term.dict() for term in all_terms]
-            
-            # Format terms for LLM
-            formatted_terms = self._format_business_terms_for_llm(term_dicts)
-            
-            # Invoke LLM to find matches
-            response = await self.llm_matching_chain.ainvoke({
-                "element_name": element_name,
-                "element_description": element_description,
-                "business_terms": formatted_terms
-            })
-            
-            # Parse the matches
-            llm_matches = self._parse_llm_matches(response)
-            
-            if not llm_matches:
-                logger.warning(f"LLM didn't return any valid matches for element: {element_name}")
-                # Fall back to vector similarity
-                return await self.vector_tag_element(element_id, element_name, element_description, top_k)
-            
-            # Look up the complete term information for each match
-            matching_terms = []
-            confidence_scores = []
-            
-            for match in llm_matches:
-                term_id = match['id']
-                confidence = match['confidence']
-                
-                # Find the term in our list
-                term_info = None
-                for term in term_dicts:
-                    if term['id'] == term_id:
-                        term_info = term
-                        break
-                
-                if term_info:
-                    # Create a term entry with similarity score
-                    term_entry = {
-                        "id": term_info["id"],
-                        "name": term_info["name"],
-                        "description": term_info["description"],
-                        "similarity": confidence  # Using LLM confidence as similarity
-                    }
-                    
-                    # Add category if available
-                    if term_info.get("metadata") and term_info["metadata"].get("category"):
-                        term_entry["category"] = term_info["metadata"]["category"]
-                    
-                    matching_terms.append(term_entry)
-                    confidence_scores.append(confidence)
-            
-            # If we don't have enough matches from LLM, fill in with vector similarity
-            if len(matching_terms) < top_k:
-                remaining_slots = top_k - len(matching_terms)
-                logger.info(f"LLM provided {len(matching_terms)} matches, adding {remaining_slots} from vector similarity")
-                
-                # Get vector matches but exclude the ones we already have
-                vector_result = self.business_term_manager.tag_element(
-                    element_id=element_id,
-                    name=element_name,
-                    description=element_description,
-                    top_k=top_k * 2  # Get more to filter out duplicates
-                )
-                
-                # Get the IDs of terms we already have
-                existing_ids = [term["id"] for term in matching_terms]
-                
-                # Add unique terms from vector matches
-                added = 0
-                for i, term in enumerate(vector_result.matching_terms):
-                    if term["id"] not in existing_ids and added < remaining_slots:
-                        matching_terms.append(term)
-                        confidence_scores.append(vector_result.confidence_scores[i])
-                        added += 1
-            
-            # Calculate average confidence
-            avg_confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0
-            
-            # Determine if modeling is required
-            modeling_required = False
-            message = f"Found {len(matching_terms)} matching terms using LLM semantic matching"
-            
-            # If highest confidence is below threshold, suggest modeling
-            if not confidence_scores or max(confidence_scores) < 0.5:
-                modeling_required = True
-                message = f"Low confidence matches (max: {max(confidence_scores) if confidence_scores else 0:.2f}). Consider modeling a new term."
-            
-            return TaggingResult(
-                element_id=element_id,
-                element_name=element_name,
-                element_description=element_description,
-                matching_terms=matching_terms[:top_k],  # Limit to top_k
-                confidence_scores=confidence_scores[:top_k],  # Limit to top_k
-                modeling_required=modeling_required,
-                message=message
-            )
-                
+            self.set("REQUESTS_CA_BUNDLE", path)
+            self.set("SSL_CERT_FILE", path)
+            self.set("CURL_CA_BUNDLE", path)
         except Exception as e:
-            logger.error(f"Error in LLM tagging: {e}")
-            # Fall back to vector similarity
-            logger.info(f"Falling back to vector similarity due to LLM error: {e}")
-            return await self.vector_tag_element(element_id, element_name, element_description, top_k)
+            logger.error(f"Error setting certificate path: {e}")
+            raise
     
-    async def vector_tag_element(self, element_id: str, element_name: str, 
-                               element_description: str, top_k: int = 3) -> TaggingResult:
+    def bulk_set(self, dotenvfile: str, print_val: bool = False)->None:
+        try:
+            if not os.path.isabs(dotenvfile):
+                dotenvfile = os.path.abspath(dotenvfile)
+            if not is_file_readable(dotenvfile):
+                return
+            temp_dict = dotenv_values(dotenvfile)
+            for key, value in temp_dict.items():
+                self.set(key, value, print_val)
+            del temp_dict
+        except Exception as e:
+            logger.error(f"Error loading environment variables from {dotenvfile}: {e}")
+            raise
+    
+    def set(self, key: str, value: str, print_val: bool = False)->None:
+        try:
+            os.environ[key] = value
+            if key not in self.var_list:  # Fixed var_name to key
+                self.var_list.append(key)  # Fixed var_name to key
+            if print_val:
+                logger.info(f"{key}: {value}")
+        except Exception as e:
+            logger.error(f"Error setting environment variable {key}: {e}")
+            raise
+    
+    def get(self, key: str, default: Optional[str] = None)->str:
+        try:
+            return os.environ.get(key, default)
+        except Exception as e:
+            logger.error(f"Error getting environment variable {key}: {e}")
+            raise
+    
+    def set_proxy(self) -> None:
+        try:
+            ad_username = self.get("AD_USERNAME")
+            ad_password = self.get("AD_USER_PW")
+            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
+            if not all([ad_username, ad_password, proxy_domain]):
+                raise ValueError("Proxy settings are incomplete")
+            proxy_url = f"https://{ad_username}:{ad_password}@{proxy_domain}"
+            self.set("HTTP_PROXY", proxy_url, print_val=False)
+            self.set("HTTPS_PROXY", proxy_url, print_val=False)
+            no_proxy_domains = [
+                'cognitiveservices.azure.com',
+                'search.windows.net',
+                'openai.azure.com',
+                'core.windows.net',
+                'azurewebsites.net'
+            ]
+            self.set("NO_PROXY", ",".join(no_proxy_domains), print_val=False)
+        except Exception as e:
+            logger.error(f"Error setting proxy: {e}")
+            raise
+    
+    def get_azure_token(self) -> str:
+        try:
+            credential = ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID"),
+                client_id=self.get("AZURE_CLIENT_ID"),
+                client_secret=self.get("AZURE_CLIENT_SECRET")
+            )
+            token = credential.get_token("https://cognitiveservices.azure.com/.default")
+            self.set("AZURE_TOKEN", token.token, print_val=False)
+            logger.info("Azure token set")
+            return token.token
+        except Exception as e:
+            logger.error(f"Error retrieving Azure token: {e}")
+            return None
+    
+    def list_env_vars(self)->None:
+        for var in self.var_list:
+            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET'}:
+                logger.info(f"{var}: [REDACTED]")
+            else:
+                logger.info(f"{var}: {os.getenv(var)}")
+
+
+## embedding class + Document class
+
+class MyDocument(BaseModel):
+    id: str = ""
+    text: str = ""
+    embedding: List[float] = []
+    metadata: Dict[str, Any] = {}
+
+class EmbeddingClient:
+    def __init__(self, azure_api_version: str = "2023-05-15", embeddings_model: str = "text-embedding-3-large"):
+        self.azure_api_version = azure_api_version
+        self.embeddings_model = embeddings_model
+        self.direct_azure_client = self._get_direct_azure_client()
+    
+    def _get_direct_azure_client(self):
+        token_provider = get_bearer_token_provider(
+            DefaultAzureCredential(),
+            "https://cognitiveservices.azure.com/.default"
+        )
+        return AzureOpenAI(token_provider=token_provider, api_version=self.azure_api_version)
+    
+    def generate_embeddings(self, doc: MyDocument)->MyDocument:
+        try:
+            response = self.direct_azure_client.embeddings.create(
+                model=self.embeddings_model,
+                input=doc.text
+            ).data[0].embedding
+            doc.embedding = response
+            return doc
+        except Exception as e:
+            logger.error(f"Error generating embeddings: {e}")
+            return doc
+
+## Instructor Integration - Generic response model type
+T = TypeVar('T', bound=BaseModel)
+
+## AzureChatbot with Instructor Integration
+class AzureChatbot:
+    def __init__(self, config_file=CONFIG_PATH, creds_file=CREDS_PATH, cert_file=CERT_PATH):
+        self.env = OSEnv(config_file, creds_file, cert_file)
+        self._setup_chat_model()
+        self.memory = ConversationBufferMemory()
+        self.conversation = ConversationChain(llm=self.llm, memory=self.memory, verbose=True)
+        self._setup_instructor_client()
+    
+    def _setup_chat_model(self):
+        try:
+            token_provider = get_bearer_token_provider(
+                self.env.credential,
+                "https://cognitiveservices.azure.com/.default"
+            )
+            model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
+            temperature = float(self.env.get("TEMPERATURE", "0.7"))
+            max_tokens = int(self.env.get("MAX_TOKENS", "800"))
+            api_version = self.env.get("API_VERSION", "2023-05-15")
+            azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
+            
+            self.llm = AzureChatOpenAI(
+                model_name=model_name,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                api_version=api_version,
+                azure_endpoint=azure_endpoint,
+                azure_ad_token_provider=token_provider
+            )
+        except Exception as e:
+            logger.error(f"Error setting up chatbot: {e}")
+            raise
+    
+    def _setup_instructor_client(self):
+        try:
+            # Create the direct Azure client for instructor
+            azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
+            api_version = self.env.get("API_VERSION", "2023-05-15")
+            
+            direct_client = AzureOpenAI(
+                azure_endpoint=azure_endpoint,
+                api_version=api_version,
+                token_provider=get_bearer_token_provider(
+                    self.env.credential,
+                    "https://cognitiveservices.azure.com/.default"
+                )
+            )
+            
+            # Apply instructor to the client
+            self.instructor_client = instructor.from_openai(direct_client)
+            logger.info("Instructor client set up successfully")
+        except Exception as e:
+            logger.error(f"Error setting up instructor client: {e}")
+            raise
+    
+    def query(self, user_input: str) -> str:
+        """Standard chat query that returns a text response"""
+        try:
+            return self.conversation.predict(input=user_input)
+        except Exception as e:
+            logger.error(f"Error in chat query: {e}")
+            return f"Error: {str(e)}"
+    
+    def structured_query(self, user_input: str, response_model: Type[T]) -> T:
         """
-        Match a data element with business terms using vector similarity search.
+        Query that returns a structured response using instructor and Pydantic model
         
         Args:
-            element_id: Unique identifier for the element
-            element_name: Enhanced name of the element
-            element_description: Enhanced description of the element
-            top_k: Number of top matching terms to return
+            user_input: The user's query text
+            response_model: A Pydantic model class defining the expected response structure
             
         Returns:
-            TaggingResult with matching terms and confidence scores
+            An instance of the response_model populated with extracted data
         """
         try:
-            # Use the business term manager to find similar terms
-            result = self.business_term_manager.tag_element(
-                element_id=element_id,
-                name=element_name,
-                description=element_description,
-                top_k=top_k,
-                threshold=0.3  # Lower threshold to find more potential matches
+            model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
+            
+            # Use instructor to get structured output
+            result = self.instructor_client.chat.completions.create(
+                model=model_name,
+                response_model=response_model,
+                messages=[
+                    {"role": "user", "content": user_input}
+                ]
+            )
+            
+            # Add the interaction to memory for context
+            self.memory.save_context(
+                {"input": user_input}, 
+                {"output": f"Extracted structured data: {result.model_dump_json()}"}
             )
             
             return result
-                
         except Exception as e:
-            logger.error(f"Error in vector tagging: {e}")
-            return TaggingResult(
-                element_id=element_id,
-                element_name=element_name,
-                element_description=element_description,
-                matching_terms=[],
-                confidence_scores=[],
-                modeling_required=True,
-                message=f"Error during vector tagging: {str(e)}"
-            )
+            logger.error(f"Error in structured query: {e}")
+            raise
+
+# Example usage:
+if __name__ == "__main__":
+    # Define a sample response model
+    class UserInfo(BaseModel):
+        name: str
+        age: int
+        
+    # Initialize the chatbot
+    chatbot = AzureChatbot()
     
-    async def tag_element(self, element_id: str, element_name: str, element_description: str, 
-                         top_k: int = 3, use_llm_first: bool = True) -> TaggingResult:
-        """
-        Match a data element with appropriate business terms using combined LLM and vector approach.
-        
-        Args:
-            element_id: Unique identifier for the element
-            element_name: Enhanced name of the element
-            element_description: Enhanced description of the element
-            top_k: Number of top matching terms to return
-            use_llm_first: Whether to try LLM matching first (default: True)
-            
-        Returns:
-            TaggingResult with matching terms, confidence scores, and validation information
-        """
-        if use_llm_first:
-            # Try LLM-based matching first
-            result = await self.llm_tag_element(element_id, element_name, element_description, top_k)
-            
-            # If LLM matching failed or found no terms, fall back to vector similarity
-            if not result.matching_terms:
-                logger.info(f"LLM matching found no terms for element: {element_name}, falling back to vector similarity")
-                result = await self.vector_tag_element(element_id, element_name, element_description, top_k)
-        else:
-            # Use vector similarity directly
-            result = await self.vector_tag_element(element_id, element_name, element_description, top_k)
-        
-        return result
+    # Example of regular query
+    response = chatbot.query("Tell me about Azure OpenAI services")
+    print(f"Regular response: {response}")
     
-    async def _validate_contextual_match(self, element_name: str, element_description: str,
-                                        term_name: str, term_description: str, term_category: str,
-                                        similarity_score: float, other_terms: str) -> ContextualMatchResult:
-        """
-        Validate if a business term is contextually appropriate for a data element.
-        
-        Args:
-            element_name: Name of the data element
-            element_description: Description of the data element
-            term_name: Name of the business term
-            term_description: Description of the business term
-            term_category: Category of the business term
-            similarity_score: Vector similarity score
-            other_terms: Text describing other potential matches
-            
-        Returns:
-            ContextualMatchResult indicating the validation result
-        """
-        try:
-            result = await self.validation_chain.ainvoke({
-                "element_name": element_name,
-                "element_description": element_description,
-                "term_name": term_name,
-                "term_description": term_description,
-                "term_category": term_category,
-                "similarity_score": f"{similarity_score:.2f}",
-                "other_terms": other_terms
-            })
-            
-            # Parse the result
-            is_match = False
-            confidence = similarity_score  # Default to the vector similarity
-            reasoning = ""
-            suggested_term_id = None
-            
-            for line in result.split('\n'):
-                if "Contextual Match:" in line:
-                    is_match = "YES" in line.upper()
-                elif "Confidence" in line and ":" in line:
-                    try:
-                        confidence_text = line.split(':')[1].strip()
-                        confidence_value = float(confidence_text.strip('[]'))
-                        confidence = max(0.0, min(1.0, confidence_value))  # Ensure valid range
-                    except (ValueError, IndexError):
-                        logger.warning(f"Failed to parse confidence from: {line}")
-                elif "Reasoning:" in line:
-                    reasoning = line.split('Reasoning:')[1].strip()
-                elif "Better Match" in line:
-                    match_text = line.split(':')[1].strip()
-                    if match_text and "None" not in match_text and "[" in match_text:
-                        # Extract the ID from the format like "[term-123]"
-                        import re
-                        id_match = re.search(r'\[([\w-]+)\]', match_text)
-                        if id_match:
-                            suggested_term_id = id_match.group(1)
-            
-            return ContextualMatchResult(
-                is_match=is_match,
-                confidence=confidence,
-                reasoning=reasoning,
-                suggested_term_id=suggested_term_id
-            )
-            
-        except Exception as e:
-            logger.error(f"Error in contextual validation: {e}")
-            # Return a default result in case of error
-            return ContextualMatchResult(
-                is_match=True,  # Default to accepting the match
-                confidence=similarity_score,
-                reasoning=f"Error during validation: {str(e)}",
-                suggested_term_id=None
-            )
-    
-    async def validate_tagging(self, tagging_result: TaggingResult) -> TaggingValidationResult:
-        """
-        Validate the tagging result and provide feedback.
-        
-        Args:
-            tagging_result: Result of the tagging process
-            
-        Returns:
-            TaggingValidationResult with validation status and suggestions
-        """
-        return await self.business_term_manager.validate_tagging_with_reasoning(tagging_result)
+    # Example of structured query
+    try:
+        user_data = chatbot.structured_query("John Doe is 30 years old", UserInfo)
+        print(f"Structured data - Name: {user_data.name}, Age: {user_data.age}")
+    except Exception as e:
+        print(f"Error in structured query: {e}")
