@@ -1,668 +1,894 @@
-import re
-import csv
-import pandas as pd
-import string
 import os
-import nltk
-from nltk.corpus import stopwords, wordnet
-from nltk.stem import PorterStemmer, WordNetLemmatizer
-from nltk.tokenize import word_tokenize
-import spacy
-from typing import List, Dict, Set, Tuple, Union, Optional
+import sys
+import uuid
+import json
+import logging
+import pandas as pd
+import numpy as np
+from typing import List, Dict, Any, Optional, TypeVar, Generic, Type, Union, Literal
+from pathlib import Path
+from dotenv import load_dotenv, dotenv_values
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_dump
+import instructor
+from instructor.function_calling import OpenAISchema
+from openai import AzureOpenAI
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider, ClientSecretCredential
+from langchain.memory import ConversationBufferMemory
+from langchain.chat_models import AzureChatOpenAI
+from langchain.chains import ConversationChain
+from collections import namedtuple
+from langgraph.graph import StateGraph, START, END
+from langgraph.prebuilt import ToolNode
+from langgraph.graph.state import NodeStateType, StateType
+from langgraph.checkpoint import MemorySaver
 
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
 
-class LexicalMatcher:
-    """
-    A class to generate robust regex patterns for lexical matching based on
-    terms, definitions, related terms, and acronyms using spaCy and NLTK.
-    """
-    
-    def __init__(self, spacy_model: str = 'en_core_web_sm', nltk_data_path: str = None):
-        """
-        Initialize the LexicalMatcher with NLP tools.
+# Define paths
+ENV_DIR = "env"
+CONFIG_PATH = f"{ENV_DIR}/config.env"
+CREDS_PATH = f"{ENV_DIR}/credentials.env"
+CERT_PATH = f"{ENV_DIR}/cacert.pem"
+
+# Create ENV_DIR if it doesn't exist
+os.makedirs(ENV_DIR, exist_ok=True)
+
+# Type variable for generic response model
+T = TypeVar('T', bound=BaseModel)
+
+# Utility functions
+def is_file_readable(filepath: str) -> bool:
+    """Check if a file is readable."""
+    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
+        return False
+    return True
+
+def str_to_bool(s: str) -> bool:
+    """Convert a string to a boolean."""
+    if s == 'True':
+        return True
+    elif s == 'False':
+        return False
+    else:
+        raise ValueError(f"Invalid boolean value: {s}")
+
+class OSEnv:
+    """Class to manage environment variables"""
+    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
+        self.var_list = []
+        self.bulk_set(config_file, True)
+        self.bulk_set(creds_file, False)
         
-        Args:
-            spacy_model: The spaCy model to use (default: small English model)
-            nltk_data_path: Custom path to NLTK data (optional)
-        """
-        # Configure NLTK to use custom data path if provided
-        if nltk_data_path:
-            nltk.data.path.insert(0, nltk_data_path)
-            print(f"Using NLTK data from: {nltk_data_path}")
+        if is_file_readable(certificate_path):
+            self.set_certificate_path(certificate_path)
+        
+        if str_to_bool(self.get("PROXY_ENABLED", "False")):
+            self.set_proxy()
+        
+        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
+            self.token = self.get_azure_token()
         else:
-            # Check for default location of NLTK resources
-            try:
-                nltk.data.find('corpora/stopwords')
-                nltk.data.find('corpora/wordnet')
-                nltk.data.find('punkt')
-                nltk.data.find('taggers/averaged_perceptron_tagger')
-            except LookupError:
-                print("NLTK data not found. Downloading required resources...")
-                nltk.download('stopwords')
-                nltk.download('wordnet')
-                nltk.download('punkt')
-                nltk.download('averaged_perceptron_tagger')
+            self.token = None
         
-        # Load spaCy model
+        self.credential = self._get_credential()
+    
+    def _get_credential(self):
+        if str_to_bool(self.get("USE_MANAGED_IDENTITY", "False")):
+            return DefaultAzureCredential()
+        else:
+            return ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID"), 
+                client_id=self.get("AZURE_CLIENT_ID"), 
+                client_secret=self.get("AZURE_CLIENT_SECRET")
+            )
+    
+    def set_certificate_path(self, path: str):
         try:
-            self.nlp = spacy.load(spacy_model)
-            print(f"Loaded spaCy model: {spacy_model}")
-        except OSError:
-            # If model is not installed, provide instructions
-            print(f"SpaCy model {spacy_model} not found.")
-            print(f"Please install it with: python -m spacy download {spacy_model}")
-            raise
-        
-        # Initialize NLTK tools
-        self.stop_words = set(stopwords.words('english'))
-        self.stemmer = PorterStemmer()
-        self.lemmatizer = WordNetLemmatizer()
-        
-        # Dictionary to store generated patterns
-        self.patterns = {}
-    
-    def _escape_regex(self, text: str) -> str:
-        """
-        Escape special regex characters.
-        
-        Args:
-            text: String to escape
+            if not os.path.isabs(path):
+                path = os.path.abspath(path)
+            if not is_file_readable(path):
+                raise FileNotFoundError(f"The file '{path}' does not exist or is not readable")
             
-        Returns:
-            Escaped string safe for regex pattern
-        """
-        return re.escape(text)
-    
-    def _get_wordnet_pos(self, treebank_tag: str) -> str:
-        """
-        Convert Penn Treebank POS tags to WordNet POS tags.
-        
-        Args:
-            treebank_tag: Penn Treebank POS tag
-            
-        Returns:
-            WordNet POS tag
-        """
-        if treebank_tag.startswith('J'):
-            return wordnet.ADJ
-        elif treebank_tag.startswith('V'):
-            return wordnet.VERB
-        elif treebank_tag.startswith('N'):
-            return wordnet.NOUN
-        elif treebank_tag.startswith('R'):
-            return wordnet.ADV
-        else:
-            # Default is noun
-            return wordnet.NOUN
-    
-    def _lemmatize_text(self, text: str) -> str:
-        """
-        Lemmatize text using WordNet lemmatizer with correct POS.
-        
-        Args:
-            text: Text to lemmatize
-            
-        Returns:
-            Lemmatized text
-        """
-        tokens = word_tokenize(text)
-        pos_tags = nltk.pos_tag(tokens)
-        
-        return ' '.join([
-            self.lemmatizer.lemmatize(
-                word, 
-                self._get_wordnet_pos(pos)
-            ) for word, pos in pos_tags
-        ])
-    
-    def _remove_vowels(self, text: str, keep_first: bool = True) -> str:
-        """
-        Remove vowels from text, optionally keeping the first letter.
-        
-        Args:
-            text: Input text
-            keep_first: Whether to keep the first character regardless of vowel status
-            
-        Returns:
-            Text with vowels removed
-        """
-        if not text:
-            return text
-            
-        if keep_first:
-            first_char = text[0]
-            rest = text[1:]
-            return first_char + re.sub(r'[aeiou]', '', rest, flags=re.IGNORECASE)
-        else:
-            return re.sub(r'[aeiou]', '', text, flags=re.IGNORECASE)
-    
-    def _extract_important_words(self, text: str) -> List[str]:
-        """
-        Extract important words from text using spaCy.
-        
-        Args:
-            text: Input text
-            
-        Returns:
-            List of important words
-        """
-        doc = self.nlp(text)
-        
-        # Get nouns, proper nouns, and adjectives
-        important_words = []
-        for token in doc:
-            # Include nouns, proper nouns, adjectives, and verbs
-            if (token.pos_ in ('NOUN', 'PROPN', 'ADJ', 'VERB') and 
-                not token.is_stop and 
-                len(token.text) > 2):
-                important_words.append(token.text.lower())
-        
-        return important_words
-    
-    def _get_synonyms(self, word: str) -> List[str]:
-        """
-        Get synonyms for a word using WordNet.
-        
-        Args:
-            word: Input word
-            
-        Returns:
-            List of synonyms
-        """
-        synonyms = []
-        
-        # Get lemma
-        word = self.lemmatizer.lemmatize(word)
-        
-        # Get synonyms from WordNet
-        for syn in wordnet.synsets(word):
-            for lemma in syn.lemmas():
-                synonym = lemma.name().lower().replace('_', ' ')
-                if synonym != word and synonym not in synonyms:
-                    synonyms.append(synonym)
-        
-        # Limit to reasonable number of synonyms
-        return synonyms[:3]
-    
-    def _extract_entities(self, text: str) -> List[str]:
-        """
-        Extract named entities from text using spaCy.
-        
-        Args:
-            text: Input text
-            
-        Returns:
-            List of named entities
-        """
-        doc = self.nlp(text)
-        entities = [ent.text.lower() for ent in doc.ents]
-        return entities
-    
-    def _generate_sensible_abbreviations(self, term: str) -> List[str]:
-        """
-        Generate sensible abbreviations using NLP techniques.
-        
-        Args:
-            term: Input term
-            
-        Returns:
-            List of generated abbreviations
-        """
-        abbreviations = []
-        term = term.lower().strip()
-        
-        if not term:
-            return abbreviations
-        
-        # Use spaCy to process the term
-        doc = self.nlp(term)
-        
-        # 1. First letter acronym (for multi-word terms)
-        if ' ' in term:
-            # Get all words
-            words = [token.text for token in doc if not token.is_punct and not token.is_space]
-            
-            # Standard acronym (first letter of each word)
-            standard_acronym = ''.join(word[0] for word in words if word)
-            if len(standard_acronym) > 1:
-                abbreviations.append(standard_acronym)
-            
-            # Enhanced acronym (first letter of important words)
-            important_words = [token.text for token in doc 
-                            if token.pos_ in ('NOUN', 'PROPN', 'ADJ', 'VERB') 
-                            and not token.is_stop]
-            
-            if important_words:
-                enhanced_acronym = ''.join(word[0] for word in important_words)
-                if len(enhanced_acronym) > 1 and enhanced_acronym != standard_acronym:
-                    abbreviations.append(enhanced_acronym)
-        
-        # 2. Consonant skeleton variants
-        # Standard consonant skeleton
-        consonant_skeleton = self._remove_vowels(term, keep_first=True)
-        if consonant_skeleton != term and len(consonant_skeleton) > 1:
-            abbreviations.append(consonant_skeleton)
-        
-        # Partial consonant skeleton for longer terms
-        if len(term) > 5:
-            partial_skeleton = term[0] + self._remove_vowels(term[1:4], keep_first=False)
-            if partial_skeleton not in abbreviations and len(partial_skeleton) > 1:
-                abbreviations.append(partial_skeleton)
-        
-        # 3. Prefixes and truncations
-        # First 2-4 characters
-        if len(term) > 2:
-            abbreviations.append(term[:min(3, len(term))])
-            
-            if len(term) > 4:
-                abbreviations.append(term[:min(4, len(term))])
-        
-        # 4. For multi-word terms, create more abbreviations
-        if ' ' in term:
-            words = term.split()
-            
-            # For two-word terms
-            if len(words) == 2:
-                # First 3 chars of first word + first 3 chars of second word
-                if len(words[0]) >= 2 and len(words[1]) >= 2:
-                    combined = words[0][:min(3, len(words[0]))] + '_' + words[1][:min(3, len(words[1]))]
-                    abbreviations.append(combined)
-                
-                # First word's consonant skeleton + second word's consonant skeleton
-                first_cons = self._remove_vowels(words[0], keep_first=True)
-                second_cons = self._remove_vowels(words[1], keep_first=True)
-                if len(first_cons) > 1 and len(second_cons) > 1:
-                    combined_cons = first_cons + '_' + second_cons
-                    abbreviations.append(combined_cons)
-            
-            # For all multi-word terms
-            if len(words) > 1:
-                # Extract nouns and important words
-                doc = self.nlp(term)
-                important_pos = ('NOUN', 'PROPN')
-                
-                # Get all nouns in the term
-                nouns = [token.text for token in doc if token.pos_ in important_pos]
-                
-                # If we have nouns, create abbreviations using just the nouns
-                if len(nouns) > 1:
-                    noun_acr = ''.join(noun[0] for noun in nouns)
-                    if len(noun_acr) > 1:
-                        abbreviations.append(noun_acr)
-                
-                # For longer compound terms (3+ words), also add first letters of first and last word
-                if len(words) >= 3:
-                    first_last = words[0][0] + words[-1][0]
-                    if len(first_last) == 2:
-                        abbreviations.append(first_last)
-        
-        # 5. Special handling for industry-specific patterns
-        # For terms like "employee number", "customer identifier", etc.
-        if ' ' in term and len(term.split()) == 2:
-            words = term.split()
-            
-            # Check if second word is an identifier word
-            id_words = ['number', 'id', 'identifier', 'code', 'key', 'reference']
-            
-            if any(id_word == words[1].lower() for id_word in id_words):
-                # Create abbreviated version with first word abbreviated + id word abbreviated
-                abbr_first = self._remove_vowels(words[0], keep_first=True)
-                abbr_id = words[1][0:3]  # Take first 3 chars of id word
-                abbreviations.append(f"{abbr_first}_{abbr_id}")
-        
-        # Remove duplicates
-        return list(set(abbreviations))
-    
-    def create_pattern(self, name: str, definition: str = "", 
-                     related_terms: Union[str, List[str]] = "", 
-                     acronyms: Union[str, List[str]] = "") -> Dict:
-        """
-        Create a robust regex pattern for lexical matching.
-        
-        Args:
-            name: The main term
-            definition: Term definition
-            related_terms: Related terms (comma-separated string or list)
-            acronyms: Known acronyms (comma-separated string or list)
-            
-        Returns:
-            Dictionary with pattern and regex object
-        """
-        # Normalize inputs
-        name = str(name).strip().lower() if name else ""
-        definition = str(definition).strip().lower() if definition else ""
-        
-        # Convert to lists if they're strings
-        if isinstance(related_terms, str):
-            related_terms_list = [term.strip().lower() for term in related_terms.split(',') if term.strip()]
-        else:
-            related_terms_list = [term.lower().strip() for term in related_terms if term]
-        
-        if isinstance(acronyms, str):
-            acronyms_list = [acr.strip().lower() for acr in acronyms.split(',') if acr.strip()]
-        else:
-            acronyms_list = [acr.lower().strip() for acr in acronyms if acr]
-        
-        # Pattern collection
-        patterns = set()
-        
-        # 1. Add exact name match
-        if name:
-            patterns.add(self._escape_regex(name))
-            
-            # Add lemmatized version if different
-            lemma_name = self._lemmatize_text(name)
-            if lemma_name != name:
-                patterns.add(self._escape_regex(lemma_name))
-        
-        # 2. Generate and add sensible abbreviations from name
-        generated_abbreviations = self._generate_sensible_abbreviations(name)
-        for abbr in generated_abbreviations:
-            patterns.add(self._escape_regex(abbr))
-        
-        # 3. Extract important words from name using spaCy
-        if name:
-            important_words = self._extract_important_words(name)
-            for word in important_words:
-                if len(word) > 2 and word != name:
-                    patterns.add(self._escape_regex(word))
-        
-        # 4. Add related terms and their abbreviations
-        for term in related_terms_list:
-            patterns.add(self._escape_regex(term))
-            
-            # Add lemmatized version
-            lemma_term = self._lemmatize_text(term)
-            if lemma_term != term:
-                patterns.add(self._escape_regex(lemma_term))
-            
-            # Generate and add abbreviations for related terms
-            term_abbrevs = self._generate_sensible_abbreviations(term)
-            for abbr in term_abbrevs:
-                patterns.add(self._escape_regex(abbr))
-                
-            # For multi-word related terms, add important words
-            important_words = self._extract_important_words(term)
-            for word in important_words:
-                if len(word) > 2:
-                    patterns.add(self._escape_regex(word))
-        
-        # 5. Add explicit acronyms
-        for acronym in acronyms_list:
-            patterns.add(self._escape_regex(acronym))
-        
-        # 6. Extract meaningful terms from definition using NLP
-        if definition:
-            # Process with spaCy to get important words
-            important_def_words = self._extract_important_words(definition)
-            
-            # Add top 3 important words from definition
-            for word in important_def_words[:3]:
-                if len(word) > 3:
-                    patterns.add(self._escape_regex(word))
-            
-            # Extract any named entities
-            entities = self._extract_entities(definition)
-            for entity in entities:
-                if len(entity) > 2:
-                    patterns.add(self._escape_regex(entity))
-        
-        # 7. Generate compound patterns for special cases
-        if name and related_terms_list:
-            # Generate name abbreviation + related term combinations
-            name_abbrevs = self._generate_sensible_abbreviations(name)
-            
-            for rel_term in related_terms_list:
-                # Look for related terms containing identifier words
-                id_words = ['number', 'code', 'id', 'identifier', 'key', 'reference']
-                rel_lower = rel_term.lower()
-                
-                for id_word in id_words:
-                    if id_word in rel_lower:
-                        # For each abbreviation + id_word combination
-                        for abbr in name_abbrevs:
-                            if len(abbr) > 1:
-                                # Create patterns like "emply_num", "emply_id", etc.
-                                compound = f"{abbr}[_\\-\\s]*{id_word[:3]}"
-                                patterns.add(compound)
-                                
-                                # Also try with just the first letter of the id word
-                                compound_short = f"{abbr}[_\\-\\s]*{id_word[0]}"
-                                patterns.add(compound_short)
-        
-        # 8. Add synonyms for important terms (limited to avoid overly broad matching)
-        if name:
-            # Get the main words from the name
-            main_words = [word for word in name.split() if len(word) > 3 and word.lower() not in self.stop_words]
-            
-            # Add synonyms for the main words (limited to key terms)
-            for word in main_words[:1]:  # Limit to just the first main word
-                synonyms = self._get_synonyms(word)
-                # Add only the first 2 synonyms to avoid too broad matching
-                for synonym in synonyms[:2]:
-                    if len(synonym) > 3:
-                        patterns.add(self._escape_regex(synonym))
-        
-        # Build final pattern with word boundaries and flexible separators
-        pattern_list = list(patterns)
-        combined_pattern = '|'.join(pattern_list)
-        
-        # Final pattern with:
-        # - Case insensitivity flag at the beginning (making it explicitly case insensitive)
-        # - Word boundaries
-        # - Optional separators between pattern components
-        final_pattern = f"(?i)\\b(?:{combined_pattern})(?:[_\\-\\s]*(?:{combined_pattern}))*\\b"
-        
-        return {
-            'pattern': final_pattern,
-            'regex': re.compile(final_pattern, re.IGNORECASE),  # Compile with IGNORECASE flag
-            'original_term': name,
-            'generated_abbreviations': generated_abbreviations,
-            'all_terms': list(patterns)
-        }
-    
-    def process_csv(self, file_path: str, 
-                   name_col: str = 'name', 
-                   def_col: str = 'definition',
-                   rel_terms_col: str = 'related terms',
-                   acronyms_col: str = 'acronyms',
-                   encoding: str = None) -> Dict:
-        """
-        Process a CSV file to generate regex patterns for all terms.
-        
-        Args:
-            file_path: Path to the CSV file
-            name_col: Column name for the main term
-            def_col: Column name for definition
-            rel_terms_col: Column name for related terms
-            acronyms_col: Column name for acronyms
-            encoding: File encoding (if None, will try multiple encodings)
-            
-        Returns:
-            Dictionary of patterns keyed by term name
-        """
-        # Check if file exists
-        if not os.path.exists(file_path):
-            print(f"CSV file not found: {file_path}")
-            return {}
-            
-        # Common encodings to try if encoding is not specified
-        encodings_to_try = ['utf-8', 'latin1', 'iso-8859-1', 'cp1252', 'ascii'] if encoding is None else [encoding]
-        
-        # Try reading with different encodings
-        df = None
-        successful_encoding = None
-        
-        for enc in encodings_to_try:
-            try:
-                print(f"Attempting to read CSV with {enc} encoding...")
-                df = pd.read_csv(file_path, encoding=enc, on_bad_lines='skip')
-                successful_encoding = enc
-                print(f"Successfully loaded CSV with {enc} encoding")
-                break
-            except UnicodeDecodeError:
-                print(f"Failed to read with {enc} encoding, trying next...")
-            except Exception as e:
-                print(f"Error reading CSV with {enc} encoding: {str(e)}")
-        
-        # If all encodings failed
-        if df is None:
-            print("Failed to read the CSV file with any encoding. Please check the file.")
-            return {}
-            
-        # Display CSV info
-        print(f"CSV loaded with {len(df)} rows and columns: {', '.join(df.columns)}")
-        
-        # Ensure required columns exist
-        if name_col not in df.columns:
-            print(f"CSV file must contain a '{name_col}' column. Available columns: {', '.join(df.columns)}")
-            # Try to suggest a similar column
-            possible_name_cols = [col for col in df.columns if 'name' in col.lower() or 'term' in col.lower()]
-            if possible_name_cols:
-                print(f"You might want to try one of these columns instead: {', '.join(possible_name_cols)}")
-            return {}
-        
-        # Process each row
-        print(f"Generating patterns for {len(df)} terms...")
-        for i, row in df.iterrows():
-            try:
-                name = str(row.get(name_col, ''))
-                if not name or pd.isna(name) or name.strip() == '':
-                    print(f"Skipping row {i+1}: No name provided")
-                    continue
-                
-                # Get other columns, handling missing values
-                definition = str(row.get(def_col, '')) if def_col in df.columns and not pd.isna(row.get(def_col)) else ''
-                related_terms = str(row.get(rel_terms_col, '')) if rel_terms_col in df.columns and not pd.isna(row.get(rel_terms_col)) else ''
-                acronyms = str(row.get(acronyms_col, '')) if acronyms_col in df.columns and not pd.isna(row.get(acronyms_col)) else ''
-                
-                print(f"Processing term {i+1}/{len(df)}: {name}")
-                self.patterns[name] = self.create_pattern(name, definition, related_terms, acronyms)
-            except Exception as e:
-                print(f"Error processing row {i+1}: {str(e)}")
-                continue
-        
-        print(f"Successfully generated patterns for {len(self.patterns)} terms")
-        return self.patterns
-    
-    def save_patterns_to_csv(self, output_file: str) -> None:
-        """
-        Save generated patterns to a CSV file.
-        
-        Args:
-            output_file: Path to save the patterns
-        """
-        try:
-            rows = []
-            for term, pattern_data in self.patterns.items():
-                rows.append({
-                    'term': term,
-                    'pattern': pattern_data['pattern'],
-                    'abbreviations': ', '.join(pattern_data['generated_abbreviations']),
-                    'all_terms': ', '.join(pattern_data['all_terms']),
-                    'notes': 'Pattern is case insensitive (uses (?i) flag)'
-                })
-            
-            # Create DataFrame and save to CSV
-            df = pd.DataFrame(rows)
-            df.to_csv(output_file, index=False)
-            print(f"Successfully saved patterns to: {output_file}")
-            print(f"Note: All patterns are case insensitive via the (?i) flag")
-            
+            self.set("REQUESTS_CA_BUNDLE", path)
+            self.set("SSL_CERT_FILE", path)
+            self.set("CURL_CA_BUNDLE", path)
         except Exception as e:
-            print(f"Error saving patterns to CSV: {e}")
+            logger.error(f"Error setting certificate path: {e}")
+            raise
     
-    def match(self, term: str, original_term: str) -> bool:
+    def bulk_set(self, dotenvfile: str, print_val: bool = False) -> None:
+        try:
+            if not os.path.isabs(dotenvfile):
+                dotenvfile = os.path.abspath(dotenvfile)
+            if not is_file_readable(dotenvfile):
+                logger.warning(f"Environment file not found or not readable: {dotenvfile}")
+                return
+                
+            temp_dict = dotenv_values(dotenvfile)
+            for key, value in temp_dict.items():
+                self.set(key, value, print_val)
+            del temp_dict
+        except Exception as e:
+            logger.error(f"Error loading environment variables from {dotenvfile}: {e}")
+            raise
+    
+    def set(self, key: str, value: str, print_val: bool = False) -> None:
+        try:
+            os.environ[key] = value
+            if key not in self.var_list:
+                self.var_list.append(key)
+            if print_val:
+                logger.info(f"{key}: {value}")
+        except Exception as e:
+            logger.error(f"Error setting environment variable {key}: {e}")
+            raise
+    
+    def get(self, key: str, default: Optional[str] = None) -> str:
+        try:
+            return os.environ.get(key, default)
+        except Exception as e:
+            logger.error(f"Error getting environment variable {key}: {e}")
+            raise
+    
+    def set_proxy(self) -> None:
+        try:
+            ad_username = self.get("AD_USERNAME")
+            ad_password = self.get("AD_USER_PW")
+            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
+            if not all([ad_username, ad_password, proxy_domain]):
+                raise ValueError("Proxy settings are incomplete")
+            proxy_url = f"https://{ad_username}:{ad_password}@{proxy_domain}"
+            self.set("HTTP_PROXY", proxy_url, print_val=False)
+            self.set("HTTPS_PROXY", proxy_url, print_val=False)
+            no_proxy_domains = [
+                'cognitiveservices.azure.com',
+                'search.windows.net',
+                'openai.azure.com',
+                'core.windows.net',
+                'azurewebsites.net'
+            ]
+            self.set("NO_PROXY", ",".join(no_proxy_domains), print_val=False)
+        except Exception as e:
+            logger.error(f"Error setting proxy: {e}")
+            raise
+    
+    def get_azure_token(self) -> str:
+        try:
+            credential = ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID"),
+                client_id=self.get("AZURE_CLIENT_ID"),
+                client_secret=self.get("AZURE_CLIENT_SECRET")
+            )
+            token = credential.get_token("https://cognitiveservices.azure.com/.default")
+            self.set("AZURE_TOKEN", token.token, print_val=False)
+            logger.info("Azure token set")
+            return token.token
+        except Exception as e:
+            logger.error(f"Error retrieving Azure token: {e}")
+            return None
+    
+    def list_env_vars(self) -> None:
+        for var in self.var_list:
+            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET'}:
+                logger.info(f"{var}: [REDACTED]")
+            else:
+                logger.info(f"{var}: {os.getenv(var)}")
+
+
+class AzureChatbot:
+    """Azure OpenAI chatbot with Instructor integration"""
+    def __init__(self, config_file=CONFIG_PATH, creds_file=CREDS_PATH, cert_file=CERT_PATH):
+        self.env = OSEnv(config_file, creds_file, cert_file)
+        self._setup_chat_model()
+        self.memory = ConversationBufferMemory()
+        self.conversation = ConversationChain(llm=self.llm, memory=self.memory, verbose=True)
+        self._setup_instructor_client()
+    
+    def _setup_chat_model(self):
+        try:
+            token_provider = get_bearer_token_provider(
+                self.env.credential,
+                "https://cognitiveservices.azure.com/.default"
+            )
+            model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
+            temperature = float(self.env.get("TEMPERATURE", "0.7"))
+            max_tokens = int(self.env.get("MAX_TOKENS", "800"))
+            api_version = self.env.get("API_VERSION", "2023-05-15")
+            azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
+            
+            self.llm = AzureChatOpenAI(
+                model_name=model_name,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                api_version=api_version,
+                azure_endpoint=azure_endpoint,
+                azure_ad_token_provider=token_provider
+            )
+        except Exception as e:
+            logger.error(f"Error setting up chatbot: {e}")
+            raise
+    
+    def _setup_instructor_client(self):
+        try:
+            # Create the direct Azure client for instructor
+            azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
+            api_version = self.env.get("API_VERSION", "2023-05-15")
+            
+            direct_client = AzureOpenAI(
+                azure_endpoint=azure_endpoint,
+                api_version=api_version,
+                azure_ad_token_provider=get_bearer_token_provider(
+                    self.env.credential,
+                    "https://cognitiveservices.azure.com/.default"
+                )
+            )
+            
+            # Apply instructor to the client
+            self.instructor_client = instructor.from_openai(direct_client)
+            logger.info("Instructor client set up successfully")
+        except Exception as e:
+            logger.error(f"Error setting up instructor client: {e}")
+            raise
+    
+    def query(self, user_input: str) -> str:
+        """Standard chat query that returns a text response"""
+        try:
+            return self.conversation.predict(input=user_input)
+        except Exception as e:
+            logger.error(f"Error in chat query: {e}")
+            return f"Error: {str(e)}"
+    
+    def structured_query(self, user_input: str, response_model: Type[T]) -> T:
         """
-        Check if a term matches a pattern.
+        Query that returns a structured response using instructor and Pydantic model
         
         Args:
-            term: Term to check
-            original_term: Original term whose pattern to use
+            user_input: The user's query text
+            response_model: A Pydantic model class defining the expected response structure
             
         Returns:
-            True if match found, False otherwise
+            An instance of the response_model populated with extracted data
         """
-        if original_term not in self.patterns:
-            return False
+        try:
+            model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
             
-        pattern = self.patterns[original_term]['regex']
-        return bool(pattern.search(term))
-    
-    def get_all_patterns(self) -> Dict:
-        """
-        Get all generated patterns.
-        
-        Returns:
-            Dictionary of all patterns
-        """
-        return self.patterns
+            # Use instructor to get structured output
+            result = self.instructor_client.chat.completions.create(
+                model=model_name,
+                response_model=response_model,
+                messages=[
+                    {"role": "user", "content": user_input}
+                ]
+            )
+            
+            # Add the interaction to memory for context
+            self.memory.save_context(
+                {"input": user_input}, 
+                {"output": f"Extracted structured data: {result.model_dump_json()}"}
+            )
+            
+            return result
+        except Exception as e:
+            logger.error(f"Error in structured query: {e}")
+            raise
 
 
-# Main execution example
-if __name__ == "__main__":
-    import argparse
+# Define Pydantic models for structured outputs as OpenAISchema
+class IncidentFeatures(OpenAISchema):
+    """Extracted relevant features from an incident"""
+    id: str
+    summary: str
+    description: str
+    resolution_name: str
+    resolution_details: str
+    category: str
+    subcategory: str
     
-    # Create command line arguments
-    parser = argparse.ArgumentParser(description='Generate regex patterns from CSV terms')
-    parser.add_argument('--csv', type=str, required=True, help='Path to the CSV file with terms')
-    parser.add_argument('--output', type=str, default='generated_patterns.csv', help='Output CSV file path')
-    parser.add_argument('--name-col', type=str, default='name', help='Column name for the term')
-    parser.add_argument('--def-col', type=str, default='definition', help='Column name for definition')
-    parser.add_argument('--encoding', type=str, help='CSV file encoding (will auto-detect if not specified)')
-    parser.add_argument('--nltk-path', type=str, default="c/users/joseph/nltk_data", help='Path to NLTK data')
+    # Extracted indicators that might suggest a data issue
+    contains_data_terms: bool = Field(
+        description="Whether the incident contains terms related to data issues (e.g., 'data', 'database', 'query', 'missing records', 'corrupt data')"
+    )
+    contains_system_terms: bool = Field(
+        description="Whether the incident contains terms related to system issues (e.g., 'server', 'network', 'hardware', 'connectivity')"
+    )
+    is_categorized_as_data: bool = Field(
+        description="Whether the incident is explicitly categorized as 'Business Process or Usage' or 'database' in category or subcategory"
+    )
+
+class ClassificationReason(OpenAISchema):
+    """A single reason supporting the classification with its impact on confidence"""
+    reason: str = Field(description="Specific evidence or observation supporting the classification")
+    impact: float = Field(description="How much this reason impacts the confidence score (0.0 to 1.0)", ge=0.0, le=1.0)
     
-    args = parser.parse_args()
-    
-    # Configure paths
-    nltk_data_path = args.nltk_path
-    csv_file_path = args.csv
-    output_path = args.output
-    
-    print(f"Starting pattern generation...")
-    print(f"CSV file: {csv_file_path}")
-    print(f"Output file: {output_path}")
-    print(f"NLTK data path: {nltk_data_path}")
-    
-    # Create the matcher with your NLTK data path
-    matcher = LexicalMatcher(nltk_data_path=nltk_data_path)
-    
-    # Process your CSV - Adjust the column names if needed
-    patterns = matcher.process_csv(
-        file_path=csv_file_path,
-        name_col=args.name_col,
-        def_col=args.def_col,
-        encoding=args.encoding
+class IncidentClassification(OpenAISchema):
+    """The final classification of an incident"""
+    incident_id: str
+    is_data_issue: bool
+    confidence_score: float = Field(description="Confidence score from 0.0 to 1.0", ge=0.0, le=1.0)
+    supporting_reasons: List[ClassificationReason] = Field(
+        description="List of reasons supporting this classification"
+    )
+    contrary_reasons: List[ClassificationReason] = Field(
+        description="List of reasons that contradict this classification"
     )
     
-    # Save patterns to CSV for reference
-    matcher.save_patterns_to_csv(output_path)
+class AgentMessage(BaseModel):
+    """Message passed between agents"""
+    content: str
+    metadata: Dict[str, Any] = {}
+
+# Define LangGraph state model
+class ClassificationState(BaseModel):
+    """The state maintained throughout the classification process"""
+    incident: Optional[IncidentFeatures] = None
+    feature_extraction_complete: bool = False
+    preliminary_classification: Optional[IncidentClassification] = None
+    final_classification: Optional[IncidentClassification] = None
     
-    # Display some example patterns
-    print("\nExample patterns generated:")
-    count = 0
-    for term, pattern_data in patterns.items():
-        print(f"\nTerm: {term}")
-        print(f"Generated abbreviations: {', '.join(pattern_data['generated_abbreviations'])}")
-        print(f"Pattern: {pattern_data['pattern'][:150]}..." if len(pattern_data['pattern']) > 150 
-              else f"Pattern: {pattern_data['pattern']}")
-        print("Note: Pattern is case insensitive")
-        
-        # Test the pattern with some variations
-        test_variations = [
-            term,
-            term.upper(),
-            term.lower(),
-            term.title()
-        ]
-        print("Test results:")
-        for test in test_variations:
-            result = pattern_data['regex'].search(test) is not None
-            print(f"  \"{test}\" => {'✓ Match' if result else '✗ No match'}")
-        
-        count += 1
-        if count >= 5:  # Show just first 5 patterns
-            break
+    # Messages between agents
+    messages: List[AgentMessage] = Field(default_factory=list)
+    current_agent: str = "feature_extractor"
     
-    print(f"\nTotal patterns generated: {len(patterns)}")
-    print(f"Patterns saved to: {output_path}")
+    # Additional metadata
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+# Multi-agent system for incident classification
+class IncidentClassifier:
+    """Multi-agent system for classifying IT incidents as data issues"""
+    def __init__(self, config_file=CONFIG_PATH, creds_file=CREDS_PATH, cert_file=CERT_PATH):
+        # Initialize the chatbot for agent operations
+        try:
+            self.chatbot = AzureChatbot(
+                config_file=config_file, 
+                creds_file=creds_file, 
+                cert_file=cert_file
+            )
+        except Exception as e:
+            logger.error(f"Error initializing AzureChatbot: {e}")
+            raise
+        
+        # Create the state graph
+        try:
+            self.graph = self._build_graph()
+        except Exception as e:
+            logger.error(f"Error building graph: {e}")
+            raise
+        
+    def _build_graph(self):
+        """Build the LangGraph for the multi-agent system"""
+        # Initialize the graph with the ClassificationState model
+        graph = StateGraph(ClassificationState)
+        
+        # Add nodes to the graph
+        graph.add_node("feature_extractor", self.feature_extractor)
+        graph.add_node("classifier", self.classifier)
+        graph.add_node("reasoning_agent", self.reasoning_agent)
+        graph.add_node("confidence_evaluator", self.confidence_evaluator)
+        
+        # Add edges to connect the nodes
+        graph.add_edge("START", "feature_extractor")
+        graph.add_edge("feature_extractor", "classifier")
+        graph.add_edge("classifier", "reasoning_agent")
+        graph.add_edge("reasoning_agent", "confidence_evaluator")
+        graph.add_edge("confidence_evaluator", END)
+        
+        # Add memory to support state checkpoints
+        memory = MemorySaver()
+        
+        # Return the compiled graph with proper checkpointing
+        return graph.compile(checkpointer=memory)
+    
+    def feature_extractor(self, state: ClassificationState) -> dict:
+        """Extract features from the incident text"""
+        # If feature extraction is already complete, return empty dict (no changes)
+        if state.feature_extraction_complete:
+            return {}
+        
+        try:
+            # Using instructor to enforce structured output for feature extraction
+            metadata = state.metadata
+            features = self.chatbot.structured_query(
+                f"""
+                Extract key features from this IT incident:
+                ID: {metadata.get("id", "Unknown")}
+                Summary: {metadata.get("summary", "")}
+                Description: {metadata.get("description", "")}
+                Resolution Name: {metadata.get("resolution_name", "")}
+                Resolution Details: {metadata.get("resolution_details", "")}
+                Category: {metadata.get("category", "")}
+                Subcategory: {metadata.get("subcategory", "")}
+                
+                Analyze the text and determine if it contains terms related to data issues,
+                system issues, and if it's categorized explicitly as a data-related issue.
+                """,
+                IncidentFeatures
+            )
+            
+            # Create a new messages list with the success message
+            new_message = AgentMessage(
+                content="Successfully extracted features from the incident",
+                metadata={"agent": "feature_extractor", "success": True}
+            )
+            messages = state.messages.copy()
+            messages.append(new_message)
+            
+            # Return the updates to the state
+            return {
+                "incident": features,
+                "feature_extraction_complete": True,
+                "current_agent": "classifier",
+                "messages": messages
+            }
+        except Exception as e:
+            logger.error(f"Error in feature extraction: {e}")
+            # Append error message to the messages
+            error_message = AgentMessage(
+                content=f"Error extracting features: {str(e)}",
+                metadata={"agent": "feature_extractor", "success": False}
+            )
+            messages = state.messages.copy()
+            messages.append(error_message)
+            return {"messages": messages}
+    
+    def classifier(self, state: ClassificationState) -> dict:
+        """Perform initial classification of the incident"""
+        if state.preliminary_classification:
+            return {}
+        
+        if not state.incident:
+            error_message = AgentMessage(
+                content="Cannot classify without extracted features",
+                metadata={"agent": "classifier", "success": False}
+            )
+            messages = state.messages.copy()
+            messages.append(error_message)
+            return {"messages": messages}
+        
+        try:
+            # Create a simple preliminary classification
+            is_data_issue = (
+                state.incident.is_categorized_as_data or 
+                state.incident.contains_data_terms
+            )
+            
+            # Create an initial classification with a basic confidence score
+            classification = IncidentClassification(
+                incident_id=state.incident.id,
+                is_data_issue=is_data_issue,
+                confidence_score=0.7 if is_data_issue else 0.3,
+                supporting_reasons=[
+                    ClassificationReason(
+                        reason=f"Incident {'is' if state.incident.is_categorized_as_data else 'is not'} explicitly categorized as data-related",
+                        impact=0.6
+                    )
+                ],
+                contrary_reasons=[]
+            )
+            
+            # Prepare success message
+            new_message = AgentMessage(
+                content=f"Initial classification: {'Data issue' if is_data_issue else 'Not a data issue'}",
+                metadata={"agent": "classifier", "success": True}
+            )
+            messages = state.messages.copy()
+            messages.append(new_message)
+            
+            return {
+                "preliminary_classification": classification,
+                "current_agent": "reasoning_agent",
+                "messages": messages
+            }
+        except Exception as e:
+            logger.error(f"Error in classification: {e}")
+            error_message = AgentMessage(
+                content=f"Error in classification: {str(e)}",
+                metadata={"agent": "classifier", "success": False}
+            )
+            messages = state.messages.copy()
+            messages.append(error_message)
+            return {"messages": messages}
+    
+    def reasoning_agent(self, state: ClassificationState) -> dict:
+        """Develop reasoning and evidence for the classification"""
+        if not state.preliminary_classification or not state.incident:
+            error_message = AgentMessage(
+                content="Cannot provide reasoning without preliminary classification and incident data",
+                metadata={"agent": "reasoning_agent", "success": False}
+            )
+            messages = state.messages.copy()
+            messages.append(error_message)
+            return {"messages": messages}
+        
+        try:
+            # Use instructor for structured output
+            improved_classification = self.chatbot.structured_query(
+                f"""
+                Analyze this IT incident in detail and provide reasoning for why it should or should not
+                be classified as a data issue:
+                
+                ID: {state.incident.id}
+                Summary: {state.incident.summary}
+                Description: {state.incident.description}
+                Resolution Name: {state.incident.resolution_name}
+                Resolution Details: {state.incident.resolution_details}
+                Category: {state.incident.category}
+                Subcategory: {state.incident.subcategory}
+                
+                Current classification: 
+                - Is data issue: {state.preliminary_classification.is_data_issue}
+                - Confidence: {state.preliminary_classification.confidence_score}
+                
+                Provide a detailed list of supporting reasons (evidence that it IS a data issue)
+                and contrary reasons (evidence that it is NOT a data issue).
+                
+                Each reason should have an impact score (0.0 to 1.0) indicating how much this 
+                particular reason should influence the final confidence score.
+                """,
+                IncidentClassification
+            )
+            
+            # Prepare success message
+            new_message = AgentMessage(
+                content="Developed detailed reasoning for classification",
+                metadata={"agent": "reasoning_agent", "success": True}
+            )
+            messages = state.messages.copy()
+            messages.append(new_message)
+            
+            return {
+                "final_classification": improved_classification,
+                "current_agent": "confidence_evaluator",
+                "messages": messages
+            }
+        except Exception as e:
+            logger.error(f"Error in reasoning: {e}")
+            error_message = AgentMessage(
+                content=f"Error in reasoning: {str(e)}",
+                metadata={"agent": "reasoning_agent", "success": False}
+            )
+            messages = state.messages.copy()
+            messages.append(error_message)
+            # Use preliminary classification as fallback
+            return {
+                "final_classification": state.preliminary_classification,
+                "current_agent": "confidence_evaluator",
+                "messages": messages
+            }
+    
+    def confidence_evaluator(self, state: ClassificationState) -> dict:
+        """Evaluate and finalize the confidence score"""
+        # Ensure we have a final classification to work with
+        final_classification = state.final_classification
+        if not final_classification:
+            if state.preliminary_classification:
+                final_classification = state.preliminary_classification
+                new_message = AgentMessage(
+                    content="Using preliminary classification as final classification",
+                    metadata={"agent": "confidence_evaluator", "success": True}
+                )
+            else:
+                # Create a default minimal classification based on metadata
+                incident_id = state.metadata.get("id", "Unknown")
+                if state.incident:
+                    incident_id = state.incident.id
+                
+                final_classification = IncidentClassification(
+                    incident_id=incident_id,
+                    is_data_issue=False,
+                    confidence_score=0.5,
+                    supporting_reasons=[
+                        ClassificationReason(
+                            reason="Insufficient data for classification",
+                            impact=1.0
+                        )
+                    ],
+                    contrary_reasons=[]
+                )
+                new_message = AgentMessage(
+                    content="Created default classification due to missing data",
+                    metadata={"agent": "confidence_evaluator", "success": False}
+                )
+            
+            messages = state.messages.copy()
+            messages.append(new_message)
+            final_classification = final_classification
+        
+        try:
+            supporting_impact = sum(reason.impact for reason in final_classification.supporting_reasons)
+            contrary_impact = sum(reason.impact for reason in final_classification.contrary_reasons)
+            
+            total_impact = supporting_impact + contrary_impact
+            if total_impact > 0:
+                if supporting_impact > contrary_impact:
+                    confidence = 0.5 + (0.5 * (supporting_impact - contrary_impact) / total_impact
+                else:
+                    confidence = 0.5 - (0.5 * (contrary_impact - supporting_impact) / total_impact
+            else:
+                confidence = 0.5  # Neutral confidence if no impacts
+            
+            # Update the confidence score
+            final_classification.confidence_score = round(confidence, 2)
+            
+            # Prepare success message
+            new_message = AgentMessage(
+                content=f"Final confidence score: {final_classification.confidence_score}",
+                metadata={"agent": "confidence_evaluator", "success": True}
+            )
+            messages = state.messages.copy()
+            messages.append(new_message)
+            
+            return {
+                "final_classification": final_classification,
+                "messages": messages
+            }
+        except Exception as e:
+            logger.error(f"Error in confidence evaluation: {e}")
+            error_message = AgentMessage(
+                content=f"Error in confidence evaluation: {str(e)}",
+                metadata={"agent": "confidence_evaluator", "success": False}
+            )
+            messages = state.messages.copy()
+            messages.append(error_message)
+            return {
+                "final_classification": final_classification,
+                "messages": messages
+            }
+    
+    def classify_incident(self, incident_data: Dict[str, str]) -> IncidentClassification:
+        """Classify a single incident using the multi-agent system"""
+        # Create the initial state
+        initial_state = ClassificationState(
+            metadata={
+                "id": incident_data.get("Id", "Unknown"),
+                "summary": incident_data.get("IT_INCIDENT_SUMMARY", ""),
+                "description": incident_data.get("IT_INCIDENT_DESC", ""),
+                "resolution_name": incident_data.get("IT_INCIDENT_RESOLUTION_DETAILS_NAME", ""),
+                "resolution_details": incident_data.get("IT_INCIDENT_RESOLUTION_DESC", ""),
+                "category": incident_data.get("IT_INCIDENT_AREA_CATEGORY", ""),
+                "subcategory": incident_data.get("IT_INCIDENT_AREA_SUBCATEGORY", "")
+            }
+        )
+        
+        # Run the graph with proper state handling
+        try:
+            # Execute the graph with the initial state
+            final_state = self.graph.invoke(initial_state)
+            
+            # Return the final classification
+            if final_state.final_classification is not None:
+                return final_state.final_classification
+            else:
+                logger.error("Classification graph did not produce a final classification")
+                raise ValueError("Classification process did not produce a final classification")
+        
+        except Exception as e:
+            logger.error(f"Error running classification graph: {e}")
+            raise
+    
+    def process_csv(self, csv_path: str, output_path: str = None) -> List[IncidentClassification]:
+        """Process a CSV file containing incident data"""
+        try:
+            # Load the CSV
+            df = pd.read_csv(csv_path)
+            logger.info(f"Loaded {len(df)} incidents from {csv_path}")
+            
+            # Process each incident
+            results = []
+            for i, row in df.iterrows():
+                incident_id = row.get('Id', f"Unknown-{i}")
+                logger.info(f"Processing incident {i+1}/{len(df)}: {incident_id}")
+                
+                try:
+                    incident_data = row.to_dict()
+                    classification = self.classify_incident(incident_data)
+                    
+                    # Ensure we got a valid classification
+                    if not isinstance(classification, IncidentClassification):
+                        logger.error(f"Invalid classification type: {type(classification)}")
+                        continue
+                        
+                    results.append(classification)
+                    
+                    # Log success
+                    logger.info(
+                        f"Successfully classified incident {classification.incident_id}: "
+                        f"{'Data issue' if classification.is_data_issue else 'Not a data issue'} "
+                        f"(Confidence: {classification.confidence_score})"
+                    )
+                except Exception as e:
+                    logger.error(f"Error processing incident {incident_id}: {e}")
+                    continue
+            
+            # Save to JSON if output path provided
+            if output_path and results:
+                with open(output_path, 'w') as f:
+                    json.dump([r.model_dump() for r in results], f, indent=2)
+                logger.info(f"Saved {len(results)} results to {output_path}")
+            
+            return results
+        except Exception as e:
+            logger.error(f"Error processing CSV: {e}")
+            raise
+
+
+def create_sample_data(csv_path: str):
+    """Create a sample CSV with IT incident data for testing"""
+    sample_data = [
+        {
+            "Id": "INC001",
+            "IT_INCIDENT_SUMMARY": "Database query timeout affecting customer reports",
+            "IT_INCIDENT_DESC": "Users reported that customer reports are taking more than 30 minutes to generate, much longer than the expected 2 minutes. Investigation showed database queries timing out due to inefficient query structure.",
+            "IT_INCIDENT_RESOLUTION_DETAILS_NAME": "Database Optimization",
+            "IT_INCIDENT_RESOLUTION_DESC": "Identified slow running query in the customer database. Optimized the query by adding proper indexing and correcting the join conditions.",
+            "IT_INCIDENT_AREA_CATEGORY": "Database",
+            "IT_INCIDENT_AREA_SUBCATEGORY": "Query Performance"
+        },
+        {
+            "Id": "INC002",
+            "IT_INCIDENT_SUMMARY": "Network connectivity issues in Building B",
+            "IT_INCIDENT_DESC": "Employees in Building B have been experiencing intermittent network connectivity issues for the past week. Some devices lose connection for 5-10 minutes at a time, affecting productivity.",
+            "IT_INCIDENT_RESOLUTION_DETAILS_NAME": "Router Replacement",
+            "IT_INCIDENT_RESOLUTION_DESC": "Found faulty router in Building B that was causing intermittent connectivity issues. Replaced the hardware and verified connectivity.",
+            "IT_INCIDENT_AREA_CATEGORY": "Network",
+            "IT_INCIDENT_AREA_SUBCATEGORY": "Hardware Failure"
+        },
+        {
+            "Id": "INC003",
+            "IT_INCIDENT_SUMMARY": "Missing customer records in monthly report",
+            "IT_INCIDENT_DESC": "The monthly customer activity report is missing approximately 15% of customer records compared to previous months. Finance department flagged the issue as critical since it affects revenue calculations.",
+            "IT_INCIDENT_RESOLUTION_DETAILS_NAME": "Data Correction",
+            "IT_INCIDENT_RESOLUTION_DESC": "Found data integrity issue where customer records were being filtered out incorrectly. Fixed the data validation rules and regenerated reports.",
+            "IT_INCIDENT_AREA_CATEGORY": "Business Process or Usage",
+            "IT_INCIDENT_AREA_SUBCATEGORY": "Data Integrity"
+        },
+        {
+            "Id": "INC004",
+            "IT_INCIDENT_SUMMARY": "Application crashing during end-of-month processing",
+            "IT_INCIDENT_DESC": "The financial reporting application crashes consistently during end-of-month processing when attempting to generate quarterly reports. Error logs show memory exceptions before the crash.",
+            "IT_INCIDENT_RESOLUTION_DETAILS_NAME": "Memory Allocation",
+            "IT_INCIDENT_RESOLUTION_DESC": "Application was running out of memory during large batch processes. Increased memory allocation and optimized the processing algorithm.",
+            "IT_INCIDENT_AREA_CATEGORY": "Application",
+            "IT_INCIDENT_AREA_SUBCATEGORY": "Performance"
+        },
+        {
+            "Id": "INC005",
+            "IT_INCIDENT_SUMMARY": "Duplicate transactions appearing in financial database",
+            "IT_INCIDENT_DESC": "Finance team identified multiple duplicate transaction records in the financial database over the past week. Some customer transactions are being recorded twice or three times, causing discrepancies in financial reports.",
+            "IT_INCIDENT_RESOLUTION_DETAILS_NAME": "Transaction Deduplication",
+            "IT_INCIDENT_RESOLUTION_DESC": "Identified issue in the transaction processing where network timeouts were causing retries without proper checking. Implemented proper idempotency checks and cleaned up duplicate data.",
+            "IT_INCIDENT_AREA_CATEGORY": "Database",
+            "IT_INCIDENT_AREA_SUBCATEGORY": "Data Consistency"
+        }
+    ]
+    
+    # Create DataFrame and save to CSV
+    df = pd.DataFrame(sample_data)
+    df.to_csv(csv_path, index=False)
+    logger.info(f"Created sample data with {len(df)} incidents")
+    return df
+
+
+def create_config_files():
+    """Create sample configuration files if they don't exist"""
+    # Create config.env
+    if not os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, 'w') as f:
+            f.write("""MODEL_NAME=gpt-4o-mini
+TEMPERATURE=0.1
+MAX_TOKENS=1000
+API_VERSION=2023-05-15
+AZURE_ENDPOINT=https://your-azure-endpoint.openai.azure.com/
+""")
+        logger.info(f"Created sample config file at {CONFIG_PATH}")
+    
+    # Create credentials.env
+    if not os.path.exists(CREDS_PATH):
+        with open(CREDS_PATH, 'w') as f:
+            f.write("""AZURE_TENANT_ID=your-tenant-id
+AZURE_CLIENT_ID=your-client-id
+AZURE_CLIENT_SECRET=your-client-secret
+USE_MANAGED_IDENTITY=False
+SECURED_ENDPOINTS=True
+""")
+        logger.info(f"Created sample credentials file at {CREDS_PATH}")
+
+
+def print_classification_results(results: List[IncidentClassification]):
+    """Print a summary of the classification results"""
+    if not results:
+        print("No classification results to display")
+        return
+        
+    data_issues = [r for r in results if r.is_data_issue]
+    high_confidence = [r for r in results if r.confidence_score >= 0.8]
+    
+    print("\n===== CLASSIFICATION RESULTS =====")
+    print(f"Total incidents analyzed: {len(results)}")
+    print(f"Data issues found: {len(data_issues)} ({len(data_issues)/len(results)*100:.1f}%)")
+    print(f"High confidence classifications: {len(high_confidence)} ({len(high_confidence)/len(results)*100:.1f}%)")
+    
+    # Display a few examples
+    print("\n===== SAMPLE CLASSIFICATIONS =====")
+    for i, result in enumerate(results[:min(3, len(results))]):  # Show first 3 results or fewer
+        print(f"\nIncident ID: {result.incident_id}")
+        print(f"Classification: {'DATA ISSUE' if result.is_data_issue else 'NOT DATA ISSUE'}")
+        print(f"Confidence: {result.confidence_score:.2f}")
+        
+        print("\nSupporting Reasons:")
+        for reason in result.supporting_reasons[:min(2, len(result.supporting_reasons))]:  # Show top 2 reasons
+            print(f"- {reason.reason} (Impact: {reason.impact:.2f})")
+        
+        print("\nContrary Reasons:")
+        for reason in result.contrary_reasons[:min(2, len(result.contrary_reasons))]:  # Show top 2 reasons
+            print(f"- {reason.reason} (Impact: {reason.impact:.2f})")
+        
+        if i < min(2, len(results) - 1):  # Don't print separator after last item
+            print("\n" + "-" * 50)
+
+
+def main():
+    """Main function to run the IT Incident Classifier"""
+    print("IT Incident Data Issue Classifier")
+    print("=" * 40)
+    
+    # Create configuration files if they don't exist
+    create_config_files()
+    
+    # Define paths
+    csv_path = "it_incidents.csv"
+    output_path = "classification_results.json"
+    
+    # Create sample data if CSV doesn't exist
+    if not os.path.exists(csv_path):
+        print(f"Sample CSV not found at {csv_path}, creating a sample dataset...")
+        create_sample_data(csv_path)
+    
+    # Check if configuration is set up properly
+    if not os.path.exists(CONFIG_PATH) or not os.path.exists(CREDS_PATH):
+        print("Error: Configuration files not found.")
+        print(f"Please configure {CONFIG_PATH} and {CREDS_PATH} with your Azure OpenAI credentials.")
+        return
+    
+    # Ask for confirmation before proceeding
+    print("\nThis script will:")
+    print("1. Connect to Azure OpenAI using your credentials")
+    print("2. Process IT incidents from the CSV file")
+    print("3. Classify each incident as a data issue or not")
+    print("4. Save results to a JSON file")
+    
+    proceed = input("\nDo you want to proceed? (y/n): ").lower()
+    if proceed != 'y':
+        print("Exiting...")
+        return
+    
+    try:
+        # Initialize the classifier
+        print("\nInitializing IT Incident Classifier...")
+        classifier = IncidentClassifier()
+        
+        # Process the CSV
+        print(f"Processing incidents from {csv_path}...")
+        results = classifier.process_csv(csv_path, output_path)
+        
+        # Print results
+        print_classification_results(results)
+        print(f"\nResults saved to {output_path}")
+        
+    except Exception as e:
+        logger.error(f"Error running classifier: {e}")
+        print(f"\nError: {str(e)}")
+        print("\nTroubleshooting tips:")
+        print("1. Check your Azure OpenAI credentials in the env files")
+        print("2. Verify that your Azure OpenAI service is set up correctly")
+        print("3. Ensure you have the required Python packages installed")
+        
+        # Provide more detailed error information
+        import traceback
+        print("\nDetailed error:")
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
