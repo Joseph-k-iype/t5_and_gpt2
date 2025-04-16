@@ -5,10 +5,10 @@ import json
 import logging
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Any, Optional, TypeVar, Generic, Type, Union, Literal
+from typing import List, Dict, Any, Optional, TypeVar, Generic, Type, Union, Literal, Tuple
 from pathlib import Path
 from dotenv import load_dotenv, dotenv_values
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_dump
 import instructor
 from instructor.function_calling import OpenAISchema
 from openai import AzureOpenAI
@@ -19,7 +19,13 @@ from langchain.chains import ConversationChain
 from collections import namedtuple
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
+from langgraph.graph.state import NodeStateType, StateType
 from langgraph.checkpoint import MemorySaver
+
+# New imports for vector embeddings and similarity search
+import chromadb
+from chromadb.config import Settings
+from chromadb.utils import embedding_functions
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -30,9 +36,11 @@ ENV_DIR = "env"
 CONFIG_PATH = f"{ENV_DIR}/config.env"
 CREDS_PATH = f"{ENV_DIR}/credentials.env"
 CERT_PATH = f"{ENV_DIR}/cacert.pem"
+CHROMA_DB_PATH = "chromadb_data"
 
 # Create ENV_DIR if it doesn't exist
 os.makedirs(ENV_DIR, exist_ok=True)
+os.makedirs(CHROMA_DB_PATH, exist_ok=True)
 
 # Type variable for generic response model
 T = TypeVar('T', bound=BaseModel)
@@ -40,7 +48,9 @@ T = TypeVar('T', bound=BaseModel)
 # Utility functions
 def is_file_readable(filepath: str) -> bool:
     """Check if a file is readable."""
-    return os.path.isfile(filepath) and os.access(filepath, os.R_OK)
+    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
+        return False
+    return True
 
 def str_to_bool(s: str) -> bool:
     """Convert a string to a boolean."""
@@ -87,6 +97,7 @@ class OSEnv:
                 path = os.path.abspath(path)
             if not is_file_readable(path):
                 raise FileNotFoundError(f"The file '{path}' does not exist or is not readable")
+            
             self.set("REQUESTS_CA_BUNDLE", path)
             self.set("SSL_CERT_FILE", path)
             self.set("CURL_CA_BUNDLE", path)
@@ -101,9 +112,11 @@ class OSEnv:
             if not is_file_readable(dotenvfile):
                 logger.warning(f"Environment file not found or not readable: {dotenvfile}")
                 return
+                
             temp_dict = dotenv_values(dotenvfile)
             for key, value in temp_dict.items():
                 self.set(key, value, print_val)
+            del temp_dict
         except Exception as e:
             logger.error(f"Error loading environment variables from {dotenvfile}: {e}")
             raise
@@ -170,14 +183,112 @@ class OSEnv:
             else:
                 logger.info(f"{var}: {os.getenv(var)}")
 
+
+class ChromaDBManager:
+    """Class to manage ChromaDB operations for incident data storage and retrieval"""
+    def __init__(self, embedding_function, persist_directory=CHROMA_DB_PATH):
+        """Initialize ChromaDB client and collection"""
+        try:
+            # Initialize the Chroma client with telemetry disabled
+            self.client = chromadb.PersistentClient(
+                path=persist_directory,
+                settings=Settings(
+                    anonymized_telemetry=False,
+                    allow_reset=True
+                )
+            )
+            
+            # Create or get an incident collection
+            try:
+                self.collection = self.client.get_collection(
+                    name="incident_embeddings",
+                    embedding_function=embedding_function
+                )
+                logger.info("Loaded existing incident collection from ChromaDB")
+            except ValueError:
+                self.collection = self.client.create_collection(
+                    name="incident_embeddings",
+                    embedding_function=embedding_function,
+                    metadata={"description": "IT incident embeddings"}
+                )
+                logger.info("Created new incident collection in ChromaDB")
+        except Exception as e:
+            logger.error(f"Error initializing ChromaDB: {e}")
+            raise
+    
+    def add_incident(self, incident_id: str, text: str, metadata: Dict[str, Any] = None) -> None:
+        """Add an incident to the collection"""
+        try:
+            # Combine text fields into a single document for embedding
+            if metadata is None:
+                metadata = {}
+            
+            # Add to collection
+            self.collection.add(
+                ids=[incident_id],
+                documents=[text],
+                metadatas=[metadata]
+            )
+            logger.info(f"Added incident {incident_id} to ChromaDB")
+        except Exception as e:
+            logger.error(f"Error adding incident to ChromaDB: {e}")
+            raise
+    
+    def find_similar_incidents(self, query_text: str, n_results: int = 5) -> Dict[str, Any]:
+        """Find incidents similar to the query text"""
+        try:
+            # Query the collection for similar incidents
+            results = self.collection.query(
+                query_texts=[query_text],
+                n_results=n_results
+            )
+            
+            logger.info(f"Found {len(results['ids'][0])} similar incidents")
+            return results
+        except Exception as e:
+            logger.error(f"Error finding similar incidents: {e}")
+            raise
+    
+    def get_total_incidents(self) -> int:
+        """Get the total number of incidents in the collection"""
+        try:
+            return self.collection.count()
+        except Exception as e:
+            logger.error(f"Error getting incident count: {e}")
+            return 0
+    
+    def delete_incident(self, incident_id: str) -> None:
+        """Delete an incident from the collection"""
+        try:
+            self.collection.delete(ids=[incident_id])
+            logger.info(f"Deleted incident {incident_id} from ChromaDB")
+        except Exception as e:
+            logger.error(f"Error deleting incident from ChromaDB: {e}")
+            raise
+            
+    def clear_collection(self) -> None:
+        """Clear all incidents from the collection"""
+        try:
+            self.collection.delete(ids=self.collection.get()["ids"])
+            logger.info("Cleared all incidents from ChromaDB collection")
+        except Exception as e:
+            logger.error(f"Error clearing ChromaDB collection: {e}")
+            raise
+
+
 class AzureChatbot:
-    """Azure OpenAI chatbot with Instructor integration"""
+    """Azure OpenAI chatbot with Instructor integration and embedding support"""
     def __init__(self, config_file=CONFIG_PATH, creds_file=CREDS_PATH, cert_file=CERT_PATH):
         self.env = OSEnv(config_file, creds_file, cert_file)
         self._setup_chat_model()
         self.memory = ConversationBufferMemory()
         self.conversation = ConversationChain(llm=self.llm, memory=self.memory, verbose=True)
         self._setup_instructor_client()
+        self._setup_embedding_client()
+        
+        # Set up ChromaDB with our embedding function
+        self.embedding_function = self._create_embedding_function()
+        self.vector_db = ChromaDBManager(embedding_function=self.embedding_function)
     
     def _setup_chat_model(self):
         try:
@@ -190,6 +301,7 @@ class AzureChatbot:
             max_tokens = int(self.env.get("MAX_TOKENS", "800"))
             api_version = self.env.get("API_VERSION", "2023-05-15")
             azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
+            
             self.llm = AzureChatOpenAI(
                 model_name=model_name,
                 temperature=temperature,
@@ -204,8 +316,10 @@ class AzureChatbot:
     
     def _setup_instructor_client(self):
         try:
+            # Create the direct Azure client for instructor
             azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
             api_version = self.env.get("API_VERSION", "2023-05-15")
+            
             direct_client = AzureOpenAI(
                 azure_endpoint=azure_endpoint,
                 api_version=api_version,
@@ -214,13 +328,64 @@ class AzureChatbot:
                     "https://cognitiveservices.azure.com/.default"
                 )
             )
+            
+            # Apply instructor to the client
             self.instructor_client = instructor.from_openai(direct_client)
             logger.info("Instructor client set up successfully")
         except Exception as e:
             logger.error(f"Error setting up instructor client: {e}")
             raise
     
+    def _setup_embedding_client(self):
+        try:
+            # Create a dedicated client for embeddings
+            azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
+            api_version = self.env.get("API_VERSION", "2023-05-15")
+            
+            self.embedding_client = AzureOpenAI(
+                azure_endpoint=azure_endpoint,
+                api_version=api_version,
+                azure_ad_token_provider=get_bearer_token_provider(
+                    self.env.credential,
+                    "https://cognitiveservices.azure.com/.default"
+                )
+            )
+            logger.info("Embedding client set up successfully")
+        except Exception as e:
+            logger.error(f"Error setting up embedding client: {e}")
+            raise
+    
+    def _create_embedding_function(self):
+        """Create an embedding function for ChromaDB that uses Azure OpenAI embeddings"""
+        # Returns an embedding function that can be used with ChromaDB
+        def _generate_embeddings(texts):
+            if not texts:
+                return []
+            
+            try:
+                # Request embeddings from Azure OpenAI
+                embedding_model = self.env.get("EMBEDDING_MODEL", "text-embedding-3-large")
+                response = self.embedding_client.embeddings.create(
+                    input=texts,
+                    model=embedding_model
+                )
+                # Extract embedding data from the response
+                embeddings = [item.embedding for item in response.data]
+                return embeddings
+            except Exception as e:
+                logger.error(f"Error generating embeddings: {e}")
+                raise
+        
+        # Return the embedding function
+        return _generate_embeddings
+    
+    def generate_embedding(self, text: str) -> List[float]:
+        """Generate an embedding for a single text"""
+        embeddings = self.embedding_function([text])
+        return embeddings[0] if embeddings else []
+    
     def query(self, user_input: str) -> str:
+        """Standard chat query that returns a text response"""
         try:
             return self.conversation.predict(input=user_input)
         except Exception as e:
@@ -228,23 +393,41 @@ class AzureChatbot:
             return f"Error: {str(e)}"
     
     def structured_query(self, user_input: str, response_model: Type[T]) -> T:
+        """
+        Query that returns a structured response using instructor and Pydantic model
+        
+        Args:
+            user_input: The user's query text
+            response_model: A Pydantic model class defining the expected response structure
+            
+        Returns:
+            An instance of the response_model populated with extracted data
+        """
         try:
             model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
+            
+            # Use instructor to get structured output
             result = self.instructor_client.chat.completions.create(
                 model=model_name,
                 response_model=response_model,
-                messages=[{"role": "user", "content": user_input}]
+                messages=[
+                    {"role": "user", "content": user_input}
+                ]
             )
+            
+            # Add the interaction to memory for context
             self.memory.save_context(
                 {"input": user_input}, 
                 {"output": f"Extracted structured data: {result.model_dump_json()}"}
             )
+            
             return result
         except Exception as e:
             logger.error(f"Error in structured query: {e}")
             raise
 
-# Define Pydantic models for structured outputs
+
+# Define Pydantic models for structured outputs as OpenAISchema
 class IncidentFeatures(OpenAISchema):
     """Extracted relevant features from an incident"""
     id: str
@@ -254,67 +437,92 @@ class IncidentFeatures(OpenAISchema):
     resolution_details: str
     category: str
     subcategory: str
+    
+    # Extracted indicators that might suggest a data issue
     contains_data_terms: bool = Field(
-        description="Whether the incident contains terms related to data issues"
+        description="Whether the incident contains terms related to data issues (e.g., 'data', 'database', 'query', 'missing records', 'corrupt data')"
     )
     contains_system_terms: bool = Field(
-        description="Whether the incident contains terms related to system issues"
+        description="Whether the incident contains terms related to system issues (e.g., 'server', 'network', 'hardware', 'connectivity')"
     )
     is_categorized_as_data: bool = Field(
-        description="Whether the incident is explicitly categorized as a data-related issue"
+        description="Whether the incident is explicitly categorized as 'Business Process or Usage' or 'database' in category or subcategory"
     )
 
 class ClassificationReason(OpenAISchema):
     """A single reason supporting the classification with its impact on confidence"""
-    reason: str = Field(description="Specific evidence supporting the classification")
-    impact: float = Field(description="Impact on confidence (0.0 to 1.0)", ge=0.0, le=1.0)
+    reason: str = Field(description="Specific evidence or observation supporting the classification")
+    impact: float = Field(description="How much this reason impacts the confidence score (0.0 to 1.0)", ge=0.0, le=1.0)
     
 class IncidentClassification(OpenAISchema):
     """The final classification of an incident"""
     incident_id: str
     is_data_issue: bool
-    confidence_score: float = Field(description="Confidence score (0.0 to 1.0)", ge=0.0, le=1.0)
+    confidence_score: float = Field(description="Confidence score from 0.0 to 1.0", ge=0.0, le=1.0)
     supporting_reasons: List[ClassificationReason] = Field(
-        description="Reasons supporting this classification"
+        description="List of reasons supporting this classification"
     )
     contrary_reasons: List[ClassificationReason] = Field(
-        description="Reasons against this classification"
+        description="List of reasons that contradict this classification"
     )
-    
+
+class SimilarIncident(OpenAISchema):
+    """Information about a similar incident"""
+    id: str = Field(description="ID of the similar incident")
+    summary: str = Field(description="Summary of the similar incident")
+    is_data_issue: bool = Field(description="Whether this similar incident was classified as a data issue")
+    similarity_score: float = Field(description="Similarity score (higher means more similar)", ge=0.0, le=1.0)
+
 class AgentMessage(BaseModel):
     """Message passed between agents"""
     content: str
     metadata: Dict[str, Any] = {}
 
-# Define LangGraph state model using Pydantic
+# Define LangGraph state model
 class ClassificationState(BaseModel):
-    """State maintained during the classification process"""
+    """The state maintained throughout the classification process"""
     incident: Optional[IncidentFeatures] = None
     feature_extraction_complete: bool = False
     preliminary_classification: Optional[IncidentClassification] = None
     final_classification: Optional[IncidentClassification] = None
+    similar_incidents: List[SimilarIncident] = Field(default_factory=list)
+    
+    # Messages between agents
     messages: List[AgentMessage] = Field(default_factory=list)
-    current_agent: str = "feature_extractor"
+    current_agent: str = "similarity_analyzer"
+    
+    # Additional metadata
     metadata: Dict[str, Any] = Field(default_factory=dict)
     
+    # Helper methods to properly interface with LangGraph
     def to_dict(self) -> dict:
-        return self.model_dump()
+        """Convert state to a dictionary for LangGraph compatibility"""
+        return model_dump(self)
     
     @classmethod
     def from_dict(cls, data: Union[Dict[str, Any], "ClassificationState"]) -> 'ClassificationState':
+        """Create state from a dictionary (or return it if already an instance) for LangGraph compatibility"""
         if isinstance(data, cls):
             return data
         return cls(**data)
+
 
 # Multi-agent system for incident classification
 class IncidentClassifier:
     """Multi-agent system for classifying IT incidents as data issues"""
     def __init__(self, config_file=CONFIG_PATH, creds_file=CREDS_PATH, cert_file=CERT_PATH):
+        # Initialize the chatbot for agent operations
         try:
-            self.chatbot = AzureChatbot(config_file=config_file, creds_file=creds_file, cert_file=cert_file)
+            self.chatbot = AzureChatbot(
+                config_file=config_file, 
+                creds_file=creds_file, 
+                cert_file=cert_file
+            )
         except Exception as e:
             logger.error(f"Error initializing AzureChatbot: {e}")
             raise
+        
+        # Create the state graph
         try:
             self.graph = self._build_graph()
         except Exception as e:
@@ -322,24 +530,141 @@ class IncidentClassifier:
             raise
         
     def _build_graph(self):
-        # Use ClassificationState directly as the state schema
-        graph = StateGraph(ClassificationState)
+        """Build the LangGraph for the multi-agent system"""
+        # Define the state type that matches our Pydantic model
+        state_type = StateType(
+            # Map of expected keys to their Pydantic models/types
+            incident=IncidentFeatures,
+            feature_extraction_complete=bool,
+            preliminary_classification=IncidentClassification,
+            final_classification=IncidentClassification,
+            similar_incidents=List[SimilarIncident],
+            messages=List[AgentMessage],
+            current_agent=str,
+            metadata=Dict[str, Any]
+        )
+        
+        # Define the node state types for LangGraph
+        node_types = {
+            "similarity_analyzer": NodeStateType(output=True),
+            "feature_extractor": NodeStateType(output=True),
+            "classifier": NodeStateType(output=True),
+            "reasoning_agent": NodeStateType(output=True),
+            "confidence_evaluator": NodeStateType(output=True)
+        }
+        
+        # Initialize the graph with our custom state type
+        graph = StateGraph(state_type)
+        
+        # Add nodes to the graph
+        graph.add_node("similarity_analyzer", self.similarity_analyzer)
         graph.add_node("feature_extractor", self.feature_extractor)
         graph.add_node("classifier", self.classifier)
         graph.add_node("reasoning_agent", self.reasoning_agent)
         graph.add_node("confidence_evaluator", self.confidence_evaluator)
-        graph.add_edge(START, "feature_extractor")
+        
+        # Add edges to connect the nodes
+        graph.add_edge("START", "similarity_analyzer")
+        graph.add_edge("similarity_analyzer", "feature_extractor")
         graph.add_edge("feature_extractor", "classifier")
         graph.add_edge("classifier", "reasoning_agent")
         graph.add_edge("reasoning_agent", "confidence_evaluator")
         graph.add_edge("confidence_evaluator", END)
+        
+        # Add memory to support state checkpoints
         memory = MemorySaver()
+        
+        # Return the compiled graph with proper checkpointing
         return graph.compile(checkpointer=memory)
     
-    def feature_extractor(self, state: Dict[str, Any]) -> Dict[str, Any]:
+    def similarity_analyzer(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Find similar incidents using vector similarity search"""
+        # Convert Dict to ClassificationState for easier handling
         current_state = ClassificationState.from_dict(state)
+        
+        try:
+            # Get incident data from metadata
+            incident_id = current_state.metadata.get("id", "Unknown")
+            incident_summary = current_state.metadata.get("summary", "")
+            incident_description = current_state.metadata.get("description", "")
+            
+            # Combine text fields for similarity search
+            query_text = f"{incident_summary} {incident_description}"
+            
+            # Get similar incidents from ChromaDB
+            similar_results = self.chatbot.vector_db.find_similar_incidents(query_text)
+            
+            if similar_results and len(similar_results["ids"][0]) > 0:
+                # Process results into SimilarIncident models
+                similar_incidents = []
+                for i in range(len(similar_results["ids"][0])):
+                    similar_id = similar_results["ids"][0][i]
+                    similar_doc = similar_results["documents"][0][i]
+                    similar_metadata = similar_results["metadatas"][0][i]
+                    similarity_score = similar_results["distances"][0][i] if "distances" in similar_results else 0.8
+                    
+                    # Convert distances to similarity scores (distances are often lower for more similar items)
+                    if similarity_score > 1:  # Some distance metrics can be > 1
+                        similarity_score = 1 / similarity_score
+                    else:
+                        similarity_score = 1 - similarity_score  # Convert distance to similarity
+                    
+                    # Create SimilarIncident object
+                    similar_incident = SimilarIncident(
+                        id=similar_id,
+                        summary=similar_doc,
+                        is_data_issue=similar_metadata.get("is_data_issue", False),
+                        similarity_score=similarity_score
+                    )
+                    similar_incidents.append(similar_incident)
+                
+                # Update state with similar incidents
+                current_state.similar_incidents = similar_incidents
+                
+                # Add message to the state
+                current_state.messages.append(
+                    AgentMessage(
+                        content=f"Found {len(similar_incidents)} similar incidents",
+                        metadata={"agent": "similarity_analyzer", "success": True}
+                    )
+                )
+                
+                logger.info(f"Found {len(similar_incidents)} similar incidents for {incident_id}")
+            else:
+                current_state.messages.append(
+                    AgentMessage(
+                        content="No similar incidents found",
+                        metadata={"agent": "similarity_analyzer", "success": True}
+                    )
+                )
+                logger.info(f"No similar incidents found for {incident_id}")
+                
+            # Set the next agent
+            current_state.current_agent = "feature_extractor"
+            
+        except Exception as e:
+            logger.error(f"Error in similarity analysis: {e}")
+            current_state.messages.append(
+                AgentMessage(
+                    content=f"Error in similarity analysis: {str(e)}",
+                    metadata={"agent": "similarity_analyzer", "success": False}
+                )
+            )
+            current_state.current_agent = "feature_extractor"  # Continue to next step despite error
+        
+        # Return state as dictionary for LangGraph
+        return current_state.to_dict()
+    
+    def feature_extractor(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract features from the incident text"""
+        # Convert Dict to ClassificationState for easier handling
+        current_state = ClassificationState.from_dict(state)
+        
+        # If feature extraction is already complete, just return the current state
         if current_state.feature_extraction_complete:
             return current_state.to_dict()
+        
+        # Using instructor to enforce structured output for feature extraction
         try:
             metadata = current_state.metadata
             features = self.chatbot.structured_query(
@@ -352,13 +677,19 @@ class IncidentClassifier:
                 Resolution Details: {metadata.get("resolution_details", "")}
                 Category: {metadata.get("category", "")}
                 Subcategory: {metadata.get("subcategory", "")}
-                Determine if the incident contains data-related or system-related terms.
+                
+                Analyze the text and determine if it contains terms related to data issues,
+                system issues, and if it's categorized explicitly as a data-related issue.
                 """,
                 IncidentFeatures
             )
+            
+            # Update the state with the extracted features
             current_state.incident = features
             current_state.feature_extraction_complete = True
             current_state.current_agent = "classifier"
+            
+            # Add a message to the state
             current_state.messages.append(
                 AgentMessage(
                     content="Successfully extracted features from the incident",
@@ -374,12 +705,18 @@ class IncidentClassifier:
                     metadata={"agent": "feature_extractor", "success": False}
                 )
             )
+        
+        # Return state as dictionary for LangGraph
         return current_state.to_dict()
     
     def classifier(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Perform initial classification of the incident"""
+        # Convert Dict to ClassificationState for easier handling
         current_state = ClassificationState.from_dict(state)
+        
         if current_state.preliminary_classification:
             return current_state.to_dict()
+        
         if not current_state.incident:
             current_state.messages.append(
                 AgentMessage(
@@ -388,11 +725,24 @@ class IncidentClassifier:
                 )
             )
             return current_state.to_dict()
+        
         try:
+            # Prepare similar incidents information for the prompt
+            similar_incidents_text = ""
+            if current_state.similar_incidents:
+                similar_incidents_text = "Similar incidents found:\n"
+                for idx, incident in enumerate(current_state.similar_incidents, 1):
+                    similar_incidents_text += f"{idx}. ID: {incident.id}, Summary: {incident.summary}, "
+                    similar_incidents_text += f"Was Data Issue: {'Yes' if incident.is_data_issue else 'No'}, "
+                    similar_incidents_text += f"Similarity Score: {incident.similarity_score:.2f}\n"
+            
+            # Create a simple preliminary classification
             is_data_issue = (
                 current_state.incident.is_categorized_as_data or 
                 current_state.incident.contains_data_terms
             )
+            
+            # Create an initial classification with a basic confidence score
             classification = IncidentClassification(
                 incident_id=current_state.incident.id,
                 is_data_issue=is_data_issue,
@@ -405,8 +755,10 @@ class IncidentClassifier:
                 ],
                 contrary_reasons=[]
             )
+            
             current_state.preliminary_classification = classification
             current_state.current_agent = "reasoning_agent"
+            
             current_state.messages.append(
                 AgentMessage(
                     content=f"Initial classification: {'Data issue' if is_data_issue else 'Not a data issue'}",
@@ -422,10 +774,15 @@ class IncidentClassifier:
                     metadata={"agent": "classifier", "success": False}
                 )
             )
+        
+        # Return state as dictionary for LangGraph
         return current_state.to_dict()
     
     def reasoning_agent(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Develop reasoning and evidence for the classification"""
+        # Convert Dict to ClassificationState for easier handling
         current_state = ClassificationState.from_dict(state)
+        
         if not current_state.preliminary_classification or not current_state.incident:
             current_state.messages.append(
                 AgentMessage(
@@ -434,10 +791,29 @@ class IncidentClassifier:
                 )
             )
             return current_state.to_dict()
+        
         try:
+            # Prepare similar incidents information for the prompt
+            similar_incidents_text = ""
+            if current_state.similar_incidents:
+                similar_incidents_text = "\nSimilar incidents found:\n"
+                for idx, incident in enumerate(current_state.similar_incidents, 1):
+                    similar_incidents_text += f"{idx}. ID: {incident.id}, Summary: {incident.summary}, "
+                    similar_incidents_text += f"Was Data Issue: {'Yes' if incident.is_data_issue else 'No'}, "
+                    similar_incidents_text += f"Similarity Score: {incident.similarity_score:.2f}\n"
+            
+            # Use instructor for structured output with enhanced prompt
             improved_classification = self.chatbot.structured_query(
                 f"""
-                Analyze this IT incident and provide reasoning for its classification:
+                Definition of a data issue: A data issue is a gap or discrepancy in an organization's 
+                data management and governance that undermines the reliability and strategic usability 
+                of information. It manifests through data quality problems—such as erroneous, inaccurate, 
+                incomplete, invalid, duplicate, irrelevant, or non-standard data—that disrupt processes 
+                and signal deeper deficiencies in governance, semantic consistency, or architectural alignment.
+                
+                Analyze this IT incident in detail and provide reasoning for why it should or should not
+                be classified as a data issue:
+                
                 ID: {current_state.incident.id}
                 Summary: {current_state.incident.summary}
                 Description: {current_state.incident.description}
@@ -445,13 +821,26 @@ class IncidentClassifier:
                 Resolution Details: {current_state.incident.resolution_details}
                 Category: {current_state.incident.category}
                 Subcategory: {current_state.incident.subcategory}
-                Current classification - Is data issue: {current_state.preliminary_classification.is_data_issue}, Confidence: {current_state.preliminary_classification.confidence_score}
-                Provide a list of supporting and contrary reasons, each with an impact score (0.0 to 1.0).
+                
+                Current classification: 
+                - Is data issue: {current_state.preliminary_classification.is_data_issue}
+                - Confidence: {current_state.preliminary_classification.confidence_score}
+                
+                {similar_incidents_text}
+                
+                Provide a detailed list of supporting reasons (evidence that it IS a data issue)
+                and contrary reasons (evidence that it is NOT a data issue).
+                
+                Each reason should have an impact score (0.0 to 1.0) indicating how much this 
+                particular reason should influence the final confidence score.
                 """,
                 IncidentClassification
             )
+            
+            # Update the state
             current_state.final_classification = improved_classification
             current_state.current_agent = "confidence_evaluator"
+            
             current_state.messages.append(
                 AgentMessage(
                     content="Developed detailed reasoning for classification",
@@ -467,12 +856,19 @@ class IncidentClassifier:
                     metadata={"agent": "reasoning_agent", "success": False}
                 )
             )
+            # Use preliminary classification as fallback
             current_state.final_classification = current_state.preliminary_classification
             current_state.current_agent = "confidence_evaluator"
+        
+        # Return state as dictionary for LangGraph
         return current_state.to_dict()
     
     def confidence_evaluator(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Evaluate and finalize the confidence score"""
+        # Convert Dict to ClassificationState for easier handling
         current_state = ClassificationState.from_dict(state)
+        
+        # Make sure we always have a final_classification
         if not current_state.final_classification:
             if current_state.preliminary_classification:
                 current_state.final_classification = current_state.preliminary_classification
@@ -483,25 +879,36 @@ class IncidentClassifier:
                     )
                 )
             else:
+                # Create a default minimal classification based on metadata
                 incident_id = current_state.metadata.get("id", "Unknown")
                 if current_state.incident:
                     incident_id = current_state.incident.id
+                
                 current_state.final_classification = IncidentClassification(
                     incident_id=incident_id,
                     is_data_issue=False,
                     confidence_score=0.5,
-                    supporting_reasons=[ClassificationReason(reason="Insufficient data for classification", impact=1.0)],
+                    supporting_reasons=[
+                        ClassificationReason(
+                            reason="Insufficient data for classification",
+                            impact=1.0
+                        )
+                    ],
                     contrary_reasons=[]
                 )
+                
                 current_state.messages.append(
                     AgentMessage(
                         content="Created default classification due to missing data",
                         metadata={"agent": "confidence_evaluator", "success": False}
                     )
                 )
+        
+        # Now calculate the confidence score based on supporting and contrary reasons
         try:
             supporting_impact = sum(reason.impact for reason in current_state.final_classification.supporting_reasons)
             contrary_impact = sum(reason.impact for reason in current_state.final_classification.contrary_reasons)
+            
             total_impact = supporting_impact + contrary_impact
             if total_impact > 0:
                 if supporting_impact > contrary_impact:
@@ -509,18 +916,24 @@ class IncidentClassifier:
                 else:
                     confidence = 0.5 - (0.5 * (contrary_impact - supporting_impact) / total_impact)
             else:
-                confidence = 0.5
+                confidence = 0.5  # Neutral confidence if no impacts
+            
+            # Update the confidence score
             current_state.final_classification.confidence_score = round(confidence, 2)
+            
             current_state.messages.append(
                 AgentMessage(
                     content=f"Final confidence score: {current_state.final_classification.confidence_score}",
                     metadata={"agent": "confidence_evaluator", "success": True}
                 )
             )
+            
             incident_id = current_state.metadata.get("id", "Unknown")
             if current_state.incident:
                 incident_id = current_state.incident.id
+                
             logger.info(f"Confidence evaluation complete for incident {incident_id}")
+            
         except Exception as e:
             logger.error(f"Error in confidence evaluation: {e}")
             current_state.messages.append(
@@ -529,52 +942,103 @@ class IncidentClassifier:
                     metadata={"agent": "confidence_evaluator", "success": False}
                 )
             )
+        
+        # Ensure we have a final classification before returning
         assert current_state.final_classification is not None, "Final classification is still None"
+        
+        # Return state as dictionary for LangGraph
         return current_state.to_dict()
     
     def classify_incident(self, incident_data: Dict[str, str]) -> IncidentClassification:
+        """Classify a single incident using the multi-agent system"""
+        # Create the initial state
         initial_state = ClassificationState(
             metadata={
                 "id": incident_data.get("Id", "Unknown"),
-                "summary": incident_data.get("IT_INCIDENT_SUMMARY", ""),
-                "description": incident_data.get("IT_INCIDENT_DESC", ""),
+                "summary": incident_data.get("Name", ""),  # Using 'Name' field from CSV
+                "description": incident_data.get("Summary", ""),  # Using 'Summary' field from CSV
                 "resolution_name": incident_data.get("IT_INCIDENT_RESOLUTION_DETAILS_NAME", ""),
                 "resolution_details": incident_data.get("IT_INCIDENT_RESOLUTION_DESC", ""),
                 "category": incident_data.get("IT_INCIDENT_AREA_CATEGORY", ""),
                 "subcategory": incident_data.get("IT_INCIDENT_AREA_SUBCATEGORY", "")
             }
         )
+        
+        # Run the graph with proper state handling
         try:
+            # Convert initial state to dict for LangGraph
             initial_dict = initial_state.to_dict()
+            
+            # Execute the graph
             logger.info(f"Running classification for incident {incident_data.get('Id', 'Unknown')}")
-            # Provide a default configuration with a 'thread_id'
-            config = {"configurable": {"thread_id": "default_thread"}}
-            final_state_dict = self.graph.invoke(initial_dict, config=config)
+            final_state_dict = self.graph.invoke(initial_dict)
+            
+            # Convert the result back to a ClassificationState
             final_state = ClassificationState.from_dict(final_state_dict)
+            
+            # Return the final classification
             if final_state.final_classification is not None:
                 return final_state.final_classification
             else:
+                # This should never happen with our assert in confidence_evaluator
                 logger.error("Classification graph did not produce a final classification")
                 raise ValueError("Classification process did not produce a final classification")
+        
         except Exception as e:
             logger.error(f"Error running classification graph: {e}")
             raise
     
-    def process_csv(self, csv_path: str, output_path: str = None) -> List[IncidentClassification]:
+    def process_csv(self, csv_path: str, output_path: str = None, train_mode: bool = False) -> List[IncidentClassification]:
+        """
+        Process a CSV file containing incident data
+        
+        Args:
+            csv_path: Path to the CSV file
+            output_path: Optional path to save results as JSON
+            train_mode: If True, will add all incidents to the vector database
+        """
         try:
+            # Load the CSV
             df = pd.read_csv(csv_path)
             logger.info(f"Loaded {len(df)} incidents from {csv_path}")
+            
+            # Process each incident
             results = []
             for i, row in df.iterrows():
                 incident_id = row.get('Id', f"Unknown-{i}")
                 logger.info(f"Processing incident {i+1}/{len(df)}: {incident_id}")
+                
                 try:
                     incident_data = row.to_dict()
+                    
+                    # Combine Name and Summary fields for vector representation
+                    combined_text = f"{incident_data.get('Name', '')} {incident_data.get('Summary', '')}"
+                    
+                    # Classify the incident
                     classification = self.classify_incident(incident_data)
+                    
+                    # Ensure we got a valid classification
                     if not isinstance(classification, IncidentClassification):
                         logger.error(f"Invalid classification type: {type(classification)}")
                         continue
+                        
                     results.append(classification)
+                    
+                    # If in train mode, add the incident to the database
+                    if train_mode and combined_text.strip():
+                        self.chatbot.vector_db.add_incident(
+                            incident_id=incident_id,
+                            text=combined_text,
+                            metadata={
+                                "is_data_issue": classification.is_data_issue,
+                                "confidence": classification.confidence_score,
+                                "name": incident_data.get('Name', ''),
+                                "summary": incident_data.get('Summary', '')
+                            }
+                        )
+                        logger.info(f"Added incident {incident_id} to vector database")
+                    
+                    # Log success
                     logger.info(
                         f"Successfully classified incident {classification.incident_id}: "
                         f"{'Data issue' if classification.is_data_issue else 'Not a data issue'} "
@@ -583,78 +1047,149 @@ class IncidentClassifier:
                 except Exception as e:
                     logger.error(f"Error processing incident {incident_id}: {e}")
                     continue
+            
+            # Save to JSON if output path provided
             if output_path and results:
                 with open(output_path, 'w') as f:
                     json.dump([r.model_dump() for r in results], f, indent=2)
                 logger.info(f"Saved {len(results)} results to {output_path}")
+            
             return results
         except Exception as e:
             logger.error(f"Error processing CSV: {e}")
             raise
+    
+    def vectorize_csv(self, csv_path: str) -> int:
+        """
+        Vectorize all incidents from a CSV and store them in the vector database
+        without running classification
+        
+        Args:
+            csv_path: Path to the CSV file
+            
+        Returns:
+            Number of incidents added to the database
+        """
+        try:
+            # Load the CSV
+            df = pd.read_csv(csv_path)
+            logger.info(f"Loaded {len(df)} incidents from {csv_path}")
+            
+            count = 0
+            # Process each incident
+            for i, row in df.iterrows():
+                incident_id = row.get('Id', f"Unknown-{i}")
+                
+                try:
+                    # Combine Name and Summary fields for vector representation
+                    name = row.get('Name', '')
+                    summary = row.get('Summary', '')
+                    combined_text = f"{name} {summary}"
+                    
+                    if combined_text.strip():
+                        # Store in vector database without classification
+                        self.chatbot.vector_db.add_incident(
+                            incident_id=incident_id,
+                            text=combined_text,
+                            metadata={
+                                "name": name,
+                                "summary": summary,
+                                # These will be updated if we later classify
+                                "is_data_issue": None,
+                                "confidence": None
+                            }
+                        )
+                        count += 1
+                        
+                        if i % 10 == 0:  # Log progress every 10 items
+                            logger.info(f"Vectorized {i+1}/{len(df)} incidents")
+                    else:
+                        logger.warning(f"Skipping incident {incident_id} with empty text")
+                        
+                except Exception as e:
+                    logger.error(f"Error vectorizing incident {incident_id}: {e}")
+                    continue
+            
+            logger.info(f"Successfully vectorized {count} incidents to ChromaDB")
+            return count
+            
+        except Exception as e:
+            logger.error(f"Error vectorizing CSV: {e}")
+            raise
+
 
 def create_sample_data(csv_path: str):
+    """Create a sample CSV with IT incident data for testing"""
     sample_data = [
         {
             "Id": "INC001",
-            "IT_INCIDENT_SUMMARY": "Database query timeout affecting customer reports",
-            "IT_INCIDENT_DESC": "Users reported that customer reports are taking more than 30 minutes to generate.",
+            "Name": "Database query timeout",
+            "Summary": "Users reported that customer reports are taking more than 30 minutes to generate, much longer than the expected 2 minutes. Investigation showed database queries timing out due to inefficient query structure.",
             "IT_INCIDENT_RESOLUTION_DETAILS_NAME": "Database Optimization",
-            "IT_INCIDENT_RESOLUTION_DESC": "Optimized the slow query.",
+            "IT_INCIDENT_RESOLUTION_DESC": "Identified slow running query in the customer database. Optimized the query by adding proper indexing and correcting the join conditions.",
             "IT_INCIDENT_AREA_CATEGORY": "Database",
             "IT_INCIDENT_AREA_SUBCATEGORY": "Query Performance"
         },
         {
             "Id": "INC002",
-            "IT_INCIDENT_SUMMARY": "Network connectivity issues in Building B",
-            "IT_INCIDENT_DESC": "Employees in Building B experience intermittent network issues.",
+            "Name": "Network connectivity issues",
+            "Summary": "Employees in Building B have been experiencing intermittent network connectivity issues for the past week. Some devices lose connection for 5-10 minutes at a time, affecting productivity.",
             "IT_INCIDENT_RESOLUTION_DETAILS_NAME": "Router Replacement",
-            "IT_INCIDENT_RESOLUTION_DESC": "Replaced faulty router.",
+            "IT_INCIDENT_RESOLUTION_DESC": "Found faulty router in Building B that was causing intermittent connectivity issues. Replaced the hardware and verified connectivity.",
             "IT_INCIDENT_AREA_CATEGORY": "Network",
             "IT_INCIDENT_AREA_SUBCATEGORY": "Hardware Failure"
         },
         {
             "Id": "INC003",
-            "IT_INCIDENT_SUMMARY": "Missing customer records in monthly report",
-            "IT_INCIDENT_DESC": "The monthly report is missing 15% of records.",
+            "Name": "Missing customer records",
+            "Summary": "The monthly customer activity report is missing approximately 15% of customer records compared to previous months. Finance department flagged the issue as critical since it affects revenue calculations.",
             "IT_INCIDENT_RESOLUTION_DETAILS_NAME": "Data Correction",
-            "IT_INCIDENT_RESOLUTION_DESC": "Fixed data filtering issue.",
+            "IT_INCIDENT_RESOLUTION_DESC": "Found data integrity issue where customer records were being filtered out incorrectly. Fixed the data validation rules and regenerated reports.",
             "IT_INCIDENT_AREA_CATEGORY": "Business Process or Usage",
             "IT_INCIDENT_AREA_SUBCATEGORY": "Data Integrity"
         },
         {
             "Id": "INC004",
-            "IT_INCIDENT_SUMMARY": "Application crashing during end-of-month processing",
-            "IT_INCIDENT_DESC": "Application crashes with memory errors during processing.",
+            "Name": "Application crashing",
+            "Summary": "The financial reporting application crashes consistently during end-of-month processing when attempting to generate quarterly reports. Error logs show memory exceptions before the crash.",
             "IT_INCIDENT_RESOLUTION_DETAILS_NAME": "Memory Allocation",
-            "IT_INCIDENT_RESOLUTION_DESC": "Increased memory allocation and optimized algorithms.",
+            "IT_INCIDENT_RESOLUTION_DESC": "Application was running out of memory during large batch processes. Increased memory allocation and optimized the processing algorithm.",
             "IT_INCIDENT_AREA_CATEGORY": "Application",
             "IT_INCIDENT_AREA_SUBCATEGORY": "Performance"
         },
         {
             "Id": "INC005",
-            "IT_INCIDENT_SUMMARY": "Duplicate transactions in financial database",
-            "IT_INCIDENT_DESC": "Duplicate transaction entries causing financial discrepancies.",
+            "Name": "Duplicate transactions",
+            "Summary": "Finance team identified multiple duplicate transaction records in the financial database over the past week. Some customer transactions are being recorded twice or three times, causing discrepancies in financial reports.",
             "IT_INCIDENT_RESOLUTION_DETAILS_NAME": "Transaction Deduplication",
-            "IT_INCIDENT_RESOLUTION_DESC": "Implemented idempotency checks.",
+            "IT_INCIDENT_RESOLUTION_DESC": "Identified issue in the transaction processing where network timeouts were causing retries without proper checking. Implemented proper idempotency checks and cleaned up duplicate data.",
             "IT_INCIDENT_AREA_CATEGORY": "Database",
             "IT_INCIDENT_AREA_SUBCATEGORY": "Data Consistency"
         }
     ]
+    
+    # Create DataFrame and save to CSV
     df = pd.DataFrame(sample_data)
     df.to_csv(csv_path, index=False)
     logger.info(f"Created sample data with {len(df)} incidents")
     return df
 
+
 def create_config_files():
+    """Create sample configuration files if they don't exist"""
+    # Create config.env
     if not os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH, 'w') as f:
             f.write("""MODEL_NAME=gpt-4o-mini
 TEMPERATURE=0.1
 MAX_TOKENS=1000
+EMBEDDING_MODEL=text-embedding-3-large
 API_VERSION=2023-05-15
 AZURE_ENDPOINT=https://your-azure-endpoint.openai.azure.com/
 """)
         logger.info(f"Created sample config file at {CONFIG_PATH}")
+    
+    # Create credentials.env
     if not os.path.exists(CREDS_PATH):
         with open(CREDS_PATH, 'w') as f:
             f.write("""AZURE_TENANT_ID=your-tenant-id
@@ -665,69 +1200,122 @@ SECURED_ENDPOINTS=True
 """)
         logger.info(f"Created sample credentials file at {CREDS_PATH}")
 
+
 def print_classification_results(results: List[IncidentClassification]):
+    """Print a summary of the classification results"""
     if not results:
         print("No classification results to display")
         return
+        
     data_issues = [r for r in results if r.is_data_issue]
     high_confidence = [r for r in results if r.confidence_score >= 0.8]
+    
     print("\n===== CLASSIFICATION RESULTS =====")
     print(f"Total incidents analyzed: {len(results)}")
     print(f"Data issues found: {len(data_issues)} ({len(data_issues)/len(results)*100:.1f}%)")
     print(f"High confidence classifications: {len(high_confidence)} ({len(high_confidence)/len(results)*100:.1f}%)")
+    
+    # Display a few examples
     print("\n===== SAMPLE CLASSIFICATIONS =====")
-    for i, result in enumerate(results[:min(3, len(results))]):
+    for i, result in enumerate(results[:min(3, len(results))]):  # Show first 3 results or fewer
         print(f"\nIncident ID: {result.incident_id}")
         print(f"Classification: {'DATA ISSUE' if result.is_data_issue else 'NOT DATA ISSUE'}")
         print(f"Confidence: {result.confidence_score:.2f}")
+        
         print("\nSupporting Reasons:")
-        for reason in result.supporting_reasons[:min(2, len(result.supporting_reasons))]:
+        for reason in result.supporting_reasons[:min(2, len(result.supporting_reasons))]:  # Show top 2 reasons
             print(f"- {reason.reason} (Impact: {reason.impact:.2f})")
+        
         print("\nContrary Reasons:")
-        for reason in result.contrary_reasons[:min(2, len(result.contrary_reasons))]:
+        for reason in result.contrary_reasons[:min(2, len(result.contrary_reasons))]:  # Show top 2 reasons
             print(f"- {reason.reason} (Impact: {reason.impact:.2f})")
-        if i < min(2, len(results) - 1):
+        
+        if i < min(2, len(results) - 1):  # Don't print separator after last item
             print("\n" + "-" * 50)
 
+
 def main():
+    """Main function to run the IT Incident Classifier"""
     print("IT Incident Data Issue Classifier")
     print("=" * 40)
+    
+    # Create configuration files if they don't exist
     create_config_files()
+    
+    # Define paths
     csv_path = "it_incidents.csv"
     output_path = "classification_results.json"
+    
+    # Create sample data if CSV doesn't exist
     if not os.path.exists(csv_path):
         print(f"Sample CSV not found at {csv_path}, creating a sample dataset...")
         create_sample_data(csv_path)
+    
+    # Check if configuration is set up properly
     if not os.path.exists(CONFIG_PATH) or not os.path.exists(CREDS_PATH):
         print("Error: Configuration files not found.")
         print(f"Please configure {CONFIG_PATH} and {CREDS_PATH} with your Azure OpenAI credentials.")
         return
+    
+    # Ask for confirmation before proceeding
     print("\nThis script will:")
     print("1. Connect to Azure OpenAI using your credentials")
-    print("2. Process IT incidents from the CSV file")
-    print("3. Classify each incident as a data issue or not")
-    print("4. Save results to a JSON file")
+    print("2. Create a vector database of incidents")
+    print("3. Process IT incidents from the CSV file")
+    print("4. Classify each incident as a data issue or not")
+    print("5. Save results to a JSON file")
+    
     proceed = input("\nDo you want to proceed? (y/n): ").lower()
     if proceed != 'y':
         print("Exiting...")
         return
+    
     try:
+        # Initialize the classifier
         print("\nInitializing IT Incident Classifier...")
         classifier = IncidentClassifier()
-        print(f"Processing incidents from {csv_path}...")
-        results = classifier.process_csv(csv_path, output_path)
+        
+        # Ask if user wants to vectorize first or directly process
+        action = input("\nDo you want to:\n1. Vectorize incidents first\n2. Process incidents directly\nChoose (1/2): ")
+        
+        if action == '1':
+            # Vectorize incidents first
+            print(f"\nVectorizing incidents from {csv_path}...")
+            count = classifier.vectorize_csv(csv_path)
+            print(f"Vectorized {count} incidents successfully")
+            
+            # Ask if they want to process now
+            process_now = input("\nDo you want to process incidents now? (y/n): ").lower()
+            if process_now != 'y':
+                print("Exiting...")
+                return
+        
+        # Process the CSV
+        print(f"\nProcessing incidents from {csv_path}...")
+        # Use train_mode=True to update vector database with classification results
+        results = classifier.process_csv(csv_path, output_path, train_mode=True)
+        
+        # Print results
         print_classification_results(results)
         print(f"\nResults saved to {output_path}")
+        
+        # Print vector database stats
+        print(f"\nVector database now contains {classifier.chatbot.vector_db.get_total_incidents()} incidents")
+        
     except Exception as e:
         logger.error(f"Error running classifier: {e}")
         print(f"\nError: {str(e)}")
         print("\nTroubleshooting tips:")
         print("1. Check your Azure OpenAI credentials in the env files")
         print("2. Verify that your Azure OpenAI service is set up correctly")
-        print("3. Ensure you have the required Python packages installed")
+        print("3. Check that you have access to the 'text-embedding-3-large' model")
+        print("4. Ensure you have the required Python packages installed")
+        
+        # Provide more detailed error information
         import traceback
         print("\nDetailed error:")
         traceback.print_exc()
+
 
 if __name__ == "__main__":
     main()
