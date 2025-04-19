@@ -1,254 +1,439 @@
-from typing import Dict, Any, List
-import re
+"""
+Enhancement API - Routes for data element enhancement.
+
+This module provides API endpoints for enhancing data elements to meet ISO/IEC 11179
+standards, with support for asynchronous processing and job tracking.
+"""
+
 import logging
-import os
-import pandas as pd
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+from typing import Dict, Any, List, Optional
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends, Query
 from langchain_openai import AzureChatOpenAI
-from app.core.models import DataElement, ValidationResult, DataQualityStatus
-from app.utils.iso_standards import ISO11179Validator
+from app.core.models import (
+    DataElement, 
+    EnhancedDataElement, 
+    EnhancementRequest, 
+    EnhancementResponse, 
+    EnhancementStatus,
+    ValidationResult,
+    DataQualityStatus
+)
+from app.core.db_manager import DBManager
+from app.agents.workflow import DataEnhancementWorkflow
+from app.config.settings import get_llm
+
+router = APIRouter(prefix="/api/v1", tags=["data-enhancement"])
+
+# In-memory cache for current jobs for fast access
+# The persistent storage is in PostgreSQL
+enhancement_jobs: Dict[str, Dict[str, Any]] = {}
 
 logger = logging.getLogger(__name__)
 
-class ValidatorAgent:
+def get_workflow() -> DataEnhancementWorkflow:
+    """
+    Get the data enhancement workflow.
     
-    def __init__(self, llm: AzureChatOpenAI):
-        self.llm = llm
-        self.iso_validator = ISO11179Validator()
-        self.approved_acronyms = self._load_approved_acronyms()
-        self._setup_validation_chain()
+    Returns:
+        DataEnhancementWorkflow: The enhancement workflow
+    """
+    llm = get_llm()
+    return DataEnhancementWorkflow(llm)
+
+def get_db():
+    """
+    Get the database manager.
     
-    def _load_approved_acronyms(self):
-        """Load approved acronyms from CSV file."""
-        approved_acronyms = {}
-        try:
-            csv_path = os.path.join("data", "acronyms.csv")
-            if os.path.exists(csv_path):
-                df = pd.read_csv(csv_path)
-                if 'acronym' in df.columns and 'description' in df.columns:
-                    for _, row in df.iterrows():
-                        approved_acronyms[row['acronym'].strip().upper()] = row['description'].strip()
-                logger.info(f"Loaded {len(approved_acronyms)} approved acronyms from {csv_path}")
-            else:
-                logger.warning(f"Acronyms file not found at {csv_path}")
-        except Exception as e:
-            logger.error(f"Error loading approved acronyms: {e}")
-        
-        return approved_acronyms
+    Returns:
+        DBManager: The database manager
+    """
+    return DBManager()
+
+@router.post("/validate", response_model=Dict[str, Any])
+async def validate_data_element(data_element: DataElement):
+    """
+    Validate a data element against ISO/IEC 11179 standards.
     
-    def _setup_validation_chain(self):
-        template = """
-        You are an expert in data governance and ISO/IEC 11179 metadata standards. Your task is to evaluate the 
-        given data element name and description against these standards to determine the quality of the metadata.
+    This endpoint performs initial validation without enhancement.
+    
+    Args:
+        data_element: The data element to validate
         
-        ISO/IEC 11179 standards for data element names (adapted for business-friendly format):
-        - Names MUST be in lowercase with spaces between words.
-        - Names MUST NOT use technical formatting like camelCase, snake_case or PascalCase
-        - Names MUST NOT contain underscores, hyphens, or special characters
-        - Names should be clear, unambiguous and self-describing
-        - Names should not use acronyms or abbreviations unless they are universally understood
-        - Names should be concise yet descriptive
-        - Names should use standard terminology in the domain
-        - Names should use business language that non-technical users can understand
+    Returns:
+        Dict with validation results in JSON format
+    """
+    logger.info(f"Validating data element: {data_element.id}")
+    workflow = get_workflow()
+    try:
+        # Run just the validation step
+        result = await workflow.validator.validate(data_element)
         
-        ISO/IEC 11179 standards for data element descriptions:
-        - Descriptions should clearly define what the data element represents
-        - Descriptions should be complete, covering the concept fully
-        - Descriptions should be precise, specific enough to distinguish from other concepts
-        - Descriptions should be objective and factual, not opinion-based
-        - Descriptions should use complete sentences with proper grammar and punctuation
-        - Descriptions should be written in business language, not technical jargon
-        
-        Data Element to Evaluate:
-        - ID: {id}
-        - Current Name: {name}
-        - Current Description: {description}
-        - Example (if provided): {example}
-        - Related Process Name (if provided): {process_name}
-        - Related Process Description (if provided): {process_description}
-        
-        Based on the ISO/IEC 11179 standards, evaluate the quality of this data element.
-        
-        IMPORTANT: Your response MUST include ALL of the following 6 evaluation points in order:
-        1. Is the name valid according to ISO/IEC 11179 standards? [yes/no]
-        2. Detailed feedback on the name
-        3. Is the description valid according to the standards? [yes/no]
-        4. Detailed feedback on the description (pay careful attention to grammar and punctuation)
-        5. Overall quality status - MUST be one of: "GOOD", "NEEDS_IMPROVEMENT", or "POOR"
-        6. List of specific improvements that could be made
-        
-        DO NOT use any special formatting characters like asterisks (**), backticks (``), or markdown syntax.
-        DO NOT include any \\n characters or other special characters in your response.
-        Please be thorough and specific in your feedback, as it will be used to improve the data element.
-        """
-        
-        self.validation_prompt = PromptTemplate(
-            input_variables=["id", "name", "description", "example", "process_name", "process_description"],
-            template=template)
-        self.validation_chain = self.validation_prompt | self.llm | StrOutputParser()
-        
-    def _parse_validation_result(self, result: str) -> ValidationResult:
-        # Clean up the result
-        result = result.replace("**", "").replace("```", "")
-        lines = result.strip().split("\n")
-        
-        is_name_valid = False
-        is_desc_valid = False
+        # Extract name and description feedback
         name_feedback = ""
         desc_feedback = ""
-        quality_status = DataQualityStatus.NEEDS_IMPROVEMENT  # Default to NEEDS_IMPROVEMENT instead of POOR
-        improvements = []
+        if result.feedback:
+            feedback_parts = result.feedback.split("\n\n")
+            if len(feedback_parts) >= 1:
+                name_feedback = feedback_parts[0].replace("Name feedback:", "").strip()
+            if len(feedback_parts) >= 2:
+                desc_feedback = feedback_parts[1].replace("Description feedback:", "").strip()
         
-        # Extract each section
-        current_section = None
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-                
-            if line.startswith("1."):
-                current_section = "name_valid"
-                if "yes" in line.lower():
-                    is_name_valid = True
-            elif line.startswith("2."):
-                current_section = "name_feedback"
-                name_feedback = line[2:].strip()
-            elif line.startswith("3."):
-                current_section = "desc_valid"
-                if "yes" in line.lower():
-                    is_desc_valid = True
-            elif line.startswith("4."):
-                current_section = "desc_feedback"
-                desc_feedback = line[2:].strip()
-            elif line.startswith("5."):
-                current_section = "quality_status"
-                if "GOOD" in line:
-                    quality_status = DataQualityStatus.GOOD
-                elif "NEEDS_IMPROVEMENT" in line or "NEEDS IMPROVEMENT" in line:
-                    quality_status = DataQualityStatus.NEEDS_IMPROVEMENT
-                elif "POOR" in line:
-                    quality_status = DataQualityStatus.POOR
-            elif line.startswith("6."):
-                current_section = "improvements"
-            elif current_section == "name_feedback":
-                name_feedback += " " + line
-            elif current_section == "desc_feedback":
-                desc_feedback += " " + line
-            elif current_section == "improvements":
-                if line.startswith("-") or line.startswith("*") or (line[0].isdigit() and ". " in line):
-                    # This is a new improvement item
-                    line = re.sub(r'^[-*]\s+|\d+\.\s+', '', line)
-                    improvements.append(line)
-                elif improvements:
-                    # This is a continuation of the previous improvement
-                    improvements[-1] += " " + line
-                else:
-                    # If no previous improvement item to append to, create a new one
-                    improvements.append(line)
+        # Format as JSON with all 6 evaluation points
+        return {
+            "id": data_element.id,
+            "name_valid": result.is_valid,
+            "name_feedback": name_feedback,
+            "description_valid": result.is_valid,
+            "description_feedback": desc_feedback,
+            "quality_status": result.quality_status.value,
+            "suggested_improvements": result.suggested_improvements
+        }
+    except Exception as e:
+        logger.error(f"Validation error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Validation error: {str(e)}")
+
+@router.post("/enhance", response_model=EnhancementResponse)
+async def enhance_data_element(
+    request: EnhancementRequest,
+    background_tasks: BackgroundTasks,
+    db: DBManager = Depends(get_db)
+):
+    """
+    Enhance a data element to meet ISO/IEC 11179 standards.
+    This is an asynchronous operation that will run in the background.
+    
+    Args:
+        request: Enhancement request with data element
+        background_tasks: FastAPI background tasks
+        db: Database manager
         
-        # Ensure quality status is consistent with validations
-        if is_name_valid and is_desc_valid:
-            # If both are valid but status wasn't explicitly GOOD, use NEEDS_IMPROVEMENT
-            if quality_status == DataQualityStatus.POOR:
-                quality_status = DataQualityStatus.NEEDS_IMPROVEMENT
-        elif not is_name_valid and not is_desc_valid:
-            # If both are invalid, it should be POOR
-            quality_status = DataQualityStatus.POOR
+    Returns:
+        EnhancementResponse with request ID and status
+    """
+    # Use the provided ID as the request ID for tracking
+    request_id = request.data_element.id
+    logger.info(f"Enhancement request received for data element: {request_id}")
+    
+    # Check if this ID is already being processed in memory
+    if request_id in enhancement_jobs:
+        logger.info(f"Enhancement job already exists in memory for ID: {request_id}")
+        job = enhancement_jobs[request_id]
         
-        # Combine feedback
-        combined_feedback = f"Name feedback: {name_feedback}\n\nDescription feedback: {desc_feedback}"
+        # If already completed or failed, return the result
+        if job["status"] in [EnhancementStatus.COMPLETED, EnhancementStatus.FAILED]:
+            return EnhancementResponse(
+                request_id=request_id,
+                status=job["status"],
+                enhanced_data=job.get("result"),  # Use get() to avoid KeyError
+                error_message=job.get("error")
+            )
         
-        # If no improvements were extracted, create some based on validation results
-        if not improvements:
-            if not is_name_valid:
-                improvements.append("Improve the name to comply with ISO/IEC 11179 standards")
-            if not is_desc_valid:
-                improvements.append("Enhance the description to be more precise and complete")
-            if is_name_valid and is_desc_valid and quality_status != DataQualityStatus.GOOD:
-                improvements.append("Further refine name and description for better clarity")
-        
-        return ValidationResult(
-            is_valid=is_name_valid and is_desc_valid,
-            quality_status=quality_status, 
-            feedback=combined_feedback,
-            suggested_improvements=improvements
+        # Otherwise, return the current status
+        return EnhancementResponse(
+            request_id=request_id,
+            status=job["status"],
+            enhanced_data=None,
+            error_message=None
         )
     
-    async def validate(self, data_element: DataElement) -> ValidationResult:
-        """Validate a data element against ISO/IEC 11179 standards with approved acronyms."""
-        try:
-            # First, perform basic validation
-            name_valid, name_feedback = self.iso_validator.validate_name(data_element.existing_name)
-            desc_valid, desc_feedback = self.iso_validator.validate_description(data_element.existing_description)
-            
-            # Check for approved acronyms in the name
-            words = re.findall(r'\b[A-Z]{2,}\b', data_element.existing_name.upper())
-            approved_acronyms_found = []
-            unapproved_acronyms = []
-            
-            for word in words:
-                if word in self.approved_acronyms:
-                    approved_acronyms_found.append(f"{word} ({self.approved_acronyms[word]})")
-                else:
-                    unapproved_acronyms.append(word)
-            
-            # Modify name feedback based on acronyms
-            if approved_acronyms_found:
-                name_feedback += f"\nFound approved acronyms: {', '.join(approved_acronyms_found)}"
-            if unapproved_acronyms:
-                name_feedback += f"\nFound unapproved acronyms: {', '.join(unapproved_acronyms)}"
-                name_valid = False  # Mark as invalid if unapproved acronyms are found
-            
-            if not name_valid or not desc_valid:
-                feedback = ""
-                if not name_valid:
-                    feedback += f"Name validation failed: {name_feedback}\n"
-                if not desc_valid:
-                    feedback += f"Description validation failed: {desc_feedback}"
-                
-                return ValidationResult(
-                    is_valid = False,
-                    quality_status = DataQualityStatus.POOR,
-                    feedback = feedback.strip(),
-                    suggested_improvements = ["Fix basic validation issues before proceeding with deeper analysis"]
-                )
-            
-            # Update the prompt with approved acronyms information
-            template = self.validation_prompt.template
-            if self.approved_acronyms:
-                acronym_info = "Approved acronyms that can be used:\n"
-                for acronym, description in list(self.approved_acronyms.items())[:10]:  # Limit to first 10 for brevity
-                    acronym_info += f"- {acronym}: {description}\n"
-                if len(self.approved_acronyms) > 10:
-                    acronym_info += f"- Plus {len(self.approved_acronyms) - 10} more approved acronyms\n"
-                    
-                template = template.replace("ISO/IEC 11179 standards for data element names", 
-                                           f"ISO/IEC 11179 standards for data element names\n\n{acronym_info}")
-            
-            # Create a custom prompt for this validation
-            custom_prompt = PromptTemplate(
-                input_variables=["id", "name", "description", "example", "process_name", "process_description"],
-                template=template)
-            custom_chain = custom_prompt | self.llm | StrOutputParser()
-            
-            # If basic validation passes, perform more detailed evaluation
-            result = await custom_chain.ainvoke({
-                "id": data_element.id,
-                "name": data_element.existing_name,
-                "description": data_element.existing_description,
-                "example": data_element.example or "Not provided",
-                "process_name": data_element.process_name or "Not provided",
-                "process_description": data_element.process_description or "Not provided"
-            })
-            
-            return self._parse_validation_result(result)
-        except Exception as e:
-            logger.error(f"Error validating data element: {e}")
-            # Return a minimal validation result in case of error
-            return ValidationResult(
-                is_valid = False,
-                quality_status = DataQualityStatus.POOR,
-                feedback = f"Error during validation: {str(e)}",
-                suggested_improvements = ["Retry validation after resolving the error"]
+    # Check if job exists in the database
+    db_job = db.get_job(request_id)
+    if db_job is not None:
+        # Job exists in database
+        status = EnhancementStatus(db_job["status"])
+        
+        # Load job data from database to memory for faster access
+        enhancement_jobs[request_id] = {
+            "status": status,
+            "request": db_job["data"].get("request", {}),
+            "result": db_job["data"].get("result"),
+            "error": db_job["data"].get("error")
+        }
+        
+        # If already completed or failed, return the result
+        if status in [EnhancementStatus.COMPLETED, EnhancementStatus.FAILED]:
+            return EnhancementResponse(
+                request_id=request_id,
+                status=status,
+                enhanced_data=enhancement_jobs[request_id].get("result"),
+                error_message=enhancement_jobs[request_id].get("error")
             )
+        
+        # Otherwise, return the current status
+        return EnhancementResponse(
+            request_id=request_id,
+            status=status,
+            enhanced_data=None,
+            error_message=None
+        )
+    
+    # Initialize job status in memory - important to set all fields
+    enhancement_jobs[request_id] = {
+        "status": EnhancementStatus.PENDING,
+        "request": request.dict(),
+        "result": None,
+        "error": None
+    }
+    
+    # Store job in database
+    db.store_job(
+        job_id=request_id,
+        job_type="enhancement",
+        status=EnhancementStatus.PENDING.value,
+        data={
+            "request": request.dict(),
+            "result": None,
+            "error": None
+        }
+    )
+    
+    # Add the enhancement task to the background tasks
+    background_tasks.add_task(
+        run_enhancement_job,
+        request_id=request_id,
+        data_element=request.data_element,
+        max_iterations=request.max_iterations
+    )
+    
+    return EnhancementResponse(
+        request_id=request_id,
+        status=EnhancementStatus.PENDING,
+        enhanced_data=None,
+        error_message=None
+    )
+
+@router.get("/enhance/{request_id}", response_model=EnhancementResponse)
+async def get_enhancement_status(request_id: str, db: DBManager = Depends(get_db)):
+    """
+    Get the status of an enhancement job.
+    
+    Args:
+        request_id: ID of the enhancement job
+        db: Database manager
+        
+    Returns:
+        EnhancementResponse with current status and results if available
+    """
+    # First check in-memory cache for faster access
+    if request_id in enhancement_jobs:
+        job = enhancement_jobs[request_id]
+        
+        logger.debug(f"Enhancement job found in memory: {request_id}, status: {job['status']}")
+        logger.debug(f"Job data: {job}")
+        
+        return EnhancementResponse(
+            request_id=request_id,
+            status=job["status"],
+            enhanced_data=job.get("result"),
+            error_message=job.get("error")
+        )
+    
+    # If not in memory, check the database
+    db_job = db.get_job(request_id)
+    if db_job is None:
+        raise HTTPException(status_code=404, detail=f"Enhancement job {request_id} not found")
+    
+    # Convert status string to enum
+    status = EnhancementStatus(db_job["status"])
+    
+    # Load into memory cache for future requests
+    enhancement_jobs[request_id] = {
+        "status": status,
+        "request": db_job["data"].get("request", {}),
+        "result": db_job["data"].get("result"),
+        "error": db_job["data"].get("error")
+    }
+    
+    logger.debug(f"Enhancement job loaded from database: {request_id}, status: {status}")
+    
+    return EnhancementResponse(
+        request_id=request_id,
+        status=status,
+        enhanced_data=enhancement_jobs[request_id].get("result"),
+        error_message=enhancement_jobs[request_id].get("error")
+    )
+
+@router.post("/enhance/batch", response_model=List[str])
+async def batch_enhance_data_elements(
+    requests: List[EnhancementRequest],
+    background_tasks: BackgroundTasks,
+    db: DBManager = Depends(get_db)
+):
+    """
+    Enhance multiple data elements in batch mode.
+    Returns a list of request IDs that can be used to check status.
+    
+    Args:
+        requests: List of enhancement requests
+        background_tasks: FastAPI background tasks
+        db: Database manager
+        
+    Returns:
+        List of request IDs
+    """
+    request_ids = []
+    
+    for request in requests:
+        request_id = request.data_element.id
+        request_ids.append(request_id)
+        
+        # Skip if already processing in memory
+        if request_id in enhancement_jobs:
+            if enhancement_jobs[request_id]["status"] not in [EnhancementStatus.COMPLETED, EnhancementStatus.FAILED]:
+                continue
+        
+        # Check if job exists in database
+        db_job = db.get_job(request_id)
+        if db_job is not None:
+            status = EnhancementStatus(db_job["status"])
+            
+            # Skip if already completed or failed
+            if status in [EnhancementStatus.COMPLETED, EnhancementStatus.FAILED]:
+                # Load into memory cache
+                enhancement_jobs[request_id] = {
+                    "status": status,
+                    "request": db_job["data"].get("request", {}),
+                    "result": db_job["data"].get("result"),
+                    "error": db_job["data"].get("error")
+                }
+                continue
+        
+        # Initialize job status with all required fields
+        enhancement_jobs[request_id] = {
+            "status": EnhancementStatus.PENDING,
+            "request": request.dict(),
+            "result": None,
+            "error": None
+        }
+        
+        # Store job in database
+        db.store_job(
+            job_id=request_id,
+            job_type="enhancement",
+            status=EnhancementStatus.PENDING.value,
+            data={
+                "request": request.dict(),
+                "result": None,
+                "error": None
+            }
+        )
+        
+        # Add the enhancement task to the background tasks
+        background_tasks.add_task(
+            run_enhancement_job,
+            request_id=request_id,
+            data_element=request.data_element,
+            max_iterations=request.max_iterations
+        )
+    
+    return request_ids
+
+@router.delete("/enhance/{request_id}", response_model=Dict[str, Any])
+async def delete_enhancement_job(request_id: str, db: DBManager = Depends(get_db)):
+    """
+    Delete an enhancement job from the system.
+    
+    Args:
+        request_id: ID of the job to delete
+        db: Database manager
+        
+    Returns:
+        Dict with deletion message
+    """
+    # Check if job exists
+    if request_id not in enhancement_jobs and db.get_job(request_id) is None:
+        raise HTTPException(status_code=404, detail=f"Enhancement job {request_id} not found")
+    
+    # Get status from memory or database
+    status = None
+    if request_id in enhancement_jobs:
+        status = enhancement_jobs[request_id]["status"]
+    else:
+        db_job = db.get_job(request_id)
+        if db_job:
+            status = EnhancementStatus(db_job["status"])
+    
+    # Don't allow deleting running jobs
+    if status == EnhancementStatus.IN_PROGRESS:
+        raise HTTPException(status_code=400, detail=f"Cannot delete a job that is currently in progress")
+    
+    # Delete from memory
+    if request_id in enhancement_jobs:
+        del enhancement_jobs[request_id]
+    
+    # Delete from database
+    db.delete_job(request_id)
+    
+    return {"message": f"Enhancement job {request_id} deleted successfully"}
+
+async def run_enhancement_job(request_id: str, data_element: DataElement, max_iterations: int = 5):
+    """
+    Run the enhancement job in the background.
+    
+    Args:
+        request_id: ID of the enhancement job
+        data_element: The data element to enhance
+        max_iterations: Maximum number of enhancement iterations
+    """
+    logger.info(f"Starting enhancement job for {request_id}")
+    workflow = get_workflow()
+    db = DBManager()
+    
+    try:
+        # Update job status to in progress
+        enhancement_jobs[request_id]["status"] = EnhancementStatus.IN_PROGRESS
+        
+        # Update database status
+        db.store_job(
+            job_id=request_id,
+            job_type="enhancement",
+            status=EnhancementStatus.IN_PROGRESS.value,
+            data=enhancement_jobs[request_id]
+        )
+        
+        # Run the workflow
+        result = await workflow.run(data_element, max_iterations)
+        
+        # Update job status to completed in memory
+        enhancement_jobs[request_id]["status"] = EnhancementStatus.COMPLETED
+        enhancement_jobs[request_id]["result"] = result
+        enhancement_jobs[request_id]["error"] = None
+        
+        logger.info(f"Job result: {result}")
+        
+        # Update database with result - important to convert result to dict
+        db.store_job(
+            job_id=request_id,
+            job_type="enhancement",
+            status=EnhancementStatus.COMPLETED.value,
+            data={
+                "request": enhancement_jobs[request_id]["request"],
+                "result": result.dict(),
+                "error": None
+            }
+        )
+        
+        logger.info(f"Enhancement job completed for {request_id}")
+        
+    except Exception as e:
+        # Update job status to failed in memory
+        logger.error(f"Enhancement job failed for {request_id}: {str(e)}")
+        
+        if request_id in enhancement_jobs:
+            enhancement_jobs[request_id]["status"] = EnhancementStatus.FAILED
+            enhancement_jobs[request_id]["error"] = str(e)
+            enhancement_jobs[request_id]["result"] = None
+        
+            # Update database with error
+            db.store_job(
+                job_id=request_id,
+                job_type="enhancement",
+                status=EnhancementStatus.FAILED.value,
+                data={
+                    "request": enhancement_jobs[request_id]["request"],
+                    "result": None,
+                    "error": str(e)
+                }
+            )
+        else:
+            logger.error(f"Job {request_id} not found in memory after failure")
