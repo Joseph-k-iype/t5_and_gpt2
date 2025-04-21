@@ -1,85 +1,616 @@
-import csv
-import json
-import uuid
+import os
 import sys
-import requests
+import uuid
+import json
+import logging
+import chardet
+import pandas as pd
+import networkx as nx
+import numpy as np
+from typing import Optional, Any, Dict, List, Union
 from pathlib import Path
+from dotenv import dotenv_values
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider, ClientSecretCredential
+from openai import AzureOpenAI
+from pydantic import BaseModel
+from langchain.chat_models import AzureChatOpenAI
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationChain, LLMChain
+from langchain.docstore import Document as LC_DOCUMENT
+from langchain.embeddings.base import Embeddings
+from langchain.vectorstores import Chroma
+from langchain.prompts import PromptTemplate
+from chromadb.config import Settings
+from chromadb.utils import embedding_functions
+from collections import namedtuple
+import re
+from pydantic import BaseModel, ValidationError, field_validator
 
-# Configuration
-input_csv_file = sys.argv[1] if len(sys.argv) > 1 else 'input.csv'  # Default to 'input.csv' if no file specified
-output_json_file = 'filtered_results.json'
-api_endpoint = 'http://127.0.0.1:8000/api/v1/validate'
-valid_statuses = ['good', 'needs_improvement']
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
 
-def process_csv():
-    """Process the CSV file and make API calls for each row."""
-    # Check if input file exists
-    if not Path(input_csv_file).exists():
-        print(f"Error: File {input_csv_file} not found.")
-        sys.exit(1)
-    
-    print(f"Starting to process {input_csv_file}...")
-    
-    # Create an array to store the filtered results
-    filtered_results = []
-    total_records = 0
-    
-    # Open and read the CSV file
-    with open(input_csv_file, mode='r', encoding='utf-8') as csv_file:
-        csv_reader = csv.DictReader(csv_file)
+ENV_DIR = "env"
+CONFIG_PATH = f"{ENV_DIR}/config.env"
+CREDS_PATH = f"{ENV_DIR}/credentials.env"
+CERT_PATH = f"{ENV_DIR}/cacert.pem"
+
+Triple = namedtuple("Triple", ["subject", "predicate", "object"])
+
+## utility functions
+def is_file_readable(filepath: str)->bool:
+    """Check if a file is readable."""
+    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
+        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
+    return True
+
+def str_to_bool(s: str)->bool:
+    """Convert a string to a boolean."""
+    if s== 'True':
+        return True
+    elif s== 'False':
+        return False
+    else:
+        raise ValueError(f"Invalid boolean value: {s}")
+
+## OSEnv class
+
+class OSEnv:
+    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
+        self.var_list = []
+        self.bulk_set(config_file, True)
+        self.bulk_set(creds_file, False)
+        self.set_certificate_path(certificate_path)
+        if str_to_bool(self.get("PROXY_ENABLED", "False")):
+            self.set_proxy()
         
-        # Check if the required columns exist
-        fieldnames = csv_reader.fieldnames
-        if 'name' not in fieldnames or 'description' not in fieldnames:
-            print("Error: CSV file must contain 'name' and 'description' columns.")
-            print(f"Found columns: {fieldnames}")
-            sys.exit(1)
+        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
+            self.token = self.get_azure_token()
+        else:
+            self.token = None
         
-        # Process each row in the CSV
-        for row in csv_reader:
-            total_records += 1
-            try:
-                # Generate a unique ID for this record
-                id = str(uuid.uuid4())
-                
-                # Prepare the data to send to the API
-                request_data = {
-                    'id': id,
-                    'existing_name': row['name'],
-                    'existing_description': row['description']
-                }
-                
-                print(f"Processing: {row['name']}")
-                
-                # Make the API call
-                response = requests.post(api_endpoint, json=request_data)
-                response.raise_for_status()  # Raise an exception for HTTP errors
-                
-                response_data = response.json()
-                
-                # Check if the quality_status is one we want to keep
-                if response_data and 'quality_status' in response_data and response_data['quality_status'] in valid_statuses:
-                    # Create an object with the original fields and all API response fields
-                    result_object = {
-                        'existing_name': row['name'],
-                        'existing_description': row['description'],
-                        **response_data  # Add all the API response fields
-                    }
-                    
-                    # Add to our filtered results
-                    filtered_results.append(result_object)
-                    print(f"Added to results: {row['name']} - Status: {response_data['quality_status']}")
-                
-            except Exception as e:
-                print(f"Error processing row for {row['name']}: {str(e)}")
+    def _get_credential(self):
+        if str_to_bool(self.get("USE_MANAGED_IDENTITY", "False")):
+            return DefaultAzureCredential()
+        else:
+            return ClientSecretCredential(tenant_id=self.get("AZURE_TENANT_ID"), client_id=self.get("AZURE_CLIENT_ID"), client_secret=self.get("AZURE_CLIENT_SECRET"))
     
-    # Write the filtered results to a JSON file
-    with open(output_json_file, 'w', encoding='utf-8') as json_file:
-        json.dump(filtered_results, json_file, indent=2)
+    def set_certificate_path(self, path: str):
+        try:
+            if not os.path.isabs(path):
+                path = os.path.abspath(path)
+            if not is_file_readable(path):
+                raise FileNotFoundError(f"The file '{path}' does not exist or is not readable")
+            
+            self.set("REQUESTS_CA_BUNDLE", path)
+            self.set("SSL_CERT_FILE", path)
+            self.set("CURL_CA_BUNDLE", path)
+        except Exception as e:
+            logger.error(f"Error setting certificate path: {e}")
+            raise
     
-    print(f"Filtered results saved to {output_json_file}")
-    print(f"Total records processed: {total_records}")
-    print(f"Records saved: {len(filtered_results)}")
+    def bulk_set(self, dotenvfile: str, print_val: bool = False)->None:
+        try:
+            if not os.path.isabs(dotenvfile):
+                dotenvfile = os.path.abspath(dotenvfile)
+            if not is_file_readable(dotenvfile):
+                temp_dict = dotenv_values(dotenvfile)
+                for key, value in temp_dict.items():
+                    self.set(key, value, print_val)
+                del temp_dict
+        except Exception as e:
+            logger.error(f"Error loading environment variables from {dotenvfile}: {e}")
+            raise
+    
+    def set(self, key: str, value: str, print_val: bool = False)->None:
+        try:
+            os.environ[key] = value
+            if var_name not in self.var_list:
+                self.var_list.append(var_name)
+            if print_val:
+                logger.info(f"{key}: {value}")
+        except Exception as e:
+            logger.error(f"Error setting environment variable {key}: {e}")
+            raise
+    
+    def get(self, key: str, default: Optional[str] = None)->str:
+        try:
+            return os.environ.get(key, default)
+        except Exception as e:
+            logger.error(f"Error getting environment variable {key}: {e}")
+            raise
+    
+    def set_proxy(self) -> None:
+        try:
+            ad_username = self.get("AD_USERNAME")
+            ad_password = self.get("AD_USER_PW")
+            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
+            if not all([ad_username, ad_password, proxy_domain]):
+                raise ValueError("Proxy settings are incomplete")
+            proxy_url = f"https://{ad_username}:{ad_password}@{proxy_domain}"
+            self.set("HTTP_PROXY", proxy_url, print_val=False)
+            self.set("HTTPS_PROXY", proxy_url, print_val=False)
+            no_proxy_domains = [
+                'cognitiveservices.azure.com',
+                'search.windows.net',
+                'openai.azure.com',
+                'core.windows.net',
+                'azurewebsites.net'
+            ]
+            self.set("NO_PROXY", ",".join(no_proxy_domains), print_val=False)
+        except Exception as e:
+            logger.error(f"Error setting proxy: {e}")
+            raise
+    
+    def get_azure_token(self) -> str:
+        try:
+            credential = ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID"),
+                client_id=self.get("AZURE_CLIENT_ID"),
+                client_secret=self.get("AZURE_CLIENT_SECRET")
+            )
+            token = credential.get_token("https://cognitiveservices.azure.com/.default")
+            self.set("AZURE_TOKEN", token.token, print_val=False)
+            logger.info("Azure token set")
+            return token.token
+        except Exception as e:
+            logger.error(f"Error retrieving Azure token: {e}")
+            return None
+    
+    def list_env_vars(self)->None:
+        for var in self.var_list:
+            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET'}:
+                logger.info(f"{var}: [REDACTED]")
+            else:
+                logger.info(f"{var}: {os.getenv(var)}")
 
+
+## embedding class + Document class
+
+class MyDocument(BaseModel):
+    id: str = ""
+    text: str = ""
+    embedding: List[float] = []
+    metadata: Dict[str, Any] = {}
+
+class EmbeddingClient:
+    def __init__(self, azure_api_version: str = "2023-05-15", embeddings_model: str = "text-embedding-3-large"):
+        self.azure_api_version = azure_api_version
+        self.embeddings_model = embeddings_model
+        self.direct_azure_client = self._get_direct_azure_client()
+    
+    def _get_direct_azure_client(self):
+        token_provider = get_bearer_token_provider(
+            DefaultAzureCredential(),
+            "https://cognitiveservices.azure.com/.default"
+        )
+        return AzureOpenAI(token_provider, self.azure_api_version)
+    
+    def generate_embeddings(self, doc: MyDocument)->MyDocument:
+        try:
+            response = self.direct_azure_client.embeddings.create(
+                model=self.embeddings_model,
+                input=doc.text
+            ).data[0].embedding
+            doc.embedding = response
+            return doc
+        except Exception as e:
+            logger.error(f"Error generating embeddings: {e}")
+            return doc
+
+## LangChain components
+## AzureChatbot components
+
+class AzureChatbot:
+    def __init__(self, config_file=str, creds_file=str, cert_file=str):
+        self.env = OSEnv(config_file, creds_file, cert_file)
+        self._setup_chat_model()
+        self.memory = ConversationBufferMemory()
+        self.conversation = ConversationChain(llm=self.llm, memory=self.memory, verbose=True)
+    
+    def _setup_chat_model(self):
+        try:
+            token_provider = get_bearer_token_provider(
+                self.env.credential,
+                "https://cognitiveservices.azure.com/.default"
+            )
+            model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
+            temperature = float(self.env.get("TEMPERATURE", "0.7"))
+            max_tokens = int(self.env.get("MAX_TOKENS", "800"))
+            api_version = self.env.get("API_VERSION", "2023-05-15")
+            azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
+            azure_ad_token_provider = token_provider
+            self.llm = AzureChatOpenAI(
+                model_name=model_name,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                api_version=api_version,
+                azure_endpoint=azure_endpoint,
+                azure_ad_token_provider=azure_ad_token_provider
+            )
+        except Exception as e:
+            logger.error(f"Error setting up chatbot: {e}")
+            raise
+
+# Enhanced Data Issue Classifier with Confidence Scoring
+
+class DataIssueReasoning(BaseModel):
+    """Model for reasoning behind data issue classification"""
+    supporting_reasons: List[str] = []
+    contrary_reasons: List[str] = []
+    confidence_calculation: Dict[str, float] = {}
+
+class DataIssueClassifier(BaseModel):
+    """Enhanced model for classifying incidents as data issues with confidence scoring"""
+    incident_id: str
+    is_data_issue: bool
+    data_quality_dimension: Optional[str] = None
+    confidence_score: float = 0.0
+    reasoning: DataIssueReasoning
+    summary: str = ""
+
+    @field_validator('data_quality_dimension')
+    def validate_dimension(cls, v):
+        if v is not None:
+            valid_dimensions = [
+                # HSBC categories
+                "Consistency",
+                "Accuracy",
+                "Completeness",
+                "Validity",
+                "Conformity",
+                "Uniqueness",
+                "Timeliness",
+                "Reasonableness",
+                "Integrity",
+                
+                # Industry categories
+                "Incomplete Data",
+                "Inaccurate Data",
+                "Duplicate Data",
+                "Inconsistent Data",
+                "Outdated Data",
+                "Invalid Data",
+                "Ambiguous Data",
+                "Data Integrity Issues",
+                "Data Redundancy"
+            ]
+            if v not in valid_dimensions:
+                raise ValueError(f"Must be one of {valid_dimensions}")
+        return v
+
+class DataIssueAnalyzer:
+    def __init__(self, azure_chatbot: AzureChatbot):
+        self.chatbot = azure_chatbot
+        self.classification_prompt_template = """
+        You are a data quality expert at HSBC analyzing incidents to determine if they are data issues.
+        
+        A data quality issue is a problem with data that impacts a process or a system through, for example:
+        erroneous, inaccurate, incomplete, invalid, duplicate, irrelevant, nonstandard data.
+        
+        The data quality issue is NOT an issue related to:
+        - system configuration,
+        - system maintenance,
+        - issues with logging to the system,
+        - issues connected to system UI refresh time,
+        - issues connected to phone/fax/email
+        
+        The data quality could be related to system and application issues, but not all system and applications issues are classified as data quality issue. In order to classify system and/or application issue as data quality issue, the problem has to be connected to the data quality.
+        
+        The examples of DQ Issues:
+        - Customers with date of birth in future
+        - Legal Entities missing Legal Entity Identifier
+        - Customer records missing Customer Risk Rating
+        - Customers invalid email address
+        - Inconsistent legal entity names and identifiers across multiple systems and jurisdictions;
+        - Inconsistent institutional client names and identifiers across multiple banking systems used by institutional clients;
+        - Inter-company transfer amounts and details are inconsistent across multiple accounting systems by HSBC legal entity;
+        - Lack of timely accessibility to vendor payment amounts by the Finance team when creating quarterly financials; and
+        - Multiple vendors listed multiple times and in many different addresses and variations of names in Vendor Payment systems.
+        
+        HSBC definitions of DQ issue dimensions (categories):
+        
+        Consistency: where data is represented differently across various records or systems. For example, Inconsistent categorization of expenses in financial statements.
+        
+        Accuracy: refers to information that is incorrect or misleading. For example, incorrect sales figures reported in financial statement.
+        
+        Completeness: arises when records are missing essential information, such as missing fields or values that are necessary for analysis or reporting. For example, missing customer email addresses in a CRM system.
+        
+        Validity: data that does not conform to predefined formats or rules. For example, out-of-range values in numerical fields, such as age or salary.
+        
+        Conformity: data that does not conform to predefined formats or rules. For example, email addresses that do not conform to standard formats.
+        
+        Uniqueness: duplicate data occurs when the same record is entered multiple times within a dataset, leading to redundancy and inflated counts, multiple entries for the same customer in a database.
+        
+        Timeliness: refers to information that is no longer current or relevant. For example, old customer contact information that hasn't been updated.
+        
+        Reasonableness: reasonableness asks whether a data pattern meets expectations. For example, whether a distribution of sales across a geographic idea makes sense based on what is known about the customers in that area.
+        
+        Integrity: data integrity issues occur when the accuracy and consistency of data are compromised, often due to unauthorized changes, corruption, or system failures. For example, corrupted data files leading to loss of critical information.
+        
+        Note: HSBC categorization is slightly different than industry categorization, but both types of categorization should be used to learn what Data Quality issue is.
+        
+        Industry categorization of data quality dimensions:
+        
+        1. Incomplete Data: This issue arises when records are missing essential information, such as missing fields or values that are necessary for analysis or reporting. Incomplete data can lead to inaccurate conclusions and hinder decision-making processes.
+        
+        2. Inaccurate Data: Inaccurate data refers to information that is incorrect or misleading, often due to human error, outdated information, or faulty data entry processes. This can result in flawed analyses and poor business decisions.
+        
+        3. Duplicate Data: Duplicate data occurs when the same record is entered multiple times within a dataset, leading to redundancy and inflated counts. This can skew analysis results and complicate data management efforts. In HSBC, the sheer scale of data sources often causes redundancy and overlap via duplicate records. Data issues like duplication of contact information may also increase the likelihood of distorted analytical outcomes. Marketing initiatives suffer when certain prospects are overlooked while others are addressed repeatedly. Duplicate records may also lead to distorted analysis outcomes.
+        
+        4. Inconsistent Data: Inconsistent data arises when the same data element is represented differently across various records or systems, such as variations in naming conventions or formats. This can create confusion and hinder data integration efforts. When you're working with various data sources, the differences might be in formats, units, or spellings. Inconsistencies in data values tend to accumulate and degrade the usefulness of data.
+        
+        5. Outdated Data: Outdated data refers to information that is no longer current or relevant, often due to changes in business processes, regulations, or market conditions. Relying on outdated data can lead to misguided strategies and decisions.
+        
+        6. Invalid Data: Invalid data includes entries that do not conform to predefined formats or rules, such as incorrect data types or values outside acceptable ranges. This can cause errors in processing and analysis.
+        
+        7. Ambiguous Data: Ambiguous data is information that can be interpreted in multiple ways, leading to confusion or misinterpretation. Clear definitions and standards are necessary to mitigate this issue.
+        
+        8. Data Integrity Issues: Data integrity issues occur when the accuracy and consistency of data are compromised, often due to unauthorized changes, corruption, or system failures. Maintaining data integrity is crucial for reliable reporting and analysis.
+        
+        9. Data Redundancy: Data redundancy refers to the unnecessary duplication of data within a database or system, which can lead to increased storage costs and maintenance challenges. It can also complicate data retrieval and analysis.
+        
+        Examples of HSBC specific data quality issues:
+        
+        Incomplete Data:
+        - Missing customer email addresses in a CRM system.
+        - Incomplete transaction records lacking item descriptions.
+        - Missing fields in employee records, such as job titles or departments.
+        - Incomplete loan applications without required financial information.
+        - Missing product specifications in inventory records.
+        
+        Inaccurate Data:
+        - Incorrect sales figures reported in financial statements.
+        - Wrong customer addresses leading to failed deliveries.
+        - Misreported inventory levels due to data entry errors.
+        - Incorrect pricing information in product catalogs.
+        - Inaccurate employee salary records affecting payroll.
+        
+        Duplicate Data:
+        - Multiple entries for the same customer in a database.
+        - Duplicate product listings in an e-commerce platform.
+        - Repeated records of transactions in a financial system.
+        - Duplicate patient records in a healthcare database.
+        - Multiple entries for the same invoice in accounting software.
+        
+        Inconsistent Data:
+        - Different formats for date entries (MM/DD/YYYY vs. DD/MM/YYYY).
+        - Variations in product names across different systems (e.g., "Widget A" vs. "Widget A1").
+        - Inconsistent currency formats in financial reports.
+        - Different naming conventions for departments in HR records.
+        - Inconsistent categorization of expenses in financial statements.
+        
+        Outdated Data:
+        - Old customer contact information that hasn't been updated.
+        - Expired product listings still visible on a website.
+        - Outdated employee records not reflecting recent job changes.
+        - Old marketing campaign data that no longer applies.
+        - Historical sales data that is no longer relevant for current analysis.
+        
+        Invalid Data:
+        - Incorrect phone number formats (e.g., letters included).
+        - Invalid email addresses that do not conform to standard formats.
+        - Out-of-range values in numerical fields, such as age or salary.
+        - Incorrectly formatted social security numbers.
+        - Invalid product codes that do not match any existing items.
+        
+        Ambiguous Data:
+        - Vague product descriptions that do not specify features.
+        - Customer feedback that lacks context or specifics.
+        - Multiple meanings for a term used in data, leading to confusion.
+        - Unclear instructions in data entry forms.
+        - Ambiguous survey responses that cannot be easily categorized.
+        
+        Data Integrity Issues:
+        - Unauthorized changes made to financial records.
+        - Corrupted data files leading to loss of critical information.
+        - Inconsistent data across different databases due to synchronization issues.
+        - Data breaches resulting in compromised sensitive information.
+        - Loss of data integrity due to system failures or crashes.
+        
+        Data Redundancy:
+        - Multiple databases storing the same customer information.
+        - Repeated entries of the same transaction in different systems.
+        - Overlapping datasets in data warehouses leading to increased storage costs.
+        
+        Analyze the following incident:
+        ID: {incident_id}
+        Summary: {summary}
+        Description: {description}
+        Resolution: {resolution}
+        
+        Provide a detailed analysis with:
+        1. Whether this is a data issue according to HSBC's definition
+        2. If yes, the most appropriate data quality dimension from HSBC's categorization
+        3. List of supporting reasons (factors that indicate this is a data issue)
+        4. List of contrary reasons (factors that indicate this is not a data issue)
+        5. A confidence score explanation based on the reasons
+        
+        Respond in JSON format:
+        {{
+            "is_data_issue": true/false,
+            "data_quality_dimension": "dimension here or null if not a data issue",
+            "supporting_reasons": ["reason1", "reason2", ...],
+            "contrary_reasons": ["reason1", "reason2", ...],
+            "confidence_calculation": {{
+                "base_score": 0.5,
+                "supporting_weight": 0.15,
+                "contrary_weight": -0.1,
+                "final_score": 0.0-1.0
+            }},
+            "summary": "brief explanation of the classification"
+        }}
+        """
+        
+    def calculate_confidence_score(self, supporting_reasons: List[str], contrary_reasons: List[str]) -> Dict[str, float]:
+        """Calculate confidence score based on supporting and contrary reasons"""
+        base_score = 0.5  # Start neutral
+        supporting_weight = 0.15  # Each supporting reason adds this much
+        contrary_weight = -0.1    # Each contrary reason subtracts this much
+        
+        # Calculate adjustments
+        supporting_adjustment = len(supporting_reasons) * supporting_weight
+        contrary_adjustment = len(contrary_reasons) * contrary_weight
+        
+        # Calculate raw score
+        raw_score = base_score + supporting_adjustment + contrary_adjustment
+        
+        # Normalize to 0-1 range using sigmoid function
+        final_score = 1 / (1 + np.exp(-4 * (raw_score - 0.5)))
+        
+        return {
+            "base_score": base_score,
+            "supporting_weight": supporting_weight,
+            "contrary_weight": contrary_weight,
+            "supporting_adjustment": supporting_adjustment,
+            "contrary_adjustment": contrary_adjustment,
+            "raw_score": raw_score,
+            "final_score": float(final_score)
+        }
+        
+    def analyze_incident(self, incident_id: str, summary: str, description: str, resolution: str) -> DataIssueClassifier:
+        """Analyze a single incident for data quality issues with enhanced reasoning"""
+        try:
+            prompt = self.classification_prompt_template.format(
+                incident_id=incident_id,
+                summary=summary,
+                description=description,
+                resolution=resolution
+            )
+            
+            response = self.chatbot.llm.predict(prompt)
+            
+            # Parse JSON response
+            response_json = json.loads(response)
+            
+            # Extract reasoning components
+            supporting_reasons = response_json.get("supporting_reasons", [])
+            contrary_reasons = response_json.get("contrary_reasons", [])
+            
+            # Calculate confidence score
+            confidence_calculation = self.calculate_confidence_score(supporting_reasons, contrary_reasons)
+            
+            # Override AI-calculated confidence with our algorithm
+            response_json["confidence_calculation"].update(confidence_calculation)
+            
+            reasoning = DataIssueReasoning(
+                supporting_reasons=supporting_reasons,
+                contrary_reasons=contrary_reasons,
+                confidence_calculation=confidence_calculation
+            )
+            
+            return DataIssueClassifier(
+                incident_id=incident_id,
+                is_data_issue=response_json.get("is_data_issue", False),
+                data_quality_dimension=response_json.get("data_quality_dimension"),
+                confidence_score=confidence_calculation["final_score"],
+                reasoning=reasoning,
+                summary=response_json.get("summary", "")
+            )
+            
+        except (json.JSONDecodeError, ValidationError) as e:
+            logger.error(f"Error parsing response for incident {incident_id}: {e}")
+            # Fallback classification
+            reasoning = DataIssueReasoning(
+                supporting_reasons=[],
+                contrary_reasons=["Error in classification"],
+                confidence_calculation={"final_score": 0.0}
+            )
+            return DataIssueClassifier(
+                incident_id=incident_id,
+                is_data_issue=False,
+                data_quality_dimension=None,
+                confidence_score=0.0,
+                reasoning=reasoning,
+                summary="Error in classification"
+            )
+    
+    def process_csv(self, file_path: str) -> pd.DataFrame:
+        """Process a CSV file and classify all incidents with enhanced analysis"""
+        try:
+            # Read CSV file
+            df = pd.read_csv(file_path)
+            
+            # Validate required columns
+            required_columns = ['Id', 'incident summary', 'incident resolution', 'incident description']
+            for col in required_columns:
+                if col not in df.columns:
+                    raise ValueError(f"Missing required column: {col}")
+            
+            # Process each incident
+            results = []
+            for _, row in df.iterrows():
+                classification = self.analyze_incident(
+                    incident_id=str(row['Id']),
+                    summary=row['incident summary'],
+                    description=row['incident description'],
+                    resolution=row['incident resolution']
+                )
+                results.append({
+                    'Id': row['Id'],
+                    'is_data_issue': classification.is_data_issue,
+                    'data_quality_dimension': classification.data_quality_dimension,
+                    'confidence_score': classification.confidence_score,
+                    'supporting_reasons': '; '.join(classification.reasoning.supporting_reasons),
+                    'contrary_reasons': '; '.join(classification.reasoning.contrary_reasons),
+                    'classification_summary': classification.summary,
+                    'confidence_calculation': json.dumps(classification.reasoning.confidence_calculation)
+                })
+            
+            # Create results DataFrame
+            results_df = pd.DataFrame(results)
+            
+            # Merge with original DataFrame
+            final_df = df.merge(results_df, on='Id', how='left')
+            
+            return final_df
+        
+        except Exception as e:
+            logger.error(f"Error processing CSV file: {e}")
+            raise
+
+# Example usage
 if __name__ == "__main__":
-    process_csv()
+    # Initialize Azure chatbot
+    chatbot = AzureChatbot(CONFIG_PATH, CREDS_PATH, CERT_PATH)
+    
+    # Initialize Data Issue Analyzer
+    analyzer = DataIssueAnalyzer(chatbot)
+    
+    # Process CSV file
+    csv_path = "incidents.csv"  # Replace with your CSV file path
+    result_df = analyzer.process_csv(csv_path)
+    
+    # Save results
+    output_path = "classified_incidents_with_reasoning.csv"
+    result_df.to_csv(output_path, index=False)
+    logger.info(f"Results saved to {output_path}")
+    
+    # Display summary
+    total_incidents = len(result_df)
+    data_issues = result_df[result_df['is_data_issue'] == True]
+    logger.info(f"Total incidents: {total_incidents}")
+    logger.info(f"Data issues: {len(data_issues)}")
+    
+    # Show distribution of data quality dimensions
+    dimension_counts = data_issues['data_quality_dimension'].value_counts()
+    logger.info("\nData Quality Dimension Distribution:")
+    for dimension, count in dimension_counts.items():
+        logger.info(f"{dimension}: {count}")
+    
+    # Show high confidence vs low confidence classifications
+    high_confidence = result_df[result_df['confidence_score'] >= 0.8]
+    low_confidence = result_df[result_df['confidence_score'] < 0.5]
+    logger.info(f"\nHigh confidence classifications (>=0.8): {len(high_confidence)}")
+    logger.info(f"Low confidence classifications (<0.5): {len(low_confidence)}")
+    
+    # Display a sample of classifications with reasoning
+    logger.info("\nSample Classifications with Reasoning:")
+    sample_results = result_df.head(5)
+    for _, row in sample_results.iterrows():
+        logger.info(f"\nIncident ID: {row['Id']}")
+        logger.info(f"Is Data Issue: {row['is_data_issue']}")
+        logger.info(f"Confidence Score: {row['confidence_score']:.2f}")
+        logger.info(f"Data Quality Dimension: {row['data_quality_dimension']}")
+        logger.info(f"Supporting Reasons: {row['supporting_reasons']}")
+        logger.info(f"Contrary Reasons: {row['contrary_reasons']}")
+        logger.info(f"Summary: {row['classification_summary']}")
