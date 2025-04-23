@@ -1,13 +1,37 @@
 import os
 import sys
-import pandas as pd
+import uuid
+import json
 import logging
+import chardet
+import pandas as pd
+import networkx as nx
+import numpy as np
+import traceback
+from typing import Optional, Any, Dict, List, Union
+from pathlib import Path
+from abc import ABC, abstractmethod
+from nltk.tokenize import sent_tokenize, word_tokenize
+from nltk.tokenize.punkt import PunktSentenceTokenizer
+from tqdm import tqdm
+from dotenv import dotenv_values
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider, ClientSecretCredential
+from openai import AzureOpenAI
+from langchain.text_splitter import RecursiveCharacterTextSplitter, TokenTextSplitter, SentenceTransformersTokenTextSplitter
+from langchain.schema import Document as LC_DOCUMENT
+from langchain.chat_models import AzureChatOpenAI
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationChain, LLMChain, RetrievalQA
+from langchain.docstore import Document
+from langchain.embeddings.base import Embeddings
+from langchain.vectorstores import Chroma
+from langchain.prompts import PromptTemplate
+from chromadb.config import Settings
+from chromadb.utils import embedding_functions
+from collections import namedtuple
 from flask import Flask, render_template, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
-
-# Import your RAG chatbot components
-# You'll need to replace this with your actual import
-from your_rag_module import RAGChatbot, ChatbotConfig
+from pydantic import BaseModel as PydanticBaseModel, ValidationError, field_validator
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -20,38 +44,23 @@ CREDS_PATH = f"{ENV_DIR}/credentials.env"
 CERT_PATH = f"{ENV_DIR}/cacert.pem"
 UPLOAD_FOLDER = "./knowledge_base"
 METADATA_FOLDER = "./metadata"
-ALLOWED_EXTENSIONS = {'pdf', 'csv'}
+VECTOR_DB_DIR = "./vector_db"
 
-# Initialize Flask app
-app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['METADATA_FOLDER'] = METADATA_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB max upload
+# === UTILITY FUNCTIONS ===
+def is_file_readable(filepath: str)->bool:
+    """Check if a file is readable."""
+    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
+        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
+    return True
 
-# Create upload and metadata folders if they don't exist
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(METADATA_FOLDER, exist_ok=True)
-
-# Initialize chatbot
-chatbot_config = ChatbotConfig(
-    pdf_directory=UPLOAD_FOLDER,
-    vector_store_dir="./vector_db"
-)
-
-try:
-    chatbot = RAGChatbot(CONFIG_PATH, CREDS_PATH, CERT_PATH, chatbot_config)
-    logger.info("RAG Chatbot initialized successfully!")
-except Exception as e:
-    logger.error(f"Error initializing chatbot: {e}")
-    chatbot = None
-
-# Track the active metadata file
-active_metadata_file = None
-metadata_df = None
-
-def allowed_file(filename):
-    """Check if a file has an allowed extension."""
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+def str_to_bool(s: str)->bool:
+    """Convert a string to a boolean."""
+    if s == 'True':
+        return True
+    elif s == 'False':
+        return False
+    else:
+        raise ValueError(f"Invalid boolean value: {s}")
 
 def validate_metadata_csv(filepath):
     """Validate and preprocess the CSV metadata file."""
@@ -103,7 +112,972 @@ def validate_metadata_csv(filepath):
         return metadata_dict
     except Exception as e:
         logger.error(f"Error validating metadata CSV: {e}")
+        logger.error(traceback.format_exc())  # Print full stack trace
         return None
+
+# === CORE CLASSES ===
+
+class OSEnv:
+    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
+        self.var_list = []
+        self.bulk_set(config_file, True)
+        self.bulk_set(creds_file, False)
+        self.set_certificate_path(certificate_path)
+        if str_to_bool(self.get("PROXY_ENABLED", "False")):
+            self.set_proxy()
+        
+        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
+            self.token = self.get_azure_token()
+        else:
+            self.token = None
+        
+        # Initialize credential
+        self.credential = self._get_credential()
+    
+    def _get_credential(self):
+        if str_to_bool(self.get("USE_MANAGED_IDENTITY", "False")):
+            return DefaultAzureCredential()
+        else:
+            return ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID"), 
+                client_id=self.get("AZURE_CLIENT_ID"), 
+                client_secret=self.get("AZURE_CLIENT_SECRET")
+            )
+    
+    def set_certificate_path(self, path: str):
+        try:
+            if not os.path.isabs(path):
+                path = os.path.abspath(path)
+            if not is_file_readable(path):
+                raise FileNotFoundError(f"The file '{path}' does not exist or is not readable")
+            
+            self.set("REQUESTS_CA_BUNDLE", path)
+            self.set("SSL_CERT_FILE", path)
+            self.set("CURL_CA_BUNDLE", path)
+        except Exception as e:
+            logger.error(f"Error setting certificate path: {e}")
+            logger.error(traceback.format_exc())
+            raise
+    
+    def bulk_set(self, dotenvfile: str, print_val: bool = False)->None:
+        try:
+            if not os.path.isabs(dotenvfile):
+                dotenvfile = os.path.abspath(dotenvfile)
+            if not os.path.exists(dotenvfile):
+                logger.warning(f"Environment file not found: {dotenvfile}")
+                return
+                
+            try:
+                is_file_readable(dotenvfile)
+                temp_dict = dotenv_values(dotenvfile)
+                for key, value in temp_dict.items():
+                    self.set(key, value, print_val)
+                del temp_dict
+            except Exception as e:
+                logger.error(f"Error loading env file: {e}")
+        except Exception as e:
+            logger.error(f"Error loading environment variables from {dotenvfile}: {e}")
+            logger.error(traceback.format_exc())
+            raise
+    
+    def set(self, key: str, value: str, print_val: bool = False)->None:
+        try:
+            os.environ[key] = value
+            if key not in self.var_list:  # Fixed var_name to key
+                self.var_list.append(key)  # Fixed var_name to key
+            if print_val:
+                logger.info(f"{key}: {value}")
+        except Exception as e:
+            logger.error(f"Error setting environment variable {key}: {e}")
+            raise
+    
+    def get(self, key: str, default: Optional[str] = None)->str:
+        try:
+            return os.environ.get(key, default)
+        except Exception as e:
+            logger.error(f"Error getting environment variable {key}: {e}")
+            raise
+    
+    def set_proxy(self) -> None:
+        try:
+            ad_username = self.get("AD_USERNAME")
+            ad_password = self.get("AD_USER_PW")
+            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
+            if not all([ad_username, ad_password, proxy_domain]):
+                logger.warning("Proxy settings are incomplete")
+                return
+                
+            proxy_url = f"https://{ad_username}:{ad_password}@{proxy_domain}"
+            self.set("HTTP_PROXY", proxy_url, print_val=False)
+            self.set("HTTPS_PROXY", proxy_url, print_val=False)
+            no_proxy_domains = [
+                'cognitiveservices.azure.com',
+                'search.windows.net',
+                'openai.azure.com',
+                'core.windows.net',
+                'azurewebsites.net'
+            ]
+            self.set("NO_PROXY", ",".join(no_proxy_domains), print_val=False)
+        except Exception as e:
+            logger.error(f"Error setting proxy: {e}")
+            raise
+    
+    def get_azure_token(self) -> str:
+        try:
+            credential = ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID"),
+                client_id=self.get("AZURE_CLIENT_ID"),
+                client_secret=self.get("AZURE_CLIENT_SECRET")
+            )
+            token = credential.get_token("https://cognitiveservices.azure.com/.default")
+            self.set("AZURE_TOKEN", token.token, print_val=False)
+            logger.info("Azure token set")
+            return token.token
+        except Exception as e:
+            logger.error(f"Error retrieving Azure token: {e}")
+            logger.error(traceback.format_exc())
+            return None
+    
+    def list_env_vars(self)->None:
+        for var in self.var_list:
+            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET'}:
+                logger.info(f"{var}: [REDACTED]")
+            else:
+                logger.info(f"{var}: {os.getenv(var)}")
+
+
+class MyDocument(PydanticBaseModel):
+    id: str = ""
+    text: str = ""
+    embedding: List[float] = []
+    metadata: Dict[str, Any] = {}
+
+
+class EmbeddingClient:
+    def __init__(self, azure_api_version: str = "2023-05-15", embeddings_model: str = "text-embedding-3-large"):
+        self.azure_api_version = azure_api_version
+        self.embeddings_model = embeddings_model
+        try:
+            self.direct_azure_client = self._get_direct_azure_client()
+            logger.info(f"EmbeddingClient initialized with model: {embeddings_model}")
+        except Exception as e:
+            logger.error(f"Error initializing EmbeddingClient: {e}")
+            logger.error(traceback.format_exc())
+            self.direct_azure_client = None
+    
+    def _get_direct_azure_client(self):
+        token_provider = get_bearer_token_provider(
+            DefaultAzureCredential(),
+            "https://cognitiveservices.azure.com/.default"
+        )
+        return AzureOpenAI(token_provider=token_provider, api_version=self.azure_api_version)
+    
+    def generate_embeddings(self, doc: MyDocument)->MyDocument:
+        try:
+            if self.direct_azure_client is None:
+                logger.error("Azure client not initialized")
+                # Create a dummy embedding with proper dimensions
+                dim = 1536  # Default dimension
+                if "3-large" in self.embeddings_model:
+                    dim = 3072
+                doc.embedding = [0.0] * dim
+                return doc
+                
+            response = self.direct_azure_client.embeddings.create(
+                model=self.embeddings_model,
+                input=doc.text
+            )
+            
+            # Check if response contains data
+            if not hasattr(response, 'data') or not response.data:
+                logger.warning("Empty response from embeddings API")
+                dim = 1536  # Default dimension
+                if "3-large" in self.embeddings_model:
+                    dim = 3072
+                doc.embedding = [0.0] * dim
+                return doc
+                
+            # Extract embedding
+            embedding = response.data[0].embedding
+            
+            # Validate embedding format
+            if not isinstance(embedding, (list, np.ndarray)):
+                logger.warning(f"Unexpected embedding type: {type(embedding)}")
+                # If it's an int, convert to an array with that many zeros
+                if isinstance(embedding, int):
+                    logger.warning(f"Converting integer {embedding} to array")
+                    dim = embedding if embedding > 0 else 1536
+                    embedding = [0.0] * dim
+                else:
+                    # Default fallback
+                    dim = 1536
+                    if "3-large" in self.embeddings_model:
+                        dim = 3072
+                    embedding = [0.0] * dim
+            
+            doc.embedding = embedding
+            return doc
+        except Exception as e:
+            logger.error(f"Error generating embeddings: {e}")
+            logger.error(traceback.format_exc())
+            
+            # Create a dummy embedding with proper dimensions
+            dim = 1536  # Default dimension
+            if "3-large" in self.embeddings_model:
+                dim = 3072
+            doc.embedding = [0.0] * dim
+            return doc
+
+
+class CustomEmbeddingFunction:
+    """Custom embedding function class compatible with Langchain."""
+    
+    def __init__(self, embedding_client):
+        self.embedding_client = embedding_client
+        
+    def embed_documents(self, texts):
+        """Embed documents - this method name is required by Langchain."""
+        try:
+            logger.info(f"Embedding {len(texts)} documents")
+            # Create a list to store embeddings
+            embeddings = []
+            for text in texts:
+                # Create a MyDocument instance with the text
+                doc = MyDocument(id=str(uuid.uuid4()), text=text)
+                # Generate embedding and add to list
+                embedding_result = self.embedding_client.generate_embeddings(doc)
+                
+                # Debug the embedding result
+                logger.info(f"Embedding result type: {type(embedding_result.embedding) if hasattr(embedding_result, 'embedding') else 'No embedding attribute'}")
+                
+                # Handle different cases for the embedding value
+                if not hasattr(embedding_result, 'embedding'):
+                    logger.warning(f"No embedding attribute found, using dummy embedding")
+                    dim = 1536  # Default dimension
+                    embeddings.append([0.0] * dim)
+                elif embedding_result.embedding is None:
+                    logger.warning(f"Embedding is None, using dummy embedding")
+                    dim = 1536  # Default dimension
+                    embeddings.append([0.0] * dim)
+                elif isinstance(embedding_result.embedding, int):
+                    # Convert integer to a list with a single value
+                    logger.warning(f"Got integer embedding ({embedding_result.embedding}), converting to list")
+                    dim = 1536  # Default dimension
+                    embeddings.append([float(embedding_result.embedding)] + [0.0] * (dim - 1))
+                elif isinstance(embedding_result.embedding, (list, tuple, np.ndarray)):
+                    # Normal case - embedding is a list-like object
+                    embeddings.append(embedding_result.embedding)
+                else:
+                    # Unknown type - create dummy embedding
+                    logger.warning(f"Unknown embedding type: {type(embedding_result.embedding)}, using dummy")
+                    dim = 1536  # Default dimension
+                    embeddings.append([0.0] * dim)
+            
+            return embeddings
+        except Exception as e:
+            logger.error(f"Error in embed_documents: {e}")
+            logger.error(traceback.format_exc())
+            # Return dummy embeddings with fixed dimensions
+            dim = 1536  # Default dimension
+            return [[0.0] * dim for _ in range(len(texts))]
+    
+    def embed_query(self, text):
+        """Embed a single query - this method name is required by Langchain."""
+        result = self.embed_documents([text])
+        if result and len(result) > 0:
+            return result[0]
+        # Fallback
+        dim = 1536
+        return [0.0] * dim
+
+
+# Document processing classes
+class PDFProcessor:
+    """Class for processing PDF documents into text."""
+    
+    def __init__(self, directory_path: str = None):
+        """Initialize with directory containing PDF files."""
+        self.directory_path = directory_path
+        
+    def set_directory(self, directory_path: str):
+        """Set the directory path containing PDF files."""
+        self.directory_path = directory_path
+        
+    def get_pdf_files(self) -> List[str]:
+        """Get list of PDF files in the directory."""
+        if not self.directory_path:
+            raise ValueError("Directory path not set")
+        
+        pdf_files = glob.glob(f"{self.directory_path}/**/*.pdf", recursive=True)
+        if not pdf_files:
+            logger.warning(f"No PDF files found in {self.directory_path}")
+        
+        return pdf_files
+        
+    def extract_text_from_pdf(self, pdf_path: str) -> str:
+        """Extract text from a single PDF file."""
+        try:
+            is_file_readable(pdf_path)
+            text = ""
+            try:
+                with open(pdf_path, 'rb') as file:
+                    reader = PyPDF2.PdfReader(file)
+                    for page in reader.pages:
+                        text += page.extract_text() + "\n"
+            except Exception as e:
+                logger.error(f"Error reading PDF {pdf_path}: {e}")
+                return ""
+            
+            if not text.strip():
+                logger.warning(f"No text extracted from {pdf_path}")
+                
+            return text
+        except Exception as e:
+            logger.error(f"Error extracting text from {pdf_path}: {e}")
+            return ""
+    
+    def batch_process_pdfs(self) -> Dict[str, str]:
+        """Process all PDFs in the directory and return a dictionary mapping filenames to texts."""
+        pdf_files = self.get_pdf_files()
+        result = {}
+        
+        for pdf_file in tqdm(pdf_files, desc="Processing PDFs"):
+            text = self.extract_text_from_pdf(pdf_file)
+            if text:
+                result[os.path.basename(pdf_file)] = text
+        
+        logger.info(f"Processed {len(result)} PDF files")
+        return result
+
+# Include other tokenization and chunking classes for completeness
+
+
+# ChromaManager with fixes
+class ChromaManager:
+    """Class for managing ChromaDB vector store."""
+    
+    def __init__(self, persist_directory: str, embedding_client: EmbeddingClient):
+        """Initialize with persistence directory and embedding client."""
+        self.persist_directory = persist_directory
+        self.embedding_client = embedding_client
+        self.vectorstore = None
+        
+        # Disable telemetry as requested
+        os.environ["ANONYMIZED_TELEMETRY"] = "False"
+        logger.info(f"Setting up ChromaManager with persist_directory: {persist_directory}")
+        
+        # Make sure the directory exists
+        os.makedirs(persist_directory, exist_ok=True)
+    
+    def get_embedding_function(self):
+        """Get a properly formatted embedding function for Langchain."""
+        return CustomEmbeddingFunction(self.embedding_client)
+    
+    def init_vectorstore(self, force_new=False):
+        """Initialize the vector store."""
+        if self.vectorstore is not None and not force_new:
+            logger.info("Vector store already initialized")
+            return self.vectorstore
+            
+        try:
+            logger.info(f"Initializing vector store at {self.persist_directory}")
+            os.makedirs(self.persist_directory, exist_ok=True)
+            
+            # Create a proper embedding function object
+            embedding_func = self.get_embedding_function()
+            
+            # Try to initialize the vector store
+            try:
+                self.vectorstore = Chroma(
+                    persist_directory=self.persist_directory,
+                    embedding_function=embedding_func,
+                    collection_name="pdf_knowledge_base"
+                )
+                logger.info("Vector store initialized successfully!")
+            except Exception as e:
+                logger.error(f"Error creating Chroma: {e}")
+                logger.error(traceback.format_exc())
+                
+                # Try a simpler initialization
+                try:
+                    # Create a dummy empty collection with no persistence
+                    logger.info("Attempting in-memory Chroma instance...")
+                    self.vectorstore = Chroma(
+                        embedding_function=embedding_func,
+                        collection_name="pdf_knowledge_base_inmemory"
+                    )
+                    logger.info("Created in-memory Chroma instance")
+                except Exception as e2:
+                    logger.error(f"Error creating in-memory Chroma: {e2}")
+                    logger.error(traceback.format_exc())
+                    raise ValueError(f"Could not initialize vector store: {e2}")
+            
+            # Verify the vectorstore was created
+            if self.vectorstore is None:
+                raise ValueError("Vector store initialization did not create a valid instance")
+                
+            return self.vectorstore
+        except Exception as e:
+            logger.error(f"Fatal error initializing vector store: {e}")
+            logger.error(traceback.format_exc())
+            raise
+    
+    def add_documents(self, documents: List[LC_DOCUMENT]):
+        """Add documents to the vector store."""
+        if not self.vectorstore:
+            logger.info("Vector store not initialized, initializing now...")
+            self.init_vectorstore()
+            
+        try:
+            # Make sure we still have a valid vectorstore
+            if self.vectorstore is None:
+                raise ValueError("Vector store is None, cannot add documents")
+            
+            # Check document validity
+            if not isinstance(documents, list):
+                logger.error(f"Expected list of documents but got {type(documents)}")
+                raise ValueError(f"Expected list of documents but got {type(documents)}")
+            
+            if not documents:
+                logger.warning("Empty document list provided")
+                return
+                
+            logger.info(f"Adding {len(documents)} document chunks to vector store")
+            
+            # Check first document for debugging
+            first_doc = documents[0]
+            logger.info(f"First document type: {type(first_doc)}")
+            logger.info(f"First document metadata: {first_doc.metadata}")
+            
+            self.vectorstore.add_documents(documents)
+            self.vectorstore.persist()
+            logger.info(f"Added {len(documents)} documents to vector store")
+        except Exception as e:
+            logger.error(f"Error adding documents to vector store: {e}")
+            logger.error(traceback.format_exc())
+            raise
+    
+    def similarity_search(self, query: str, k: int = 5) -> List[LC_DOCUMENT]:
+        """Search for similar documents."""
+        if not self.vectorstore:
+            logger.error("Vector store not initialized when attempting similarity search")
+            raise ValueError("Vector store not initialized")
+            
+        try:
+            return self.vectorstore.similarity_search(query, k=k)
+        except Exception as e:
+            logger.error(f"Error searching vector store: {e}")
+            logger.error(traceback.format_exc())
+            return []
+    
+    def get_retriever(self, search_kwargs: Dict[str, Any] = None):
+        """Get a retriever for the vector store."""
+        if self.vectorstore is None:
+            logger.error("Vector store not initialized when attempting to get retriever")
+            raise ValueError("Vector store not initialized")
+            
+        if not search_kwargs:
+            search_kwargs = {"k": 5}
+        
+        logger.info(f"Creating retriever with search_kwargs: {search_kwargs}")
+        
+        try:
+            retriever = self.vectorstore.as_retriever(search_kwargs=search_kwargs)
+            if retriever is None:
+                raise ValueError("Retriever creation returned None")
+            return retriever
+        except Exception as e:
+            logger.error(f"Error creating retriever: {e}")
+            logger.error(traceback.format_exc())
+            raise ValueError(f"Failed to create retriever: {e}")
+
+
+# AzureChatbot Class
+class AzureChatbot:
+    """Base class for Azure OpenAI based chatbots."""
+    
+    def __init__(self, config_file: str, creds_file: str, cert_file: str):
+        """Initialize with configuration and credential files."""
+        self.env = OSEnv(config_file, creds_file, cert_file)
+        self._setup_chat_model()
+        self.memory = ConversationBufferMemory()
+        self.conversation = ConversationChain(llm=self.llm, memory=self.memory, verbose=True)
+        
+        logger.info("Azure Chatbot initialized successfully")
+    
+    def _setup_chat_model(self):
+        try:
+            # Use the credential from OSEnv
+            token_provider = get_bearer_token_provider(
+                self.env.credential,
+                "https://cognitiveservices.azure.com/.default"
+            )
+            
+            model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
+            temperature = float(self.env.get("TEMPERATURE", "0.7"))
+            max_tokens = int(self.env.get("MAX_TOKENS", "800"))
+            api_version = self.env.get("API_VERSION", "2023-05-15")
+            azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
+            
+            self.llm = AzureChatOpenAI(
+                model_name=model_name,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                api_version=api_version,
+                azure_endpoint=azure_endpoint,
+                azure_ad_token_provider=token_provider
+            )
+            
+            logger.info(f"LLM initialized with model: {model_name}")
+        except Exception as e:
+            logger.error(f"Error initializing LLM: {e}")
+            logger.error(traceback.format_exc())
+            raise
+    
+    def generate_response(self, prompt: str) -> str:
+        """Generate a response from the LLM."""
+        try:
+            response = self.llm(prompt)
+            return response
+        except Exception as e:
+            logger.error(f"Error generating response: {e}")
+            return f"Error: {str(e)}"
+    
+    def chat(self, messages: List[Dict[str, str]]) -> str:
+        """Conduct a chat with the LLM."""
+        try:
+            # Convert to prompt
+            prompt = self._format_chat_messages(messages)
+            return self.generate_response(prompt)
+        except Exception as e:
+            logger.error(f"Error in chat: {e}")
+            return f"Error: {str(e)}"
+    
+    def _format_chat_messages(self, messages: List[Dict[str, str]]) -> str:
+        """Format chat messages into a prompt."""
+        prompt = ""
+        for message in messages:
+            role = message.get("role", "user")
+            content = message.get("content", "")
+            
+            if role == "system":
+                prompt += f"System: {content}\n\n"
+            elif role == "user":
+                prompt += f"User: {content}\n\n"
+            elif role == "assistant":
+                prompt += f"Assistant: {content}\n\n"
+                
+        prompt += "Assistant: "
+        return prompt
+
+
+## RAG Chatbot Extension
+class ChatbotConfig(PydanticBaseModel):
+    """Configuration for the RAG chatbot."""
+    model_name: str = "gpt-4o-mini"
+    temperature: float = 0.7
+    max_tokens: int = 800
+    chunk_size: int = 1000
+    chunk_overlap: int = 200
+    chunking_strategy: str = "auto"  # auto, character, sentence, word, regex
+    k_documents: int = 5
+    pdf_directory: str = "./knowledge_base"
+    vector_store_dir: str = "./vector_db"
+    embeddings_model: str = "text-embedding-3-large"
+    metadata_directory: str = "./metadata"  # Add metadata directory
+    
+    @field_validator('chunking_strategy')
+    def validate_chunking_strategy(cls, v):
+        valid_strategies = ['auto', 'character', 'sentence', 'word', 'regex']
+        if v not in valid_strategies:
+            raise ValueError(f"Chunking strategy must be one of {valid_strategies}")
+        return v
+
+
+class RAGChatbot(AzureChatbot):
+    """Extension of AzureChatbot to support Retrieval Augmented Generation (RAG)."""
+    
+    def __init__(self, config_file: str, creds_file: str, cert_file: str, chatbot_config: ChatbotConfig = None):
+        """Initialize with configuration files and chatbot config."""
+        super().__init__(config_file, creds_file, cert_file)
+        
+        self.config = chatbot_config or ChatbotConfig()
+        logger.info("Initializing RAG Chatbot")
+        
+        # Initialize components
+        self.pdf_processor = PDFProcessor(self.config.pdf_directory)
+        
+        # Initialize text chunker with appropriate strategy
+        if self.config.chunking_strategy == 'auto':
+            self.text_chunker = TextChunker(
+                strategy="character",  # Initial strategy, will be auto-selected per document
+                chunk_size=self.config.chunk_size, 
+                chunk_overlap=self.config.chunk_overlap
+            )
+        else:
+            self.text_chunker = TextChunker(
+                strategy=self.config.chunking_strategy,
+                chunk_size=self.config.chunk_size, 
+                chunk_overlap=self.config.chunk_overlap
+            )
+        
+        # Create embedding client
+        logger.info("Creating embedding client...")
+        self.embedding_client = EmbeddingClient(
+            azure_api_version=self.env.get("API_VERSION", "2023-05-15"),
+            embeddings_model=self.config.embeddings_model
+        )
+        
+        # Create vector store directory if it doesn't exist
+        vector_dir = os.path.abspath(self.config.vector_store_dir)
+        os.makedirs(vector_dir, exist_ok=True)
+        logger.info(f"Created vector store directory: {vector_dir}")
+        
+        # Initialize ChromaManager but NOT the vectorstore yet
+        logger.info(f"Creating ChromaManager with vector store directory: {vector_dir}")
+        self.chroma_manager = ChromaManager(
+            persist_directory=vector_dir,
+            embedding_client=self.embedding_client
+        )
+        
+        # Flag to track if we've processed documents
+        self.docs_processed = False
+        self.qa_chain = None
+        
+        logger.info("RAG Chatbot initialization complete")
+    
+    def process_knowledge_base(self, pdf_metadata=None):
+        """Process all PDFs in the knowledge base and add to vector store.
+        
+        Args:
+            pdf_metadata (dict, optional): A dictionary mapping PDF filenames to their metadata.
+        """
+        # Add debug logging for metadata
+        if pdf_metadata:
+            logger.info(f"Processing knowledge base with metadata for {len(pdf_metadata)} documents")
+            # Log a sample of the metadata
+            for filename, meta in list(pdf_metadata.items())[:2]:  # Log first 2 items only
+                logger.info(f"Sample metadata for {filename}: {meta}")
+        else:
+            logger.info("Processing knowledge base without metadata")
+        
+        # Process PDFs to extract text
+        texts_dict = self.pdf_processor.batch_process_pdfs()
+        
+        if not texts_dict:
+            logger.warning("No text extracted from PDFs")
+            return False
+        
+        # Log document count
+        logger.info(f"Extracted text from {len(texts_dict)} documents")
+        
+        # Chunk the texts with enhanced metadata
+        chunked_docs = []
+        
+        for filename, text in texts_dict.items():
+            # Get metadata for this file if available
+            metadata = {"source": filename}
+            
+            # Add any additional metadata from CSV if available
+            metadata_prefix = ""
+            if pdf_metadata and filename in pdf_metadata:
+                # Add metadata to the document content itself for better retrieval
+                metadata_prefix = "DOCUMENT METADATA:\n"
+                for key, value in pdf_metadata[filename].items():
+                    metadata_prefix += f"{key}: {value}\n"
+                metadata_prefix += "\nDOCUMENT CONTENT:\n"
+                
+                # Also add to metadata dictionary for direct access
+                metadata.update(pdf_metadata[filename])
+                logger.info(f"Added metadata to {filename}: {pdf_metadata[filename]}")
+            
+            # Add metadata prefix to the text
+            enhanced_text = metadata_prefix + text
+            
+            # Auto-select optimal strategy for this text
+            self.text_chunker.auto_select_strategy(enhanced_text)
+            logger.info(f"Selected {self.text_chunker.strategy} chunking strategy for {filename}")
+            
+            # Chunk the text with metadata
+            chunks = self.text_chunker.chunk_text(enhanced_text, metadata)
+            chunked_docs.extend(chunks)
+        
+        logger.info(f"Created {len(chunked_docs)} chunks from {len(texts_dict)} documents")
+        
+        # After creating chunks, check a few to verify metadata was attached
+        if chunked_docs:
+            for i in range(min(3, len(chunked_docs))):
+                logger.info(f"Sample chunk {i} metadata: {chunked_docs[i].metadata}")
+                logger.info(f"Sample chunk {i} content preview: {chunked_docs[i].page_content[:100]}...")
+        
+        if not chunked_docs:
+            logger.warning("No chunks created from documents")
+            return False
+        
+        # Initialize vector store before adding documents
+        if self.chroma_manager.vectorstore is None:
+            logger.info("Initializing vector store before adding documents")
+            try:
+                self.chroma_manager.init_vectorstore(force_new=True)
+            except Exception as e:
+                logger.error(f"Failed to initialize vector store: {e}")
+                logger.error(traceback.format_exc())
+                return False
+        
+        # Add to vector store
+        logger.info(f"Adding {len(chunked_docs)} document chunks to vector store")
+        try:
+            self.chroma_manager.add_documents(chunked_docs)
+        except Exception as e:
+            logger.error(f"Failed to add documents to vector store: {e}")
+            logger.error(traceback.format_exc())
+            return False
+        
+        # Set flag that we've processed documents
+        self.docs_processed = True
+        
+        # Re-initialize QA chain with updated vector store
+        logger.info("Setting up QA chain with new documents")
+        try:
+            self._setup_qa_chain()
+        except Exception as e:
+            logger.error(f"Failed to set up QA chain: {e}")
+            logger.error(traceback.format_exc())
+            return False
+        
+        logger.info("Knowledge base processed successfully")
+        return True
+    
+    def _setup_qa_chain(self):
+        """Set up the QA chain for answering questions."""
+        try:
+            # First explicitly initialize the vector store if not done yet
+            if self.chroma_manager.vectorstore is None:
+                logger.info("Vector store not initialized, initializing now...")
+                self.chroma_manager.init_vectorstore()
+            
+            logger.info("Creating retriever...")
+            
+            # Get retriever with configured k, but handle error gracefully
+            try:
+                retriever = self.chroma_manager.get_retriever(
+                    search_kwargs={"k": 1}  # Start with k=1 for safety
+                )
+                logger.info("Successfully created retriever with k=1")
+                
+                # Try with the actual k if k=1 worked
+                if self.config.k_documents > 1:
+                    try:
+                        retriever = self.chroma_manager.get_retriever(
+                            search_kwargs={"k": self.config.k_documents}
+                        )
+                        logger.info(f"Successfully created retriever with k={self.config.k_documents}")
+                    except Exception as e:
+                        logger.warning(f"Could not create retriever with k={self.config.k_documents}, using k=1 instead: {e}")
+            except Exception as e:
+                logger.error(f"Failed to get retriever: {e}")
+                logger.error(traceback.format_exc())
+                
+                if not self.docs_processed:
+                    raise ValueError("Cannot create retriever - no documents processed yet")
+                else:
+                    raise ValueError(f"Could not create retriever: {e}")
+            
+            # Define RAG prompt template with explicit metadata instructions
+            template = """You are an intelligent assistant answering questions based on a knowledge base of documents and their associated metadata.
+
+Use the following pieces of context to answer the user's question. Pay special attention to any metadata fields such as author, date, category, or keywords that might be relevant to the question.
+
+When the user asks about metadata fields like author, date, category, or any other attributes that are not in the main document text, prioritize the information from the metadata.
+
+Context:
+{context}
+
+Question: {question}
+
+In your answer, explicitly reference metadata when it helps answer the question. If the question specifically asks about metadata like "who wrote this document" or "what category is this document", make sure to check the metadata fields in the context first.
+
+Answer:"""
+            
+            qa_prompt = PromptTemplate(
+                template=template,
+                input_variables=["context", "question"]
+            )
+            
+            # Create QA chain
+            logger.info("Creating RetrievalQA chain...")
+            self.qa_chain = RetrievalQA.from_chain_type(
+                llm=self.llm,
+                chain_type="stuff",
+                retriever=retriever,
+                return_source_documents=True,
+                chain_type_kwargs={"prompt": qa_prompt}
+            )
+            
+            logger.info("QA chain initialized successfully")
+        except Exception as e:
+            logger.error(f"Error setting up QA chain: {e}")
+            logger.error(traceback.format_exc())
+            # Set qa_chain to None to indicate it wasn't initialized
+            self.qa_chain = None
+            raise
+    
+    def answer_question(self, question: str) -> Dict[str, Any]:
+        """Answer a question using the RAG approach with metadata support."""
+        try:
+            # If we haven't processed documents yet, tell the user
+            if not self.docs_processed:
+                return {
+                    "question": question,
+                    "answer": "I need to process the knowledge base before I can answer questions. Please run the 'process_knowledge_base' function first.",
+                    "sources": []
+                }
+            
+            # Check if vector store is initialized
+            if not self.chroma_manager.vectorstore:
+                logger.error("Cannot answer question - vector store not initialized")
+                return {
+                    "question": question,
+                    "answer": "Error: Knowledge base not initialized. Please process documents first.",
+                    "sources": []
+                }
+            
+            # Detect if the question is about metadata specifically
+            metadata_keywords = ['author', 'wrote', 'written by', 'created by', 'date', 'when', 
+                                'category', 'type', 'keywords', 'tags', 'metadata', 'published',
+                                'topic', 'classification', 'subject']
+            
+            is_metadata_question = any(keyword in question.lower() for keyword in metadata_keywords)
+            
+            # Log metadata detection
+            if is_metadata_question:
+                logger.info(f"Question detected as metadata-related: {question}")
+            
+            # Check if qa_chain is initialized
+            if not hasattr(self, 'qa_chain') or self.qa_chain is None:
+                logger.error("QA chain not initialized")
+                # Try to initialize QA chain if possible
+                try:
+                    logger.info("Attempting to initialize QA chain...")
+                    self._setup_qa_chain()
+                except Exception as e:
+                    logger.error(f"Failed to initialize QA chain: {e}")
+                    logger.error(traceback.format_exc())
+                    return {
+                        "question": question,
+                        "answer": "Error: QA system not initialized. Please process documents first.",
+                        "sources": []
+                    }
+            
+            # Get answer from QA chain
+            try:
+                # For metadata questions, we might need to augment the query
+                if is_metadata_question:
+                    # Create a more explicit query to help the retriever find relevant metadata
+                    enhanced_question = f"Find documents and their metadata relevant to: {question}"
+                    logger.info(f"Using enhanced question for metadata query: {enhanced_question}")
+                    result = self.qa_chain({"query": enhanced_question})
+                else:
+                    result = self.qa_chain({"query": question})
+                    
+                # Check if we got a non-answer response
+                answer = result["result"]
+                if "don't know" in answer.lower() or "don't have enough information" in answer.lower():
+                    logger.warning(f"Got 'don't know' response for question: {question}")
+                    
+                    # Check if we have metadata that might help
+                    metadata_found = False
+                    for doc in result.get("source_documents", []):
+                        if any(k != 'source' for k in doc.metadata.keys()):
+                            metadata_found = True
+                            break
+                    
+                    if metadata_found and is_metadata_question:
+                        # Try again with a more specific prompt about metadata
+                        logger.info("Trying again with metadata-specific prompt")
+                        
+                        # Direct prompt to metadata in sources
+                        metadata_prompt = f"""I need information about the metadata of documents. 
+                        My question is: '{question}'
+                        Look specifically at the metadata fields in the documents and tell me about {', '.join(metadata_keywords)}.
+                        If you can find any relevant metadata in the documents, please share it."""
+                        
+                        # Get a direct LLM response focusing on metadata
+                        fallback_response = self.generate_response(metadata_prompt)
+                        answer = fallback_response
+            except Exception as e:
+                logger.error(f"Error in QA chain: {e}")
+                logger.error(traceback.format_exc())
+                # Fallback to direct LLM response
+                fallback_response = self.generate_response(
+                    f"The following question was asked, but I couldn't find relevant information in the knowledge base: '{question}'. "
+                    "Please respond that you don't have enough information in the knowledge base to answer this question."
+                )
+                return {
+                    "question": question,
+                    "answer": fallback_response,
+                    "sources": []
+                }
+            
+            # Format sources with metadata
+            sources = []
+            for doc in result.get("source_documents", []):
+                # Extract metadata excluding 'source' which is handled separately
+                metadata = {k: v for k, v in doc.metadata.items() if k != 'source'}
+                
+                sources.append({
+                    "content": doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content,
+                    "source": doc.metadata.get("source", "Unknown"),
+                    "metadata": metadata  # Include additional metadata from CSV
+                })
+            
+            return {
+                "question": question,
+                "answer": answer,
+                "sources": sources
+            }
+        except Exception as e:
+            logger.error(f"Error answering question: {e}")
+            logger.error(traceback.format_exc())
+            return {
+                "question": question,
+                "answer": f"Error processing your question: {str(e)}. Please try processing the knowledge base first.",
+                "sources": []
+            }
+
+
+# === FLASK APP ===
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['METADATA_FOLDER'] = METADATA_FOLDER
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB max upload
+
+# Create upload and metadata folders if they don't exist
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(METADATA_FOLDER, exist_ok=True)
+
+# Initialize chatbot
+chatbot_config = ChatbotConfig(
+    pdf_directory=UPLOAD_FOLDER,
+    vector_store_dir=VECTOR_DB_DIR,
+    metadata_directory=METADATA_FOLDER
+)
+
+try:
+    chatbot = RAGChatbot(CONFIG_PATH, CREDS_PATH, CERT_PATH, chatbot_config)
+    logger.info("RAG Chatbot initialized successfully!")
+except Exception as e:
+    logger.error(f"Error initializing chatbot: {e}")
+    logger.error(traceback.format_exc())
+    chatbot = None
+
+# Track the active metadata file
+active_metadata_file = None
+metadata_df = None
+
+def allowed_file(filename):
+    """Check if a file has an allowed extension."""
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ['pdf', 'csv']
 
 @app.route('/')
 def index():
@@ -194,6 +1168,7 @@ def process_knowledge_base():
                     return jsonify({'success': False, 'message': 'Failed to validate active metadata file'}), 500
             except Exception as e:
                 logger.error(f"Error processing metadata: {e}")
+                logger.error(traceback.format_exc())
                 return jsonify({'success': False, 'message': f'Error processing metadata: {str(e)}'}), 500
         
         # Process knowledge base with metadata
@@ -206,6 +1181,7 @@ def process_knowledge_base():
             return jsonify({'success': False, 'message': 'Failed to process knowledge base'}), 500
     except Exception as e:
         logger.error(f"Error processing knowledge base: {e}")
+        logger.error(traceback.format_exc())
         return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
 
 @app.route('/ask', methods=['POST'])
@@ -232,6 +1208,7 @@ def ask_question():
         })
     except Exception as e:
         logger.error(f"Error answering question: {e}")
+        logger.error(traceback.format_exc())
         return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
 
 @app.route('/files', methods=['GET'])
@@ -257,6 +1234,7 @@ def list_files():
         })
     except Exception as e:
         logger.error(f"Error listing files: {e}")
+        logger.error(traceback.format_exc())
         return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
 
 @app.route('/delete/<filename>', methods=['DELETE'])
@@ -283,6 +1261,7 @@ def delete_file(filename):
             return jsonify({'success': False, 'message': f'File {filename} not found'}), 404
     except Exception as e:
         logger.error(f"Error deleting file: {e}")
+        logger.error(traceback.format_exc())
         return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
 
 @app.route('/activate-metadata/<filename>', methods=['POST'])
@@ -315,6 +1294,7 @@ def activate_metadata(filename):
         })
     except Exception as e:
         logger.error(f"Error activating metadata file: {e}")
+        logger.error(traceback.format_exc())
         return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
 
 @app.route('/metadata-info', methods=['GET'])
@@ -350,6 +1330,7 @@ def metadata_info():
         })
     except Exception as e:
         logger.error(f"Error getting metadata info: {e}")
+        logger.error(traceback.format_exc())
         return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
 
 @app.route('/metadata-preview/<filename>', methods=['GET'])
@@ -385,6 +1366,7 @@ def metadata_preview(filename):
         })
     except Exception as e:
         logger.error(f"Error getting metadata preview: {e}")
+        logger.error(traceback.format_exc())
         return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
 
 @app.route('/health', methods=['GET'])
@@ -408,14 +1390,20 @@ def request_entity_too_large(error):
 def internal_server_error(error):
     """Handle internal server errors."""
     logger.error(f"Internal server error: {error}")
+    logger.error(traceback.format_exc())
     return jsonify({
         'success': False,
         'message': 'Internal server error occurred'
     }), 500
 
 if __name__ == '__main__':
+    # Import needed for CLI mode
+    import PyPDF2
+    import glob
+    from TextChunker import TextChunker  # Make sure this is imported properly
+    
     port = int(os.environ.get('PORT', 5000))
     debug = os.environ.get('FLASK_DEBUG', 'True').lower() == 'true'
     
     print(f"Starting RAG Chatbot UI server on port {port}, debug mode: {debug}")
-    app.run(host='0.0.0.0', port=port, debug=debug)
+    app.run(hos
