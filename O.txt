@@ -1,696 +1,808 @@
-import os
-import sys
-import uuid
-import json
-import logging
-import chardet
-import pandas as pd
-import networkx as nx
-import numpy as np
-from typing import Optional, Any, Dict, List, Union
-from pathlib import Path
-from dotenv import dotenv_values
-from azure.identity import DefaultAzureCredential, get_bearer_token_provider, ClientSecretCredential
-from openai import AzureOpenAI
-from pydantic import BaseModel
-from langchain.chat_models import AzureChatOpenAI
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationChain, LLMChain
-from langchain.schema import Document as LC_DOCUMENT
-from langchain.embeddings.base import Embeddings
-from langchain.vectorstores import Chroma
-from langchain.prompts import PromptTemplate
-from chromadb.config import Settings
-from chromadb.utils import embedding_functions
-from collections import namedtuple
+## PDF Processing and Vector DB Components
+
+import PyPDF2
 import re
-from pydantic import BaseModel, ValidationError, field_validator
+import nltk
+import os
+import datetime
+from abc import ABC, abstractmethod
+from nltk.tokenize import sent_tokenize, word_tokenize
+from nltk.tokenize.punkt import PunktSentenceTokenizer
+from tqdm import tqdm
+from langchain.text_splitter import RecursiveCharacterTextSplitter, TokenTextSplitter, SentenceTransformersTokenTextSplitter
+from langchain.schema import Document as LC_DOCUMENT  # Updated import path
 
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-logger = logging.getLogger(__name__)
+# Set NLTK data path to custom location
+NLTK_DATA_PATH = os.path.abspath("code/library/nltk")
+nltk.data.path.insert(0, NLTK_DATA_PATH)
 
-ENV_DIR = "env"
-CONFIG_PATH = f"{ENV_DIR}/config.env"
-CREDS_PATH = f"{ENV_DIR}/credentials.env"
-CERT_PATH = f"{ENV_DIR}/cacert.pem"
+# Verify NLTK data path is correctly set up
+logger.info(f"Using NLTK data from: {NLTK_DATA_PATH}")
+if not os.path.exists(os.path.join(NLTK_DATA_PATH, "tokenizers/punkt")):
+    logger.warning(f"Punkt tokenizer not found in {NLTK_DATA_PATH}. Some tokenization features may not work.")
+from langchain.vectorstores import Chroma
+from langchain.chains import RetrievalQA
+from fastapi import FastAPI, Request, HTTPException, Depends, BackgroundTasks
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel as PydanticBaseModel
+from typing import List, Dict, Any, Optional
+import uvicorn
+import glob
 
-Triple = namedtuple("Triple", ["subject", "predicate", "object"])
-
-## utility functions
-def is_file_readable(filepath: str)->bool:
-    """Check if a file is readable."""
-    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
-        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
-    return True
-
-def str_to_bool(s: str)->bool:
-    """Convert a string to a boolean."""
-    if s== 'True':
-        return True
-    elif s== 'False':
-        return False
-    else:
-        raise ValueError(f"Invalid boolean value: {s}")
-
-## OSEnv class
-
-class OSEnv:
-    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
-        self.var_list = []
-        self.bulk_set(config_file, True)
-        self.bulk_set(creds_file, False)
-        self.set_certificate_path(certificate_path)
-        if str_to_bool(self.get("PROXY_ENABLED", "False")):
-            self.set_proxy()
-        
-        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
-            self.token = self.get_azure_token()
-        else:
-            self.token = None
-        
-    def _get_credential(self):
-        if str_to_bool(self.get("USE_MANAGED_IDENTITY", "False")):
-            return DefaultAzureCredential()
-        else:
-            return ClientSecretCredential(tenant_id=self.get("AZURE_TENANT_ID"), client_id=self.get("AZURE_CLIENT_ID"), client_secret=self.get("AZURE_CLIENT_SECRET"))
+# Document processing classes
+class PDFProcessor:
+    """Class for processing PDF documents into text."""
     
-    def set_certificate_path(self, path: str):
+    def __init__(self, directory_path: str = None):
+        """Initialize with directory containing PDF files."""
+        self.directory_path = directory_path
+        
+    def set_directory(self, directory_path: str):
+        """Set the directory path containing PDF files."""
+        self.directory_path = directory_path
+        
+    def get_pdf_files(self) -> List[str]:
+        """Get list of PDF files in the directory."""
+        if not self.directory_path:
+            raise ValueError("Directory path not set")
+        
+        pdf_files = glob.glob(f"{self.directory_path}/**/*.pdf", recursive=True)
+        if not pdf_files:
+            logger.warning(f"No PDF files found in {self.directory_path}")
+        
+        return pdf_files
+        
+    def extract_text_from_pdf(self, pdf_path: str) -> str:
+        """Extract text from a single PDF file."""
         try:
-            if not os.path.isabs(path):
-                path = os.path.abspath(path)
-            if not is_file_readable(path):
-                raise FileNotFoundError(f"The file '{path}' does not exist or is not readable")
+            is_file_readable(pdf_path)
+            text = ""
+            with open(pdf_path, 'rb') as file:
+                reader = PyPDF2.PdfReader(file)
+                for page in reader.pages:
+                    text += page.extract_text() + "\n"
             
-            self.set("REQUESTS_CA_BUNDLE", path)
-            self.set("SSL_CERT_FILE", path)
-            self.set("CURL_CA_BUNDLE", path)
-        except Exception as e:
-            logger.error(f"Error setting certificate path: {e}")
-            raise
-    
-    def bulk_set(self, dotenvfile: str, print_val: bool = False)->None:
-        try:
-            if not os.path.isabs(dotenvfile):
-                dotenvfile = os.path.abspath(dotenvfile)
-            if not is_file_readable(dotenvfile):
-                temp_dict = dotenv_values(dotenvfile)
-                for key, value in temp_dict.items():
-                    self.set(key, value, print_val)
-                del temp_dict
-        except Exception as e:
-            logger.error(f"Error loading environment variables from {dotenvfile}: {e}")
-            raise
-    
-    def set(self, key: str, value: str, print_val: bool = False)->None:
-        try:
-            os.environ[key] = value
-            if key not in self.var_list:
-                self.var_list.append(key)
-            if print_val:
-                logger.info(f"{key}: {value}")
-        except Exception as e:
-            logger.error(f"Error setting environment variable {key}: {e}")
-            raise
-    
-    def get(self, key: str, default: Optional[str] = None)->str:
-        try:
-            return os.environ.get(key, default)
-        except Exception as e:
-            logger.error(f"Error getting environment variable {key}: {e}")
-            raise
-    
-    def set_proxy(self) -> None:
-        try:
-            ad_username = self.get("AD_USERNAME")
-            ad_password = self.get("AD_USER_PW")
-            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
-            if not all([ad_username, ad_password, proxy_domain]):
-                raise ValueError("Proxy settings are incomplete")
-            proxy_url = f"https://{ad_username}:{ad_password}@{proxy_domain}"
-            self.set("HTTP_PROXY", proxy_url, print_val=False)
-            self.set("HTTPS_PROXY", proxy_url, print_val=False)
-            no_proxy_domains = [
-                'cognitiveservices.azure.com',
-                'search.windows.net',
-                'openai.azure.com',
-                'core.windows.net',
-                'azurewebsites.net'
-            ]
-            self.set("NO_PROXY", ",".join(no_proxy_domains), print_val=False)
-        except Exception as e:
-            logger.error(f"Error setting proxy: {e}")
-            raise
-    
-    def get_azure_token(self) -> str:
-        try:
-            credential = ClientSecretCredential(
-                tenant_id=self.get("AZURE_TENANT_ID"),
-                client_id=self.get("AZURE_CLIENT_ID"),
-                client_secret=self.get("AZURE_CLIENT_SECRET")
-            )
-            token = credential.get_token("https://cognitiveservices.azure.com/.default")
-            self.set("AZURE_TOKEN", token.token, print_val=False)
-            logger.info("Azure token set")
-            return token.token
-        except Exception as e:
-            logger.error(f"Error retrieving Azure token: {e}")
-            return None
-    
-    def list_env_vars(self)->None:
-        for var in self.var_list:
-            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET'}:
-                logger.info(f"{var}: [REDACTED]")
-            else:
-                logger.info(f"{var}: {os.getenv(var)}")
-
-
-## embedding class + Document class
-
-class MyDocument(BaseModel):
-    id: str = ""
-    text: str = ""
-    embedding: List[float] = []
-    metadata: Dict[str, Any] = {}
-
-class EmbeddingClient:
-    def __init__(self, azure_api_version: str = "2023-05-15", embeddings_model: str = "text-embedding-3-large"):
-        self.azure_api_version = azure_api_version
-        self.embeddings_model = embeddings_model
-        self.direct_azure_client = self._get_direct_azure_client()
-    
-    def _get_direct_azure_client(self):
-        token_provider = get_bearer_token_provider(
-            DefaultAzureCredential(),
-            "https://cognitiveservices.azure.com/.default"
-        )
-        return AzureOpenAI(token_provider, self.azure_api_version)
-    
-    def generate_embeddings(self, doc: MyDocument)->MyDocument:
-        try:
-            response = self.direct_azure_client.embeddings.create(
-                model=self.embeddings_model,
-                input=doc.text
-            ).data[0].embedding
-            doc.embedding = response
-            return doc
-        except Exception as e:
-            logger.error(f"Error generating embeddings: {e}")
-            return doc
-
-## LangChain components
-## AzureChatbot components
-
-class AzureChatbot:
-    def __init__(self, config_file=str, creds_file=str, cert_file=str):
-        self.env = OSEnv(config_file, creds_file, cert_file)
-        self._setup_chat_model()
-        self.memory = ConversationBufferMemory()
-        self.conversation = ConversationChain(llm=self.llm, memory=self.memory, verbose=True)
-    
-    def _setup_chat_model(self):
-        try:
-            token_provider = get_bearer_token_provider(
-                self.env.credential,
-                "https://cognitiveservices.azure.com/.default"
-            )
-            model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
-            temperature = float(self.env.get("TEMPERATURE", "0.7"))
-            max_tokens = int(self.env.get("MAX_TOKENS", "800"))
-            api_version = self.env.get("API_VERSION", "2023-05-15")
-            azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
-            azure_ad_token_provider = token_provider
-            self.llm = AzureChatOpenAI(
-                model_name=model_name,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                api_version=api_version,
-                azure_endpoint=azure_endpoint,
-                azure_ad_token_provider=azure_ad_token_provider
-            )
-        except Exception as e:
-            logger.error(f"Error setting up chatbot: {e}")
-            raise
-
-# Enhanced Data Issue Classifier with Confidence Scoring
-
-class DataIssueReasoning(BaseModel):
-    """Model for reasoning behind data issue classification"""
-    supporting_reasons: List[str] = []
-    contrary_reasons: List[str] = []
-    confidence_calculation: Dict[str, float] = {}
-
-class DataIssueClassifier(BaseModel):
-    """Enhanced model for classifying incidents as data issues with confidence scoring"""
-    incident_id: str
-    is_data_issue: bool
-    data_quality_dimension: Optional[str] = None
-    confidence_score: float = 0.0
-    reasoning: DataIssueReasoning
-    summary: str = ""
-
-    @field_validator('data_quality_dimension')
-    def validate_dimension(cls, v):
-        if v is not None:
-            valid_dimensions = [
-                # HSBC categories
-                "Consistency",
-                "Accuracy",
-                "Completeness",
-                "Validity",
-                "Conformity",
-                "Uniqueness",
-                "Timeliness",
-                "Reasonableness",
-                "Integrity",
+            if not text.strip():
+                logger.warning(f"No text extracted from {pdf_path}")
                 
-                # Industry categories
-                "Incomplete Data",
-                "Inaccurate Data",
-                "Duplicate Data",
-                "Inconsistent Data",
-                "Outdated Data",
-                "Invalid Data",
-                "Ambiguous Data",
-                "Data Integrity Issues",
-                "Data Redundancy"
-            ]
-            if v not in valid_dimensions:
-                raise ValueError(f"Must be one of {valid_dimensions}")
+            return text
+        except Exception as e:
+            logger.error(f"Error extracting text from {pdf_path}: {e}")
+            return ""
+    
+    def batch_process_pdfs(self) -> Dict[str, str]:
+        """Process all PDFs in the directory and return a dictionary mapping filenames to texts."""
+        pdf_files = self.get_pdf_files()
+        result = {}
+        
+        for pdf_file in tqdm(pdf_files, desc="Processing PDFs"):
+            text = self.extract_text_from_pdf(pdf_file)
+            if text:
+                result[os.path.basename(pdf_file)] = text
+        
+        return result
+
+
+# Tokenization and Chunking Architecture
+class BaseTokenizer(ABC):
+    """Abstract base class for text tokenization."""
+    
+    @abstractmethod
+    def tokenize(self, text: str) -> List[str]:
+        """Tokenize text into units (words, sentences, etc.)"""
+        pass
+    
+    @abstractmethod
+    def count_tokens(self, text: str) -> int:
+        """Count the number of tokens in text"""
+        pass
+    
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Return tokenizer name"""
+        pass
+
+
+class BaseChunker(ABC):
+    """Abstract base class for text chunking."""
+    
+    @abstractmethod
+    def chunk_text(self, text: str, metadata: Dict[str, Any] = None) -> List[LC_DOCUMENT]:
+        """Split text into chunks"""
+        pass
+    
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Return chunker name"""
+        pass
+
+
+class WordTokenizer(BaseTokenizer):
+    """Simple word-based tokenizer using NLTK."""
+    
+    def tokenize(self, text: str) -> List[str]:
+        return word_tokenize(text)
+    
+    def count_tokens(self, text: str) -> int:
+        return len(self.tokenize(text))
+    
+    @property
+    def name(self) -> str:
+        return "word_tokenizer"
+
+
+class SentenceTokenizer(BaseTokenizer):
+    """Sentence-based tokenizer using NLTK."""
+    
+    def __init__(self):
+        self.tokenizer = PunktSentenceTokenizer()
+    
+    def tokenize(self, text: str) -> List[str]:
+        return self.tokenizer.tokenize(text)
+    
+    def count_tokens(self, text: str) -> int:
+        return len(self.tokenize(text))
+    
+    @property
+    def name(self) -> str:
+        return "sentence_tokenizer"
+
+
+class RegexTokenizer(BaseTokenizer):
+    """Simple regex-based tokenizer."""
+    
+    def __init__(self, pattern: str = r"\b\w+\b"):
+        self.pattern = re.compile(pattern)
+    
+    def tokenize(self, text: str) -> List[str]:
+        return self.pattern.findall(text)
+    
+    def count_tokens(self, text: str) -> int:
+        return len(self.tokenize(text))
+    
+    @property
+    def name(self) -> str:
+        return "regex_tokenizer"
+
+
+class CharacterChunker(BaseChunker):
+    """Character-based chunker using RecursiveCharacterTextSplitter."""
+    
+    def __init__(self, chunk_size: int = 1000, chunk_overlap: int = 200):
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
+            length_function=len,
+        )
+    
+    def chunk_text(self, text: str, metadata: Dict[str, Any] = None) -> List[LC_DOCUMENT]:
+        if not metadata:
+            metadata = {}
+        
+        return self.text_splitter.create_documents([text], metadatas=[metadata])
+    
+    @property
+    def name(self) -> str:
+        return "character_chunker"
+
+
+class SentenceChunker(BaseChunker):
+    """Sentence-based chunker using sentence tokenization."""
+    
+    def __init__(self, chunk_size: int = 10, chunk_overlap: int = 2):
+        self.chunk_size = chunk_size  # Number of sentences per chunk
+        self.chunk_overlap = chunk_overlap  # Number of overlapping sentences
+        self.tokenizer = SentenceTokenizer()
+    
+    def chunk_text(self, text: str, metadata: Dict[str, Any] = None) -> List[LC_DOCUMENT]:
+        if not metadata:
+            metadata = {}
+        
+        sentences = self.tokenizer.tokenize(text)
+        chunks = []
+        
+        for i in range(0, len(sentences), self.chunk_size - self.chunk_overlap):
+            # Ensure we don't go beyond the array bounds
+            end_idx = min(i + self.chunk_size, len(sentences))
+            # Create chunk from sentences
+            chunk_text = " ".join(sentences[i:end_idx])
+            chunks.append(LC_DOCUMENT(page_content=chunk_text, metadata=metadata.copy()))
+            
+            # Break if we've reached the end
+            if end_idx == len(sentences):
+                break
+        
+        return chunks
+    
+    @property
+    def name(self) -> str:
+        return "sentence_chunker"
+
+
+class TokenChunker(BaseChunker):
+    """Token-based chunker using custom tokenizers."""
+    
+    def __init__(self, tokenizer: BaseTokenizer, chunk_size: int = 500, chunk_overlap: int = 50):
+        self.tokenizer = tokenizer
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        
+    def chunk_text(self, text: str, metadata: Dict[str, Any] = None) -> List[LC_DOCUMENT]:
+        if not metadata:
+            metadata = {}
+        
+        tokens = self.tokenizer.tokenize(text)
+        chunks = []
+        
+        for i in range(0, len(tokens), self.chunk_size - self.chunk_overlap):
+            # Ensure we don't go beyond the array bounds
+            end_idx = min(i + self.chunk_size, len(tokens))
+            # Create chunk from tokens
+            chunk_text = " ".join(tokens[i:end_idx])
+            chunks.append(LC_DOCUMENT(page_content=chunk_text, metadata=metadata.copy()))
+            
+            # Break if we've reached the end
+            if end_idx == len(tokens):
+                break
+        
+        return chunks
+    
+    @property
+    def name(self) -> str:
+        return f"token_chunker_{self.tokenizer.name}"
+
+
+class ChunkingStrategy:
+    """Factory class for creating optimal chunking strategies."""
+    
+    STRATEGIES = {
+        "character": lambda chunk_size, chunk_overlap: CharacterChunker(chunk_size, chunk_overlap),
+        "sentence": lambda chunk_size, chunk_overlap: SentenceChunker(chunk_size, chunk_overlap),
+        "word": lambda chunk_size, chunk_overlap: TokenChunker(WordTokenizer(), chunk_size, chunk_overlap),
+        "regex": lambda chunk_size, chunk_overlap: TokenChunker(RegexTokenizer(), chunk_size, chunk_overlap),
+    }
+    
+    @staticmethod
+    def get_chunker(strategy: str = "character", chunk_size: int = 1000, chunk_overlap: int = 200) -> BaseChunker:
+        """Get a chunker based on the specified strategy."""
+        if strategy not in ChunkingStrategy.STRATEGIES:
+            logger.warning(f"Unknown chunking strategy: {strategy}. Using character chunking.")
+            strategy = "character"
+        
+        return ChunkingStrategy.STRATEGIES[strategy](chunk_size, chunk_overlap)
+    
+    @staticmethod
+    def get_optimal_chunker_for_pdf() -> BaseChunker:
+        """Get the optimal chunker for PDF documents."""
+        # For PDFs, sentence-based chunking often works best due to layout challenges
+        return SentenceChunker(chunk_size=10, chunk_overlap=2)
+
+
+class TextChunker:
+    """Enhanced class for chunking document text with multiple strategies."""
+    
+    def __init__(self, strategy: str = "character", chunk_size: int = 1000, chunk_overlap: int = 200):
+        """Initialize with chunking strategy and parameters."""
+        self.strategy = strategy
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.chunker = ChunkingStrategy.get_chunker(strategy, chunk_size, chunk_overlap)
+    
+    def set_strategy(self, strategy: str):
+        """Change the chunking strategy."""
+        self.strategy = strategy
+        self.chunker = ChunkingStrategy.get_chunker(strategy, self.chunk_size, self.chunk_overlap)
+        logger.info(f"Chunking strategy changed to: {strategy}")
+    
+    def auto_select_strategy(self, text: str):
+        """Auto-select optimal chunking strategy based on text characteristics."""
+        text_length = len(text)
+        
+        if text_length < 5000:
+            # For short texts, character chunking is fine
+            self.set_strategy("character")
+        elif re.search(r"^\s*\d+\.\s+", text, re.MULTILINE) is not None:
+            # Text with numbered lists or sections, sentence chunking works well
+            self.set_strategy("sentence")
+        elif len(sent_tokenize(text[:5000])) > 30:
+            # Text with many short sentences
+            self.set_strategy("sentence")
+        else:
+            # Default to word tokenization for most texts
+            self.set_strategy("word")
+    
+    def chunk_text(self, text: str, metadata: Dict[str, Any] = None) -> List[LC_DOCUMENT]:
+        """Split text into chunks and return as LangChain documents."""
+        if not metadata:
+            metadata = {}
+            
+        try:
+            return self.chunker.chunk_text(text, metadata)
+        except Exception as e:
+            logger.error(f"Error chunking text with {self.strategy} strategy: {e}")
+            # Fallback to character chunking on failure
+            fallback_chunker = CharacterChunker(self.chunk_size, self.chunk_overlap)
+            logger.info(f"Falling back to character chunking")
+            return fallback_chunker.chunk_text(text, metadata)
+    
+    def batch_chunk_texts(self, texts_dict: Dict[str, str]) -> List[LC_DOCUMENT]:
+        """Process multiple texts and return chunked documents."""
+        all_chunks = []
+        
+        for filename, text in tqdm(texts_dict.items(), desc="Chunking documents"):
+            metadata = {"source": filename}
+            
+            # Auto-select optimal strategy for this text
+            self.auto_select_strategy(text)
+            logger.info(f"Selected {self.strategy} chunking strategy for {filename}")
+            
+            chunks = self.chunk_text(text, metadata)
+            all_chunks.extend(chunks)
+            
+        logger.info(f"Created {len(all_chunks)} chunks from {len(texts_dict)} documents")
+        return all_chunks
+
+
+class ChromaManager:
+    """Class for managing ChromaDB vector store."""
+    
+    def __init__(self, persist_directory: str, embedding_client: EmbeddingClient):
+        """Initialize with persistence directory and embedding client."""
+        self.persist_directory = persist_directory
+        self.embedding_client = embedding_client
+        self.embedding_function = self._create_embedding_function()
+        self.vectorstore = None
+        
+        # Disable telemetry as requested
+        os.environ["ANONYMIZED_TELEMETRY"] = "False"
+    
+    def _create_embedding_function(self):
+        """Create a custom embedding function that uses our embedding client."""
+        return lambda texts: [
+            self.embedding_client.generate_embeddings(
+                MyDocument(id=str(uuid.uuid4()), text=text)
+            ).embedding 
+            for text in texts
+        ]
+    
+    def _get_embedding_dims(self) -> int:
+        """Get the dimensionality of the embeddings."""
+        # text-embedding-3-large has 3072 dimensions
+        if "3-large" in self.embedding_client.embeddings_model:
+            return 3072
+        # text-embedding-3-small has 1536 dimensions
+        elif "3-small" in self.embedding_client.embeddings_model:
+            return 1536
+        # Default for older models
+        else:
+            return 1536
+    
+    def init_vectorstore(self):
+        """Initialize the vector store."""
+        try:
+            os.makedirs(self.persist_directory, exist_ok=True)
+            
+            self.vectorstore = Chroma(
+                persist_directory=self.persist_directory,
+                embedding_function=self.embedding_function,
+                collection_name="pdf_knowledge_base",
+                client_settings=Settings(
+                    anonymized_telemetry=False
+                )
+            )
+            
+            logger.info(f"Vector store initialized at {self.persist_directory}")
+            return self.vectorstore
+        except Exception as e:
+            logger.error(f"Error initializing vector store: {e}")
+            raise
+    
+    def add_documents(self, documents: List[LC_DOCUMENT]):
+        """Add documents to the vector store."""
+        if not self.vectorstore:
+            self.init_vectorstore()
+            
+        try:
+            # Process in smaller batches to avoid memory issues
+            batch_size = 100
+            
+            for i in range(0, len(documents), batch_size):
+                batch = documents[i:i+batch_size]
+                logger.info(f"Adding batch {i//batch_size + 1}/{(len(documents)-1)//batch_size + 1} to vector store")
+                self.vectorstore.add_documents(batch)
+                # Persist after each batch
+                self.vectorstore.persist()
+            
+            logger.info(f"Added {len(documents)} documents to vector store")
+        except Exception as e:
+            logger.error(f"Error adding documents to vector store: {e}")
+            raise
+    
+    def similarity_search(self, query: str, k: int = 5) -> List[LC_DOCUMENT]:
+        """Search for similar documents."""
+        if not self.vectorstore:
+            raise ValueError("Vector store not initialized")
+            
+        try:
+            return self.vectorstore.similarity_search(query, k=k)
+        except Exception as e:
+            logger.error(f"Error searching vector store: {e}")
+            return []
+    
+    def get_retriever(self, search_kwargs: Dict[str, Any] = None):
+        """Get a retriever for the vector store."""
+        if not self.vectorstore:
+            raise ValueError("Vector store not initialized")
+            
+        if not search_kwargs:
+            search_kwargs = {"k": 5}
+            
+        return self.vectorstore.as_retriever(search_kwargs=search_kwargs)
+
+
+## RAG Chatbot Extension
+
+class ChatbotConfig(PydanticBaseModel):
+    """Configuration for the RAG chatbot."""
+    model_name: str = "gpt-4o-mini"
+    temperature: float = 0.7
+    max_tokens: int = 800
+    chunk_size: int = 1000
+    chunk_overlap: int = 200
+    chunking_strategy: str = "auto"  # auto, character, sentence, word, regex
+    k_documents: int = 5
+    pdf_directory: str = "./knowledge_base"
+    vector_store_dir: str = "./vector_db"
+    embeddings_model: str = "text-embedding-3-large"
+    
+    @field_validator('chunking_strategy')
+    def validate_chunking_strategy(cls, v):
+        valid_strategies = ['auto', 'character', 'sentence', 'word', 'regex']
+        if v not in valid_strategies:
+            raise ValueError(f"Chunking strategy must be one of {valid_strategies}")
         return v
 
-class DataIssueAnalyzer:
-    def __init__(self, azure_chatbot: AzureChatbot):
-        self.chatbot = azure_chatbot
-        self.classification_prompt_template = """
-        You are a data quality expert at HSBC analyzing incidents to determine if they are data issues.
-        
-        A data quality issue is a problem with data that impacts a process or a system through, for example:
-        erroneous, inaccurate, incomplete, invalid, duplicate, irrelevant, nonstandard data.
-        
-        The data quality issue is NOT an issue related to:
-        - system configuration,
-        - system maintenance,
-        - issues with logging to the system,
-        - issues connected to system UI refresh time,
-        - issues connected to phone/fax/email
-        
-        The data quality could be related to system and application issues, but not all system and applications issues are classified as data quality issue. In order to classify system and/or application issue as data quality issue, the problem has to be connected to the data quality.
-        
-        The examples of DQ Issues:
-        - Customers with date of birth in future
-        - Legal Entities missing Legal Entity Identifier
-        - Customer records missing Customer Risk Rating
-        - Customers invalid email address
-        - Inconsistent legal entity names and identifiers across multiple systems and jurisdictions;
-        - Inconsistent institutional client names and identifiers across multiple banking systems used by institutional clients;
-        - Inter-company transfer amounts and details are inconsistent across multiple accounting systems by HSBC legal entity;
-        - Lack of timely accessibility to vendor payment amounts by the Finance team when creating quarterly financials; and
-        - Multiple vendors listed multiple times and in many different addresses and variations of names in Vendor Payment systems.
-        
-        HSBC definitions of DQ issue dimensions (categories):
-        
-        Consistency: where data is represented differently across various records or systems. For example, Inconsistent categorization of expenses in financial statements.
-        
-        Accuracy: refers to information that is incorrect or misleading. For example, incorrect sales figures reported in financial statement.
-        
-        Completeness: arises when records are missing essential information, such as missing fields or values that are necessary for analysis or reporting. For example, missing customer email addresses in a CRM system.
-        
-        Validity: data that does not conform to predefined formats or rules. For example, out-of-range values in numerical fields, such as age or salary.
-        
-        Conformity: data that does not conform to predefined formats or rules. For example, email addresses that do not conform to standard formats.
-        
-        Uniqueness: duplicate data occurs when the same record is entered multiple times within a dataset, leading to redundancy and inflated counts, multiple entries for the same customer in a database.
-        
-        Timeliness: refers to information that is no longer current or relevant. For example, old customer contact information that hasn't been updated.
-        
-        Reasonableness: reasonableness asks whether a data pattern meets expectations. For example, whether a distribution of sales across a geographic idea makes sense based on what is known about the customers in that area.
-        
-        Integrity: data integrity issues occur when the accuracy and consistency of data are compromised, often due to unauthorized changes, corruption, or system failures. For example, corrupted data files leading to loss of critical information.
-        
-        Note: HSBC categorization is slightly different than industry categorization, but both types of categorization should be used to learn what Data Quality issue is.
-        
-        Industry categorization of data quality dimensions:
-        
-        1. Incomplete Data: This issue arises when records are missing essential information, such as missing fields or values that are necessary for analysis or reporting. Incomplete data can lead to inaccurate conclusions and hinder decision-making processes.
-        
-        2. Inaccurate Data: Inaccurate data refers to information that is incorrect or misleading, often due to human error, outdated information, or faulty data entry processes. This can result in flawed analyses and poor business decisions.
-        
-        3. Duplicate Data: Duplicate data occurs when the same record is entered multiple times within a dataset, leading to redundancy and inflated counts. This can skew analysis results and complicate data management efforts. In HSBC, the sheer scale of data sources often causes redundancy and overlap via duplicate records. Data issues like duplication of contact information may also increase the likelihood of distorted analytical outcomes. Marketing initiatives suffer when certain prospects are overlooked while others are addressed repeatedly. Duplicate records may also lead to distorted analysis outcomes.
-        
-        4. Inconsistent Data: Inconsistent data arises when the same data element is represented differently across various records or systems, such as variations in naming conventions or formats. This can create confusion and hinder data integration efforts. When you're working with various data sources, the differences might be in formats, units, or spellings. Inconsistencies in data values tend to accumulate and degrade the usefulness of data.
-        
-        5. Outdated Data: Outdated data refers to information that is no longer current or relevant, often due to changes in business processes, regulations, or market conditions. Relying on outdated data can lead to misguided strategies and decisions.
-        
-        6. Invalid Data: Invalid data includes entries that do not conform to predefined formats or rules, such as incorrect data types or values outside acceptable ranges. This can cause errors in processing and analysis.
-        
-        7. Ambiguous Data: Ambiguous data is information that can be interpreted in multiple ways, leading to confusion or misinterpretation. Clear definitions and standards are necessary to mitigate this issue.
-        
-        8. Data Integrity Issues: Data integrity issues occur when the accuracy and consistency of data are compromised, often due to unauthorized changes, corruption, or system failures. Maintaining data integrity is crucial for reliable reporting and analysis.
-        
-        9. Data Redundancy: Data redundancy refers to the unnecessary duplication of data within a database or system, which can lead to increased storage costs and maintenance challenges. It can also complicate data retrieval and analysis.
-        
-        Examples of HSBC specific data quality issues:
-        
-        Incomplete Data:
-        - Missing customer email addresses in a CRM system.
-        - Incomplete transaction records lacking item descriptions.
-        - Missing fields in employee records, such as job titles or departments.
-        - Incomplete loan applications without required financial information.
-        - Missing product specifications in inventory records.
-        
-        Inaccurate Data:
-        - Incorrect sales figures reported in financial statements.
-        - Wrong customer addresses leading to failed deliveries.
-        - Misreported inventory levels due to data entry errors.
-        - Incorrect pricing information in product catalogs.
-        - Inaccurate employee salary records affecting payroll.
-        
-        Duplicate Data:
-        - Multiple entries for the same customer in a database.
-        - Duplicate product listings in an e-commerce platform.
-        - Repeated records of transactions in a financial system.
-        - Duplicate patient records in a healthcare database.
-        - Multiple entries for the same invoice in accounting software.
-        
-        Inconsistent Data:
-        - Different formats for date entries (MM/DD/YYYY vs. DD/MM/YYYY).
-        - Variations in product names across different systems (e.g., "Widget A" vs. "Widget A1").
-        - Inconsistent currency formats in financial reports.
-        - Different naming conventions for departments in HR records.
-        - Inconsistent categorization of expenses in financial statements.
-        
-        Outdated Data:
-        - Old customer contact information that hasn't been updated.
-        - Expired product listings still visible on a website.
-        - Outdated employee records not reflecting recent job changes.
-        - Old marketing campaign data that no longer applies.
-        - Historical sales data that is no longer relevant for current analysis.
-        
-        Invalid Data:
-        - Incorrect phone number formats (e.g., letters included).
-        - Invalid email addresses that do not conform to standard formats.
-        - Out-of-range values in numerical fields, such as age or salary.
-        - Incorrectly formatted social security numbers.
-        - Invalid product codes that do not match any existing items.
-        
-        Ambiguous Data:
-        - Vague product descriptions that do not specify features.
-        - Customer feedback that lacks context or specifics.
-        - Multiple meanings for a term used in data, leading to confusion.
-        - Unclear instructions in data entry forms.
-        - Ambiguous survey responses that cannot be easily categorized.
-        
-        Data Integrity Issues:
-        - Unauthorized changes made to financial records.
-        - Corrupted data files leading to loss of critical information.
-        - Inconsistent data across different databases due to synchronization issues.
-        - Data breaches resulting in compromised sensitive information.
-        - Loss of data integrity due to system failures or crashes.
-        
-        Data Redundancy:
-        - Multiple databases storing the same customer information.
-        - Repeated entries of the same transaction in different systems.
-        - Overlapping datasets in data warehouses leading to increased storage costs.
-        
-        Analyze the following incident:
-        ID: {incident_id}
-        Summary: {summary}
-        Description: {description}
-        Resolution: {resolution}
-        
-        Provide a detailed analysis with:
-        1. Whether this is a data issue according to HSBC's definition
-        2. If yes, the most appropriate data quality dimension from HSBC's categorization
-        3. List of supporting reasons (factors that indicate this is a data issue)
-        4. List of contrary reasons (factors that indicate this is not a data issue)
-        5. A confidence score explanation based on the reasons
-        
-        You must respond ONLY with a valid JSON object using the following exact format:
-        {{
-            "is_data_issue": true/false,
-            "data_quality_dimension": "dimension here or null if not a data issue",
-            "supporting_reasons": ["reason1", "reason2", ...],
-            "contrary_reasons": ["reason1", "reason2", ...],
-            "confidence_calculation": {{
-                "base_score": 0.5,
-                "supporting_weight": 0.15,
-                "contrary_weight": -0.1,
-                "final_score": 0.0-1.0
-            }},
-            "summary": "brief explanation of the classification"
-        }}
-        
-        Do not include any text before or after the JSON object. The response must be valid JSON that can be parsed directly.
-        """
-        """
-        
-    def calculate_confidence_score(self, supporting_reasons: List[str], contrary_reasons: List[str]) -> Dict[str, float]:
-        """Calculate confidence score based on supporting and contrary reasons"""
-        base_score = 0.5  # Start neutral
-        supporting_weight = 0.15  # Each supporting reason adds this much
-        contrary_weight = -0.1    # Each contrary reason subtracts this much
-        
-        # Calculate adjustments
-        supporting_adjustment = len(supporting_reasons) * supporting_weight
-        contrary_adjustment = len(contrary_reasons) * contrary_weight
-        
-        # Calculate raw score
-        raw_score = base_score + supporting_adjustment + contrary_adjustment
-        
-        # Normalize to 0-1 range using sigmoid function
-        final_score = 1 / (1 + np.exp(-4 * (raw_score - 0.5)))
-        
-        return {
-            "base_score": base_score,
-            "supporting_weight": supporting_weight,
-            "contrary_weight": contrary_weight,
-            "supporting_adjustment": supporting_adjustment,
-            "contrary_adjustment": contrary_adjustment,
-            "raw_score": raw_score,
-            "final_score": float(final_score)
-        }
-        
-    def analyze_incident(self, incident_id: str, summary: str, description: str, resolution: str) -> DataIssueClassifier:
-        """Analyze a single incident for data quality issues with enhanced reasoning"""
-        try:
-            prompt = self.classification_prompt_template.format(
-                incident_id=incident_id,
-                summary=summary,
-                description=description,
-                resolution=resolution
-            )
-            
-            response = self.chatbot.llm.predict(prompt)
-            
-            # Extract JSON from response (in case there's additional text)
-            json_match = re.search(r'({[\s\S]*})', response)
-            if json_match:
-                json_str = json_match.group(1)
-                try:
-                    response_json = json.loads(json_str)
-                except json.JSONDecodeError:
-                    # Try cleaning the JSON string if initial parsing fails
-                    json_str = re.sub(r'```json|```', '', json_str).strip()
-                    response_json = json.loads(json_str)
-            else:
-                # If no JSON pattern found, try parsing the whole response
-                response_json = json.loads(response)
-            
-            # Extract reasoning components
-            supporting_reasons = response_json.get("supporting_reasons", [])
-            contrary_reasons = response_json.get("contrary_reasons", [])
-            
-            # Calculate confidence score
-            confidence_calculation = self.calculate_confidence_score(supporting_reasons, contrary_reasons)
-            
-            # Handle potential missing confidence_calculation in response
-            if "confidence_calculation" not in response_json:
-                response_json["confidence_calculation"] = {}
-            
-            # Update with our algorithm
-            response_json["confidence_calculation"].update(confidence_calculation)
-            
-            reasoning = DataIssueReasoning(
-                supporting_reasons=supporting_reasons,
-                contrary_reasons=contrary_reasons,
-                confidence_calculation=confidence_calculation
-            )
-            
-            return DataIssueClassifier(
-                incident_id=incident_id,
-                is_data_issue=response_json.get("is_data_issue", False),
-                data_quality_dimension=response_json.get("data_quality_dimension"),
-                confidence_score=confidence_calculation["final_score"],
-                reasoning=reasoning,
-                summary=response_json.get("summary", "")
-            )
-            
-        except (json.JSONDecodeError, ValidationError) as e:
-            logger.error(f"Error parsing response for incident {incident_id}: {e}")
-            logger.error(f"Raw response: {response}")
-            
-            # Fallback classification
-            reasoning = DataIssueReasoning(
-                supporting_reasons=[],
-                contrary_reasons=["Error in classification: Unable to parse response"],
-                confidence_calculation={"final_score": 0.0}
-            )
-            return DataIssueClassifier(
-                incident_id=incident_id,
-                is_data_issue=False,
-                data_quality_dimension=None,
-                confidence_score=0.0,
-                reasoning=reasoning,
-                summary="Error in classification: Unable to parse AI response"
-            )
-    
-    def process_csv(self, file_path: str, output_path: str = "classified_incidents_streaming.csv") -> Dict[str, any]:
-        """Process a CSV file and classify all incidents, writing results immediately row by row"""
-        try:
-            # Read CSV file
-            df = pd.read_csv(file_path)
-            
-            # Validate required columns
-            required_columns = ['Id', 'incident summary', 'incident resolution', 'incident description']
-            for col in required_columns:
-                if col not in df.columns:
-                    raise ValueError(f"Missing required column: {col}")
-            
-            # Define additional columns for results
-            result_columns = [
-                'is_data_issue', 
-                'data_quality_dimension', 
-                'confidence_score',
-                'supporting_reasons', 
-                'contrary_reasons',
-                'classification_summary', 
-                'confidence_calculation'
-            ]
-            
-            # Create output file with headers
-            all_columns = df.columns.tolist() + result_columns
-            with open(output_path, 'w', newline='', encoding='utf-8') as f:
-                f.write(','.join(all_columns) + '\n')
-            
-            # Initialize counters for summary
-            total_incidents = len(df)
-            processed_count = 0
-            data_issues_count = 0
-            dimension_counts = {}
-            
-            # Process each incident and write results immediately
-            for idx, row in df.iterrows():
-                try:
-                    # Process the incident
-                    classification = self.analyze_incident(
-                        incident_id=str(row['Id']),
-                        summary=row['incident summary'],
-                        description=row['incident description'],
-                        resolution=row['incident resolution']
-                    )
-                    
-                    # Update counters
-                    processed_count += 1
-                    if classification.is_data_issue:
-                        data_issues_count += 1
-                        dim = classification.data_quality_dimension
-                        if dim:
-                            dimension_counts[dim] = dimension_counts.get(dim, 0) + 1
-                    
-                    # Prepare row data
-                    result_data = {
-                        'is_data_issue': classification.is_data_issue,
-                        'data_quality_dimension': classification.data_quality_dimension,
-                        'confidence_score': classification.confidence_score,
-                        'supporting_reasons': '; '.join(classification.reasoning.supporting_reasons),
-                        'contrary_reasons': '; '.join(classification.reasoning.contrary_reasons),
-                        'classification_summary': classification.summary,
-                        'confidence_calculation': json.dumps(classification.reasoning.confidence_calculation)
-                    }
-                    
-                    # Combine original row with results
-                    combined_row = {**row.to_dict(), **result_data}
-                    
-                    # Convert to a pandas Series to ensure proper ordering
-                    result_series = pd.Series(combined_row)
-                    
-                    # Write the row to CSV
-                    with open(output_path, 'a', newline='', encoding='utf-8') as f:
-                        # Escape any commas in the values and wrap in quotes if needed
-                        csv_row = []
-                        for col in all_columns:
-                            val = str(result_series.get(col, ""))
-                            if ',' in val or '"' in val or '\n' in val:
-                                # Replace double quotes with two double quotes for CSV escaping
-                                val = val.replace('"', '""')
-                                val = f'"{val}"'
-                            csv_row.append(val)
-                        f.write(','.join(csv_row) + '\n')
-                    
-                    # Log progress
-                    if processed_count % 10 == 0 or processed_count == total_incidents:
-                        logger.info(f"Processed {processed_count}/{total_incidents} incidents")
-                
-                except Exception as e:
-                    logger.error(f"Error processing row {idx}, incident ID {row['Id']}: {e}")
-                    # Continue with the next row instead of failing the entire process
-                    continue
-            
-            # Generate summary
-            summary = {
-                "total_incidents": total_incidents,
-                "processed_count": processed_count,
-                "data_issues_count": data_issues_count,
-                "dimension_counts": dimension_counts,
-                "output_path": output_path
-            }
-            
-            # Log summary
-            logger.info(f"Results saved to {output_path}")
-            logger.info(f"Total incidents: {total_incidents}")
-            logger.info(f"Processed: {processed_count}")
-            logger.info(f"Data issues: {data_issues_count}")
-            logger.info("\nData Quality Dimension Distribution:")
-            for dimension, count in dimension_counts.items():
-                logger.info(f"{dimension}: {count}")
-            
-            return summary
-        
-        except Exception as e:
-            logger.error(f"Error processing CSV file: {e}")
-            raise
 
-# Example usage
+class RAGChatbot(AzureChatbot):
+    """Extension of AzureChatbot to support Retrieval Augmented Generation (RAG)."""
+    
+    def __init__(self, config_file: str, creds_file: str, cert_file: str, chatbot_config: ChatbotConfig = None):
+        """Initialize with configuration files and chatbot config."""
+        super().__init__(config_file, creds_file, cert_file)
+        
+        self.config = chatbot_config or ChatbotConfig()
+        
+        # Initialize components
+        self.pdf_processor = PDFProcessor(self.config.pdf_directory)
+        
+        # Initialize text chunker with appropriate strategy
+        if self.config.chunking_strategy == 'auto':
+            self.text_chunker = TextChunker(
+                strategy="character",  # Initial strategy, will be auto-selected per document
+                chunk_size=self.config.chunk_size, 
+                chunk_overlap=self.config.chunk_overlap
+            )
+        else:
+            self.text_chunker = TextChunker(
+                strategy=self.config.chunking_strategy,
+                chunk_size=self.config.chunk_size, 
+                chunk_overlap=self.config.chunk_overlap
+            )
+        
+        # Create embedding client
+        self.embedding_client = EmbeddingClient(
+            azure_api_version=self.env.get("API_VERSION", "2023-05-15"),
+            embeddings_model=self.config.embeddings_model
+        )
+        
+        # Initialize vector store
+        self.chroma_manager = ChromaManager(
+            persist_directory=self.config.vector_store_dir,
+            embedding_client=self.embedding_client
+        )
+        
+        # Initialize QA chain
+        self._setup_qa_chain()
+    
+    def _setup_qa_chain(self):
+        """Set up the QA chain for answering questions."""
+        try:
+            # Initialize vector store if needed
+            if not self.chroma_manager.vectorstore:
+                self.chroma_manager.init_vectorstore()
+            
+            # Get retriever with configured k
+            retriever = self.chroma_manager.get_retriever(
+                search_kwargs={"k": self.config.k_documents}
+            )
+            
+            # Define RAG prompt template
+            template = """You are an intelligent assistant answering questions based on a knowledge base. 
+Use the following pieces of context to answer the user's question. 
+If you don't know the answer, just say that you don't know, don't try to make up an answer.
+
+Context:
+{context}
+
+Question: {question}
+Answer:"""
+            
+            qa_prompt = PromptTemplate(
+                template=template,
+                input_variables=["context", "question"]
+            )
+            
+            # Create QA chain
+            self.qa_chain = RetrievalQA.from_chain_type(
+                llm=self.llm,
+                chain_type="stuff",
+                retriever=retriever,
+                return_source_documents=True,
+                chain_type_kwargs={"prompt": qa_prompt}
+            )
+            
+            logger.info("QA chain initialized successfully")
+        except Exception as e:
+            logger.error(f"Error setting up QA chain: {e}")
+            raise
+    
+    def process_knowledge_base(self):
+        """Process all PDFs in the knowledge base and add to vector store."""
+        # Process PDFs to extract text
+        texts_dict = self.pdf_processor.batch_process_pdfs()
+        
+        if not texts_dict:
+            logger.warning("No text extracted from PDFs")
+            return False
+        
+        # Chunk the texts
+        chunked_docs = self.text_chunker.batch_chunk_texts(texts_dict)
+        
+        if not chunked_docs:
+            logger.warning("No chunks created from documents")
+            return False
+        
+        # Add to vector store
+        self.chroma_manager.add_documents(chunked_docs)
+        
+        # Re-initialize QA chain with updated vector store
+        self._setup_qa_chain()
+        
+        return True
+    
+    def answer_question(self, question: str) -> Dict[str, Any]:
+        """Answer a question using the RAG approach."""
+        try:
+            # Get answer from QA chain
+            result = self.qa_chain({"query": question})
+            
+            # Format sources
+            sources = []
+            for doc in result.get("source_documents", []):
+                sources.append({
+                    "content": doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content,
+                    "source": doc.metadata.get("source", "Unknown")
+                })
+            
+            return {
+                "question": question,
+                "answer": result["result"],
+                "sources": sources
+            }
+        except Exception as e:
+            logger.error(f"Error answering question: {e}")
+            return {
+                "question": question,
+                "answer": f"Error processing your question: {str(e)}",
+                "sources": []
+            }
+
+
+## CLI Interface
+
+def run_cli(config_file: str, creds_file: str, cert_file: str):
+    """Run the chatbot in CLI mode."""
+    print("Initializing Knowledge Base Chatbot...")
+    
+    # Configure chatbot
+    chatbot_config = ChatbotConfig()
+    
+    # Allow user to customize configuration
+    print("\nCurrent Configuration:")
+    for key, value in chatbot_config.dict().items():
+        print(f"  {key}: {value}")
+    
+    customize = input("\nWould you like to customize this configuration? (y/n): ").lower() == 'y'
+    
+    if customize:
+        chatbot_config.pdf_directory = input(f"PDF Directory [{chatbot_config.pdf_directory}]: ") or chatbot_config.pdf_directory
+        chatbot_config.vector_store_dir = input(f"Vector Store Directory [{chatbot_config.vector_store_dir}]: ") or chatbot_config.vector_store_dir
+        chatbot_config.k_documents = int(input(f"Number of documents to retrieve [{chatbot_config.k_documents}]: ") or chatbot_config.k_documents)
+        
+        # Chunking strategy selection
+        print("\nChunking Strategy Options:")
+        print("  auto     - Automatically select optimal strategy per document")
+        print("  character - Character-based chunking")
+        print("  sentence - Sentence-based chunking")
+        print("  word     - Word-based chunking")
+        print("  regex    - Regex pattern-based chunking")
+        
+        strategy = input(f"Chunking Strategy [{chatbot_config.chunking_strategy}]: ") or chatbot_config.chunking_strategy
+        if strategy in ['auto', 'character', 'sentence', 'word', 'regex']:
+            chatbot_config.chunking_strategy = strategy
+        else:
+            print(f"Invalid strategy '{strategy}'. Using '{chatbot_config.chunking_strategy}' instead.")
+    
+    # Initialize chatbot
+    chatbot = RAGChatbot(config_file, creds_file, cert_file, chatbot_config)
+    
+    # Process knowledge base
+    process_kb = input("\nProcess knowledge base PDFs? (y/n): ").lower() == 'y'
+    if process_kb:
+        print("Processing knowledge base... This may take a while.")
+        success = chatbot.process_knowledge_base()
+        if success:
+            print("Knowledge base processed successfully!")
+        else:
+            print("Failed to process knowledge base.")
+    
+    # Chat loop
+    print("\nChatbot initialized! Type 'exit' to quit.")
+    while True:
+        question = input("\nQuestion: ")
+        if question.lower() in ['exit', 'quit', 'q']:
+            break
+            
+        result = chatbot.answer_question(question)
+        
+        print(f"\nAnswer: {result['answer']}")
+        
+        if result['sources']:
+            print("\nSources:")
+            for i, source in enumerate(result['sources'], 1):
+                print(f"  {i}. {source['source']}")
+
+
+## API Interface
+
+class QuestionRequest(PydanticBaseModel):
+    """Request model for question answering API."""
+    question: str
+
+
+class QuestionResponse(PydanticBaseModel):
+    """Response model for question answering API."""
+    question: str
+    answer: str
+    sources: List[Dict[str, str]] = []
+
+
+class ProcessKBRequest(PydanticBaseModel):
+    """Request model for processing knowledge base API."""
+    pdf_directory: Optional[str] = None
+
+
+class ProcessKBResponse(PydanticBaseModel):
+    """Response model for processing knowledge base API."""
+    success: bool
+    message: str
+
+
+def create_api(config_file: str, creds_file: str, cert_file: str):
+    """Create FastAPI application for the chatbot."""
+    app = FastAPI(
+        title="Knowledge Base PDF Chatbot API",
+        description="API for answering questions based on PDF knowledge base",
+        version="1.0.0"
+    )
+    
+    # Add CORS middleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    
+    # Create chatbot instance
+    chatbot = RAGChatbot(config_file, creds_file, cert_file)
+    
+    # Add error handling middleware
+    @app.middleware("http")
+    async def catch_exceptions_middleware(request: Request, call_next):
+        try:
+            return await call_next(request)
+        except Exception as e:
+            logger.error(f"API Error: {str(e)}")
+            error_detail = {"error": str(e), "type": type(e).__name__}
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Internal Server Error", "error_info": error_detail}
+            )
+    
+    @app.post("/answer", response_model=QuestionResponse)
+    async def answer_question(request: QuestionRequest):
+        """Answer a question using the knowledge base."""
+        try:
+            result = chatbot.answer_question(request.question)
+            return result
+        except Exception as e:
+            logger.error(f"Error answering question: {str(e)}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error processing question: {str(e)}"
+            )
+    
+    @app.post("/process-kb", response_model=ProcessKBResponse)
+    async def process_knowledge_base(
+        request: ProcessKBRequest, 
+        background_tasks: BackgroundTasks
+    ):
+        """Process the knowledge base PDFs."""
+        try:
+            if request.pdf_directory:
+                chatbot.pdf_processor.set_directory(request.pdf_directory)
+            
+            # Process in background
+            background_tasks.add_task(chatbot.process_knowledge_base)
+            
+            return {
+                "success": True,
+                "message": "Knowledge base processing started in the background"
+            }
+        except Exception as e:
+            logger.error(f"Error starting knowledge base processing: {str(e)}")
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Error starting knowledge base processing: {str(e)}"
+            )
+    
+    @app.get("/process-status")
+    async def process_status():
+        """Check the status of background processing."""
+        # Add a simple status check mechanism
+        processing_status = getattr(chatbot, "processing_status", None)
+        return {
+            "status": processing_status or "unknown",
+            "last_update": getattr(chatbot, "last_status_update", None)
+        }
+    
+    @app.get("/health")
+    async def health_check():
+        """Check if the API is healthy."""
+        return {"status": "healthy"}
+    
+    return app
+
+
+## Main function
+
+def main():
+    """Main function to run the chatbot."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Run the Knowledge Base PDF Chatbot")
+    parser.add_argument("--config", default=CONFIG_PATH, help="Path to config file")
+    parser.add_argument("--creds", default=CREDS_PATH, help="Path to credentials file")
+    parser.add_argument("--cert", default=CERT_PATH, help="Path to certificate file")
+    parser.add_argument("--mode", choices=["cli", "api"], default="cli", help="Run mode (cli or api)")
+    parser.add_argument("--host", default="127.0.0.1", help="Host for API server")
+    parser.add_argument("--port", type=int, default=8000, help="Port for API server")
+    
+    args = parser.parse_args()
+    
+    if args.mode == "cli":
+        run_cli(args.config, args.creds, args.cert)
+    else:
+        app = create_api(args.config, args.creds, args.cert)
+        uvicorn.run(app, host=args.host, port=args.port)
+
+
 if __name__ == "__main__":
-    # Initialize Azure chatbot
-    chatbot = AzureChatbot(CONFIG_PATH, CREDS_PATH, CERT_PATH)
-    
-    # Initialize Data Issue Analyzer
-    analyzer = DataIssueAnalyzer(chatbot)
-    
-    # Process CSV file with row-by-row output
-    csv_path = "incidents.csv"  # Replace with your CSV file path
-    output_path = "classified_incidents_streaming.csv"
-    summary = analyzer.process_csv(csv_path, output_path)
-    
-    # Display summary statistics
-    logger.info("\nProcessing Summary:")
-    logger.info(f"Total incidents: {summary['total_incidents']}")
-    logger.info(f"Processed: {summary['processed_count']}")
-    logger.info(f"Data issues identified: {summary['data_issues_count']}")
-    
-    # Calculate percentages
-    if summary['processed_count'] > 0:
-        data_issue_percentage = (summary['data_issues_count'] / summary['processed_count']) * 100
-        logger.info(f"Data issues percentage: {data_issue_percentage:.1f}%")
-    
-    # Show high vs low confidence classifications
-    try:
-        # Read the completed CSV to get confidence statistics
-        result_df = pd.read_csv(output_path)
-        high_confidence = result_df[result_df['confidence_score'] >= 0.8]
-        low_confidence = result_df[result_df['confidence_score'] < 0.5]
-        logger.info(f"\nHigh confidence classifications (>=0.8): {len(high_confidence)}")
-        logger.info(f"Low confidence classifications (<0.5): {len(low_confidence)}")
-    except Exception as e:
-        logger.error(f"Error generating confidence statistics: {e}")
+    main()
