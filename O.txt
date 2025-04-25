@@ -1,512 +1,361 @@
 """
-Main Application - Entry point for the Data Element Enhancement API.
+Bootstrap GCP Authentication - Utility for bootstrapping GCP authentication.
 
-This module initializes and configures the FastAPI application, sets up routes,
-middleware, and monitoring, and handles command line arguments for configuration.
-Includes enhanced error handling for GCP authentication and fallback mechanisms.
+This module provides functionality to bootstrap GCP authentication without
+having credentials stored locally, by using alternative authentication methods
+while respecting proxy settings from environment.py.
 """
 
-import argparse
-import logging
 import os
-import sys
+import json
+import logging
+import tempfile
+import atexit
+from typing import Optional, Dict, Any, Tuple
+import requests
 import traceback
-from fastapi import FastAPI, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-import uvicorn
-from app.api.routes.enhancement import router as enhancement_router
-from app.api.routes.tagging import router as tagging_router
-from app.api.routes.settings import router as settings_router
-from app.api.routes.dashboard import router as dashboard_router
-from app.config.environment import get_os_env, str_to_bool
-from app.core.system_monitor import start_monitoring, stop_monitoring
-from app.core.db_manager import DBManager
-from app.core.business_terms import BusinessTermManager
-from app.config.settings import get_vector_store
-from app.utils.gcp_certificate_manager import is_gcp_path, get_or_download_cert
-from app.utils.bootstrap_gcp_auth import fetch_service_account_json
-
-# Default GCP paths - always fetch from these locations
-DEFAULT_GCP_CERT_PATH = "gs://abc.com/stitching/cacert.pem"
-DEFAULT_GCP_SA_PATH = "gs://abc.com/stitching/sa.json"
-
-# Configure more detailed logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
-    handlers=[
-        logging.StreamHandler()
-    ]
-)
-
-# Increase logging level for more diagnostic information
-logging.getLogger('app.utils').setLevel(logging.DEBUG)
-logging.getLogger('google.auth').setLevel(logging.DEBUG)
-logging.getLogger('google.cloud').setLevel(logging.DEBUG)
 
 logger = logging.getLogger(__name__)
 
-# Make sure required packages are installed
-def ensure_packages_installed():
-    packages_to_check = {
-        "psutil": False,
-        "google-cloud-storage": False
-    }
-    
-    # Check each package
-    for package in packages_to_check:
-        try:
-            __import__(package.replace("-", "_"))
-            packages_to_check[package] = True
-        except ImportError:
-            pass
-    
-    # Install missing packages
-    for package, installed in packages_to_check.items():
-        if not installed:
-            logger.warning(f"{package} not installed. Installing...")
-            import subprocess
-            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-            logger.info(f"Successfully installed {package}")
+# Dictionary to track temp files, so we can clean them up on exit
+_temp_cred_files = {}
 
-# Ensure all required packages are installed
-ensure_packages_installed()
-
-def setup_manual_service_account():
-    """
-    Set up manual service account credentials from environment variables if available.
-    This is a fallback if downloading from GCP fails.
-    """
-    # Check for service account environment variables
-    client_email = os.environ.get("GCP_CLIENT_EMAIL")
-    private_key = os.environ.get("GCP_PRIVATE_KEY")
-    project_id = os.environ.get("GCP_PROJECT_ID")
-    
-    if all([client_email, private_key, project_id]):
+def cleanup_temp_cred_files():
+    """Clean up any temporary credential files on application exit."""
+    for path in _temp_cred_files.values():
         try:
-            logger.info("Setting up manual service account from environment variables")
-            
-            # Create a JSON file with the credentials
-            import json
-            import tempfile
-            
-            service_account_info = {
-                "type": "service_account",
-                "project_id": project_id,
-                "private_key": private_key,
-                "client_email": client_email,
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-                "client_x509_cert_url": f"https://www.googleapis.com/robot/v1/metadata/x509/{client_email.replace('@', '%40')}"
-            }
-            
-            # Write to a temporary file
-            fd, temp_path = tempfile.mkstemp(suffix='.json')
-            with os.fdopen(fd, 'w') as file:
-                json.dump(service_account_info, file, indent=2)
-            
-            # Set environment variable
-            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_path
-            logger.info(f"Set GOOGLE_APPLICATION_CREDENTIALS to {temp_path}")
-            return True
+            if os.path.exists(path):
+                os.remove(path)
+                logger.info(f"Cleaned up temporary credential file: {path}")
         except Exception as e:
-            logger.error(f"Error setting up manual service account: {e}")
-            return False
-    
-    return False
+            logger.error(f"Error cleaning up temporary credential file {path}: {e}")
 
-def fetch_credentials_and_certificate():
+# Register cleanup function to run at exit
+atexit.register(cleanup_temp_cred_files)
+
+def get_proxy_settings():
     """
-    Fetch service account credentials and certificate from GCP bucket.
-    This function bootstraps the authentication process.
-    """
-    service_account_path = None
-    cert_path = None
+    Get proxy settings from environment variables.
     
-    # First step - fetch the service account JSON
+    Returns:
+        dict: Dictionary with proxy settings
+    """
+    proxies = {}
+    
+    http_proxy = os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy')
+    https_proxy = os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy')
+    no_proxy = os.environ.get('NO_PROXY') or os.environ.get('no_proxy')
+    
+    if http_proxy:
+        proxies['http'] = http_proxy
+        logger.info(f"Using HTTP proxy: {http_proxy}")
+    
+    if https_proxy:
+        proxies['https'] = https_proxy
+        logger.info(f"Using HTTPS proxy: {https_proxy}")
+    
+    if no_proxy:
+        # We don't add this to proxies dict, but log it for debugging
+        logger.info(f"NO_PROXY domains: {no_proxy}")
+    
+    # If proxy variables are set in environment but empty, don't use proxies
+    if 'http' in proxies and not proxies['http']:
+        del proxies['http']
+    if 'https' in proxies and not proxies['https']:
+        del proxies['https']
+    
+    return proxies
+
+def initialize_proxy_for_google_auth():
+    """
+    Initialize proxy settings for Google auth libraries by setting environment variables.
+    This should be called before importing any Google auth libraries.
+    """
+    # Check if we need to load proxy settings from environment.py
     try:
-        bucket_name, object_path = DEFAULT_GCP_SA_PATH[5:].split('/', 1)
-        logger.info(f"Attempting to fetch service account from bucket: {bucket_name}, path: {object_path}")
+        # Try to import from app.config
+        from app.config.environment import get_os_env
         
-        service_account_path = fetch_service_account_json(bucket_name, object_path)
+        # Get settings without initializing everything
+        env = get_os_env()
         
-        if service_account_path:
-            logger.info(f"Service account fetched successfully to temporary location: {service_account_path}")
-        else:
-            logger.warning("Could not fetch service account from GCP bucket.")
+        # Check if proxy is enabled
+        proxy_enabled = env.get("PROXY_ENABLED", "").lower() in ("true", "t", "1", "yes", "y")
+        
+        if proxy_enabled:
+            logger.info("Initializing proxy settings from environment.py")
             
-            # Try fallback to manual setup
-            if setup_manual_service_account():
-                logger.info("Successfully set up manual service account from environment variables")
+            # These should be set by environment.py already, but let's log them
+            http_proxy = os.environ.get('HTTP_PROXY')
+            https_proxy = os.environ.get('HTTPS_PROXY')
+            
+            if http_proxy or https_proxy:
+                logger.info(f"Proxy detected from environment variables: HTTP={http_proxy}, HTTPS={https_proxy}")
             else:
-                logger.warning("Will attempt to use default credentials")
-    except Exception as e:
-        logger.error(f"Error fetching service account: {e}")
-        logger.error(f"Exception details: {traceback.format_exc()}")
-        logger.warning("Will attempt to use default credentials")
-    
-    # Second step - fetch the certificate
-    try:
-        logger.info(f"Attempting to fetch certificate from: {DEFAULT_GCP_CERT_PATH}")
-        cert_path = get_or_download_cert(DEFAULT_GCP_CERT_PATH)
-        
-        if cert_path:
-            logger.info(f"Certificate fetched successfully to temporary location: {cert_path}")
+                logger.warning("Proxy is enabled in settings but HTTP_PROXY/HTTPS_PROXY not set")
+                
+                # Try to manually set up proxy from environment.py variables
+                ad_username = env.get("AD_USERNAME")
+                ad_password = env.get("AD_USER_PW")
+                proxy_domain = env.get("HTTPS_PROXY_DOMAIN")
+                
+                if all([ad_username, ad_password, proxy_domain]):
+                    proxy_url = f"http://{ad_username}:{ad_password}@{proxy_domain}"
+                    os.environ["HTTP_PROXY"] = proxy_url
+                    os.environ["HTTPS_PROXY"] = proxy_url
+                    logger.info("Manually set up proxy environment variables")
         else:
-            logger.warning("Could not fetch certificate. Will use system certificates.")
-    except Exception as e:
-        logger.error(f"Error fetching certificate: {e}")
-        logger.error(f"Exception details: {traceback.format_exc()}")
-        logger.warning("Will use system certificates")
+            logger.info("Proxy is disabled in environment settings")
     
-    return cert_path
+    except Exception as e:
+        logger.warning(f"Could not initialize proxy from environment.py: {e}")
+        logger.warning("Will use any existing proxy environment variables")
 
-def create_application(
-    proxy_enabled: bool = True, 
-    monitoring_interval: int = 300,
-    vector_db_type: str = None,   # This parameter is ignored
-    chroma_dir: str = None,
-    chroma_collection: str = None,
-    certificate_path: str = None  # Will use fetched certificate if provided
-) -> FastAPI:
+def get_gcp_metadata_token() -> Optional[str]:
     """
-    Create the FastAPI application.
+    Try to get a token from GCP instance metadata.
+    This will only work when running on GCP VMs or Cloud Run.
+    Uses proxy settings if configured.
+    
+    Returns:
+        str: Access token or None if not available
+    """
+    try:
+        logger.info("Attempting to get token from GCP metadata server...")
+        metadata_url = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
+        headers = {"Metadata-Flavor": "Google"}
+        
+        # Metadata server should be accessed directly without proxy
+        # It's always at a link-local address
+        response = requests.get(metadata_url, headers=headers, timeout=2, proxies={})
+        
+        if response.status_code == 200:
+            token_data = response.json()
+            token = token_data.get("access_token")
+            logger.info("Successfully obtained token from GCP metadata server")
+            return token
+        logger.info(f"Failed to get token from metadata server: {response.status_code} - {response.text}")
+        return None
+    except Exception as e:
+        logger.debug(f"Could not get metadata token (likely not running on GCP): {e}")
+        return None
+
+def get_adc_token() -> Optional[str]:
+    """
+    Try to get a token from Application Default Credentials.
+    This could be from gcloud auth or environment variable.
+    Respects proxy settings.
+    
+    Returns:
+        str: Access token or None if not available
+    """
+    try:
+        logger.info("Attempting to get token from Application Default Credentials...")
+        
+        # Initialize proxy for Google auth libraries
+        initialize_proxy_for_google_auth()
+        
+        from google.auth.transport.requests import Request
+        from google.auth import default
+        
+        credentials, _ = default(scopes=['https://www.googleapis.com/auth/cloud-platform'])
+        
+        # Create a request object that respects proxies
+        request = Request()
+        
+        # Refresh the credentials if necessary
+        if hasattr(credentials, 'valid') and not credentials.valid:
+            credentials.refresh(request)
+        
+        if hasattr(credentials, 'token'):
+            logger.info("Successfully obtained token from Application Default Credentials")
+            return credentials.token
+        
+        logger.info("ADC credentials don't have a token attribute")
+        return None
+    except Exception as e:
+        logger.warning(f"Could not get ADC token: {e}")
+        return None
+
+def get_env_var_credentials() -> Optional[Tuple[str, str, str]]:
+    """
+    Try to get credentials from environment variables.
+    
+    Returns:
+        Tuple containing (project_id, client_email, private_key) or None
+    """
+    try:
+        logger.info("Checking for service account details in environment variables...")
+        client_email = os.environ.get("GCP_CLIENT_EMAIL")
+        private_key = os.environ.get("GCP_PRIVATE_KEY")
+        project_id = os.environ.get("GCP_PROJECT_ID")
+        
+        if all([client_email, private_key, project_id]):
+            logger.info("Found service account details in environment variables")
+            return (project_id, client_email, private_key)
+        
+        logger.info("Service account details not found in environment variables")
+        return None
+    except Exception as e:
+        logger.warning(f"Error getting credentials from environment variables: {e}")
+        return None
+
+def bootstrap_storage_client():
+    """
+    Create a GCP Storage client using available auth methods.
+    Respects proxy settings from environment.
+    
+    Returns:
+        storage.Client: Authenticated GCP Storage client
+    """
+    # Make sure proxy settings are initialized
+    initialize_proxy_for_google_auth()
+    
+    # Now import Google libraries after proxy is set up
+    from google.cloud import storage
+    
+    # Try different methods to get authentication
+    token = get_gcp_metadata_token() or get_adc_token()
+    
+    if token:
+        # Create storage client with the token
+        logger.info("Creating storage client with OAuth token")
+        from google.auth import credentials
+        from google.auth.transport.requests import AuthorizedSession
+        
+        class TokenCredentials(credentials.Credentials):
+            def __init__(self, token):
+                self.token = token
+                self.expiry = None
+                
+            def refresh(self, request):
+                pass
+                
+            @property
+            def valid(self):
+                return True
+                
+            def apply(self, headers, token=None):
+                headers["Authorization"] = f"Bearer {self.token}"
+                
+        creds = TokenCredentials(token)
+        client = storage.Client(credentials=creds)
+        return client
+    
+    # Try with environment variables
+    env_creds = get_env_var_credentials()
+    if env_creds:
+        logger.info("Creating storage client with environment variable credentials")
+        project_id, client_email, private_key = env_creds
+        
+        from google.oauth2 import service_account
+        import io
+        
+        # Create a JSON service account info dictionary
+        sa_info = {
+            "type": "service_account",
+            "project_id": project_id,
+            "private_key": private_key,
+            "client_email": client_email,
+            "token_uri": "https://oauth2.googleapis.com/token"
+        }
+        
+        # Create credentials from dict
+        creds = service_account.Credentials.from_service_account_info(
+            sa_info, 
+            scopes=['https://www.googleapis.com/auth/cloud-platform']
+        )
+        
+        client = storage.Client(credentials=creds, project=project_id)
+        return client
+    
+    # Fall back to default credentials
+    try:
+        logger.info("Attempting to create storage client with default credentials")
+        client = storage.Client()
+        logger.info("Successfully created storage client with default credentials")
+        return client
+    except Exception as e:
+        logger.error(f"Could not create storage client with default credentials: {e}")
+        logger.error(f"Detailed exception: {traceback.format_exc()}")
+        raise
+
+def fetch_service_account_json(bucket_name: str, object_path: str) -> Optional[str]:
+    """
+    Fetch the service account JSON file from GCP Storage.
+    Uses proxy settings from environment if configured.
     
     Args:
-        proxy_enabled: Whether to use proxy for API connections (default: True)
-        monitoring_interval: Interval in seconds for system monitoring (0 to disable)
-        vector_db_type: Type of vector database to use (always uses ChromaDB)
-        chroma_dir: ChromaDB persistent directory
-        chroma_collection: ChromaDB collection name
-        certificate_path: Path to SSL certificate (will use fetched certificate)
-    
+        bucket_name: GCP bucket name
+        object_path: Path to service account file in bucket
+        
     Returns:
-        FastAPI: The application instance
+        str: Path to temporary service account file or None if not available
     """
-    # Use the certificate path that was fetched from GCP
-    local_cert_path = certificate_path
+    cache_key = f"{bucket_name}/{object_path}"
     
-    # Initialize environment with proxy and certificate settings
-    env = get_os_env(proxy_enabled=proxy_enabled, certificate_path=local_cert_path)
+    # If we've already processed this path, return the cached result
+    if cache_key in _temp_cred_files:
+        return _temp_cred_files[cache_key]
     
-    # Always use ChromaDB regardless of input parameter
-    os.environ["VECTOR_DB_TYPE"] = "chroma"
+    try:
+        logger.info(f"Attempting to fetch service account JSON from gs://{bucket_name}/{object_path}")
         
-    # Set ChromaDB settings if provided
-    if chroma_dir:
-        os.environ["CHROMA_PERSIST_DIR"] = chroma_dir
-    else:
-        os.environ["CHROMA_PERSIST_DIR"] = "./data/chroma_db"
+        # Log proxy settings
+        proxies = get_proxy_settings()
+        if proxies:
+            logger.info(f"Using proxy settings: {proxies}")
+        else:
+            logger.info("No proxy settings detected")
         
-    if chroma_collection:
-        os.environ["CHROMA_COLLECTION"] = chroma_collection
-    else:
-        os.environ["CHROMA_COLLECTION"] = "business_terms"
-    
-    # Initialize database connection
-    db_manager = DBManager()
-    db_health = db_manager.health_check()
-    if db_health["status"] == "healthy":
-        logger.info(f"Database connection successful - PostgreSQL {db_health.get('version', '').split()[1] if 'version' in db_health else 'unknown'}")
-        logger.info(f"pgvector extension: {'Enabled' if db_health.get('vector_enabled', False) else 'Disabled'} (Note: Not used, all vectors stored in ChromaDB)")
-    else:
-        logger.error(f"Database connection failed: {db_health.get('error', 'Unknown error')}")
-    
-    # Initialize vector store
-    vector_store = get_vector_store()
-    vector_store_health = vector_store.health_check()
-    logger.info(f"Vector database: ChromaDB ({vector_store_health['status']})")
-    logger.info(f"Using vector database type: ChromaDB exclusively")
-    
-    # Initialize business term manager
-    business_term_manager = BusinessTermManager()
-    term_count = business_term_manager.get_term_count()
-    logger.info(f"Business terms loaded: {term_count}")
-    
-    # Create FastAPI app
-    app = FastAPI(
-        title="Data Element Enhancement and Tagging API",
-        description="API for enhancing data element names and descriptions based on ISO/IEC 11179 standards, and tagging with preferred business terms",
-        version="1.0.0",
-    )
-    
-    # Configure CORS
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],  # Restrict in production
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-    
-    # Include routers
-    app.include_router(enhancement_router)
-    app.include_router(tagging_router)
-    app.include_router(settings_router)
-    app.include_router(dashboard_router, prefix="/api")
-    
-    # Add static files directory for dashboard assets
-    static_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
-    os.makedirs(static_dir, exist_ok=True)
-    app.mount("/static", StaticFiles(directory=static_dir), name="static")
-    
-    # Start system monitoring if enabled
-    if monitoring_interval > 0:
-        logger.info(f"Starting system monitoring with {monitoring_interval}s interval")
-        start_monitoring(interval=monitoring_interval)
-    
-    @app.get("/health")
-    async def health_check():
-        """Health check endpoint."""
-        db_status = db_manager.health_check()
-
-        # Get vector database status - always ChromaDB
-        vector_db_status = {
-            "type": "chroma",
-            "persist_dir": os.environ.get("CHROMA_PERSIST_DIR", "./data/chroma_db"),
-            "collection": os.environ.get("CHROMA_COLLECTION", "business_terms")
-        }
+        # Create a bootstrapped storage client
+        storage_client = bootstrap_storage_client()
         
-        # Include security information (sanitized)
-        security_status = {
-            "certificate_source": "GCP Storage" if certificate_path else "System Certificates",
-            "certificate_path": DEFAULT_GCP_CERT_PATH if certificate_path else "System Default",
-            "service_account_source": "GCP Storage",
-            "service_account_path": DEFAULT_GCP_SA_PATH,
-            "using_temporary_storage": True if certificate_path else False
-        }
+        # Create a temporary file to store the service account
+        fd, temp_path = tempfile.mkstemp(suffix='.json')
+        os.close(fd)  # Close the file descriptor
         
-        # Add GCP auth info
-        auth_info = {
-            "application_default_credentials_set": "GOOGLE_APPLICATION_CREDENTIALS" in os.environ,
-            "gcp_environment_vars_set": all([
-                "GCP_CLIENT_EMAIL" in os.environ,
-                "GCP_PRIVATE_KEY" in os.environ,
-                "GCP_PROJECT_ID" in os.environ
-            ])
-        }
+        logger.info(f"Created temporary file for service account: {temp_path}")
         
-        return {
-            "status": "healthy",
-            "proxy_enabled": str_to_bool(env.get("PROXY_ENABLED", "True")),
-            "azure_endpoint": env.get("AZURE_ENDPOINT", ""),
-            "model": env.get("MODEL_NAME", "gpt-4o"),
-            "database": {
-                "status": db_status["status"],
-                "host": env.get("PG_HOST", "localhost"),
-                "port": env.get("PG_PORT", "5432"),
-                "db": env.get("PG_DB", "metadata_db")
-            },
-            "vector_database": vector_db_status,
-            "business_terms_count": term_count,
-            "security": security_status,
-            "authentication": auth_info
-        }
-    
-    @app.get("/")
-    async def root():
-        """Root endpoint with basic information."""
-        return {
-            "application": "Data Element Enhancement and Tagging API",
-            "version": "1.0.0",
-            "status": "running",
-            "documentation": "/docs",
-            "dashboard": "/api/dashboard",
-            "proxy_enabled": str_to_bool(env.get("PROXY_ENABLED", "True")),
-            "database": env.get("PG_DB", "metadata_db"),
-            "vector_database": {
-                "type": "chroma",
-                "details": {
-                    "chroma_persist_dir": os.environ.get("CHROMA_PERSIST_DIR", "./data/chroma_db"),
-                    "chroma_collection": os.environ.get("CHROMA_COLLECTION", "business_terms")
-                }
-            },
-            "security": {
-                "using_gcp_stored_credentials": certificate_path is not None,
-                "certificate_source": "GCP Storage" if certificate_path else "System Default",
-                "temporary_storage_only": True
-            }
-        }
-    
-    # Register shutdown event to stop monitoring
-    @app.on_event("shutdown")
-    def shutdown_event():
-        """Shutdown event handler to clean up resources."""
-        logger.info("Application shutting down...")
+        # Download file from GCP
+        bucket = storage_client.bucket(bucket_name)
+        logger.info(f"Accessing bucket: {bucket_name}")
         
-        # Stop system monitoring
-        stop_monitoring()
-    
-    return app
-
-def parse_args():
-    """
-    Parse command line arguments.
-    
-    Returns:
-        argparse.Namespace: Parsed arguments
-    """
-    parser = argparse.ArgumentParser(description="ISO/IEC 11179 Data Enhancement API")
-    parser.add_argument("--proxy", dest="proxy_enabled", action="store_true", 
-                        help="Enable proxy for API connections")
-    parser.add_argument("--no-proxy", dest="proxy_enabled", action="store_false", 
-                        help="Disable proxy for API connections")
-    parser.add_argument("--host", type=str, default="0.0.0.0", 
-                        help="Host to bind the server to")
-    parser.add_argument("--port", type=int, default=8000, 
-                        help="Port to bind the server to")
-    parser.add_argument("--reload", action="store_true", 
-                        help="Enable auto-reload for development")
-    parser.add_argument("--config", type=str, default="env/config.env", 
-                        help="Path to configuration file")
-    parser.add_argument("--creds", type=str, default="env/credentials.env", 
-                        help="Path to credentials file")
-    parser.add_argument("--monitoring-interval", type=int, default=300,
-                        help="Interval in seconds for system monitoring (0 to disable)")
-    
-    # GCP Authentication override options
-    parser.add_argument("--gcp-client-email", type=str, help="GCP service account client email")
-    parser.add_argument("--gcp-private-key-file", type=str, help="File containing GCP service account private key")
-    parser.add_argument("--gcp-project-id", type=str, help="GCP project ID")
-    
-    # PostgreSQL settings
-    parser.add_argument("--pg-host", type=str, help="PostgreSQL host")
-    parser.add_argument("--pg-port", type=int, help="PostgreSQL port")
-    parser.add_argument("--pg-user", type=str, help="PostgreSQL user")
-    parser.add_argument("--pg-password", type=str, help="PostgreSQL password")
-    parser.add_argument("--pg-db", type=str, help="PostgreSQL database name")
-    
-    # Vector database options - always default to ChromaDB
-    parser.add_argument("--vector-db", type=str, choices=["postgresql", "chroma"], 
-                      default="chroma", help="Vector database backend (Note: ChromaDB will always be used)")
-    parser.add_argument("--chroma-dir", type=str, default="./data/chroma_db",
-                      help="ChromaDB persistent directory")
-    parser.add_argument("--chroma-collection", type=str, default="business_terms",
-                      help="ChromaDB collection name")
-    
-    # Set default for proxy to True
-    parser.set_defaults(proxy_enabled=True)
-    
-    return parser.parse_args()
-
-# Process command line arguments for manual auth setup
-def process_auth_args(args):
-    """Set up GCP auth from command line arguments if provided."""
-    if args.gcp_client_email:
-        os.environ["GCP_CLIENT_EMAIL"] = args.gcp_client_email
-        logger.info(f"Set GCP_CLIENT_EMAIL from command line")
-    
-    if args.gcp_project_id:
-        os.environ["GCP_PROJECT_ID"] = args.gcp_project_id
-        logger.info(f"Set GCP_PROJECT_ID from command line")
-    
-    if args.gcp_private_key_file and os.path.exists(args.gcp_private_key_file):
+        blob = bucket.blob(object_path)
+        logger.info(f"Accessing blob: {object_path}")
+        
+        # Check if blob exists
+        if not blob.exists():
+            logger.error(f"Service account file does not exist at gs://{bucket_name}/{object_path}")
+            return None
+        
+        logger.info(f"Downloading service account JSON file...")
+        blob.download_to_filename(temp_path)
+        
+        # Verify the downloaded file
         try:
-            with open(args.gcp_private_key_file, 'r') as f:
-                private_key = f.read()
-            os.environ["GCP_PRIVATE_KEY"] = private_key
-            logger.info(f"Set GCP_PRIVATE_KEY from file: {args.gcp_private_key_file}")
+            with open(temp_path, 'r') as f:
+                service_account_data = json.load(f)
+                # Check if it looks like a service account file
+                required_keys = ["type", "project_id", "private_key", "client_email"]
+                if not all(key in service_account_data for key in required_keys):
+                    logger.warning("Downloaded JSON doesn't look like a valid service account file")
+                else:
+                    logger.info("Service account JSON file validated successfully")
         except Exception as e:
-            logger.error(f"Error reading private key file: {e}")
-
-# First fetch credentials and certificate from GCP
-logger.info(f"Fetching service account and certificate from GCP...")
-certificate_path = fetch_credentials_and_certificate()
-
-# Create a simple app instance for module import cases
-os.environ["VECTOR_DB_TYPE"] = "chroma"  # Set default vector DB to ChromaDB
-os.environ["CHROMA_PERSIST_DIR"] = "./data/chroma_db"
-os.environ["CHROMA_COLLECTION"] = "business_terms"
-
-# Create app with fetched certificate
-app = create_application(
-    monitoring_interval=0,  # Disable monitoring for imported app
-    certificate_path=certificate_path  # Use the fetched certificate
-)
-
-if __name__ == "__main__":
-    # For local development with command line arguments
-    args = parse_args()
+            logger.error(f"Error validating service account JSON: {e}")
+            # Continue anyway, as it might still work
+        
+        # Cache the temp path for future requests and cleanup
+        _temp_cred_files[cache_key] = temp_path
+        
+        # Set environment variable to point to this file
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_path
+        
+        logger.info(f"Service account downloaded to {temp_path} and set as GOOGLE_APPLICATION_CREDENTIALS")
+        return temp_path
     
-    # Set environment variables from command line arguments
-    os.environ["ENV_CONFIG_PATH"] = args.config
-    os.environ["ENV_CREDS_PATH"] = args.creds
-    
-    # Process any manual auth arguments
-    process_auth_args(args)
-    
-    # Set PostgreSQL environment variables if provided
-    if args.pg_host:
-        os.environ["PG_HOST"] = args.pg_host
-    if args.pg_port:
-        os.environ["PG_PORT"] = str(args.pg_port)
-    if args.pg_user:
-        os.environ["PG_USER"] = args.pg_user
-    if args.pg_password:
-        os.environ["PG_PASSWORD"] = args.pg_password
-    if args.pg_db:
-        os.environ["PG_DB"] = args.pg_db
-    
-    # Set vector database environment variables - always use ChromaDB
-    os.environ["VECTOR_DB_TYPE"] = "chroma"  # Always use ChromaDB
-    os.environ["CHROMA_PERSIST_DIR"] = args.chroma_dir
-    os.environ["CHROMA_COLLECTION"] = args.chroma_collection
-    
-    # Log startup configuration
-    logger.info(f"Starting server with configuration:")
-    logger.info(f"  Host: {args.host}")
-    logger.info(f"  Port: {args.port}")
-    logger.info(f"  Proxy: {args.proxy_enabled}")
-    logger.info(f"  Config file: {args.config}")
-    logger.info(f"  Credentials file: {args.creds}")
-    logger.info(f"  Certificate (GCP): {DEFAULT_GCP_CERT_PATH}")
-    logger.info(f"  Service Account (GCP): {DEFAULT_GCP_SA_PATH}")
-    logger.info(f"  Auto-reload: {args.reload}")
-    logger.info(f"  Monitoring interval: {args.monitoring_interval}s")
-    logger.info(f"  Vector database: ChromaDB (forced)")
-    logger.info(f"  ChromaDB directory: {args.chroma_dir}")
-    logger.info(f"  ChromaDB collection: {args.chroma_collection}")
-    
-    if args.pg_host:
-        logger.info(f"  PostgreSQL host: {args.pg_host}")
-        logger.info(f"  PostgreSQL port: {args.pg_port}")
-        logger.info(f"  PostgreSQL database: {args.pg_db}")
-        logger.info(f"  PostgreSQL user: {args.pg_user}")
-    
-    # Override the default app with command line configured one
-    app = create_application(
-        proxy_enabled=args.proxy_enabled, 
-        monitoring_interval=args.monitoring_interval,
-        vector_db_type="chroma",  # Force ChromaDB regardless of args.vector_db
-        chroma_dir=args.chroma_dir,
-        chroma_collection=args.chroma_collection,
-        certificate_path=certificate_path  # Use the fetched certificate
-    )
-    
-    # Run application directly to avoid module import issues with reload
-    if args.reload:
-        # For reload mode, use string-based import but with proper error handling
-        try:
-            uvicorn.run(
-                "main:app",
-                host=args.host,
-                port=args.port,
-                reload=True
-            )
-        except ModuleNotFoundError:
-            logger.error("Could not run with reload mode - check your PYTHONPATH")
-            # Fallback to direct app instance
-            uvicorn.run(
-                app,
-                host=args.host,
-                port=args.port
-            )
-    else:
-        # For normal mode, use direct app instance
-        uvicorn.run(
-            app,
-            host=args.host,
-            port=args.port
-        )
+    except Exception as e:
+        logger.error(f"Error downloading service account from GCP: {e}")
+        logger.error(f"Detailed exception: {traceback.format_exc()}")
+        return None
