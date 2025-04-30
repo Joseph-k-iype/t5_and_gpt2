@@ -1,543 +1,834 @@
 """
-AI Tagging Evaluation Agent - Uses AI/LLM to evaluate term matches for quality.
+Business Terms Manager - Core component for managing and matching business terms.
 
-This agent evaluates the quality of business term matches and provides detailed
-reasoning about the match quality, allowing for more accurate tagging decisions.
+This module provides functionality for storing, retrieving, and matching business terms
+using vector similarity search with ChromaDB's HNSW indexing, enhanced with AI evaluation
+of term matches.
 """
 
+import csv
 import logging
+import os
+import time
 import re
-from typing import Dict, Any, List, Optional, Tuple, Union
-from app.core.models import TaggingResult
-from app.config.settings import get_llm
+import uuid
+from typing import List, Dict, Any, Optional, Tuple
+import numpy as np
+from pydantic import BaseModel, Field
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+from app.core.db_manager import DBManager
+from app.core.embedding import EmbeddingClient, MyDocument
+from app.core.models import TaggingResult, TaggingValidationResult
+from app.config.environment import get_os_env
+from app.config.settings import get_vector_store
+from app.agents.tagging_evaluation_agent import AITaggingEvaluationAgent
 
 logger = logging.getLogger(__name__)
 
-class AITaggingEvaluationAgent:
-    """
-    Agent that uses AI/LLM to evaluate the quality of business term matches.
+class BusinessTerm(BaseModel):
+    """Model representing a business term in the repository."""
+    id: str = Field(..., description="Unique identifier for the term")
+    name: str = Field(..., description="Name of the business term")
+    description: str = Field(..., description="Description of the business term")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata for the term")
     
-    This agent provides detailed analysis of term matches and can determine
-    if the matches are appropriate for the data element or if new term modeling
-    is required.
+    def dict(self) -> Dict[str, Any]:
+        """Convert the business term to a dictionary."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
+            "metadata": self.metadata
+        }
+
+class BusinessTermManager:
     """
+    Manager for business terms, handling storage, retrieval, and similarity matching.
+    
+    Uses ChromaDB with HNSW indexing for vector similarity search, enhanced with
+    AI-powered evaluation of term matches.
+    """
+    
+    _instance = None
+    
+    def __new__(cls):
+        """Singleton pattern to ensure only one instance is created."""
+        if cls._instance is None:
+            cls._instance = super(BusinessTermManager, cls).__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
     
     def __init__(self):
-        """Initialize the AI tagging evaluation agent."""
-        # No need to initialize the LLM here, we'll get it when needed
-        pass
+        """Initialize the business term manager."""
+        if self._initialized:
+            return
+            
+        self._initialized = True
+        self.env = get_os_env()
+        self.embedding_client = EmbeddingClient()
+        
+        # Initialize DB manager for job storage
+        self.db_manager = DBManager()
+        
+        self.similarity_threshold = float(self.env.get("SIMILARITY_THRESHOLD", "0.5"))  # 50% similarity threshold
+        
+        # Get vector store based on configuration
+        self.vector_store = get_vector_store()
+        
+        # Get the vector database type
+        self.vector_db_type = self.env.get("VECTOR_DB_TYPE", "chroma").lower()
+        
+        # Initialize AI evaluation agent
+        self.ai_evaluation_agent = AITaggingEvaluationAgent()
+        
+        logger.info(f"Business term manager initialized with {self.vector_db_type} backend for vectors")
     
-    async def evaluate_tagging_result(self, tagging_result: TaggingResult) -> Tuple[bool, float, str, TaggingResult]:
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type((Exception,)),
+        reraise=True
+    )
+    def import_terms_from_csv(self, csv_path: str, encoding: str = 'utf-8', batch_size: int = 100) -> int:
         """
-        Evaluate tagging results using LLM to determine if matches are appropriate.
+        Import business terms from a CSV file and generate embeddings using EmbeddingClient.
+        
+        Args:
+            csv_path: Path to the CSV file
+            encoding: File encoding (auto-detected if not provided)
+            batch_size: Number of terms to process in each batch
+            
+        Returns:
+            Number of terms imported
+            
+        Raises:
+            ValueError: If CSV file is missing required columns
+            IOError: If file cannot be read
+        """
+        try:
+            # Get existing terms
+            existing_terms = {}
+            for term in self.get_all_terms():
+                term_key = f"{term.name}::{term.description}"
+                existing_terms[term_key] = term.id
+            
+            # Track terms in CSV
+            csv_term_keys = set()
+            terms_to_add = []
+            
+            # Try to detect encoding if not specified
+            if encoding.lower() == 'auto' or encoding.lower() == 'detect':
+                try:
+                    # Try to install and import chardet if not available
+                    try:
+                        import chardet
+                    except ImportError:
+                        import subprocess
+                        import sys
+                        logger.info("Installing chardet for encoding detection")
+                        subprocess.check_call([sys.executable, "-m", "pip", "install", "chardet"])
+                        import chardet
+                    
+                    # Detect encoding with appropriate sample size
+                    with open(csv_path, 'rb') as rawfile:
+                        # For large files, read up to 1MB for detection
+                        file_size = os.path.getsize(csv_path)
+                        sample = rawfile.read(min(1024 * 1024, file_size))
+                        result = chardet.detect(sample)
+                        detected_encoding = result['encoding']
+                        confidence = result['confidence']
+                        
+                        # Log detection results
+                        logger.info(f"Encoding detection: {detected_encoding} (confidence: {confidence:.2f})")
+                        
+                        # Use detected encoding, no fallback
+                        encoding = detected_encoding
+                except Exception as e:
+                    logger.error(f"Error during encoding detection: {e}")
+                    # If detection fails completely, try common encodings in a specific order
+                    logger.warning(f"Will try common encodings in sequence: utf-8, latin1, cp1252, iso-8859-1")
+                    # We'll handle this later by trying multiple encodings
+            
+            # Define a helper function to process CSV with a given encoding
+            def process_csv_with_encoding(file_path, enc):
+                """Process CSV file with the given encoding and return extracted terms"""
+                logger.info(f"Attempting to read CSV with encoding: {enc}")
+                
+                extracted_terms = []
+                try:
+                    with open(file_path, 'r', encoding=enc) as csvfile:
+                        reader = csv.DictReader(csvfile)
+                        
+                        # Verify required columns
+                        if not reader.fieldnames:
+                            logger.warning(f"CSV has no headers or is empty with encoding {enc}")
+                            return None
+                        
+                        # Handle different column naming conventions
+                        field_name_map = {}
+                        for field in reader.fieldnames:
+                            if field.upper() == 'PBT_NAME':
+                                field_name_map[field] = 'name'
+                            elif field.upper() == 'PBT_DEFINITION':
+                                field_name_map[field] = 'description'
+                            elif field.upper() == 'CDM':
+                                field_name_map[field] = 'cdm'
+                            else:
+                                # Keep other fields as is
+                                field_name_map[field] = field
+                        
+                        # Check if required fields are available after mapping
+                        all_mapped_fields = set(field_name_map.values())
+                        if 'name' not in all_mapped_fields or 'description' not in all_mapped_fields:
+                            missing = []
+                            if 'name' not in all_mapped_fields:
+                                missing.append('name/PBT_NAME')
+                            if 'description' not in all_mapped_fields:
+                                missing.append('description/PBT_DEFINITION')
+                            logger.warning(f"CSV missing required columns with encoding {enc}: {', '.join(missing)}")
+                            return None
+                        
+                        # Process rows
+                        for row in reader:
+                            # Map field names
+                            mapped_row = {}
+                            for orig_field, value in row.items():
+                                if orig_field in field_name_map:
+                                    mapped_row[field_name_map[orig_field]] = value
+                                else:
+                                    mapped_row[orig_field] = value
+                            
+                            if 'name' not in mapped_row or 'description' not in mapped_row:
+                                continue
+                            
+                            # Get term ID (generate if not provided)
+                            term_id = mapped_row.get('id', '').strip()
+                            name = mapped_row['name'].strip()
+                            description = mapped_row['description'].strip()
+                            
+                            # Skip rows with empty name or description
+                            if not name or not description:
+                                continue
+                            
+                            # Generate a unique ID if not provided or empty
+                            if not term_id:
+                                term_id = f"term-{uuid.uuid4()}"
+                            
+                            term_key = f"{name}::{description}"
+                            csv_term_keys.add(term_key)
+                            
+                            # Skip if term already exists and is unchanged
+                            if term_key in existing_terms and existing_terms[term_key] == term_id:
+                                continue
+                            
+                            # Extract metadata if present in CSV
+                            metadata = {}
+                            for key, value in mapped_row.items():
+                                if key not in ['id', 'name', 'description'] and value:
+                                    metadata[key] = value
+                            
+                            extracted_terms.append({
+                                "id": term_id,
+                                "name": name,
+                                "description": description,
+                                "term_key": term_key,
+                                "metadata": metadata
+                            })
+                    
+                    # Successfully read the file
+                    logger.info(f"Successfully processed CSV with encoding: {enc} - found {len(extracted_terms)} terms")
+                    return extracted_terms
+                
+                except UnicodeDecodeError:
+                    logger.warning(f"Unicode decode error with encoding: {enc}")
+                    return None
+                except Exception as e:
+                    logger.warning(f"Error processing CSV with encoding {enc}: {e}")
+                    return None
+            
+            # Try reading with detected/specified encoding first
+            terms_to_add = process_csv_with_encoding(csv_path, encoding)
+            
+            # If failed, try common encodings in sequence
+            if not terms_to_add:
+                # List of common encodings to try
+                encodings_to_try = ['utf-8', 'latin1', 'cp1252', 'iso-8859-1', 'utf-16']
+                
+                for enc in encodings_to_try:
+                    if enc != encoding:  # Skip if we already tried this encoding
+                        result = process_csv_with_encoding(csv_path, enc)
+                        if result:
+                            terms_to_add = result
+                            encoding = enc  # Update encoding for logging
+                            break
+            
+            # If we still have no terms, raise an error
+            if not terms_to_add:
+                raise ValueError(f"Could not read CSV file {csv_path} with any encoding")
+            
+            # Process terms in batches
+            added_count = 0
+            for i in range(0, len(terms_to_add), batch_size):
+                batch = terms_to_add[i:i + batch_size]
+                batch_start_time = time.time()
+                
+                # Create batch of vectors to insert
+                vectors_batch = []
+                
+                # Prepare documents for batch embedding generation
+                docs_to_embed = []
+                for term in batch:
+                    # Create document for embedding
+                    doc = MyDocument(
+                        id=term["id"],
+                        text=f"{term['name']}. {term['description']}"
+                    )
+                    docs_to_embed.append(doc)
+                
+                # Generate embeddings in batch for better efficiency
+                docs_with_embeddings = self.embedding_client.batch_generate_embeddings(docs_to_embed)
+                
+                # Process the documents with embeddings
+                for i, doc_with_embedding in enumerate(docs_with_embeddings):
+                    term = batch[i]
+                    
+                    if not doc_with_embedding.embedding:
+                        logger.warning(f"Skipping term without embedding: {term['name']}")
+                        continue
+                    
+                    vectors_batch.append({
+                        "id": term["id"],
+                        "name": term["name"],
+                        "description": term["description"],
+                        "embedding": doc_with_embedding.embedding,
+                        "metadata": term.get("metadata", {})
+                    })
+                
+                # Batch insert into vector store
+                if vectors_batch:
+                    inserted = self.vector_store.batch_store_vectors(vectors_batch)
+                    added_count += inserted
+                    
+                    batch_duration = time.time() - batch_start_time
+                    logger.info(f"Processed batch {i//batch_size + 1}/{(len(terms_to_add) + batch_size - 1)//batch_size}: "
+                               f"{inserted} terms in {batch_duration:.2f}s "
+                               f"({inserted/batch_duration:.2f} terms/sec)")
+            
+            # Handle term deletion (terms that exist in the database but not in the CSV)
+            deleted_count = 0
+            terms_to_delete = []
+            for term_key, term_id in existing_terms.items():
+                if term_key not in csv_term_keys:
+                    terms_to_delete.append(term_id)
+            
+            # Delete in batches
+            for i in range(0, len(terms_to_delete), batch_size):
+                batch = terms_to_delete[i:i + batch_size]
+                deleted_in_batch = 0
+                
+                for term_id in batch:
+                    if self.vector_store.delete_term(term_id):
+                        deleted_in_batch += 1
+                
+                deleted_count += deleted_in_batch
+                if deleted_in_batch > 0:
+                    logger.info(f"Deleted batch of {deleted_in_batch} terms")
+            
+            logger.info(f"Import summary: Added {added_count} terms, deleted {deleted_count} terms")
+            return added_count
+        
+        except Exception as e:
+            logger.error(f"Error importing terms from CSV: {e}")
+            raise
+    
+    async def tag_element(self, element_id: str, name: str, description: str, 
+                   top_k: int = 3, threshold: float = 0.3, 
+                   cdm: Optional[str] = None,
+                   example: Optional[str] = None,
+                   process_name: Optional[str] = None,
+                   process_description: Optional[str] = None) -> TaggingResult:
+        """
+        Tag a data element with the most similar business terms using HNSW vector similarity 
+        search, enhanced with AI evaluation.
+        
+        Args:
+            element_id: Unique identifier for the element
+            name: Enhanced name of the element
+            description: Enhanced description of the element
+            top_k: Number of top matching terms to return
+            threshold: Minimum similarity threshold (0-1)
+            cdm: Optional CDM to prioritize in matches
+            example: Optional example for context
+            process_name: Optional process name for context
+            process_description: Optional process description for context
+                
+        Returns:
+            TaggingResult containing matching terms and confidence scores
+        """
+        try:
+            # Validate inputs
+            if not name or not description:
+                logger.warning(f"Empty name or description for element: {element_id}")
+                return TaggingResult(
+                    element_id=element_id,
+                    element_name=name or "",
+                    element_description=description or "",
+                    matching_terms=[],
+                    confidence_scores=[],
+                    modeling_required=True,
+                    message="Name or description is empty. Modeling should be performed."
+                )
+            
+            # Create document with embedding - combine all context for better matching
+            query_text = f"{name}"
+            
+            # Add description to the query
+            query_text += f" {description}"
+            
+            # Add example if provided
+            if example:
+                query_text += f" Example: {example}"
+                
+            # Add process information if provided
+            if process_name:
+                query_text += f" Process: {process_name}"
+            if process_description:
+                query_text += f" Process details: {process_description}"
+                
+            # Create document and generate embedding
+            doc = MyDocument(
+                id=element_id,
+                text=query_text
+            )
+            
+            doc_with_embedding = self.embedding_client.generate_embeddings(doc)
+            
+            if not doc_with_embedding.embedding:
+                logger.warning(f"Could not generate embedding for element: {name}")
+                return TaggingResult(
+                    element_id=element_id,
+                    element_name=name,
+                    element_description=description,
+                    matching_terms=[],
+                    confidence_scores=[],
+                    modeling_required=True,
+                    message="Could not generate embedding. Modeling should be performed."
+                )
+            
+            # Query for similar terms using vector search, get more terms than needed for filtering
+            query_top_k = top_k * 3  # Fetch more for better filtering
+            similar_terms = self.vector_store.find_similar_vectors(
+                query_vector=doc_with_embedding.embedding,
+                top_k=query_top_k,
+                threshold=threshold * 0.8  # Lower threshold to get more potential matches
+            )
+            
+            # If no similar terms found with this threshold, try a lower threshold as fallback
+            if not similar_terms and threshold > 0.15:
+                logger.info(f"No terms found with threshold {threshold}, trying with lower threshold")
+                similar_terms = self.vector_store.find_similar_vectors(
+                    query_vector=doc_with_embedding.embedding,
+                    top_k=query_top_k,
+                    threshold=0.15  # Lower fallback threshold
+                )
+            
+            # If still no matches, recommend modeling
+            if not similar_terms:
+                return TaggingResult(
+                    element_id=element_id,
+                    element_name=name,
+                    element_description=description,
+                    matching_terms=[],
+                    confidence_scores=[],
+                    modeling_required=True,
+                    message=f"No similar terms found, even with lower threshold. Modeling should be performed."
+                )
+            
+            # For CDM-based filtering - if CDM is specified, prioritize those terms
+            if cdm:
+                # Filter and boost terms that match the specified CDM
+                cdm_terms = []
+                other_terms = []
+                
+                for term in similar_terms:
+                    term_cdm = None
+                    if "metadata" in term and term["metadata"] and "cdm" in term["metadata"]:
+                        term_cdm = term["metadata"]["cdm"]
+                    
+                    if term_cdm and term_cdm.lower() == cdm.lower():
+                        # Boost similarity for CDM matches
+                        term["similarity"] = min(term["similarity"] * 1.25, 1.0)
+                        cdm_terms.append(term)
+                    else:
+                        other_terms.append(term)
+                
+                # Combine terms with CDM terms first
+                similar_terms = cdm_terms + other_terms
+            
+            # Format matching terms and sort by similarity score
+            matching_terms = []
+            confidence_scores = []
+            
+            # Sort by similarity score (highest first)
+            similar_terms.sort(key=lambda x: x["similarity"], reverse=True)
+            
+            # Take the top_k items, or fewer if not enough matches
+            max_items = min(top_k, len(similar_terms))
+            for term in similar_terms[:max_items]:
+                # Add category and CDM from metadata if available
+                category = None
+                cdm_value = None
+                if "metadata" in term and term["metadata"]:
+                    category = term["metadata"].get("category")
+                    cdm_value = term["metadata"].get("cdm")
+                
+                term_entry = {
+                    "id": term["id"],
+                    "name": term["name"],
+                    "description": term["description"],
+                    "similarity": term["similarity"]
+                }
+                
+                # Add category and CDM if available
+                if category:
+                    term_entry["category"] = category
+                if cdm_value:
+                    term_entry["cdm"] = cdm_value
+                
+                matching_terms.append(term_entry)
+                confidence_scores.append(term["similarity"])
+            
+            # Create initial tagging result
+            initial_result = TaggingResult(
+                element_id=element_id,
+                element_name=name,
+                element_description=description,
+                matching_terms=matching_terms,
+                confidence_scores=confidence_scores,
+                modeling_required=False,  # Will be evaluated by AI
+                message="Initial vector similarity matches found"
+            )
+            
+            # Use AI agent to evaluate and improve the matches
+            is_valid, overall_confidence, reasoning, improved_result = await self.ai_evaluation_agent.evaluate_tagging_result(initial_result)
+            
+            # Update the modeling_required flag based on AI evaluation
+            improved_result.modeling_required = not is_valid or overall_confidence < 0.5
+            
+            # Add details about the CDM filter in the message if applicable
+            if cdm and improved_result.matching_terms:
+                cdm_matches = sum(1 for term in improved_result.matching_terms if term.get("cdm") == cdm)
+                if cdm_matches > 0:
+                    improved_result.message += f" (Found {cdm_matches} terms in the requested CDM: {cdm})"
+            
+            # If the AI evaluation determined matches are not good, try to find better matches
+            if improved_result.modeling_required and similar_terms and len(similar_terms) > top_k:
+                logger.info(f"AI evaluation suggests modeling for '{name}'. Trying to find better matches using LLM...")
+                
+                # Get all terms for better AI-based matching
+                all_terms = self.get_all_terms()
+                all_term_dicts = [term.dict() for term in all_terms]
+                
+                # Ask AI to find better matches from all terms
+                better_matches = await self.ai_evaluation_agent.find_better_matches(
+                    name,
+                    description,
+                    all_term_dicts,
+                    matching_terms,
+                    max_suggestions=top_k
+                )
+                
+                # If better matches were found, update the result
+                if better_matches:
+                    logger.info(f"AI found {len(better_matches)} better matches for '{name}'")
+                    
+                    # Create confidence scores from similarities
+                    better_confidence_scores = [match.get("similarity", 0.5) for match in better_matches]
+                    
+                    # Check if the best match has a high enough confidence
+                    best_confidence = max(better_confidence_scores) if better_confidence_scores else 0.0
+                    
+                    # Update the tagging result with AI-selected matches
+                    improved_result = TaggingResult(
+                        element_id=element_id,
+                        element_name=name,
+                        element_description=description,
+                        matching_terms=better_matches,
+                        confidence_scores=better_confidence_scores,
+                        modeling_required=best_confidence < 0.5,  # Still require modeling if confidence is low
+                        message=f"AI-selected better matches with confidence {best_confidence:.2f}"
+                    )
+            
+            return improved_result
+                
+        except Exception as e:
+            logger.error(f"Error tagging element: {e}", exc_info=True)
+            return TaggingResult(
+                element_id=element_id,
+                element_name=name,
+                element_description=description,
+                matching_terms=[],
+                confidence_scores=[],
+                modeling_required=True,
+                message=f"Error during tagging: {str(e)}. Modeling should be performed."
+            )
+
+    async def evaluate_tagging_with_reasoning(self, tagging_result: TaggingResult) -> Tuple[float, str]:
+        """
+        Evaluate the confidence in the tagging with detailed reasoning using the AI evaluation agent.
         
         Args:
             tagging_result: Tagging result to evaluate
             
         Returns:
-            Tuple containing:
-            - is_valid: Whether any terms are valid matches
-            - overall_confidence: Confidence score (0-1)
-            - reasoning: Detailed reasoning for the evaluation
-            - improved_result: Potentially improved tagging result
+            Tuple containing (confidence_score, reasoning)
         """
         try:
-            # Skip evaluation if modeling is required or no matches found
-            if tagging_result.modeling_required or not tagging_result.matching_terms:
-                return (
-                    False, 
-                    0.0, 
-                    "No suitable matches found or modeling already required.", 
-                    tagging_result
-                )
-            
-            # Get LLM from settings
-            llm = get_llm()
-            if not llm:
-                logger.warning("LLM not available for tagging evaluation")
-                # Return a simplified result based on confidence scores
-                avg_confidence = sum(tagging_result.confidence_scores) / len(tagging_result.confidence_scores) if tagging_result.confidence_scores else 0.0
-                return (
-                    avg_confidence >= 0.5,
-                    avg_confidence,
-                    f"Basic confidence evaluation: {avg_confidence:.2f}",
-                    tagging_result
-                )
-            
-            # Format terms for the LLM
-            formatted_terms = self._format_terms_for_prompt(tagging_result.matching_terms, tagging_result.confidence_scores)
-            
-            # Create the evaluation prompt
-            evaluation_prompt = f"""
-            You are an expert in data governance and business terminology with deep domain knowledge.
-            Your task is to evaluate whether the following business terms are appropriate for a data element.
-            
-            Data Element:
-            - Name: {tagging_result.element_name}
-            - Description: {tagging_result.element_description}
-            
-            Matched Business Terms:
-            {formatted_terms}
-            
-            Provide your evaluation as follows:
-            
-            1. Analysis of Each Term:
-               - For each term, assess how well it matches the data element semantically
-               - Consider conceptual alignment, completeness, and appropriate specificity
-               - Provide a score from 0 to 10 for each term
-            
-            2. Overall Assessment:
-               - Determine if ANY of the terms are good matches (score >= 7)
-               - Provide an overall confidence score between 0.0 and 1.0
-               - Explain your reasoning in detail
-               
-            3. Best Match:
-               - Identify which term (if any) is the best match and why
-               
-            4. Final Recommendation:
-               - Should the data element be modeled as a new term? Yes or No
-               - If No, which existing term should be used?
-            
-            Your assessment:
-            """
-            
-            # Get response from LLM
-            from langchain_core.output_parsers import StrOutputParser
-            
-            # Create a chain for evaluation
-            chain = llm | StrOutputParser()
-            
-            # Get reasoning with timeout
-            import asyncio
-            try:
-                reasoning_task = chain.ainvoke(evaluation_prompt)
-                reasoning = await asyncio.wait_for(reasoning_task, timeout=20.0)
-            except asyncio.TimeoutError:
-                logger.warning("LLM evaluation timed out")
-                # Fall back to confidence scores
-                avg_confidence = sum(tagging_result.confidence_scores) / len(tagging_result.confidence_scores) if tagging_result.confidence_scores else 0.0
-                return (
-                    avg_confidence >= 0.5,
-                    avg_confidence,
-                    "LLM evaluation timed out. Using average confidence score.",
-                    tagging_result
-                )
-            
-            # Extract key information from the reasoning
-            is_valid = self._extract_is_valid(reasoning)
-            overall_confidence = self._extract_confidence(reasoning)
-            best_match_index = self._extract_best_match_index(reasoning, tagging_result.matching_terms)
-            
-            # Create an improved result if a clear best match was identified
-            improved_result = tagging_result
-            if best_match_index is not None and 0 <= best_match_index < len(tagging_result.matching_terms):
-                # Put the best match first and adjust confidence scores
-                best_term = tagging_result.matching_terms[best_match_index]
-                best_confidence = max(tagging_result.confidence_scores[best_match_index], overall_confidence)
+            # Skip evaluation if modeling is required
+            if tagging_result.modeling_required:
+                return 0.0, "Modeling is required as no suitable matches were found."
                 
-                # Create a new list with the best match first, followed by others
-                reordered_terms = [best_term] + [term for i, term in enumerate(tagging_result.matching_terms) if i != best_match_index]
-                reordered_scores = [best_confidence] + [score for i, score in enumerate(tagging_result.confidence_scores) if i != best_match_index]
-                
-                improved_result = TaggingResult(
-                    element_id=tagging_result.element_id,
-                    element_name=tagging_result.element_name,
-                    element_description=tagging_result.element_description,
-                    matching_terms=reordered_terms,
-                    confidence_scores=reordered_scores,
-                    modeling_required=not is_valid,
-                    message=f"AI evaluated matches with confidence {overall_confidence:.2f}"
-                )
+            # If no matches, return zero confidence
+            if not tagging_result.matching_terms:
+                return 0.0, "No matching terms were found. Modeling is required."
             
-            return (is_valid, overall_confidence, reasoning, improved_result)
+            # Use the AI evaluation agent to evaluate the matches
+            is_valid, overall_confidence, reasoning, _ = await self.ai_evaluation_agent.evaluate_tagging_result(tagging_result)
+            
+            return overall_confidence, reasoning
         
         except Exception as e:
-            logger.error(f"Error evaluating tagging result: {e}")
-            # Return original result with low confidence on error
-            return (
-                False,
-                0.3,
-                f"Error during evaluation: {str(e)}",
-                tagging_result
+            logger.error(f"Error evaluating tagging confidence with reasoning: {e}")
+            return 0.5, f"Error evaluating tagging confidence: {e}"
+    
+    async def validate_tagging(self, tagging_result: TaggingResult) -> TaggingValidationResult:
+        """
+        Validate the tagging result.
+        
+        Args:
+            tagging_result: Result of tagging to validate
+            
+        Returns:
+            TaggingValidationResult with validation status and suggestions
+        """
+        try:
+            # Use the AI evaluation agent to evaluate the matches
+            is_valid, overall_confidence, reasoning, improved_result = await self.ai_evaluation_agent.evaluate_tagging_result(tagging_result)
+            
+            # Return validation result using AI-based evaluation
+            return TaggingValidationResult(
+                is_valid=is_valid,
+                feedback=reasoning,
+                suggested_alternatives=[]  # Could include better matches here if needed
+            )
+            
+        except Exception as e:
+            logger.error(f"Error validating tagging: {e}")
+            return TaggingValidationResult(
+                is_valid=False,
+                feedback=f"Error during validation: {str(e)}",
+                suggested_alternatives=[]
             )
     
-    async def find_better_matches(self, 
-                                element_name: str, 
-                                element_description: str, 
-                                all_terms: List[Dict[str, Any]], 
-                                current_matches: List[Dict[str, Any]],
-                                max_suggestions: int = 3) -> List[Dict[str, Any]]:
+    def get_all_terms(self) -> List[BusinessTerm]:
         """
-        Find better matches using LLM reasoning across all available terms.
+        Get all business terms from the collection.
         
-        Args:
-            element_name: Name of the data element
-            element_description: Description of the data element
-            all_terms: All available business terms
-            current_matches: Current matched terms (to exclude)
-            max_suggestions: Maximum number of better matches to suggest
-            
         Returns:
-            List of better matching terms if found
+            List of BusinessTerm objects
         """
         try:
-            # Get LLM from settings
-            llm = get_llm()
-            if not llm:
-                logger.warning("LLM not available for finding better matches")
-                return []
+            term_dicts = self.vector_store.get_all_terms()
             
-            # Format current matches for reference
-            current_matches_text = "\n".join([
-                f"- {term['name']}: {term['description'][:100]}..."
-                for term in current_matches
-            ])
-            
-            # Extract current term IDs to exclude
-            current_ids = set(term.get("id", "") for term in current_matches)
-            
-            # Select a sample of other terms (not in current matches)
-            other_terms = [term for term in all_terms if term["id"] not in current_ids]
-            
-            # If we have too many terms, first filter by basic text similarity
-            if len(other_terms) > 30:
-                filtered_terms = self._pre_filter_terms(element_name, element_description, other_terms, max_terms=30)
-            else:
-                filtered_terms = other_terms
-            
-            # Format terms for prompt
-            terms_text = ""
-            for i, term in enumerate(filtered_terms):
-                terms_text += f"TERM {i+1}:\n"
-                terms_text += f"ID: {term['id']}\n"
-                terms_text += f"Name: {term['name']}\n"
-                terms_text += f"Description: {term['description']}\n"
-                # Add metadata if present
-                if "metadata" in term and term["metadata"]:
-                    for key, value in term["metadata"].items():
-                        terms_text += f"{key}: {value}\n"
-                terms_text += "\n"
-            
-            # Create the prompt for finding better matches
-            prompt = f"""
-            You are an expert in data governance and business terminology with deep domain knowledge.
-            Your task is to identify if any of the following business terms are better matches for a data element
-            than the current matches.
-            
-            Data Element:
-            - Name: {element_name}
-            - Description: {element_description}
-            
-            Current Matches:
-            {current_matches_text}
-            
-            Alternative Terms:
-            {terms_text}
-            
-            Analyze each alternative term and identify up to {max_suggestions} terms that are better matches
-            for the data element than the current matches.
-            
-            For each better match you identify, provide:
-            1. The term number
-            2. Why it's a better match than the current matches
-            3. A similarity score from 0.0 to 1.0 representing how good the match is
-            
-            Format your response as follows:
-            
-            BETTER MATCH #1:
-            Term: [Term number]
-            Reason: [Detailed explanation]
-            Similarity: [Score between 0.0 and 1.0]
-            
-            BETTER MATCH #2:
-            ...
-            
-            If none of the alternative terms are better matches, explicitly state "No better matches found."
-            """
-            
-            # Get response from LLM
-            from langchain_core.output_parsers import StrOutputParser
-            chain = llm | StrOutputParser()
-            
-            # Get reasoning with timeout
-            import asyncio
-            try:
-                reasoning_task = chain.ainvoke(prompt)
-                reasoning = await asyncio.wait_for(reasoning_task, timeout=30.0)
-            except asyncio.TimeoutError:
-                logger.warning("LLM analysis timed out when finding better matches")
-                return []
-            
-            # Check if response indicates no better matches
-            if "no better matches found" in reasoning.lower():
-                logger.info("LLM found no better matches")
-                return []
-            
-            # Extract better matches
-            better_matches = []
-            match_sections = reasoning.split("BETTER MATCH #")
-            
-            for section in match_sections[1:]:  # Skip the first (empty) section
-                # Extract term number
-                term_match = re.search(r"Term:\s*(\d+)", section)
-                if not term_match:
-                    continue
-                    
-                try:
-                    term_idx = int(term_match.group(1)) - 1  # Convert to 0-based
-                    
-                    if term_idx < 0 or term_idx >= len(filtered_terms):
-                        continue
-                        
-                    # Extract similarity score
-                    similarity_match = re.search(r"Similarity:\s*(\d+\.\d+)", section)
-                    similarity = 0.7  # Default if not found
-                    
-                    if similarity_match:
-                        similarity = float(similarity_match.group(1))
-                        similarity = max(0.0, min(similarity, 1.0))  # Ensure in range [0,1]
-                    
-                    # Get the term
-                    term = filtered_terms[term_idx]
-                    
-                    # Create matching term entry
-                    term_entry = {
-                        "id": term["id"],
-                        "name": term["name"],
-                        "description": term["description"],
-                        "similarity": similarity
-                    }
-                    
-                    # Add any metadata
-                    if "metadata" in term:
-                        for key, value in term["metadata"].items():
-                            term_entry[key] = value
-                    
-                    better_matches.append(term_entry)
-                    
-                    if len(better_matches) >= max_suggestions:
-                        break
-                        
-                except (ValueError, IndexError):
-                    continue
-            
-            # Sort by similarity (highest first)
-            better_matches.sort(key=lambda x: x.get("similarity", 0), reverse=True)
-            
-            return better_matches
-            
+            terms = []
+            for term_dict in term_dicts:
+                terms.append(BusinessTerm(
+                    id=term_dict["id"],
+                    name=term_dict["name"],
+                    description=term_dict["description"],
+                    metadata=term_dict.get("metadata", {})
+                ))
+                
+            return terms
         except Exception as e:
-            logger.error(f"Error finding better matches: {e}")
+            logger.error(f"Error retrieving all terms: {e}")
             return []
     
-    def _format_terms_for_prompt(self, matching_terms: List[Dict[str, Any]], confidence_scores: List[float]) -> str:
-        """Format matching terms for use in an LLM prompt."""
-        result = ""
-        for i, (term, score) in enumerate(zip(matching_terms, confidence_scores)):
-            result += f"TERM {i+1} (Similarity: {score:.2f})\n"
-            result += f"Name: {term['name']}\n"
-            result += f"Description: {term['description']}\n"
-            
-            # Include all available metadata
-            if "category" in term:
-                result += f"Category: {term['category']}\n"
-            if "cdm" in term:
-                result += f"CDM: {term['cdm']}\n"
-                
-            result += "\n"
-        return result
-    
-    def _extract_is_valid(self, reasoning: str) -> bool:
-        """Extract whether any terms are valid matches from the reasoning."""
-        # Look for positive indicators
-        positive_indicators = [
-            "good match",
-            "appropriate match",
-            "score >= 7",
-            "score ≥ 7",
-            "score of 7 or higher",
-            "recommended term",
-            "existing term should be used",
-            "no new modeling required",
-            "modeling is not required"
-        ]
-        
-        # Look for negative indicators
-        negative_indicators = [
-            "no good match",
-            "no appropriate match",
-            "modeling is required",
-            "new term should be created",
-            "should be modeled as a new term: yes"
-        ]
-        
-        reasoning_lower = reasoning.lower()
-        
-        # Check for explicit recommendations
-        if "final recommendation:" in reasoning_lower:
-            recommendation_section = reasoning_lower.split("final recommendation:")[1].strip().split("\n")[0]
-            if any(neg in recommendation_section.lower() for neg in ["yes", "new term", "modeling required"]):
-                return False
-            if any(pos in recommendation_section.lower() for pos in ["no", "existing term", "no modeling"]):
-                return True
-        
-        # Check for positive and negative indicators
-        positive_matches = sum(1 for indicator in positive_indicators if indicator in reasoning_lower)
-        negative_matches = sum(1 for indicator in negative_indicators if indicator in reasoning_lower)
-        
-        # If more positive than negative, consider valid
-        return positive_matches > negative_matches
-    
-    def _extract_confidence(self, reasoning: str) -> float:
-        """Extract the overall confidence score from the reasoning."""
-        import re
-        
-        # Look for confidence patterns
-        confidence_patterns = [
-            r"confidence score[^\d]*?(\d+\.\d+)",
-            r"confidence[^\d]*?(\d+\.\d+)",
-            r"overall confidence[^\d]*?(\d+\.\d+)",
-            r"confidence level[^\d]*?(\d+\.\d+)"
-        ]
-        
-        # Try each pattern
-        for pattern in confidence_patterns:
-            matches = re.search(pattern, reasoning.lower())
-            if matches:
-                try:
-                    confidence = float(matches.group(1))
-                    return max(0.0, min(confidence, 1.0))  # Ensure in range [0,1]
-                except ValueError:
-                    pass
-        
-        # If no explicit confidence found, look for scores out of 10
-        score_pattern = r"score[^\d]*?(\d+)(?:\s*\/\s*10| out of 10)"
-        score_matches = re.findall(score_pattern, reasoning.lower())
-        if score_matches:
-            try:
-                # Average the scores and convert to 0-1 scale
-                avg_score = sum(int(score) for score in score_matches) / len(score_matches)
-                return avg_score / 10.0
-            except ValueError:
-                pass
-        
-        # Default confidence based on text sentiment
-        positive_indicators = ["good match", "appropriate", "recommended", "suitable"]
-        negative_indicators = ["poor match", "inappropriate", "not recommended", "unsuitable"]
-        
-        positive_count = sum(reasoning.lower().count(indicator) for indicator in positive_indicators)
-        negative_count = sum(reasoning.lower().count(indicator) for indicator in negative_indicators)
-        
-        # Calculate a sentiment-based confidence
-        total = positive_count + negative_count
-        if total > 0:
-            return 0.5 + (0.4 * (positive_count - negative_count) / total)
-        
-        # Default moderate confidence
-        return 0.5
-    
-    def _extract_best_match_index(self, reasoning: str, matching_terms: List[Dict[str, Any]]) -> Optional[int]:
-        """Extract the index of the best matching term from the reasoning."""
-        import re
-        
-        # Look for explicit best match statements
-        best_match_patterns = [
-            r"best match.*?(?:is|:|=)\s*(?:term|match)?\s*(\d+)",
-            r"term\s*(\d+)\s*is the best match",
-            r"recommend(?:ed)? term\s*(\d+)"
-        ]
-        
-        for pattern in best_match_patterns:
-            matches = re.search(pattern, reasoning.lower())
-            if matches:
-                try:
-                    term_num = int(matches.group(1))
-                    if 1 <= term_num <= len(matching_terms):
-                        return term_num - 1  # Convert to 0-based index
-                except ValueError:
-                    pass
-        
-        # If no explicit mention, look for term names
-        for i, term in enumerate(matching_terms):
-            term_name = term["name"].lower()
-            # Look for patterns like "X is the best match" where X is the term name
-            if re.search(fr"{re.escape(term_name)}\s+is\s+the\s+best\s+match", reasoning.lower()):
-                return i
-        
-        # If no clear best match found, return the one with highest score pattern
-        score_pattern = r"term\s*(\d+).*?score.*?(\d+)"
-        score_matches = re.findall(score_pattern, reasoning.lower())
-        
-        if score_matches:
-            # Find the term with the highest score
-            max_score = 0
-            max_term_idx = None
-            
-            for term_str, score_str in score_matches:
-                try:
-                    term_idx = int(term_str) - 1  # Convert to 0-based
-                    score = int(score_str)
-                    
-                    if score > max_score and 0 <= term_idx < len(matching_terms):
-                        max_score = score
-                        max_term_idx = term_idx
-                except ValueError:
-                    pass
-            
-            return max_term_idx
-        
-        # No best match identified
-        return None
-    
-    def _pre_filter_terms(self, element_name: str, element_description: str, terms: List[Dict[str, Any]], max_terms: int = 30) -> List[Dict[str, Any]]:
+    def get_term_by_id(self, term_id: str) -> Optional[BusinessTerm]:
         """
-        Pre-filter terms by basic text similarity to reduce the number for LLM analysis.
-        This is a simple filtering approach for when we have a large number of terms.
+        Get a business term by its ID.
         
         Args:
-            element_name: Name of the data element
-            element_description: Description of the data element
-            terms: List of terms to filter
-            max_terms: Maximum number of terms to return
+            term_id: Unique identifier of the term
             
         Returns:
-            Filtered list of terms
+            BusinessTerm if found, None otherwise
         """
-        # Simple function to score based on text overlap
-        def text_similarity_score(term):
-            name = term["name"].lower()
-            description = term["description"].lower()
+        try:
+            term_dict = self.vector_store.get_term_by_id(term_id)
             
-            element_name_lower = element_name.lower()
-            element_desc_lower = element_description.lower()
+            if term_dict:
+                return BusinessTerm(
+                    id=term_dict["id"],
+                    name=term_dict["name"],
+                    description=term_dict["description"],
+                    metadata=term_dict.get("metadata", {})
+                )
             
-            # Check for exact or partial name matches
-            name_score = 0
-            if name == element_name_lower:
-                name_score = 1.0
-            elif name in element_name_lower or element_name_lower in name:
-                name_score = 0.8
-            else:
-                # Calculate word overlap
-                name_words = set(name.split())
-                element_words = set(element_name_lower.split())
-                if name_words and element_words:
-                    overlap = len(name_words.intersection(element_words))
-                    name_score = overlap / max(len(name_words), len(element_words))
-            
-            # Check for key terms in description
-            desc_score = 0
-            element_key_words = set([word for word in element_name_lower.split() if len(word) > 3])
-            if element_key_words:
-                matches = sum(1 for word in element_key_words if word in description)
-                desc_score = matches / len(element_key_words) * 0.5
-            
-            # Combine scores (name match is more important)
-            return name_score * 0.7 + desc_score * 0.3
+            return None
+        except Exception as e:
+            logger.error(f"Error retrieving term by ID: {e}")
+            return None
+    
+    def get_term_count(self) -> int:
+        """
+        Get the total count of business terms.
         
-        # Score and sort terms
-        scored_terms = [(term, text_similarity_score(term)) for term in terms]
-        scored_terms.sort(key=lambda x: x[1], reverse=True)
+        Returns:
+            Total number of terms
+        """
+        try:
+            terms = self.vector_store.get_all_terms()
+            return len(terms)
+        except Exception as e:
+            logger.error(f"Error getting term count: {e}")
+            return 0
+    
+    def delete_term(self, term_id: str) -> bool:
+        """
+        Delete a business term by ID.
         
-        # Return top terms
-        return [term for term, score in scored_terms[:max_terms]]
+        Args:
+            term_id: ID of the term to delete
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            return self.vector_store.delete_term(term_id)
+        except Exception as e:
+            logger.error(f"Error deleting term: {e}")
+            return False
+    
+    def delete_all_terms(self) -> int:
+        """
+        Delete all business terms.
+        
+        Returns:
+            Number of terms deleted
+        """
+        try:
+            return self.vector_store.delete_all_terms()
+        except Exception as e:
+            logger.error(f"Error deleting all terms: {e}")
+            return 0
+    
+    def search_terms(self, query: str, limit: int = 20) -> List[BusinessTerm]:
+        """
+        Search for business terms by name or description.
+        
+        Args:
+            query: Search query
+            limit: Maximum number of results
+            
+        Returns:
+            List of matching BusinessTerm objects
+        """
+        try:
+            term_dicts = self.vector_store.search_terms(query, limit)
+            
+            results = []
+            for term_dict in term_dicts:
+                results.append(BusinessTerm(
+                    id=term_dict["id"],
+                    name=term_dict["name"],
+                    description=term_dict["description"],
+                    metadata=term_dict.get("metadata", {})
+                ))
+            
+            return results
+        except Exception as e:
+            logger.error(f"Error searching terms: {e}")
+            return []
+    
+    def compute_similarity(self, text1: str, text2: str) -> float:
+        """
+        Compute semantic similarity between two text strings.
+        
+        Args:
+            text1: First text
+            text2: Second text
+            
+        Returns:
+            Similarity score between 0 and 1
+        """
+        try:
+            # Generate embeddings
+            doc1 = MyDocument(id="temp1", text=text1)
+            doc2 = MyDocument(id="temp2", text=text2)
+            
+            doc1_with_embedding = self.embedding_client.generate_embeddings(doc1)
+            doc2_with_embedding = self.embedding_client.generate_embeddings(doc2)
+            
+            if not doc1_with_embedding.embedding or not doc2_with_embedding.embedding:
+                logger.warning("Could not generate embeddings for similarity computation")
+                return 0.0
+            
+            # Compute cosine similarity using vector store
+            return self.vector_store.compute_cosine_similarity(
+                doc1_with_embedding.embedding,
+                doc2_with_embedding.embedding
+            )
+        except Exception as e:
+            logger.error(f"Error computing similarity: {e}")
+            return 0.0
+    
+    def get_vector_store_info(self) -> Dict[str, Any]:
+        """
+        Get information about the current vector store.
+        
+        Returns:
+            Dict containing vector store information
+        """
+        try:
+            # Get vector store health check
+            health = self.vector_store.health_check()
+            
+            # Add vector store type
+            info = {
+                "type": self.vector_db_type,
+                "status": health.get("status", "unknown"),
+                "term_count": health.get("term_count", 0)
+            }
+            
+            # Add database-specific details
+            if self.vector_db_type == "postgresql":
+                # Get PostgreSQL details
+                db_health = self.db_manager.health_check()
+                info.update({
+                    "database": {
+                        "host": self.env.get("PG_HOST", "localhost"),
+                        "port": int(self.env.get("PG_PORT", "5432")),
+                        "db": self.env.get("PG_DB", "metadata_db"),
+                        "schema": self.db_manager.schema_name,
+                        "pgvector_enabled": db_health.get("vector_enabled", False),
+                        "version": db_health.get("version", "unknown")
+                    }
+                })
+            elif self.vector_db_type == "chroma":
+                info.update({
+                    "chroma": {
+                        "persist_dir": self.env.get("CHROMA_PERSIST_DIR", "./data/chroma_db"),
+                        "collection": self.env.get("CHROMA_COLLECTION", "business_terms")
+                    }
+                })
+            
+            return info
+        except Exception as e:
+            logger.error(f"Error getting vector store info: {e}")
+            return {
+                "type": self.vector_db_type,
+                "status": "error",
+                "error": str(e)
+            }
