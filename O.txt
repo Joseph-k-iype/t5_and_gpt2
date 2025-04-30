@@ -11,25 +11,20 @@ import os
 import sys
 import logging
 import argparse
+import tempfile
 from typing import Optional, Tuple, List, Dict, Any
-import pandas as pd
-import uuid
-import csv
 import time
-import json
-import numpy as np
+import uuid
 from pathlib import Path
-import chromadb
-from chromadb.config import Settings
+import shutil
 
 # Add parent directory to path to import app modules
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from app.core.business_terms import BusinessTermManager, ConceptRelationship
-from app.core.embedding import MyDocument, EmbeddingClient
+from app.core.business_terms import BusinessTermManager
+from app.core.embedding import EmbeddingClient
 from app.config.environment import get_os_env
 from app.config.settings import get_vector_store
-from app.core.vector_store_chroma import ChromaDBVectorStore
 
 # Set up logging
 logging.basicConfig(
@@ -39,13 +34,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def check_dependencies():
-    """Check if required dependencies are installed."""
+def install_chardet():
+    """Install chardet if not already available."""
     try:
         import chardet
         return True
     except ImportError:
-        logger.error("chardet library not installed. Installing now...")
+        logger.info("chardet library not installed. Installing now...")
         try:
             import subprocess
             subprocess.check_call([sys.executable, "-m", "pip", "install", "chardet"])
@@ -59,7 +54,7 @@ def check_dependencies():
 
 def detect_encoding(file_path: str) -> Tuple[str, float]:
     """
-    Detect the encoding of a file using chardet.
+    Detect the encoding of a file using chardet with appropriate sample size.
     
     Args:
         file_path: Path to the file
@@ -68,18 +63,35 @@ def detect_encoding(file_path: str) -> Tuple[str, float]:
         Tuple containing the detected encoding and confidence
     """
     try:
+        # Ensure chardet is installed
         import chardet
     except ImportError:
-        logger.warning("chardet not available. Defaulting to UTF-8.")
-        return "utf-8", 0.0
+        if not install_chardet():
+            logger.warning("Unable to install chardet. Using default encoding 'latin1' which rarely fails.")
+            return "latin1", 0.0
+        import chardet
         
     try:
         with open(file_path, 'rb') as f:
-            # Read a sample of the file for detection
-            # For large files, we don't need to read the whole file
+            # Read an appropriate sample size
             file_size = os.path.getsize(file_path)
-            # Read up to 1MB or the entire file for smaller files
-            sample = f.read(min(1024 * 1024, file_size))
+            
+            # For small files (<1MB), read the whole file
+            # For larger files, read up to 1MB from the beginning, middle, and end
+            if file_size <= 1024 * 1024:  # 1MB
+                sample = f.read()
+            else:
+                # Read beginning (384KB), middle (384KB), and end (384KB)
+                beginning = f.read(384 * 1024)
+                
+                f.seek(file_size // 2 - 192 * 1024)
+                middle = f.read(384 * 1024)
+                
+                f.seek(max(0, file_size - 384 * 1024))
+                end = f.read(384 * 1024)
+                
+                # Combine samples
+                sample = beginning + middle + end
         
         result = chardet.detect(sample)
         encoding = result['encoding']
@@ -89,560 +101,325 @@ def detect_encoding(file_path: str) -> Tuple[str, float]:
         return encoding, confidence
     except Exception as e:
         logger.error(f"Error detecting encoding: {e}")
-        return "utf-8", 0.0
+        logger.warning("Using default encoding 'latin1' which rarely fails")
+        return "latin1", 0.0
 
-def validate_csv(file_path: str) -> bool:
+def preprocess_csv(file_path: str, output_path: Optional[str] = None, 
+                   remove_null_bytes: bool = True, remove_control_chars: bool = False,
+                   use_temp: bool = True) -> str:
     """
-    Validate the CSV file has the required columns.
+    Preprocess a CSV file to remove problematic characters.
+    
+    Args:
+        file_path: Path to the CSV file
+        output_path: Path to save the cleaned file (optional)
+        remove_null_bytes: Whether to remove null bytes
+        remove_control_chars: Whether to remove control characters
+        use_temp: Whether to use a temporary file if output_path is not provided
+        
+    Returns:
+        Path to the cleaned CSV file
+    """
+    logger.info(f"Preprocessing CSV file: {file_path}")
+    
+    if not os.path.exists(file_path):
+        logger.error(f"File not found: {file_path}")
+        return file_path
+    
+    # Determine output path
+    if not output_path:
+        if use_temp:
+            # Use a temporary file
+            fd, output_path = tempfile.mkstemp(suffix='.csv')
+            os.close(fd)  # Close the file descriptor
+        else:
+            # Use the original filename with .cleaned extension
+            file_name = os.path.basename(file_path)
+            dir_name = os.path.dirname(file_path)
+            base_name, ext = os.path.splitext(file_name)
+            output_path = os.path.join(dir_name, f"{base_name}.cleaned{ext}")
+    
+    try:
+        # Read file in binary mode
+        with open(file_path, 'rb') as f:
+            content = f.read()
+        
+        cleaned_content = content
+        
+        # Remove null bytes if requested
+        if remove_null_bytes:
+            original_size = len(cleaned_content)
+            cleaned_content = cleaned_content.replace(b'\x00', b'')
+            new_size = len(cleaned_content)
+            null_bytes_removed = original_size - new_size
+            if null_bytes_removed > 0:
+                logger.info(f"Removed {null_bytes_removed} null bytes from the file")
+        
+        # Remove control characters if requested
+        if remove_control_chars:
+            original_size = len(cleaned_content)
+            # Replace control characters (except normal whitespace: \t, \n, \r)
+            replacements = []
+            for i in range(32):
+                if i not in (9, 10, 13):  # Tab, LF, CR
+                    replacements.append((bytes([i]), b''))
+            
+            for old, new in replacements:
+                cleaned_content = cleaned_content.replace(old, new)
+            
+            new_size = len(cleaned_content)
+            control_chars_removed = original_size - new_size
+            if control_chars_removed > 0:
+                logger.info(f"Removed {control_chars_removed} control characters from the file")
+        
+        # Only write a new file if changes were made
+        if cleaned_content != content:
+            with open(output_path, 'wb') as f:
+                f.write(cleaned_content)
+            logger.info(f"Cleaned CSV file saved to {output_path}")
+            return output_path
+        else:
+            logger.info("No problematic characters found in the file, using original")
+            if output_path != file_path and os.path.exists(output_path):
+                # Remove the empty output file if it was created
+                os.remove(output_path)
+            return file_path
+            
+    except Exception as e:
+        logger.error(f"Error preprocessing CSV: {e}")
+        if output_path != file_path and os.path.exists(output_path):
+            # Remove the output file if it was created
+            os.remove(output_path)
+        return file_path
+
+def validate_csv(file_path: str) -> Tuple[bool, Optional[str]]:
+    """
+    Validate the CSV file has the required columns and determine its encoding.
     
     Args:
         file_path: Path to the CSV file
         
     Returns:
-        bool: True if valid, False otherwise
+        Tuple containing (is_valid, detected_encoding)
     """
-    try:
-        # Detect file encoding
-        encoding, confidence = detect_encoding(file_path)
+    if not os.path.exists(file_path):
+        logger.error(f"File doesn't exist: {file_path}")
+        return False, None
         
-        if confidence < 0.7:
-            logger.warning(f"Low confidence in encoding detection ({confidence:.2f})")
+    # Detect file encoding
+    encoding, confidence = detect_encoding(file_path)
+    
+    if confidence < 0.7:
+        logger.warning(f"Low confidence in encoding detection ({confidence:.2f})")
         
-        # Try with detected encoding first
+    # Define a function to check columns with a specific encoding
+    def check_columns_with_encoding(enc):
         try:
-            df = pd.read_csv(file_path, nrows=1, encoding=encoding)
-        except Exception as e:
-            logger.warning(f"Failed to read with detected encoding {encoding}: {e}")
-            
-            # Fallback encodings to try
-            fallback_encodings = ['utf-8', 'latin1', 'iso-8859-1', 'cp1252']
-            for enc in fallback_encodings:
-                if enc != encoding:  # Skip if already tried
-                    try:
-                        logger.info(f"Trying with encoding: {enc}")
-                        df = pd.read_csv(file_path, nrows=1, encoding=enc)
-                        logger.info(f"Successfully read with encoding: {enc}")
-                        encoding = enc  # Update to the working encoding
-                        break
-                    except Exception:
-                        continue
-            else:
-                logger.error("Failed to read CSV with all attempted encodings")
-                return False
-        
-        # Check for required columns - using PBT_NAME, PBT_DEFINITION, CDM format
-        # Define all possible column name variations we support
-        name_columns = ['PBT_NAME', 'NAME', 'TERM_NAME', 'BUSINESS_TERM_NAME', 'TERM']
-        definition_columns = ['PBT_DEFINITION', 'DEFINITION', 'TERM_DEFINITION', 'DESCRIPTION']
-        
-        # Check if any of the name column variants exist
-        name_col_found = any(col in df.columns for col in name_columns)
-        definition_col_found = any(col in df.columns for col in definition_columns)
-        
-        if not name_col_found:
-            logger.error(f"Missing name column. Expected one of: {', '.join(name_columns)}")
+            import csv
+            with open(file_path, 'r', encoding=enc, errors='replace') as csvfile:
+                # Just read the header row
+                reader = csv.DictReader(csvfile)
+                headers = reader.fieldnames
+                
+                if not headers:
+                    logger.warning(f"No headers found with encoding {enc}")
+                    return False
+                
+                # Check for required columns using any of their possible names
+                name_columns = ['PBT_NAME', 'NAME', 'TERM_NAME', 'BUSINESS_TERM_NAME', 'TERM']
+                definition_columns = ['PBT_DEFINITION', 'DEFINITION', 'TERM_DEFINITION', 'DESCRIPTION']
+                
+                name_found = any(col in headers for col in name_columns)
+                definition_found = any(col in headers for col in definition_columns)
+                
+                if not name_found:
+                    logger.warning(f"Missing name column with encoding {enc}. Expected one of: {', '.join(name_columns)}")
+                    return False
+                
+                if not definition_found:
+                    logger.warning(f"Missing definition column with encoding {enc}. Expected one of: {', '.join(definition_columns)}")
+                    return False
+                
+                logger.info(f"CSV headers with encoding {enc}: {', '.join(headers)}")
+                return True
+        except UnicodeDecodeError:
+            logger.warning(f"Cannot decode file with encoding {enc}")
             return False
-            
-        if not definition_col_found:
-            logger.error(f"Missing definition column. Expected one of: {', '.join(definition_columns)}")
-            return False
-        
-        # Store the detected encoding in the environment for later use
-        os.environ["CSV_DETECTED_ENCODING"] = encoding
-        
-        # Print column summary
-        logger.info(f"CSV columns found: {', '.join(df.columns)}")
-        return True
-    except Exception as e:
-        logger.error(f"Error validating CSV file: {e}")
-        return False
-
-def clean_csv(input_file: str, output_file: Optional[str] = None) -> Optional[str]:
-    """
-    Clean and prepare CSV file for import.
-    
-    Args:
-        input_file: Path to the input CSV file
-        output_file: Path to save the cleaned CSV file, if not provided, a temp file is created
-        
-    Returns:
-        str: Path to the cleaned CSV file, or None if cleaning failed
-    """
-    try:
-        if not os.path.exists(input_file):
-            logger.error(f"Input file doesn't exist: {input_file}")
-            return None
-            
-        # Create output file path if not provided
-        if not output_file:
-            basename = os.path.basename(input_file)
-            dirname = os.path.dirname(input_file)
-            filename, ext = os.path.splitext(basename)
-            output_file = os.path.join(dirname, f"{filename}_cleaned{ext}")
-        
-        # Get the detected encoding from environment or detect it
-        encoding = os.environ.get("CSV_DETECTED_ENCODING")
-        if not encoding:
-            encoding, _ = detect_encoding(input_file)
-        
-        logger.info(f"Reading CSV with encoding: {encoding}")
-        
-        # Read the CSV file with detected encoding
-        try:
-            df = pd.read_csv(input_file, encoding=encoding)
         except Exception as e:
-            logger.warning(f"Error reading with encoding {encoding}: {e}")
-            # Fallback to latin1 which rarely fails (but might not interpret characters correctly)
-            logger.info("Falling back to latin1 encoding")
-            df = pd.read_csv(input_file, encoding='latin1')
-        
-        # Basic cleaning: remove extra whitespace, drop completely empty rows
-        for col in df.columns:
-            if df[col].dtype == 'object':
-                df[col] = df[col].str.strip()
-        
-        df = df.dropna(how='all')
-        
-        # Map standard column names
-        name_columns = ['PBT_NAME', 'NAME', 'TERM_NAME', 'BUSINESS_TERM_NAME', 'TERM']
-        definition_columns = ['PBT_DEFINITION', 'DEFINITION', 'TERM_DEFINITION', 'DESCRIPTION']
-        cdm_columns = ['CDM', 'DOMAIN', 'SUBJECT_AREA']
-        category_columns = ['CATEGORY', 'TERM_CATEGORY', 'TYPE']
-        
-        # Rename columns to match our expected format
-        column_mapping = {}
-        headers = df.columns.tolist()
-        
-        # Find and map name column
-        for col in name_columns:
-            if col in headers:
-                column_mapping[col] = 'name'
-                break
-        
-        # Find and map definition column
-        for col in definition_columns:
-            if col in headers:
-                column_mapping[col] = 'description'
-                break
-        
-        # Find and map CDM column if it exists
-        for col in cdm_columns:
-            if col in headers:
-                column_mapping[col] = 'cdm'
-                break
-        
-        # Find and map category column if it exists
-        for col in category_columns:
-            if col in headers:
-                column_mapping[col] = 'category'
-                break
-        
-        # If columns need to be renamed, do it
-        if column_mapping:
-            df = df.rename(columns=column_mapping)
-        
-        # Ensure ID column exists
-        if 'id' not in df.columns:
-            logger.info("Adding 'id' column with generated UUIDs")
-            df['id'] = [f"term-{uuid.uuid4()}" for _ in range(len(df))]
-        
-        # Ensure required columns exist
-        for col in ['name', 'description']:
-            if col not in df.columns:
-                logger.error(f"Required column '{col}' missing from CSV after mapping")
-                return None
-        
-        # Handle missing values 
-        df['name'] = df['name'].fillna('')
-        df['description'] = df['description'].fillna('')
-        
-        # Filter rows with empty name or description
-        valid_rows = (df['name'] != '') & (df['description'] != '')
-        invalid_count = (~valid_rows).sum()
-        
-        if invalid_count > 0:
-            logger.warning(f"Removing {invalid_count} rows with empty name or description")
-            df = df[valid_rows]
-        
-        # Preprocessing for better import
-        # Convert all metadata columns to strings
-        metadata_cols = [col for col in df.columns if col not in ['id', 'name', 'description']]
-        for col in metadata_cols:
-            df[col] = df[col].astype(str)
-        
-        # Save cleaned CSV with UTF-8 encoding for consistency
-        df.to_csv(output_file, index=False, encoding='utf-8')
-        logger.info(f"Cleaned CSV saved to {output_file}")
-        
-        return output_file
-    except Exception as e:
-        logger.error(f"Error cleaning CSV: {e}")
-        return None
+            logger.warning(f"Error checking CSV with encoding {enc}: {e}")
+            return False
+    
+    # Try with detected encoding first
+    if check_columns_with_encoding(encoding):
+        return True, encoding
+    
+    # Try with fallback encodings
+    fallback_encodings = ['utf-8', 'latin1', 'cp1252', 'iso-8859-1', 'utf-16']
+    for enc in fallback_encodings:
+        if enc != encoding:  # Skip if already tried
+            logger.info(f"Trying validation with fallback encoding: {enc}")
+            if check_columns_with_encoding(enc):
+                return True, enc
+    
+    logger.error("CSV validation failed with all attempted encodings")
+    return False, None
 
-def setup_chroma_with_hnsw(persist_dir: str, collection_name: str) -> Optional[ChromaDBVectorStore]:
-    """
-    Set up ChromaDB with optimized HNSW configuration.
+def print_term_counts(term_manager):
+    """Print the distribution of terms by CDM, domain, and other categories."""
+    terms = term_manager.get_all_terms()
+    if not terms:
+        logger.info("No terms in the database")
+        return
+        
+    # Count by CDM
+    cdm_counts = {}
+    domain_counts = {}
+    total_terms = len(terms)
     
-    Args:
-        persist_dir: Directory for persistent storage
-        collection_name: Name of the ChromaDB collection
+    for term in terms:
+        metadata = term.metadata if hasattr(term, 'metadata') else {}
         
-    Returns:
-        ChromaDBVectorStore instance or None if setup fails
-    """
-    try:
-        # Ensure the persist directory exists
-        os.makedirs(persist_dir, exist_ok=True)
+        # Count by CDM
+        cdm = metadata.get('cdm', 'Unknown')
+        cdm_counts[cdm] = cdm_counts.get(cdm, 0) + 1
         
-        # Use our enhanced ChromaDBVectorStore that configures HNSW properly
-        vector_store = ChromaDBVectorStore(
-            collection_name=collection_name,
-            persist_dir=persist_dir
-        )
-        
-        # Test if the vector store is working properly
-        health = vector_store.health_check()
-        if health["status"] != "healthy":
-            logger.error(f"Vector store health check failed: {health.get('error', 'Unknown error')}")
-            return None
-            
-        logger.info(f"ChromaDB set up successfully with collection: {collection_name}")
-        logger.info(f"Current term count: {health.get('term_count', 0)}")
-        
-        return vector_store
-    except Exception as e:
-        logger.error(f"Error setting up ChromaDB: {e}")
-        return None
-
-def import_terms_in_batches(
-    file_path: str, 
-    embedding_client: EmbeddingClient, 
-    vector_store: ChromaDBVectorStore,
-    batch_size: int = 100, 
-    delete_missing: bool = True
-) -> Tuple[int, int, int]:
-    """
-    Import terms from CSV in optimized batches, with progress tracking.
+        # Count by domain/category if available
+        domain = metadata.get('category', metadata.get('domain', 'Unknown'))
+        domain_counts[domain] = domain_counts.get(domain, 0) + 1
     
-    Args:
-        file_path: Path to the CSV file
-        embedding_client: EmbeddingClient instance
-        vector_store: ChromaDBVectorStore instance
-        batch_size: Number of terms per batch
-        delete_missing: Whether to delete terms not in CSV
-        
-    Returns:
-        Tuple of (added_count, updated_count, deleted_count)
-    """
-    try:
-        # Read the CSV file
-        df = pd.read_csv(file_path, encoding='utf-8')
-        
-        # Get existing terms for tracking what needs to be deleted later
-        existing_terms = {}
-        for term in vector_store.get_all_terms():
-            term_key = f"{term['name']}::{term['description']}"
-            existing_terms[term_key] = term['id']
-        
-        # Track terms found in CSV for deletion tracking
-        csv_term_keys = set()
-        
-        # Progress tracking
-        total_rows = len(df)
-        added_count = 0
-        updated_count = 0
-        skipped_count = 0
-        error_count = 0
-        start_time = time.time()
-        logger.info(f"Starting import of {total_rows} terms in batches of {batch_size}")
-        
-        # Process in batches
-        for batch_start in range(0, total_rows, batch_size):
-            batch_end = min(batch_start + batch_size, total_rows)
-            batch_df = df.iloc[batch_start:batch_end]
-            
-            # Track time for ETA calculation
-            batch_start_time = time.time()
-            
-            # Prepare batch data
-            docs_to_embed = []
-            batch_terms = []
-            
-            for _, row in batch_df.iterrows():
-                # Get required fields
-                term_id = str(row.get('id', '')).strip()
-                name = str(row['name']).strip()
-                description = str(row['description']).strip()
-                
-                # Skip rows with empty name or description
-                if not name or not description:
-                    skipped_count += 1
-                    continue
-                
-                # Generate a unique ID if not provided
-                if not term_id:
-                    term_id = f"term-{uuid.uuid4()}"
-                
-                # Create term key for tracking
-                term_key = f"{name}::{description}"
-                csv_term_keys.add(term_key)
-                
-                # Extract metadata from other columns
-                metadata = {}
-                for col in row.index:
-                    if col not in ['id', 'name', 'description'] and not pd.isna(row[col]):
-                        metadata[col] = str(row[col])
-                
-                # Store term info for later
-                batch_terms.append({
-                    "id": term_id,
-                    "name": name,
-                    "description": description,
-                    "term_key": term_key,
-                    "metadata": metadata
-                })
-                
-                # Create document for embedding
-                doc = MyDocument(
-                    id=term_id,
-                    text=f"{name}. {description}"
-                )
-                docs_to_embed.append(doc)
-            
-            # Generate embeddings in batch for better efficiency
-            docs_with_embeddings = embedding_client.batch_generate_embeddings(docs_to_embed)
-            
-            # Create vectors batch for ChromaDB
-            vectors_batch = []
-            for i, doc_with_embedding in enumerate(docs_with_embeddings):
-                term = batch_terms[i]
-                
-                if not doc_with_embedding.embedding:
-                    logger.warning(f"Skipping term without embedding: {term['name']}")
-                    error_count += 1
-                    continue
-                
-                vectors_batch.append({
-                    "id": term["id"],
-                    "name": term["name"],
-                    "description": term["description"],
-                    "embedding": doc_with_embedding.embedding,
-                    "metadata": term.get("metadata", {})
-                })
-            
-            # Store vectors in ChromaDB
-            if vectors_batch:
-                for term in vectors_batch:
-                    term_key = f"{term['name']}::{term['description']}"
-                    # Check if term exists and needs update or is new
-                    if term_key in existing_terms:
-                        if existing_terms[term_key] == term['id']:
-                            # Same ID, this is an update
-                            updated_count += 1
-                        else:
-                            # Different ID, treat as a new term
-                            added_count += 1
-                    else:
-                        # New term
-                        added_count += 1
-                
-                # Batch store the vectors
-                inserted = vector_store.batch_store_vectors(vectors_batch)
-                
-                if inserted != len(vectors_batch):
-                    logger.warning(f"Expected to insert {len(vectors_batch)} terms, but inserted {inserted}")
-            
-            # Calculate and log progress
-            batch_duration = time.time() - batch_start_time
-            elapsed_total = time.time() - start_time
-            progress = batch_end / total_rows * 100
-            
-            # Calculate ETA
-            if batch_end > batch_start:
-                items_per_second = (batch_end - batch_start) / batch_duration
-                remaining_items = total_rows - batch_end
-                eta_seconds = remaining_items / items_per_second if items_per_second > 0 else 0
-                eta_str = time.strftime("%H:%M:%S", time.gmtime(eta_seconds))
-            else:
-                eta_str = "Unknown"
-                items_per_second = 0
-            
-            logger.info(
-                f"Progress: {progress:.1f}% - Batch {batch_start//batch_size + 1}/{(total_rows + batch_size - 1)//batch_size} - "
-                f"Added: {added_count}, Updated: {updated_count}, Skipped: {skipped_count}, "
-                f"Errors: {error_count} - Rate: {items_per_second:.1f} terms/sec - ETA: {eta_str}"
-            )
-        
-        # Handle deletion of terms not in the CSV
-        deleted_count = 0
-        if delete_missing:
-            terms_to_delete = []
-            for term_key, term_id in existing_terms.items():
-                if term_key not in csv_term_keys:
-                    terms_to_delete.append(term_id)
-            
-            if terms_to_delete:
-                logger.info(f"Deleting {len(terms_to_delete)} terms not found in CSV")
-                
-                # Delete in batches of 20 to avoid overwhelming the system
-                for i in range(0, len(terms_to_delete), 20):
-                    batch = terms_to_delete[i:i+20]
-                    for term_id in batch:
-                        if vector_store.delete_term(term_id):
-                            deleted_count += 1
-                    
-                    if i % 100 == 0 and i > 0:
-                        logger.info(f"Deleted {deleted_count}/{len(terms_to_delete)} terms")
-        
-        # Log final summary
-        total_time = time.time() - start_time
-        logger.info(
-            f"Import complete: Added {added_count}, Updated {updated_count}, "
-            f"Skipped {skipped_count}, Deleted {deleted_count}, "
-            f"Errors {error_count} in {total_time:.1f} seconds "
-            f"({total_rows/total_time:.1f} terms/sec)"
-        )
-        
-        return added_count, updated_count, deleted_count
+    # Print summary
+    logger.info(f"Term Distribution Summary (Total: {total_terms})")
     
-    except Exception as e:
-        logger.error(f"Error importing terms: {e}")
-        raise
-
-def initialize_concept_relationships(vector_store: ChromaDBVectorStore):
-    """
-    Initialize concept relationships for better term matching.
+    if cdm_counts:
+        logger.info("By CDM:")
+        for cdm, count in sorted(cdm_counts.items(), key=lambda x: x[1], reverse=True):
+            percentage = (count / total_terms) * 100
+            logger.info(f"  {cdm}: {count} ({percentage:.1f}%)")
     
-    Args:
-        vector_store: ChromaDBVectorStore instance
-    """
-    try:
-        # Get all terms
-        all_terms = vector_store.get_all_terms()
+    if domain_counts:
+        logger.info("By Domain/Category:")
+        for domain, count in sorted(domain_counts.items(), key=lambda x: x[1], reverse=True)[:10]:  # Top 10
+            percentage = (count / total_terms) * 100
+            logger.info(f"  {domain}: {count} ({percentage:.1f}%)")
         
-        # Initialize concept relationships
-        concept_relationships = ConceptRelationship()
-        concept_relationships.initialize_from_terms(all_terms)
-        
-        logger.info(
-            f"Initialized concept relationships with "
-            f"{len(concept_relationships.concept_map)} concepts and "
-            f"{sum(len(v) for v in concept_relationships.related_terms.values())} relationships"
-        )
-        
-        # Log category and CDM information
-        logger.info(f"Found {len(concept_relationships.category_concepts)} categories")
-        logger.info(f"Found {len(concept_relationships.cdm_concepts)} CDMs")
-        
-        # Log statistics for important categories and CDMs
-        category_stats = sorted(
-            [(cat, len(terms)) for cat, terms in concept_relationships.category_concepts.items()],
-            key=lambda x: x[1],
-            reverse=True
-        )
-        
-        cdm_stats = sorted(
-            [(cdm, len(terms)) for cdm, terms in concept_relationships.cdm_concepts.items()],
-            key=lambda x: x[1],
-            reverse=True
-        )
-        
-        # Log top categories
-        if category_stats:
-            logger.info("Top categories:")
-            for cat, count in category_stats[:5]:
-                logger.info(f"  - {cat}: {count} terms")
-        
-        # Log top CDMs
-        if cdm_stats:
-            logger.info("Top CDMs:")
-            for cdm, count in cdm_stats[:5]:
-                logger.info(f"  - {cdm}: {count} terms")
-        
-        return concept_relationships
-    except Exception as e:
-        logger.error(f"Error initializing concept relationships: {e}")
-        return None
+        # If there are more than 10 domains, show count of others
+        if len(domain_counts) > 10:
+            other_count = sum([count for domain, count in domain_counts.items() 
+                               if domain not in [d for d, _ in sorted(domain_counts.items(), 
+                                                                    key=lambda x: x[1], 
+                                                                    reverse=True)[:10]]])
+            percentage = (other_count / total_terms) * 100
+            logger.info(f"  Others: {other_count} ({percentage:.1f}%)")
 
 def main():
-    # Ensure all dependencies are installed
-    if not check_dependencies():
-        return 1
+    # Ensure chardet is available
+    install_chardet()
         
     parser = argparse.ArgumentParser(description="Import business terms from a CSV file")
     parser.add_argument("csv_file", help="Path to the CSV file containing business terms")
     parser.add_argument("--batch-size", type=int, default=100, help="Number of terms to process in each batch")
-    parser.add_argument("--clean", action="store_true", help="Clean and prepare the CSV file before import")
     parser.add_argument("--validate-only", action="store_true", help="Only validate the CSV file, don't import")
-    parser.add_argument("--output", help="Path to save the cleaned CSV file")
-    parser.add_argument("--chroma-dir", help="Override the ChromaDB directory")
-    parser.add_argument("--chroma-collection", help="Override the ChromaDB collection name")
     parser.add_argument("--encoding", help="Force a specific encoding instead of auto-detection")
     parser.add_argument("--no-delete", action="store_true", help="Don't delete terms not found in the CSV")
-    parser.add_argument("--hnsw-params", type=str, help="JSON string with HNSW parameters for ChromaDB")
+    parser.add_argument("--chroma-dir", help="Override the ChromaDB directory")
+    parser.add_argument("--chroma-collection", help="Override the ChromaDB collection name")
+    parser.add_argument("--clean", action="store_true", help="Preprocess the CSV to remove problematic characters")
+    parser.add_argument("--clean-output", help="Path to save the cleaned CSV file (only with --clean)")
+    parser.add_argument("--remove-control-chars", action="store_true", help="Remove all control characters during preprocessing (only with --clean)")
+    parser.add_argument("--embedding-model", default=os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small"),
+                        help="Embedding model to use (default: text-embedding-3-small)")
+    parser.add_argument("--summary", action="store_true", help="Print a summary of term distribution after import")
     
     args = parser.parse_args()
     
     # Set environment variables if overrides provided
-    chroma_dir = args.chroma_dir or os.environ.get("CHROMA_PERSIST_DIR", "./data/chroma_db")
     if args.chroma_dir:
         os.environ["CHROMA_PERSIST_DIR"] = args.chroma_dir
         logger.info(f"Using ChromaDB directory: {args.chroma_dir}")
     
-    chroma_collection = args.chroma_collection or os.environ.get("CHROMA_COLLECTION", "business_terms")
     if args.chroma_collection:
         os.environ["CHROMA_COLLECTION"] = args.chroma_collection
         logger.info(f"Using ChromaDB collection: {args.chroma_collection}")
-        
-    # Set encoding if provided
-    if args.encoding:
-        os.environ["CSV_DETECTED_ENCODING"] = args.encoding
-        logger.info(f"Using forced encoding: {args.encoding}")
     
-    # Validate the CSV file
-    if not validate_csv(args.csv_file):
+    if args.embedding_model:
+        os.environ["EMBEDDING_MODEL"] = args.embedding_model
+        logger.info(f"Using embedding model: {args.embedding_model}")
+    
+    # Process the file first if clean option is selected
+    csv_path_to_use = args.csv_file
+    if args.clean:
+        logger.info("Preprocessing CSV file to remove problematic characters")
+        csv_path_to_use = preprocess_csv(
+            args.csv_file, 
+            output_path=args.clean_output,
+            remove_null_bytes=True,
+            remove_control_chars=args.remove_control_chars,
+            use_temp=args.clean_output is None
+        )
+    
+    # Validate the CSV file and determine encoding
+    is_valid, detected_encoding = validate_csv(csv_path_to_use)
+    if not is_valid:
         logger.error("CSV file validation failed")
         return 1
     
     if args.validate_only:
         logger.info("CSV file validation successful")
+        logger.info(f"Detected encoding: {detected_encoding}")
         return 0
     
-    # Clean the CSV file if requested
-    csv_file_to_import = args.csv_file
-    if args.clean:
-        cleaned_file = clean_csv(args.csv_file, args.output)
-        if not cleaned_file:
-            logger.error("CSV cleaning failed")
-            return 1
-        csv_file_to_import = cleaned_file
+    # Determine which encoding to use
+    # Always prioritize explicit encoding if provided, otherwise use 'auto'
+    encoding_to_use = args.encoding if args.encoding else "auto"
+    logger.info(f"Using encoding: {encoding_to_use}")
     
-    # Set up ChromaDB with optimized HNSW configuration
-    vector_store = setup_chroma_with_hnsw(chroma_dir, chroma_collection)
-    if not vector_store:
-        logger.error("Failed to set up ChromaDB")
-        return 1
-    
-    # Create embedding client
-    embedding_client = EmbeddingClient()
-    
-    # Import the terms
+    # Initialize business term manager and perform import
     try:
-        added, updated, deleted = import_terms_in_batches(
-            file_path=csv_file_to_import,
-            embedding_client=embedding_client,
-            vector_store=vector_store,
-            batch_size=args.batch_size,
-            delete_missing=not args.no_delete
+        business_term_manager = BusinessTermManager()
+        
+        # Get initial term count for comparison
+        initial_term_count = business_term_manager.get_term_count()
+        logger.info(f"Initial term count: {initial_term_count}")
+        
+        # Import the terms
+        start_time = time.time()
+        added_count = business_term_manager.import_terms_from_csv(
+            csv_path=csv_path_to_use,
+            encoding=encoding_to_use,
+            batch_size=args.batch_size
         )
         
-        # Initialize concept relationships for better term matching
-        initialize_concept_relationships(vector_store)
+        total_time = time.time() - start_time
+        term_count = business_term_manager.get_term_count()
         
-        logger.info(f"Import completed successfully: {added} added, {updated} updated, {deleted} deleted")
+        logger.info(f"Import completed successfully in {total_time:.2f} seconds")
+        logger.info(f"Added {added_count} terms")
+        logger.info(f"Total terms in database: {term_count}")
+        
+        # Print term distribution summary if requested
+        if args.summary:
+            print_term_counts(business_term_manager)
+        
+        # Clean up the temporary file if we created one
+        if args.clean and args.clean_output is None and csv_path_to_use != args.csv_file:
+            try:
+                os.remove(csv_path_to_use)
+                logger.info(f"Removed temporary file: {csv_path_to_use}")
+            except Exception as e:
+                logger.warning(f"Could not remove temporary file {csv_path_to_use}: {e}")
+        
         return 0
     except Exception as e:
         logger.error(f"Import failed: {e}")
+        
+        # Clean up temporary file if there was an error
+        if args.clean and args.clean_output is None and csv_path_to_use != args.csv_file:
+            try:
+                os.remove(csv_path_to_use)
+                logger.info(f"Removed temporary file: {csv_path_to_use}")
+            except Exception as remove_error:
+                logger.warning(f"Could not remove temporary file {csv_path_to_use}: {remove_error}")
+        
         return 1
 
 if __name__ == "__main__":
