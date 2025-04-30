@@ -1,580 +1,445 @@
 """
-Term Matching Agent - ReAct-based agent for matching data elements to business terms.
+Tagging API - Routes for matching data elements with business terms.
 
-This module provides a ReAct agent that uses reasoning and tool usage to find the best
-matching business terms for a data element, with robust fallback mechanisms.
+This module provides API endpoints for matching data elements with appropriate business
+terms, including both LLM-based semantic matching and vector similarity search.
 """
 
-from langchain.agents import Tool, AgentExecutor, create_react_agent
-from langchain_core.prompts import PromptTemplate
-from typing import List, Dict, Any, Optional, Tuple
-import json
 import logging
-import os
-import re
-import asyncio
-from pydantic import BaseModel
-
-from app.core.models import TaggingResult
+import uuid
+from typing import Dict, Any, List, Optional
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends, Query
+from pydantic import BaseModel, Field
+from langchain_openai import AzureChatOpenAI
+from app.core.models import (
+    TaggingRequest, 
+    TaggingResponse, 
+    TaggingResult,
+    TaggingValidationResult
+)
+from app.core.db_manager import DBManager
+from app.core.business_terms import BusinessTermManager
+from app.agents.tagging_workflow import DataTaggingWorkflow
 from app.config.settings import get_llm
-from app.core.embedding import MyDocument
+
+router = APIRouter(prefix="/api/v1", tags=["tagging"])
+
+# In-memory cache for current jobs
+tagging_jobs: Dict[str, Dict[str, Any]] = {}
 
 logger = logging.getLogger(__name__)
 
-class TermRecord(BaseModel):
-    """Model for term record returned by tools."""
-    id: str
-    name: str
-    description: str
-    cdm: Optional[str] = None
-    similarity: Optional[float] = None
-    metadata: Optional[Dict[str, Any]] = None
+# Extended tagging request model with optional fields
+class EnhancedTaggingRequest(BaseModel):
+    """Extended tagging request model with optional context fields."""
+    element_id: str
+    element_name: str
+    element_description: str
+    top_k: int = 3
+    cdm: Optional[str] = Field(None, description="Optional CDM to prioritize")
+    example: Optional[str] = Field(None, description="Optional example for context")
+    process_name: Optional[str] = Field(None, description="Optional process name for context")
+    process_description: Optional[str] = Field(None, description="Optional process description for context")
 
-class TermMatchResult(BaseModel):
-    """Model for term match result."""
-    term_id: str
-    confidence: float
-    reasoning: str
+def get_workflow() -> DataTaggingWorkflow:
+    """
+    Get the tagging workflow.
+    
+    Returns:
+        DataTaggingWorkflow: The tagging workflow
+    """
+    llm = get_llm()
+    return DataTaggingWorkflow(llm)
 
-class TermMatchingAgent:
-    """Agent for matching data elements to business terms using ReAct framework."""
+def get_db():
+    """
+    Get database manager.
     
-    def __init__(self, business_term_manager):
-        """Initialize the term matching agent with a business term manager."""
-        self.business_term_manager = business_term_manager
-        self.llm = get_llm()
-        self.tools = self._create_tools()
-        self.agent = self._create_agent()
+    Returns:
+        DBManager: The database manager
+    """
+    return DBManager()
+
+def get_business_term_manager():
+    """
+    Get business term manager.
     
-    def _create_tools(self) -> List[Tool]:
-        """Create tools for the ReAct agent."""
-        tools = [
-            Tool(
-                name="search_terms_by_vector",
-                func=self._search_terms_by_vector,
-                description="Search for business terms similar to the data element using vector similarity. Returns a list of terms with similarity scores.",
-                args_schema=self._get_search_vector_args_schema()
-            ),
-            Tool(
-                name="search_terms_by_text",
-                func=self._search_terms_by_text,
-                description="Search for business terms by text match in name or description. Returns a list of matching terms.",
-                args_schema=self._get_search_text_args_schema()
-            ),
-            Tool(
-                name="get_term_by_id",
-                func=self._get_term_by_id,
-                description="Get detailed information about a specific business term by its ID.",
-                args_schema=self._get_term_by_id_args_schema()
-            ),
-            Tool(
-                name="filter_terms_by_cdm",
-                func=self._filter_terms_by_cdm,
-                description="Filter a list of terms to only include those from a specific CDM.",
-                args_schema=self._get_filter_by_cdm_args_schema()
-            ),
-            Tool(
-                name="compare_terms",
-                func=self._compare_terms,
-                description="Compare multiple business terms to determine which best matches the data element.",
-                args_schema=self._get_compare_terms_args_schema()
-            ),
-            Tool(
-                name="load_terms_from_csv",
-                func=self._load_terms_from_csv,
-                description="Load business terms from the CSV file if needed. Use this as a last resort if other searches return no results.",
-                args_schema=self._get_load_csv_args_schema()
+    Returns:
+        BusinessTermManager: The business term manager
+    """
+    return BusinessTermManager()
+
+@router.post("/tag", response_model=TaggingResponse)
+async def tag_data_element(
+    request: EnhancedTaggingRequest,
+    background_tasks: BackgroundTasks,
+    db: DBManager = Depends(get_db),
+    llm_first: bool = Query(True, description="Whether to use LLM matching first before vector similarity")
+):
+    """
+    Match a data element with appropriate business terms.
+    This is an asynchronous operation that will run in the background.
+    
+    Args:
+        request: Enhanced tagging request with data element information and optional context
+        background_tasks: FastAPI background tasks
+        db: Database manager
+        llm_first: Whether to use LLM matching first before vector similarity
+        
+    Returns:
+        TaggingResponse with request ID and results
+    """
+    # Generate a request ID if not provided
+    request_id = request.element_id or str(uuid.uuid4())
+    logger.info(f"Tagging request received for element ID: {request_id}")
+    
+    # Check if this ID is already being processed
+    if request_id in tagging_jobs:
+        logger.info(f"Tagging job already exists for ID: {request_id}")
+        
+        # Return the existing results
+        job = tagging_jobs[request_id]
+        tagging_result = job.get("tagging_result")
+        
+        if tagging_result:
+            return TaggingResponse(
+                request_id=request_id,
+                element_name=tagging_result.element_name,
+                matching_terms=tagging_result.matching_terms,
+                confidence_scores=tagging_result.confidence_scores,
+                validation_result=job.get("validation_result"),
+                modeling_required=tagging_result.modeling_required,
+                message=tagging_result.message
             )
-        ]
-        return tools
     
-    def _create_agent(self):
-        """Create the ReAct agent."""
-        # Define the prompt for the ReAct agent
-        prompt = PromptTemplate.from_template(
-            """You are an expert data governance agent tasked with matching data elements to appropriate business terms.
-            Your goal is to find the most semantically equivalent business terms for a given data element.
-            
-            Data Element:
-            - Name: {element_name}
-            - Description: {element_description}
-            {element_context}
-            
-            Your task is to find the best matching business terms for this data element.
-            Carefully analyze the semantic meaning of the data element and compare it with candidate business terms.
-            Consider both the name and description when making matches.
-            
-            {format_instructions}
-            
-            Ensure you follow these steps:
-            1. Search for candidate terms using vector similarity first
-            2. If needed, search by text to find additional candidates
-            3. If a CDM is specified, prioritize terms from that CDM
-            4. For each promising candidate, get its full details and compare
-            5. Finally, select the best matches with confidence scores
-            
-            Note that exact text matches are not required - focus on semantic equivalence.
-            For example, "account number" may match with "account identifier" if they represent the same concept.
-            
-            Think step-by-step and explain your reasoning.
-            
-            {agent_scratchpad}
-            """
-        )
+    # Check if job exists in the database
+    db_job = db.get_job(request_id)
+    if db_job is not None and db_job.get("job_type") == "tagging":
+        logger.info(f"Tagging job found in database for ID: {request_id}")
         
-        # Create the ReAct agent
-        agent = create_react_agent(
-            self.llm,
-            self.tools,
-            prompt
-        )
+        # Load job data to memory for faster access
+        job_data = db_job.get("data", {})
+        tagging_result = job_data.get("tagging_result")
         
-        # Create the agent executor
-        executor = AgentExecutor(
-            agent=agent,
-            tools=self.tools,
-            verbose=True,
-            max_iterations=10,
-            handle_parsing_errors=True
-        )
-        
-        return executor
-    
-    # Tool implementation methods
-    async def _search_terms_by_vector(self, query: str, threshold: float = 0.1, max_results: int = 10) -> str:
-        """Search for business terms by vector similarity."""
-        try:
-            element_id = f"temp-{hash(query)}"
+        if tagging_result:
+            # Convert dict back to TaggingResult for easier handling
+            result_obj = TaggingResult(**tagging_result)
             
-            # Generate embedding for query
-            doc = MyDocument(id=element_id, text=query)
-            doc_with_embedding = self.business_term_manager.embedding_client.generate_embeddings(doc)
-            
-            if not doc_with_embedding.embedding:
-                return json.dumps({"error": "Failed to generate embedding for query"})
-            
-            # Search for similar vectors
-            similar_terms = self.business_term_manager.vector_store.find_similar_vectors(
-                query_vector=doc_with_embedding.embedding,
-                top_k=max_results,
-                threshold=threshold
-            )
-            
-            # Convert results to a list of TermRecord
-            results = []
-            for term in similar_terms:
-                # Extract CDM from metadata if it exists
-                cdm = None
-                if "metadata" in term and term["metadata"] and "cdm" in term["metadata"]:
-                    cdm = term["metadata"]["cdm"]
-                
-                results.append(TermRecord(
-                    id=term["id"],
-                    name=term["name"],
-                    description=term["description"],
-                    cdm=cdm,
-                    similarity=term["similarity"],
-                    metadata=term.get("metadata", {})
-                ).dict())
-            
-            return json.dumps({"results": results, "count": len(results)})
-        except Exception as e:
-            logger.error(f"Error in search_terms_by_vector: {e}")
-            return json.dumps({"error": str(e), "results": []})
-    
-    async def _search_terms_by_text(self, query: str, max_results: int = 10) -> str:
-        """Search for business terms by text match in name or description."""
-        try:
-            terms = self.business_term_manager.search_terms(query, limit=max_results)
-            
-            # Convert results to a list of TermRecord
-            results = []
-            for term in terms:
-                # Extract CDM from metadata if it exists
-                cdm = None
-                if hasattr(term, "metadata") and term.metadata and "cdm" in term.metadata:
-                    cdm = term.metadata["cdm"]
-                
-                # Convert to dictionary if it's an object
-                if hasattr(term, "dict"):
-                    term_dict = term.dict()
-                else:
-                    term_dict = term
-                
-                results.append(TermRecord(
-                    id=term_dict["id"],
-                    name=term_dict["name"],
-                    description=term_dict["description"],
-                    cdm=cdm,
-                    metadata=term_dict.get("metadata", {})
-                ).dict())
-            
-            return json.dumps({"results": results, "count": len(results)})
-        except Exception as e:
-            logger.error(f"Error in search_terms_by_text: {e}")
-            return json.dumps({"error": str(e), "results": []})
-    
-    async def _get_term_by_id(self, term_id: str) -> str:
-        """Get a specific business term by ID."""
-        try:
-            term = self.business_term_manager.get_term_by_id(term_id)
-            if not term:
-                return json.dumps({"error": f"Term with ID {term_id} not found"})
-            
-            # Extract CDM from metadata if it exists
-            cdm = None
-            if hasattr(term, "metadata") and term.metadata and "cdm" in term.metadata:
-                cdm = term.metadata["cdm"]
-            
-            # Convert to dictionary if it's an object
-            if hasattr(term, "dict"):
-                term_dict = term.dict()
-            else:
-                term_dict = term
-            
-            result = TermRecord(
-                id=term_dict["id"],
-                name=term_dict["name"],
-                description=term_dict["description"],
-                cdm=cdm,
-                metadata=term_dict.get("metadata", {})
-            ).dict()
-            
-            return json.dumps(result)
-        except Exception as e:
-            logger.error(f"Error in get_term_by_id: {e}")
-            return json.dumps({"error": str(e)})
-    
-    async def _filter_terms_by_cdm(self, terms_json: str, cdm: str) -> str:
-        """Filter a list of terms to only include those from a specific CDM."""
-        try:
-            terms_data = json.loads(terms_json)
-            
-            if "results" in terms_data:
-                terms = terms_data["results"]
-            else:
-                terms = terms_data
-            
-            # Filter terms by CDM
-            filtered_terms = []
-            for term in terms:
-                term_cdm = term.get("cdm")
-                if term_cdm and term_cdm.lower() == cdm.lower():
-                    filtered_terms.append(term)
-            
-            return json.dumps({"results": filtered_terms, "count": len(filtered_terms)})
-        except Exception as e:
-            logger.error(f"Error in filter_terms_by_cdm: {e}")
-            return json.dumps({"error": str(e), "results": []})
-    
-    async def _compare_terms(self, element_name: str, element_description: str, terms_json: str) -> str:
-        """Compare multiple business terms to determine which best matches the data element."""
-        try:
-            terms_data = json.loads(terms_json)
-            
-            if "results" in terms_data:
-                terms = terms_data["results"]
-            else:
-                terms = terms_data
-            
-            if not terms:
-                return json.dumps({"error": "No terms provided for comparison", "matches": []})
-            
-            # For multiple terms, use the LLM to compare them
-            # Prepare prompt
-            prompt = f"""
-            You are a data governance expert. Compare the following data element to these business terms and determine which ones match semantically.
-            
-            Data Element:
-            - Name: {element_name}
-            - Description: {element_description}
-            
-            Business Terms:
-            """
-            
-            for i, term in enumerate(terms, 1):
-                prompt += f"""
-                Term {i}:
-                - ID: {term['id']}
-                - Name: {term['name']}
-                - Description: {term['description']}
-                """
-                if "cdm" in term and term["cdm"]:
-                    prompt += f"- CDM: {term['cdm']}\n"
-            
-            prompt += """
-            For each term, determine if it matches the data element conceptually. Consider semantic equivalence rather than exact text matching.
-            Score each term from 0.0 to 1.0, where:
-            - 0.0 means no match at all
-            - 0.5 means a partial match (similar but not exact)
-            - 1.0 means a perfect semantic match
-            
-            Return your analysis in this JSON format:
-            {
-              "matches": [
-                {
-                  "term_id": "id of the term",
-                  "confidence": 0.X, // score between 0.0 and 1.0
-                  "reasoning": "brief explanation of your reasoning"
-                },
-                // additional matches...
-              ]
+            # Store in memory cache
+            tagging_jobs[request_id] = {
+                "tagging_result": result_obj,
+                "validation_result": job_data.get("validation_result")
             }
-            """
             
-            # Use LLM to compare terms
-            from langchain_core.output_parsers import StrOutputParser
-            parser = StrOutputParser()
-            
-            # Get response with timeout
-            response_task = self.llm.ainvoke(prompt)
-            response = await asyncio.wait_for(response_task, timeout=20.0)
-            text_response = parser.parse(response)
-            
-            # Extract the JSON content from the response
-            json_match = re.search(r'```json\n(.*?)\n```', text_response, re.DOTALL)
-            if json_match:
-                json_content = json_match.group(1)
-            else:
-                # Try to find any JSON object
-                json_match = re.search(r'({[^{]*"matches"[^}]*})', text_response, re.DOTALL)
-                if json_match:
-                    json_content = json_match.group(1)
-                else:
-                    # Just use the whole response and hope it's valid JSON
-                    json_content = text_response
-            
+            return TaggingResponse(
+                request_id=request_id,
+                element_name=result_obj.element_name,
+                matching_terms=result_obj.matching_terms,
+                confidence_scores=result_obj.confidence_scores,
+                validation_result=job_data.get("validation_result"),
+                modeling_required=result_obj.modeling_required,
+                message=result_obj.message
+            )
+    
+    # Initialize job in memory
+    tagging_jobs[request_id] = {
+        "tagging_result": None,
+        "validation_result": None
+    }
+    
+    # Store initial job in database
+    db.store_job(
+        job_id=request_id,
+        job_type="tagging",
+        status="pending",
+        data={
+            "request": request.dict(),
+            "tagging_result": None,
+            "validation_result": None
+        }
+    )
+    
+    # Add tagging task to background tasks
+    background_tasks.add_task(
+        run_tagging_job,
+        request_id=request_id,
+        element_id=request_id,
+        element_name=request.element_name,
+        element_description=request.element_description,
+        top_k=request.top_k,
+        llm_first=llm_first,
+        cdm=request.cdm,
+        example=request.example,
+        process_name=request.process_name,
+        process_description=request.process_description
+    )
+    
+    # Return initial response
+    return TaggingResponse(
+        request_id=request_id,
+        element_name=request.element_name,
+        matching_terms=[],
+        confidence_scores=[],
+        validation_result=None,
+        modeling_required=False,
+        message="Tagging job started"
+    )
+
+@router.post("/tag-llm", response_model=TaggingResponse)
+async def tag_data_element_with_llm(
+    request: EnhancedTaggingRequest,
+    background_tasks: BackgroundTasks,
+    db: DBManager = Depends(get_db)
+):
+    """
+    Match a data element with appropriate business terms using the LLM-first approach.
+    
+    Args:
+        request: Enhanced tagging request with data element information and optional context
+        background_tasks: FastAPI background tasks
+        db: Database manager
+        
+    Returns:
+        TaggingResponse with request ID and results
+    """
+    return await tag_data_element(request, background_tasks, db, llm_first=True)
+
+@router.post("/tag-vector", response_model=TaggingResponse)
+async def tag_data_element_with_vector(
+    request: EnhancedTaggingRequest,
+    background_tasks: BackgroundTasks,
+    db: DBManager = Depends(get_db)
+):
+    """
+    Match a data element with appropriate business terms using vector similarity.
+    
+    Args:
+        request: Enhanced tagging request with data element information and optional context
+        background_tasks: FastAPI background tasks
+        db: Database manager
+        
+    Returns:
+        TaggingResponse with request ID and results
+    """
+    return await tag_data_element(request, background_tasks, db, llm_first=False)
+
+@router.get("/tag/{request_id}", response_model=TaggingResponse)
+async def get_tagging_status(
+    request_id: str,
+    db: DBManager = Depends(get_db)
+):
+    """
+    Get the status and results of a tagging job.
+    
+    Args:
+        request_id: ID of the tagging job
+        db: Database manager
+        
+    Returns:
+        TaggingResponse with current results
+    """
+    # First check in-memory cache
+    if request_id in tagging_jobs:
+        job = tagging_jobs[request_id]
+        tagging_result = job.get("tagging_result")
+        
+        if tagging_result:
+            return TaggingResponse(
+                request_id=request_id,
+                element_name=tagging_result.element_name,
+                matching_terms=tagging_result.matching_terms,
+                confidence_scores=tagging_result.confidence_scores,
+                validation_result=job.get("validation_result"),
+                modeling_required=tagging_result.modeling_required,
+                message=tagging_result.message
+            )
+    
+    # Check database if not in memory
+    db_job = db.get_job(request_id)
+    if db_job is None or db_job.get("job_type") != "tagging":
+        raise HTTPException(status_code=404, detail=f"Tagging job {request_id} not found")
+    
+    # Load job data
+    job_data = db_job.get("data", {})
+    tagging_result = job_data.get("tagging_result")
+    
+    if not tagging_result:
+        return TaggingResponse(
+            request_id=request_id,
+            element_name=job_data.get("request", {}).get("element_name", ""),
+            matching_terms=[],
+            confidence_scores=[],
+            validation_result=None,
+            modeling_required=False,
+            message="Tagging in progress"
+        )
+    
+    # Convert dict to TaggingResult
+    result_obj = TaggingResult(**tagging_result)
+    
+    # Store in memory for future requests
+    tagging_jobs[request_id] = {
+        "tagging_result": result_obj,
+        "validation_result": job_data.get("validation_result")
+    }
+    
+    return TaggingResponse(
+        request_id=request_id,
+        element_name=result_obj.element_name,
+        matching_terms=result_obj.matching_terms,
+        confidence_scores=result_obj.confidence_scores,
+        validation_result=job_data.get("validation_result"),
+        modeling_required=result_obj.modeling_required,
+        message=result_obj.message
+    )
+
+@router.post("/validate", response_model=TaggingValidationResult)
+async def validate_tagging(
+    tagging_result: TaggingResult,
+    business_term_manager: BusinessTermManager = Depends(get_business_term_manager)
+):
+    """
+    Validate a tagging result.
+    
+    Args:
+        tagging_result: The tagging result to validate
+        business_term_manager: The business term manager
+        
+    Returns:
+        TaggingValidationResult with validation status and suggestions
+    """
+    try:
+        confidence, reasoning = await business_term_manager.evaluate_tagging_with_reasoning(tagging_result)
+        
+        is_valid = confidence >= 0.5
+        
+        return TaggingValidationResult(
+            is_valid=is_valid,
+            feedback=reasoning,
+            suggested_alternatives=[]
+        )
+    except Exception as e:
+        logger.error(f"Error validating tagging: {e}")
+        return TaggingValidationResult(
+            is_valid=False,
+            feedback=f"Error validating tagging: {str(e)}",
+            suggested_alternatives=[]
+        )
+
+async def run_tagging_job(
+    request_id: str,
+    element_id: str,
+    element_name: str,
+    element_description: str,
+    top_k: int = 3,
+    llm_first: bool = True,
+    cdm: Optional[str] = None,
+    example: Optional[str] = None,
+    process_name: Optional[str] = None,
+    process_description: Optional[str] = None
+):
+    """
+    Run the tagging job in the background.
+    
+    Args:
+        request_id: ID of the tagging job
+        element_id: ID of the data element
+        element_name: Name of the data element
+        element_description: Description of the data element
+        top_k: Number of top matching terms to return
+        llm_first: Whether to use LLM matching first
+        cdm: Optional CDM to prioritize
+        example: Optional example for context
+        process_name: Optional process name for context
+        process_description: Optional process description for context
+    """
+    logger.info(f"Starting tagging job for {request_id}")
+    
+    try:
+        # Get business term manager directly for more control
+        business_term_manager = BusinessTermManager()
+        db = DBManager()
+        
+        # Run the direct tagging with all context
+        # IMPORTANT: Added await here to properly handle the async method
+        tagging_result = await business_term_manager.tag_element(
+            element_id=element_id,
+            name=element_name,
+            description=element_description,
+            top_k=top_k,
+            threshold=0.3,  # Lower threshold to get more potential matches
+            cdm=cdm,
+            example=example,
+            process_name=process_name,
+            process_description=process_description
+        )
+        
+        logger.info(f"Tagging completed for {request_id}, found {len(tagging_result.matching_terms)} matches")
+        
+        # Get validation result (if matches were found)
+        validation_result = None
+        if tagging_result.matching_terms and not tagging_result.modeling_required:
             try:
-                # Parse the JSON
-                result = json.loads(json_content)
-                return json.dumps(result)
-            except json.JSONDecodeError:
-                # If JSON parsing fails, create a basic response with the raw text
-                logger.warning(f"Failed to parse LLM response as JSON: {text_response}")
-                manual_matches = []
+                confidence, reasoning = await business_term_manager.evaluate_tagging_with_reasoning(tagging_result)
                 
-                # Try to extract matches using regex
-                match_pattern = r'term_id["\s:]+([^,"]+)[^}]*confidence["\s:]+(\d+\.\d+)[^}]*reasoning["\s:]+([^"]+)'
-                for match in re.finditer(match_pattern, text_response, re.IGNORECASE):
-                    term_id = match.group(1).strip('"\'[] ')
-                    try:
-                        confidence = float(match.group(2))
-                        confidence = max(0.0, min(confidence, 1.0))  # Ensure in range [0, 1]
-                    except ValueError:
-                        confidence = 0.5  # Default if parsing fails
-                    reasoning = match.group(3).strip('"\'[] ')
-                    
-                    manual_matches.append({
-                        "term_id": term_id,
-                        "confidence": confidence,
-                        "reasoning": reasoning
-                    })
+                validation_result = {
+                    "is_valid": confidence >= 0.5,
+                    "feedback": reasoning,
+                    "suggested_alternatives": []
+                }
                 
-                # If we still couldn't extract matches, create default ones based on similarity
-                if not manual_matches:
-                    for term in terms:
-                        similarity = term.get("similarity", 0.5)
-                        manual_matches.append({
-                            "term_id": term["id"],
-                            "confidence": similarity,
-                            "reasoning": f"Based on vector similarity score of {similarity}"
-                        })
+                logger.info(f"Validation completed for {request_id}, valid: {validation_result['is_valid']}")
                 
-                return json.dumps({"matches": manual_matches})
-                
-        except Exception as e:
-            logger.error(f"Error in compare_terms: {e}")
-            return json.dumps({"error": str(e), "matches": []})
-    
-    async def _load_terms_from_csv(self, csv_path: str = "data/pbt_cdm.csv") -> str:
-        """Load business terms from the CSV file."""
-        try:
-            import csv
-            import uuid
-            
-            if not os.path.exists(csv_path):
-                return json.dumps({"error": f"CSV file not found: {csv_path}", "results": []})
-            
-            terms = []
-            with open(csv_path, 'r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    # Check if we have the required columns
-                    if not ("PBT_NAME" in row and "PBT_DEFINITION" in row):
-                        continue
-                    
-                    # Create a term record
-                    term_id = str(uuid.uuid4())
-                    terms.append(TermRecord(
-                        id=term_id,
-                        name=row["PBT_NAME"],
-                        description=row["PBT_DEFINITION"],
-                        cdm=row.get("CDM"),
-                        metadata={"source": "csv"}
-                    ).dict())
-            
-            return json.dumps({"results": terms, "count": len(terms)})
-        except Exception as e:
-            logger.error(f"Error in load_terms_from_csv: {e}")
-            return json.dumps({"error": str(e), "results": []})
-    
-    # Helper methods for tool schemas
-    def _get_search_vector_args_schema(self):
-        class SearchVectorArgs(BaseModel):
-            query: str = "The text to search for (typically the data element name and description)"
-            threshold: float = 0.1
-            max_results: int = 10
-        return SearchVectorArgs
-    
-    def _get_search_text_args_schema(self):
-        class SearchTextArgs(BaseModel):
-            query: str = "The text to search for"
-            max_results: int = 10
-        return SearchTextArgs
-    
-    def _get_term_by_id_args_schema(self):
-        class TermByIdArgs(BaseModel):
-            term_id: str = "The ID of the business term to retrieve"
-        return TermByIdArgs
-    
-    def _get_filter_by_cdm_args_schema(self):
-        class FilterByCdmArgs(BaseModel):
-            terms_json: str = "JSON string containing the terms to filter"
-            cdm: str = "The CDM to filter by"
-        return FilterByCdmArgs
-    
-    def _get_compare_terms_args_schema(self):
-        class CompareTermsArgs(BaseModel):
-            element_name: str = "The name of the data element"
-            element_description: str = "The description of the data element"
-            terms_json: str = "JSON string containing the terms to compare"
-        return CompareTermsArgs
-    
-    def _get_load_csv_args_schema(self):
-        class LoadCsvArgs(BaseModel):
-            csv_path: str = "data/pbt_cdm.csv"
-        return LoadCsvArgs
-    
-    async def find_matching_terms(self, element_id: str, element_name: str, element_description: str, 
-                               top_k: int = 3, cdm: Optional[str] = None, 
-                               example: Optional[str] = None,
-                               process_name: Optional[str] = None,
-                               process_description: Optional[str] = None) -> Tuple[List[Dict[str, Any]], List[float]]:
-        """
-        Find matching business terms using the ReAct agent.
+            except Exception as validation_error:
+                logger.error(f"Error validating tagging for {request_id}: {validation_error}")
         
-        Args:
-            element_id: Unique identifier for the element
-            element_name: Name of the data element
-            element_description: Description of the data element
-            top_k: Maximum number of matching terms to return
-            cdm: Optional CDM to prioritize
-            example: Optional example for context
-            process_name: Optional process name for context
-            process_description: Optional process description for context
-            
-        Returns:
-            Tuple containing matching terms list and confidence scores list
-        """
-        try:
-            # Prepare context information
-            element_context = ""
-            if example:
-                element_context += f"- Example: {example}\n"
-            if process_name:
-                element_context += f"- Process Name: {process_name}\n"
-            if process_description:
-                element_context += f"- Process Description: {process_description}\n"
-            if cdm:
-                element_context += f"- Preferred CDM: {cdm} (prioritize terms from this CDM)\n"
-            
-            # Run the agent to find matching terms
-            result = await self.agent.ainvoke({
-                "element_name": element_name,
-                "element_description": element_description,
-                "element_context": element_context,
-                "format_instructions": f"Find up to {top_k} business terms that best match the data element."
-            })
-            
-            # Extract the agent's final answer
-            answer = result.get("output", "")
-            
-            # Parse the answer to extract matching terms
-            matches = self._parse_agent_answer(answer)
-            
-            # Fetch full term details for each match
-            matching_terms = []
-            confidence_scores = []
-            
-            for match in matches[:top_k]:  # Limit to top_k
-                term_id = match.get("term_id")
-                confidence = match.get("confidence", 0.5)
-                
-                # Get the full term details
-                term = self.business_term_manager.get_term_by_id(term_id)
-                
-                if term:
-                    # Convert to dict if it's an object
-                    if hasattr(term, "dict"):
-                        term_dict = term.dict()
-                    else:
-                        term_dict = term
-                    
-                    # Add similarity for compatibility with existing code
-                    term_dict["similarity"] = confidence
-                    
-                    matching_terms.append(term_dict)
-                    confidence_scores.append(confidence)
-            
-            return matching_terms, confidence_scores
-        except Exception as e:
-            logger.error(f"Error in find_matching_terms: {e}")
-            return [], []
-    
-    def _parse_agent_answer(self, answer: str) -> List[Dict[str, Any]]:
-        """
-        Parse the agent's answer to extract matching terms.
+        # Store in memory cache
+        tagging_jobs[request_id] = {
+            "tagging_result": tagging_result,
+            "validation_result": validation_result
+        }
         
-        Args:
-            answer: The agent's final answer
-            
-        Returns:
-            List of matched terms with confidence scores
-        """
-        try:
-            # Try to find a JSON object in the answer
-            json_match = re.search(r'```json\n(.*?)\n```', answer, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(1)
-                try:
-                    data = json.loads(json_str)
-                    if "matches" in data:
-                        return data["matches"]
-                    return data
-                except json.JSONDecodeError:
-                    pass
-            
-            # Try to find matches using regex
-            matches = []
-            
-            # Pattern for matches in format "Term ID: X, Confidence: Y, Reasoning: Z"
-            term_pattern = r'(?:Term ID:|ID:)\s*([^,\n]+)[^,]*(?:Confidence:|Score:)\s*(\d+\.\d+)[^,]*(?:Reasoning:|Justification:|Explanation:)\s*([^,\n]+)'
-            for match in re.finditer(term_pattern, answer, re.IGNORECASE):
-                term_id = match.group(1).strip('"\'[] ')
-                try:
-                    confidence = float(match.group(2))
-                    confidence = max(0.0, min(confidence, 1.0))  # Ensure in range [0, 1]
-                except ValueError:
-                    confidence = 0.5  # Default if parsing fails
-                reasoning = match.group(3).strip('"\'[] ')
-                
-                matches.append({
-                    "term_id": term_id,
-                    "confidence": confidence,
-                    "reasoning": reasoning
-                })
-            
-            return matches
-        except Exception as e:
-            logger.error(f"Error parsing agent answer: {e}")
-            return []
+        # Store in database
+        db.store_job(
+            job_id=request_id,
+            job_type="tagging",
+            status="completed",
+            data={
+                "request": {
+                    "element_id": element_id,
+                    "element_name": element_name,
+                    "element_description": element_description,
+                    "top_k": top_k,
+                    "cdm": cdm,
+                    "example": example,
+                    "process_name": process_name,
+                    "process_description": process_description
+                },
+                "tagging_result": tagging_result.dict(),
+                "validation_result": validation_result
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in tagging job for {request_id}: {e}")
+        
+        # Store error in database
+        db = DBManager()
+        db.store_job(
+            job_id=request_id,
+            job_type="tagging",
+            status="failed",
+            data={
+                "request": {
+                    "element_id": element_id,
+                    "element_name": element_name,
+                    "element_description": element_description,
+                    "top_k": top_k,
+                    "cdm": cdm,
+                    "example": example,
+                    "process_name": process_name,
+                    "process_description": process_description
+                },
+                "error": str(e)
+            }
+        )
