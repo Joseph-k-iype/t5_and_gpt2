@@ -1,834 +1,317 @@
 """
-Business Terms Manager - Core component for managing and matching business terms.
+Tagging Workflow - LangGraph workflow for matching data elements with business terms.
 
-This module provides functionality for storing, retrieving, and matching business terms
-using vector similarity search with ChromaDB's HNSW indexing, enhanced with AI evaluation
-of term matches.
+This module provides a LangGraph-based workflow for the process of tagging data elements
+with appropriate business terms, including LLM-based semantic matching, vector similarity,
+and AI-powered evaluation.
 """
 
-import csv
 import logging
-import os
-import time
-import re
-import uuid
-from typing import List, Dict, Any, Optional, Tuple
-import numpy as np
+from typing import Dict, Any, List, Optional, TypedDict, Union
 from pydantic import BaseModel, Field
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from langchain_openai import AzureChatOpenAI
+from langgraph.graph import StateGraph, END
 
-from app.core.db_manager import DBManager
-from app.core.embedding import EmbeddingClient, MyDocument
-from app.core.models import TaggingResult, TaggingValidationResult
-from app.config.environment import get_os_env
-from app.config.settings import get_vector_store
+from app.core.models import TaggingResult, TaggingValidationResult, EnhancedDataElement
+from app.agents.tagging_agent import TaggingAgent
+from app.core.business_terms import BusinessTermManager
 from app.agents.tagging_evaluation_agent import AITaggingEvaluationAgent
 
 logger = logging.getLogger(__name__)
 
-class BusinessTerm(BaseModel):
-    """Model representing a business term in the repository."""
-    id: str = Field(..., description="Unique identifier for the term")
-    name: str = Field(..., description="Name of the business term")
-    description: str = Field(..., description="Description of the business term")
-    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata for the term")
-    
-    def dict(self) -> Dict[str, Any]:
-        """Convert the business term to a dictionary."""
-        return {
-            "id": self.id,
-            "name": self.name,
-            "description": self.description,
-            "metadata": self.metadata
-        }
+# Define workflow state
+class TaggingWorkflowState(TypedDict):
+    """State for the tagging workflow."""
+    element_id: str
+    element_name: str
+    element_description: str
+    matching_terms: List[Dict[str, Any]]
+    confidence_scores: List[float]
+    validation_result: Optional[Dict[str, Any]]
+    ai_evaluation_result: Optional[Dict[str, Any]]  # New field for AI evaluation
+    is_complete: bool
+    modeling_required: bool
+    error: Optional[str]
+    message: str
+    use_llm_first: bool
+    cdm: Optional[str]  # Added CDM to workflow state
+    example: Optional[str]  # Added example to workflow state
+    process_name: Optional[str]  # Added process name to workflow state
+    process_description: Optional[str]  # Added process description to workflow state
 
-class BusinessTermManager:
-    """
-    Manager for business terms, handling storage, retrieval, and similarity matching.
+class DataTaggingWorkflow:
+    """LangGraph workflow for tagging data elements with business terms."""
     
-    Uses ChromaDB with HNSW indexing for vector similarity search, enhanced with
-    AI-powered evaluation of term matches.
-    """
-    
-    _instance = None
-    
-    def __new__(cls):
-        """Singleton pattern to ensure only one instance is created."""
-        if cls._instance is None:
-            cls._instance = super(BusinessTermManager, cls).__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
-    
-    def __init__(self):
-        """Initialize the business term manager."""
-        if self._initialized:
-            return
-            
-        self._initialized = True
-        self.env = get_os_env()
-        self.embedding_client = EmbeddingClient()
-        
-        # Initialize DB manager for job storage
-        self.db_manager = DBManager()
-        
-        self.similarity_threshold = float(self.env.get("SIMILARITY_THRESHOLD", "0.5"))  # 50% similarity threshold
-        
-        # Get vector store based on configuration
-        self.vector_store = get_vector_store()
-        
-        # Get the vector database type
-        self.vector_db_type = self.env.get("VECTOR_DB_TYPE", "chroma").lower()
-        
-        # Initialize AI evaluation agent
-        self.ai_evaluation_agent = AITaggingEvaluationAgent()
-        
-        logger.info(f"Business term manager initialized with {self.vector_db_type} backend for vectors")
-    
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type((Exception,)),
-        reraise=True
-    )
-    def import_terms_from_csv(self, csv_path: str, encoding: str = 'utf-8', batch_size: int = 100) -> int:
+    def __init__(self, llm: AzureChatOpenAI):
         """
-        Import business terms from a CSV file and generate embeddings using EmbeddingClient.
+        Initialize the tagging workflow.
         
         Args:
-            csv_path: Path to the CSV file
-            encoding: File encoding (auto-detected if not provided)
-            batch_size: Number of terms to process in each batch
+            llm: The language model to use for semantic matching and validation
+        """
+        self.llm = llm
+        self.tagging_agent = TaggingAgent(llm)
+        self.business_term_manager = BusinessTermManager()
+        self.ai_evaluation_agent = AITaggingEvaluationAgent()
+        self.graph = self._build_graph()
+    
+    async def _find_matching_terms(self, state: TaggingWorkflowState) -> TaggingWorkflowState:
+        """
+        Find matching business terms for the data element.
+        
+        Args:
+            state: The current workflow state
             
         Returns:
-            Number of terms imported
-            
-        Raises:
-            ValueError: If CSV file is missing required columns
-            IOError: If file cannot be read
+            Updated workflow state
         """
         try:
-            # Get existing terms
-            existing_terms = {}
-            for term in self.get_all_terms():
-                term_key = f"{term.name}::{term.description}"
-                existing_terms[term_key] = term.id
+            # Use the tagging agent to find matching terms based on strategy
+            if state["use_llm_first"]:
+                # For LLM-first matching, use the tagging agent's approach
+                result = await self.tagging_agent.tag_element(
+                    element_id=state["element_id"],
+                    element_name=state["element_name"],
+                    element_description=state["element_description"],
+                    top_k=5,  # Get more for better filtering
+                    use_llm_first=state["use_llm_first"],
+                    cdm=state.get("cdm"),
+                    example=state.get("example"),
+                    process_name=state.get("process_name"),
+                    process_description=state.get("process_description")
+                )
+            else:
+                # For vector-first approach, use the business term manager directly
+                result = await self.business_term_manager.tag_element(
+                    element_id=state["element_id"],
+                    name=state["element_name"],
+                    description=state["element_description"],
+                    top_k=5,  # Get more for better filtering
+                    threshold=0.3,
+                    cdm=state.get("cdm"),
+                    example=state.get("example"),
+                    process_name=state.get("process_name"),
+                    process_description=state.get("process_description")
+                )
             
-            # Track terms in CSV
-            csv_term_keys = set()
-            terms_to_add = []
+            # Update state with the results
+            state["matching_terms"] = result.matching_terms
+            state["confidence_scores"] = result.confidence_scores
+            state["modeling_required"] = result.modeling_required
+            state["message"] = result.message
             
-            # Try to detect encoding if not specified
-            if encoding.lower() == 'auto' or encoding.lower() == 'detect':
-                try:
-                    # Try to install and import chardet if not available
-                    try:
-                        import chardet
-                    except ImportError:
-                        import subprocess
-                        import sys
-                        logger.info("Installing chardet for encoding detection")
-                        subprocess.check_call([sys.executable, "-m", "pip", "install", "chardet"])
-                        import chardet
-                    
-                    # Detect encoding with appropriate sample size
-                    with open(csv_path, 'rb') as rawfile:
-                        # For large files, read up to 1MB for detection
-                        file_size = os.path.getsize(csv_path)
-                        sample = rawfile.read(min(1024 * 1024, file_size))
-                        result = chardet.detect(sample)
-                        detected_encoding = result['encoding']
-                        confidence = result['confidence']
-                        
-                        # Log detection results
-                        logger.info(f"Encoding detection: {detected_encoding} (confidence: {confidence:.2f})")
-                        
-                        # Use detected encoding, no fallback
-                        encoding = detected_encoding
-                except Exception as e:
-                    logger.error(f"Error during encoding detection: {e}")
-                    # If detection fails completely, try common encodings in a specific order
-                    logger.warning(f"Will try common encodings in sequence: utf-8, latin1, cp1252, iso-8859-1")
-                    # We'll handle this later by trying multiple encodings
-            
-            # Define a helper function to process CSV with a given encoding
-            def process_csv_with_encoding(file_path, enc):
-                """Process CSV file with the given encoding and return extracted terms"""
-                logger.info(f"Attempting to read CSV with encoding: {enc}")
-                
-                extracted_terms = []
-                try:
-                    with open(file_path, 'r', encoding=enc) as csvfile:
-                        reader = csv.DictReader(csvfile)
-                        
-                        # Verify required columns
-                        if not reader.fieldnames:
-                            logger.warning(f"CSV has no headers or is empty with encoding {enc}")
-                            return None
-                        
-                        # Handle different column naming conventions
-                        field_name_map = {}
-                        for field in reader.fieldnames:
-                            if field.upper() == 'PBT_NAME':
-                                field_name_map[field] = 'name'
-                            elif field.upper() == 'PBT_DEFINITION':
-                                field_name_map[field] = 'description'
-                            elif field.upper() == 'CDM':
-                                field_name_map[field] = 'cdm'
-                            else:
-                                # Keep other fields as is
-                                field_name_map[field] = field
-                        
-                        # Check if required fields are available after mapping
-                        all_mapped_fields = set(field_name_map.values())
-                        if 'name' not in all_mapped_fields or 'description' not in all_mapped_fields:
-                            missing = []
-                            if 'name' not in all_mapped_fields:
-                                missing.append('name/PBT_NAME')
-                            if 'description' not in all_mapped_fields:
-                                missing.append('description/PBT_DEFINITION')
-                            logger.warning(f"CSV missing required columns with encoding {enc}: {', '.join(missing)}")
-                            return None
-                        
-                        # Process rows
-                        for row in reader:
-                            # Map field names
-                            mapped_row = {}
-                            for orig_field, value in row.items():
-                                if orig_field in field_name_map:
-                                    mapped_row[field_name_map[orig_field]] = value
-                                else:
-                                    mapped_row[orig_field] = value
-                            
-                            if 'name' not in mapped_row or 'description' not in mapped_row:
-                                continue
-                            
-                            # Get term ID (generate if not provided)
-                            term_id = mapped_row.get('id', '').strip()
-                            name = mapped_row['name'].strip()
-                            description = mapped_row['description'].strip()
-                            
-                            # Skip rows with empty name or description
-                            if not name or not description:
-                                continue
-                            
-                            # Generate a unique ID if not provided or empty
-                            if not term_id:
-                                term_id = f"term-{uuid.uuid4()}"
-                            
-                            term_key = f"{name}::{description}"
-                            csv_term_keys.add(term_key)
-                            
-                            # Skip if term already exists and is unchanged
-                            if term_key in existing_terms and existing_terms[term_key] == term_id:
-                                continue
-                            
-                            # Extract metadata if present in CSV
-                            metadata = {}
-                            for key, value in mapped_row.items():
-                                if key not in ['id', 'name', 'description'] and value:
-                                    metadata[key] = value
-                            
-                            extracted_terms.append({
-                                "id": term_id,
-                                "name": name,
-                                "description": description,
-                                "term_key": term_key,
-                                "metadata": metadata
-                            })
-                    
-                    # Successfully read the file
-                    logger.info(f"Successfully processed CSV with encoding: {enc} - found {len(extracted_terms)} terms")
-                    return extracted_terms
-                
-                except UnicodeDecodeError:
-                    logger.warning(f"Unicode decode error with encoding: {enc}")
-                    return None
-                except Exception as e:
-                    logger.warning(f"Error processing CSV with encoding {enc}: {e}")
-                    return None
-            
-            # Try reading with detected/specified encoding first
-            terms_to_add = process_csv_with_encoding(csv_path, encoding)
-            
-            # If failed, try common encodings in sequence
-            if not terms_to_add:
-                # List of common encodings to try
-                encodings_to_try = ['utf-8', 'latin1', 'cp1252', 'iso-8859-1', 'utf-16']
-                
-                for enc in encodings_to_try:
-                    if enc != encoding:  # Skip if we already tried this encoding
-                        result = process_csv_with_encoding(csv_path, enc)
-                        if result:
-                            terms_to_add = result
-                            encoding = enc  # Update encoding for logging
-                            break
-            
-            # If we still have no terms, raise an error
-            if not terms_to_add:
-                raise ValueError(f"Could not read CSV file {csv_path} with any encoding")
-            
-            # Process terms in batches
-            added_count = 0
-            for i in range(0, len(terms_to_add), batch_size):
-                batch = terms_to_add[i:i + batch_size]
-                batch_start_time = time.time()
-                
-                # Create batch of vectors to insert
-                vectors_batch = []
-                
-                # Prepare documents for batch embedding generation
-                docs_to_embed = []
-                for term in batch:
-                    # Create document for embedding
-                    doc = MyDocument(
-                        id=term["id"],
-                        text=f"{term['name']}. {term['description']}"
-                    )
-                    docs_to_embed.append(doc)
-                
-                # Generate embeddings in batch for better efficiency
-                docs_with_embeddings = self.embedding_client.batch_generate_embeddings(docs_to_embed)
-                
-                # Process the documents with embeddings
-                for i, doc_with_embedding in enumerate(docs_with_embeddings):
-                    term = batch[i]
-                    
-                    if not doc_with_embedding.embedding:
-                        logger.warning(f"Skipping term without embedding: {term['name']}")
-                        continue
-                    
-                    vectors_batch.append({
-                        "id": term["id"],
-                        "name": term["name"],
-                        "description": term["description"],
-                        "embedding": doc_with_embedding.embedding,
-                        "metadata": term.get("metadata", {})
-                    })
-                
-                # Batch insert into vector store
-                if vectors_batch:
-                    inserted = self.vector_store.batch_store_vectors(vectors_batch)
-                    added_count += inserted
-                    
-                    batch_duration = time.time() - batch_start_time
-                    logger.info(f"Processed batch {i//batch_size + 1}/{(len(terms_to_add) + batch_size - 1)//batch_size}: "
-                               f"{inserted} terms in {batch_duration:.2f}s "
-                               f"({inserted/batch_duration:.2f} terms/sec)")
-            
-            # Handle term deletion (terms that exist in the database but not in the CSV)
-            deleted_count = 0
-            terms_to_delete = []
-            for term_key, term_id in existing_terms.items():
-                if term_key not in csv_term_keys:
-                    terms_to_delete.append(term_id)
-            
-            # Delete in batches
-            for i in range(0, len(terms_to_delete), batch_size):
-                batch = terms_to_delete[i:i + batch_size]
-                deleted_in_batch = 0
-                
-                for term_id in batch:
-                    if self.vector_store.delete_term(term_id):
-                        deleted_in_batch += 1
-                
-                deleted_count += deleted_in_batch
-                if deleted_in_batch > 0:
-                    logger.info(f"Deleted batch of {deleted_in_batch} terms")
-            
-            logger.info(f"Import summary: Added {added_count} terms, deleted {deleted_count} terms")
-            return added_count
-        
+            return state
         except Exception as e:
-            logger.error(f"Error importing terms from CSV: {e}")
-            raise
+            logger.error(f"Error finding matching terms: {e}")
+            state["error"] = f"Error finding matching terms: {str(e)}"
+            state["is_complete"] = True
+            return state
     
-    async def tag_element(self, element_id: str, name: str, description: str, 
-                   top_k: int = 3, threshold: float = 0.3, 
-                   cdm: Optional[str] = None,
-                   example: Optional[str] = None,
-                   process_name: Optional[str] = None,
-                   process_description: Optional[str] = None) -> TaggingResult:
+    async def _ai_evaluate_matches(self, state: TaggingWorkflowState) -> TaggingWorkflowState:
         """
-        Tag a data element with the most similar business terms using HNSW vector similarity 
-        search, enhanced with AI evaluation.
+        Evaluate the matches using AI reasoning.
+        
+        Args:
+            state: The current workflow state
+            
+        Returns:
+            Updated workflow state
+        """
+        try:
+            # Skip if no matching terms found or modeling is required
+            if not state["matching_terms"] or state["modeling_required"]:
+                state["is_complete"] = True
+                return state
+            
+            # Create a tagging result for evaluation
+            tagging_result = TaggingResult(
+                element_id=state["element_id"],
+                element_name=state["element_name"],
+                element_description=state["element_description"],
+                matching_terms=state["matching_terms"],
+                confidence_scores=state["confidence_scores"],
+                modeling_required=state["modeling_required"],
+                message=state["message"]
+            )
+            
+            # Evaluate with AI
+            is_valid, overall_confidence, reasoning, improved_result = await self.ai_evaluation_agent.evaluate_tagging_result(tagging_result)
+            
+            # Update state with AI evaluation
+            state["ai_evaluation_result"] = {
+                "is_valid": is_valid,
+                "confidence": overall_confidence,
+                "reasoning": reasoning
+            }
+            
+            # Use the improved matches from AI evaluation
+            state["matching_terms"] = improved_result.matching_terms
+            state["confidence_scores"] = improved_result.confidence_scores
+            state["modeling_required"] = improved_result.modeling_required
+            state["message"] = improved_result.message
+            
+            # If modeling is required but we have matches, try to find better matches
+            if state["modeling_required"] and state["matching_terms"]:
+                # Get all terms for AI-based selection
+                all_terms = self.business_term_manager.get_all_terms()
+                all_term_dicts = [term.dict() for term in all_terms]
+                
+                # Find better matches
+                better_matches = await self.ai_evaluation_agent.find_better_matches(
+                    state["element_name"],
+                    state["element_description"],
+                    all_term_dicts,
+                    state["matching_terms"],
+                    max_suggestions=5
+                )
+                
+                # If better matches were found, update the state
+                if better_matches:
+                    state["matching_terms"] = better_matches
+                    state["confidence_scores"] = [term.get("similarity", 0.5) for term in better_matches]
+                    state["message"] = f"AI found better matches with confidence {max(state['confidence_scores'] or [0]):.2f}"
+                    
+                    # Update modeling_required based on best confidence
+                    state["modeling_required"] = max(state["confidence_scores"] or [0]) < 0.5
+            
+            state["is_complete"] = True
+            return state
+        except Exception as e:
+            logger.error(f"Error in AI evaluation: {e}")
+            state["error"] = f"Error in AI evaluation: {str(e)}"
+            state["is_complete"] = True
+            return state
+    
+    def _build_graph(self) -> StateGraph:
+        """Build the LangGraph workflow."""
+        workflow = StateGraph(TaggingWorkflowState)
+        
+        # Add nodes
+        workflow.add_node("find_matching_terms", self._find_matching_terms)
+        workflow.add_node("ai_evaluate_matches", self._ai_evaluate_matches)
+        
+        # Add edges
+        workflow.add_edge("find_matching_terms", "ai_evaluate_matches")
+        workflow.add_edge("ai_evaluate_matches", END)
+        
+        # Set entrypoint
+        workflow.set_entry_point("find_matching_terms")
+        
+        return workflow.compile()
+    
+    async def run(self, 
+                 element_id: str, 
+                 element_name: str, 
+                 element_description: str, 
+                 use_llm_first: bool = True,
+                 cdm: Optional[str] = None,
+                 example: Optional[str] = None,
+                 process_name: Optional[str] = None,
+                 process_description: Optional[str] = None) -> TaggingResult:
+        """
+        Run the tagging workflow on a data element.
         
         Args:
             element_id: Unique identifier for the element
-            name: Enhanced name of the element
-            description: Enhanced description of the element
-            top_k: Number of top matching terms to return
-            threshold: Minimum similarity threshold (0-1)
-            cdm: Optional CDM to prioritize in matches
-            example: Optional example for context
-            process_name: Optional process name for context
-            process_description: Optional process description for context
-                
+            element_name: Name of the element
+            element_description: Description of the element
+            use_llm_first: Whether to use LLM matching first before vector similarity
+            cdm: Optional CDM to prioritize in the matching
+            example: Optional example for additional context
+            process_name: Optional process name for additional context
+            process_description: Optional process description for additional context
+        
         Returns:
             TaggingResult containing matching terms and confidence scores
         """
-        try:
-            # Validate inputs
-            if not name or not description:
-                logger.warning(f"Empty name or description for element: {element_id}")
-                return TaggingResult(
-                    element_id=element_id,
-                    element_name=name or "",
-                    element_description=description or "",
-                    matching_terms=[],
-                    confidence_scores=[],
-                    modeling_required=True,
-                    message="Name or description is empty. Modeling should be performed."
-                )
-            
-            # Create document with embedding - combine all context for better matching
-            query_text = f"{name}"
-            
-            # Add description to the query
-            query_text += f" {description}"
-            
-            # Add example if provided
-            if example:
-                query_text += f" Example: {example}"
-                
-            # Add process information if provided
-            if process_name:
-                query_text += f" Process: {process_name}"
-            if process_description:
-                query_text += f" Process details: {process_description}"
-                
-            # Create document and generate embedding
-            doc = MyDocument(
-                id=element_id,
-                text=query_text
-            )
-            
-            doc_with_embedding = self.embedding_client.generate_embeddings(doc)
-            
-            if not doc_with_embedding.embedding:
-                logger.warning(f"Could not generate embedding for element: {name}")
-                return TaggingResult(
-                    element_id=element_id,
-                    element_name=name,
-                    element_description=description,
-                    matching_terms=[],
-                    confidence_scores=[],
-                    modeling_required=True,
-                    message="Could not generate embedding. Modeling should be performed."
-                )
-            
-            # Query for similar terms using vector search, get more terms than needed for filtering
-            query_top_k = top_k * 3  # Fetch more for better filtering
-            similar_terms = self.vector_store.find_similar_vectors(
-                query_vector=doc_with_embedding.embedding,
-                top_k=query_top_k,
-                threshold=threshold * 0.8  # Lower threshold to get more potential matches
-            )
-            
-            # If no similar terms found with this threshold, try a lower threshold as fallback
-            if not similar_terms and threshold > 0.15:
-                logger.info(f"No terms found with threshold {threshold}, trying with lower threshold")
-                similar_terms = self.vector_store.find_similar_vectors(
-                    query_vector=doc_with_embedding.embedding,
-                    top_k=query_top_k,
-                    threshold=0.15  # Lower fallback threshold
-                )
-            
-            # If still no matches, recommend modeling
-            if not similar_terms:
-                return TaggingResult(
-                    element_id=element_id,
-                    element_name=name,
-                    element_description=description,
-                    matching_terms=[],
-                    confidence_scores=[],
-                    modeling_required=True,
-                    message=f"No similar terms found, even with lower threshold. Modeling should be performed."
-                )
-            
-            # For CDM-based filtering - if CDM is specified, prioritize those terms
-            if cdm:
-                # Filter and boost terms that match the specified CDM
-                cdm_terms = []
-                other_terms = []
-                
-                for term in similar_terms:
-                    term_cdm = None
-                    if "metadata" in term and term["metadata"] and "cdm" in term["metadata"]:
-                        term_cdm = term["metadata"]["cdm"]
-                    
-                    if term_cdm and term_cdm.lower() == cdm.lower():
-                        # Boost similarity for CDM matches
-                        term["similarity"] = min(term["similarity"] * 1.25, 1.0)
-                        cdm_terms.append(term)
-                    else:
-                        other_terms.append(term)
-                
-                # Combine terms with CDM terms first
-                similar_terms = cdm_terms + other_terms
-            
-            # Format matching terms and sort by similarity score
-            matching_terms = []
-            confidence_scores = []
-            
-            # Sort by similarity score (highest first)
-            similar_terms.sort(key=lambda x: x["similarity"], reverse=True)
-            
-            # Take the top_k items, or fewer if not enough matches
-            max_items = min(top_k, len(similar_terms))
-            for term in similar_terms[:max_items]:
-                # Add category and CDM from metadata if available
-                category = None
-                cdm_value = None
-                if "metadata" in term and term["metadata"]:
-                    category = term["metadata"].get("category")
-                    cdm_value = term["metadata"].get("cdm")
-                
-                term_entry = {
-                    "id": term["id"],
-                    "name": term["name"],
-                    "description": term["description"],
-                    "similarity": term["similarity"]
-                }
-                
-                # Add category and CDM if available
-                if category:
-                    term_entry["category"] = category
-                if cdm_value:
-                    term_entry["cdm"] = cdm_value
-                
-                matching_terms.append(term_entry)
-                confidence_scores.append(term["similarity"])
-            
-            # Create initial tagging result
-            initial_result = TaggingResult(
-                element_id=element_id,
-                element_name=name,
-                element_description=description,
-                matching_terms=matching_terms,
-                confidence_scores=confidence_scores,
-                modeling_required=False,  # Will be evaluated by AI
-                message="Initial vector similarity matches found"
-            )
-            
-            # Use AI agent to evaluate and improve the matches
-            is_valid, overall_confidence, reasoning, improved_result = await self.ai_evaluation_agent.evaluate_tagging_result(initial_result)
-            
-            # Update the modeling_required flag based on AI evaluation
-            improved_result.modeling_required = not is_valid or overall_confidence < 0.5
-            
-            # Add details about the CDM filter in the message if applicable
-            if cdm and improved_result.matching_terms:
-                cdm_matches = sum(1 for term in improved_result.matching_terms if term.get("cdm") == cdm)
-                if cdm_matches > 0:
-                    improved_result.message += f" (Found {cdm_matches} terms in the requested CDM: {cdm})"
-            
-            # If the AI evaluation determined matches are not good, try to find better matches
-            if improved_result.modeling_required and similar_terms and len(similar_terms) > top_k:
-                logger.info(f"AI evaluation suggests modeling for '{name}'. Trying to find better matches using LLM...")
-                
-                # Get all terms for better AI-based matching
-                all_terms = self.get_all_terms()
-                all_term_dicts = [term.dict() for term in all_terms]
-                
-                # Ask AI to find better matches from all terms
-                better_matches = await self.ai_evaluation_agent.find_better_matches(
-                    name,
-                    description,
-                    all_term_dicts,
-                    matching_terms,
-                    max_suggestions=top_k
-                )
-                
-                # If better matches were found, update the result
-                if better_matches:
-                    logger.info(f"AI found {len(better_matches)} better matches for '{name}'")
-                    
-                    # Create confidence scores from similarities
-                    better_confidence_scores = [match.get("similarity", 0.5) for match in better_matches]
-                    
-                    # Check if the best match has a high enough confidence
-                    best_confidence = max(better_confidence_scores) if better_confidence_scores else 0.0
-                    
-                    # Update the tagging result with AI-selected matches
-                    improved_result = TaggingResult(
-                        element_id=element_id,
-                        element_name=name,
-                        element_description=description,
-                        matching_terms=better_matches,
-                        confidence_scores=better_confidence_scores,
-                        modeling_required=best_confidence < 0.5,  # Still require modeling if confidence is low
-                        message=f"AI-selected better matches with confidence {best_confidence:.2f}"
-                    )
-            
-            return improved_result
-                
-        except Exception as e:
-            logger.error(f"Error tagging element: {e}", exc_info=True)
+        logger.info(f"Starting tagging workflow for element: {element_id} with LLM first: {use_llm_first}, CDM: {cdm}")
+        
+        initial_state: TaggingWorkflowState = {
+            "element_id": element_id,
+            "element_name": element_name,
+            "element_description": element_description,
+            "matching_terms": [],
+            "confidence_scores": [],
+            "validation_result": None,
+            "ai_evaluation_result": None,
+            "is_complete": False,
+            "modeling_required": False,
+            "error": None,
+            "message": "",
+            "use_llm_first": use_llm_first,
+            "cdm": cdm,
+            "example": example,
+            "process_name": process_name,
+            "process_description": process_description
+        }
+        
+        # Run the workflow
+        result = await self.graph.ainvoke(initial_state)
+        
+        if result.get("error"):
+            logger.error(f"Workflow error: {result['error']}")
             return TaggingResult(
                 element_id=element_id,
-                element_name=name,
-                element_description=description,
+                element_name=element_name,
+                element_description=element_description,
                 matching_terms=[],
                 confidence_scores=[],
                 modeling_required=True,
-                message=f"Error during tagging: {str(e)}. Modeling should be performed."
+                message=result["error"]
             )
-
-    async def evaluate_tagging_with_reasoning(self, tagging_result: TaggingResult) -> Tuple[float, str]:
+        
+        # Include AI evaluation reasoning in the message if available
+        message = result["message"]
+        if result.get("ai_evaluation_result") and result["ai_evaluation_result"].get("reasoning"):
+            reasoning_snippet = result["ai_evaluation_result"]["reasoning"]
+            # Limit reasoning to first 100 characters to keep message concise
+            if len(reasoning_snippet) > 100:
+                reasoning_snippet = reasoning_snippet[:100] + "..."
+            message = f"{message} - AI evaluation: {reasoning_snippet}"
+        
+        return TaggingResult(
+            element_id=result["element_id"],
+            element_name=result["element_name"],
+            element_description=result["element_description"],
+            matching_terms=result["matching_terms"],
+            confidence_scores=result["confidence_scores"],
+            modeling_required=result["modeling_required"],
+            message=message
+        )
+        
+    async def tag_enhanced_element(self, 
+                                 enhanced_element: EnhancedDataElement, 
+                                 use_llm_first: bool = True,
+                                 cdm: Optional[str] = None,
+                                 example: Optional[str] = None,
+                                 process_name: Optional[str] = None,
+                                 process_description: Optional[str] = None) -> TaggingResult:
         """
-        Evaluate the confidence in the tagging with detailed reasoning using the AI evaluation agent.
+        Tag an enhanced data element with appropriate business terms.
         
         Args:
-            tagging_result: Tagging result to evaluate
+            enhanced_element: The enhanced data element
+            use_llm_first: Whether to use LLM matching first
+            cdm: Optional CDM to prioritize in the matching
+            example: Optional example from the original data element if available
+            process_name: Optional process name from the original data element if available
+            process_description: Optional process description from the original data element if available
             
         Returns:
-            Tuple containing (confidence_score, reasoning)
+            TaggingResult with matching terms and confidence scores
         """
-        try:
-            # Skip evaluation if modeling is required
-            if tagging_result.modeling_required:
-                return 0.0, "Modeling is required as no suitable matches were found."
-                
-            # If no matches, return zero confidence
-            if not tagging_result.matching_terms:
-                return 0.0, "No matching terms were found. Modeling is required."
-            
-            # Use the AI evaluation agent to evaluate the matches
-            is_valid, overall_confidence, reasoning, _ = await self.ai_evaluation_agent.evaluate_tagging_result(tagging_result)
-            
-            return overall_confidence, reasoning
+        # Use any provided example/process info, or get from enhanced element if available
+        example = example or enhanced_element.example
+        process_name = process_name or enhanced_element.process_name
+        process_description = process_description or enhanced_element.process_description
         
-        except Exception as e:
-            logger.error(f"Error evaluating tagging confidence with reasoning: {e}")
-            return 0.5, f"Error evaluating tagging confidence: {e}"
-    
-    async def validate_tagging(self, tagging_result: TaggingResult) -> TaggingValidationResult:
-        """
-        Validate the tagging result.
-        
-        Args:
-            tagging_result: Result of tagging to validate
-            
-        Returns:
-            TaggingValidationResult with validation status and suggestions
-        """
-        try:
-            # Use the AI evaluation agent to evaluate the matches
-            is_valid, overall_confidence, reasoning, improved_result = await self.ai_evaluation_agent.evaluate_tagging_result(tagging_result)
-            
-            # Return validation result using AI-based evaluation
-            return TaggingValidationResult(
-                is_valid=is_valid,
-                feedback=reasoning,
-                suggested_alternatives=[]  # Could include better matches here if needed
-            )
-            
-        except Exception as e:
-            logger.error(f"Error validating tagging: {e}")
-            return TaggingValidationResult(
-                is_valid=False,
-                feedback=f"Error during validation: {str(e)}",
-                suggested_alternatives=[]
-            )
-    
-    def get_all_terms(self) -> List[BusinessTerm]:
-        """
-        Get all business terms from the collection.
-        
-        Returns:
-            List of BusinessTerm objects
-        """
-        try:
-            term_dicts = self.vector_store.get_all_terms()
-            
-            terms = []
-            for term_dict in term_dicts:
-                terms.append(BusinessTerm(
-                    id=term_dict["id"],
-                    name=term_dict["name"],
-                    description=term_dict["description"],
-                    metadata=term_dict.get("metadata", {})
-                ))
-                
-            return terms
-        except Exception as e:
-            logger.error(f"Error retrieving all terms: {e}")
-            return []
-    
-    def get_term_by_id(self, term_id: str) -> Optional[BusinessTerm]:
-        """
-        Get a business term by its ID.
-        
-        Args:
-            term_id: Unique identifier of the term
-            
-        Returns:
-            BusinessTerm if found, None otherwise
-        """
-        try:
-            term_dict = self.vector_store.get_term_by_id(term_id)
-            
-            if term_dict:
-                return BusinessTerm(
-                    id=term_dict["id"],
-                    name=term_dict["name"],
-                    description=term_dict["description"],
-                    metadata=term_dict.get("metadata", {})
-                )
-            
-            return None
-        except Exception as e:
-            logger.error(f"Error retrieving term by ID: {e}")
-            return None
-    
-    def get_term_count(self) -> int:
-        """
-        Get the total count of business terms.
-        
-        Returns:
-            Total number of terms
-        """
-        try:
-            terms = self.vector_store.get_all_terms()
-            return len(terms)
-        except Exception as e:
-            logger.error(f"Error getting term count: {e}")
-            return 0
-    
-    def delete_term(self, term_id: str) -> bool:
-        """
-        Delete a business term by ID.
-        
-        Args:
-            term_id: ID of the term to delete
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            return self.vector_store.delete_term(term_id)
-        except Exception as e:
-            logger.error(f"Error deleting term: {e}")
-            return False
-    
-    def delete_all_terms(self) -> int:
-        """
-        Delete all business terms.
-        
-        Returns:
-            Number of terms deleted
-        """
-        try:
-            return self.vector_store.delete_all_terms()
-        except Exception as e:
-            logger.error(f"Error deleting all terms: {e}")
-            return 0
-    
-    def search_terms(self, query: str, limit: int = 20) -> List[BusinessTerm]:
-        """
-        Search for business terms by name or description.
-        
-        Args:
-            query: Search query
-            limit: Maximum number of results
-            
-        Returns:
-            List of matching BusinessTerm objects
-        """
-        try:
-            term_dicts = self.vector_store.search_terms(query, limit)
-            
-            results = []
-            for term_dict in term_dicts:
-                results.append(BusinessTerm(
-                    id=term_dict["id"],
-                    name=term_dict["name"],
-                    description=term_dict["description"],
-                    metadata=term_dict.get("metadata", {})
-                ))
-            
-            return results
-        except Exception as e:
-            logger.error(f"Error searching terms: {e}")
-            return []
-    
-    def compute_similarity(self, text1: str, text2: str) -> float:
-        """
-        Compute semantic similarity between two text strings.
-        
-        Args:
-            text1: First text
-            text2: Second text
-            
-        Returns:
-            Similarity score between 0 and 1
-        """
-        try:
-            # Generate embeddings
-            doc1 = MyDocument(id="temp1", text=text1)
-            doc2 = MyDocument(id="temp2", text=text2)
-            
-            doc1_with_embedding = self.embedding_client.generate_embeddings(doc1)
-            doc2_with_embedding = self.embedding_client.generate_embeddings(doc2)
-            
-            if not doc1_with_embedding.embedding or not doc2_with_embedding.embedding:
-                logger.warning("Could not generate embeddings for similarity computation")
-                return 0.0
-            
-            # Compute cosine similarity using vector store
-            return self.vector_store.compute_cosine_similarity(
-                doc1_with_embedding.embedding,
-                doc2_with_embedding.embedding
-            )
-        except Exception as e:
-            logger.error(f"Error computing similarity: {e}")
-            return 0.0
-    
-    def get_vector_store_info(self) -> Dict[str, Any]:
-        """
-        Get information about the current vector store.
-        
-        Returns:
-            Dict containing vector store information
-        """
-        try:
-            # Get vector store health check
-            health = self.vector_store.health_check()
-            
-            # Add vector store type
-            info = {
-                "type": self.vector_db_type,
-                "status": health.get("status", "unknown"),
-                "term_count": health.get("term_count", 0)
-            }
-            
-            # Add database-specific details
-            if self.vector_db_type == "postgresql":
-                # Get PostgreSQL details
-                db_health = self.db_manager.health_check()
-                info.update({
-                    "database": {
-                        "host": self.env.get("PG_HOST", "localhost"),
-                        "port": int(self.env.get("PG_PORT", "5432")),
-                        "db": self.env.get("PG_DB", "metadata_db"),
-                        "schema": self.db_manager.schema_name,
-                        "pgvector_enabled": db_health.get("vector_enabled", False),
-                        "version": db_health.get("version", "unknown")
-                    }
-                })
-            elif self.vector_db_type == "chroma":
-                info.update({
-                    "chroma": {
-                        "persist_dir": self.env.get("CHROMA_PERSIST_DIR", "./data/chroma_db"),
-                        "collection": self.env.get("CHROMA_COLLECTION", "business_terms")
-                    }
-                })
-            
-            return info
-        except Exception as e:
-            logger.error(f"Error getting vector store info: {e}")
-            return {
-                "type": self.vector_db_type,
-                "status": "error",
-                "error": str(e)
-            }
+        return await self.run(
+            element_id=enhanced_element.id,
+            element_name=enhanced_element.enhanced_name,
+            element_description=enhanced_element.enhanced_description,
+            use_llm_first=use_llm_first,
+            cdm=cdm,
+            example=example,
+            process_name=process_name,
+            process_description=process_description
+        )
