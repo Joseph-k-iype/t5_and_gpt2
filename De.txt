@@ -1,27 +1,81 @@
 """
 TermMatchingAgent - Agent responsible for finding and ranking business terms.
 
-This agent uses vector similarity search as a first pass and can incorporate
-LLM-based re-ranking or filtering to provide more contextually relevant term matches.
-It forms part of the RAG (Retrieval Augmented Generation) pattern for PBT tagging.
+This agent uses vector similarity search to retrieve initial candidates and then
+leverages an LLM to perform context-aware semantic matching and ranking,
+implementing a RAG (Retrieval Augmented Generation) pattern.
 """
 import logging
+import json
 from typing import List, Dict, Any, Optional, Tuple
 
 # Assuming BusinessTermManager is in app.core.business_terms
-# This creates a circular dependency if BusinessTermManager imports TermMatchingAgent directly at the top level.
-# It's better if BusinessTermManager instantiates TermMatchingAgent and passes itself (or necessary components)
-# to the agent's constructor if the agent needs to call back into the manager (e.g., for vector search).
-
-# from app.core.business_terms import BusinessTermManager # Avoid direct import if manager imports this
-from app.core.embedding import EmbeddingClient, MyDocument
-# from app.config.settings import get_llm # If LLM is used directly by this agent
-# from langchain_openai import AzureChatOpenAI # If LLM is used directly
+# Agent needs access to vector store and embedding client via the manager.
+# Needs access to the LLM.
+from app.core.embedding import MyDocument
+from app.config.settings import get_llm # Function to get the LLM instance
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+# from langchain_openai import AzureChatOpenAI # Type hint
 
 logger = logging.getLogger(__name__)
 
+# --- Constants ---
+# Adjust these based on performance and desired recall/precision
+CANDIDATE_FETCH_MULTIPLIER = 5 # Fetch 5x the number of final results needed
+MIN_CANDIDATES_TO_FETCH = 20 # Fetch at least 20 candidates
+DEFAULT_INITIAL_THRESHOLD = 0.2 # Lower threshold for broader retrieval
+
+# --- LLM Prompt Template ---
+# This prompt asks the LLM to evaluate candidates based on context.
+LLM_MATCHING_TEMPLATE = """
+You are an expert Data Governance Analyst specializing in mapping data elements to a central Business Glossary of Preferred Business Terms (PBTs).
+Your task is to identify the best PBT matches for a given Input Item based on its name, description, and additional context.
+
+**Input Item Details:**
+* Name: {element_name}
+* Description: {element_description}
+* Associated CDM (if any): {cdm_context}
+* Examples (if any): {example_context}
+* Related Process Name (if any): {process_name_context}
+* Related Process Description (if any): {process_description_context}
+
+**Candidate Preferred Business Terms (PBTs) retrieved via semantic search:**
+{candidate_pbts_details}
+
+**Instructions:**
+1.  Carefully analyze the Input Item Details.
+2.  Evaluate each Candidate PBT based on how semantically relevant its name and description are to the Input Item, considering ALL the provided context (CDM, examples, process).
+3.  Assign a relevance score between 0.0 (not relevant) and 1.0 (perfect match) to EACH candidate PBT based on your analysis.
+4.  Provide a brief reasoning (1 sentence) for the score assigned to each candidate.
+5.  Select the top {top_k} most relevant PBTs based on your scores.
+6.  If none of the candidates seem relevant (e.g., all scores below 0.5), state that clearly.
+
+**Output Format:**
+Provide your response ONLY as a JSON object containing a single key "ranked_candidates".
+The value of "ranked_candidates" should be a list of JSON objects, one for each evaluated candidate PBT.
+Each object in the list MUST have the following keys:
+    - "pbt_id": The ID of the candidate PBT.
+    - "pbt_name": The name of the candidate PBT.
+    - "score": Your calculated relevance score (float between 0.0 and 1.0).
+    - "reasoning": Your brief reasoning for the score (string).
+
+Example of a single candidate object in the list:
+{{
+  "pbt_id": "pbt123",
+  "pbt_name": "Customer Identifier",
+  "score": 0.9,
+  "reasoning": "Strong semantic match for identifying customers, aligning with the input description."
+}}
+
+If no candidates are relevant, return an empty list: {"ranked_candidates": []}
+
+**Begin Evaluation:**
+"""
+
+
 class TermMatchingAgent:
-    def __init__(self, business_term_manager): # Accept BusinessTermManager instance
+    def __init__(self, business_term_manager):
         """
         Initialize the TermMatchingAgent.
 
@@ -31,8 +85,21 @@ class TermMatchingAgent:
         """
         self.bt_manager = business_term_manager
         self.embedding_client = business_term_manager.embedding_client
-        # self.llm = get_llm() # Initialize LLM if this agent uses it directly for re-ranking/RAG
-        logger.info("TermMatchingAgent initialized.")
+        try:
+            # Get the LLM instance configured in settings.py
+            self.llm = get_llm()
+            self.llm_chain = (
+                PromptTemplate.from_template(LLM_MATCHING_TEMPLATE)
+                | self.llm
+                | StrOutputParser()
+            )
+            logger.info("TermMatchingAgent initialized with LLM.")
+        except Exception as e:
+            logger.error(f"Failed to initialize LLM for TermMatchingAgent: {e}", exc_info=True)
+            self.llm = None
+            self.llm_chain = None
+            logger.warning("TermMatchingAgent will fall back to basic vector search due to LLM initialization failure.")
+
 
     async def find_matching_terms(
         self,
@@ -44,56 +111,37 @@ class TermMatchingAgent:
         example_context: Optional[str] = None,
         process_name_context: Optional[str] = None,
         process_description_context: Optional[str] = None,
-        initial_threshold: float = 0.3
+        initial_threshold: float = DEFAULT_INITIAL_THRESHOLD # Use the lower default
     ) -> Tuple[List[Dict[str, Any]], List[float]]:
         """
-        Finds matching business terms for a given element name and description,
-        incorporating contextual information.
-
-        This method should implement the RAG pattern:
-        1. Retrieve: Fetch initial candidates from the vector store.
-        2. Augment: (Optional) Prepare context for an LLM.
-        3. Generate/Rank: Use an LLM to re-rank, filter, or generate explanations for matches,
-           or apply other business logic for hybrid search.
+        Finds matching business terms using vector retrieval followed by LLM evaluation.
 
         Args:
-            element_id: ID of the element being tagged.
-            element_name: Name of the element.
-            element_description: Description of the element.
-            top_k: The final number of top terms to return.
-            cdm_context: CDM associated with the element.
-            example_context: Example values/usage of the element.
-            process_name_context: Related business process name.
-            process_description_context: Related business process description.
-            initial_threshold: Initial similarity threshold for vector search.
+            element_id, element_name, element_description: Details of the item to tag.
+            top_k: Final number of top terms to return.
+            cdm_context, example_context, process_name_context, process_description_context: Optional context.
+            initial_threshold: Similarity threshold for initial vector retrieval.
 
         Returns:
-            A tuple containing:
-                - A list of dictionaries, where each dictionary represents a matched term
-                  (including 'id', 'name', 'description', 'metadata', 'similarity').
-                - A list of confidence scores corresponding to the matched terms.
+            Tuple(List of matched term dictionaries, List of confidence scores).
         """
-        logger.info(f"TermMatchingAgent: Finding terms for '{element_name}' (ID: {element_id}) with top_k={top_k}, threshold={initial_threshold}")
+        logger.info(f"TermMatchingAgent (LLM Hybrid): Finding terms for '{element_name}' (ID: {element_id})")
         logger.debug(f"Context: CDM='{cdm_context}', Example='{example_context[:50]}...', Process='{process_name_context}'")
 
-        # 1. Construct a comprehensive query text for embedding
+        # --- Step 1: Construct Query and Retrieve Initial Candidates ---
         query_parts = [
             f"Item Name: {element_name}",
             f"Description: {element_description}"
         ]
-        if example_context:
-            query_parts.append(f"Examples: {example_context}")
-        if process_name_context:
-            query_parts.append(f"Related Business Process: {process_name_context}")
-        if process_description_context:
-            query_parts.append(f"Process Description: {process_description_context}")
-        if cdm_context: # Include element's CDM in the query for semantic matching
-            query_parts.append(f"Associated Common Data Model (CDM): {cdm_context}")
+        # Add context only if it exists to keep query concise if context is absent
+        if example_context: query_parts.append(f"Examples: {example_context}")
+        if process_name_context: query_parts.append(f"Related Business Process: {process_name_context}")
+        if process_description_context: query_parts.append(f"Process Description: {process_description_context}")
+        if cdm_context: query_parts.append(f"Associated Common Data Model (CDM): {cdm_context}")
         
         query_text = ". ".join(query_parts)
         logger.debug(f"Constructed query text for embedding: {query_text[:300]}...")
 
-        # 2. Generate embedding for the query
         query_doc = MyDocument(id=f"query_{element_id}", text=query_text)
         try:
             embedded_query_doc = self.embedding_client.generate_embeddings(query_doc)
@@ -103,87 +151,147 @@ class TermMatchingAgent:
         except Exception as e:
             logger.error(f"Error during embedding generation for query: {e}", exc_info=True)
             return [], []
-        
-        # 3. Retrieve initial candidates from the vector store
-        # Fetch more than top_k initially to allow for re-ranking/filtering.
-        # The vector_store.find_similar_vectors should return dicts with 'id', 'name', 'description', 'metadata', 'similarity'
+
+        num_candidates_to_fetch = max(top_k * CANDIDATE_FETCH_MULTIPLIER, MIN_CANDIDATES_TO_FETCH)
+        logger.debug(f"Fetching {num_candidates_to_fetch} candidates from vector store with threshold {initial_threshold}...")
         try:
-            # We might want to fetch more candidates if we plan to re-rank heavily.
-            # Let's say fetch 3*top_k or a fixed number like 20-50.
-            num_candidates_to_fetch = max(top_k * 3, 20) 
-            logger.debug(f"Fetching {num_candidates_to_fetch} candidates from vector store with threshold {initial_threshold}...")
+            # find_similar_vectors returns list of dicts: {'id', 'name', 'description', 'metadata', 'similarity'}
             initial_candidates = self.bt_manager.vector_store.find_similar_vectors(
                 query_vector=embedded_query_doc.embedding,
                 top_k=num_candidates_to_fetch,
-                threshold=initial_threshold 
+                threshold=initial_threshold
             )
+            logger.info(f"Retrieved {len(initial_candidates)} initial candidates from vector store.")
         except Exception as e:
             logger.error(f"Error retrieving candidates from vector store: {e}", exc_info=True)
             return [], []
 
-        logger.info(f"Retrieved {len(initial_candidates)} initial candidates from vector store.")
         if not initial_candidates:
+            logger.warning("No initial candidates found from vector search.")
             return [], []
 
-        # 4. Augment & Generate/Rank (RAG step - Placeholder for your advanced logic)
-        # This is where you would use an LLM or other sophisticated ranking.
-        # For now, we'll implement a basic hybrid approach:
-        # - Semantic score (from vector search)
-        # - Keyword relevance (simple check)
-        # - CDM preference (if cdm_context is provided)
+        # --- Step 2: Use LLM for Re-ranking and Selection (if LLM is available) ---
+        if not self.llm_chain:
+            # Fallback to basic vector search results if LLM failed to initialize
+            logger.warning("LLM not available, returning results based purely on initial vector similarity.")
+            # Sort by original similarity and take top_k
+            initial_candidates.sort(key=lambda x: x.get('similarity', 0.0), reverse=True)
+            top_results_basic = initial_candidates[:top_k]
+            matched_terms_output = top_results_basic
+            confidence_scores_output = [term.get('similarity', 0.0) for term in top_results_basic]
+            return matched_terms_output, confidence_scores_output
 
-        final_ranked_terms = []
-        for candidate in initial_candidates:
-            term_name = candidate.get("name", "").lower()
-            term_desc = candidate.get("description", "").lower()
-            term_cdm = candidate.get("metadata", {}).get("cdm", "").lower()
+        # Prepare candidate details string for the prompt
+        candidate_details_str = ""
+        candidate_map = {} # To easily retrieve full candidate details later
+        for idx, candidate in enumerate(initial_candidates):
+            candidate_id = candidate.get('id', f'unknown_{idx}')
+            candidate_map[candidate_id] = candidate # Store full details
+            candidate_details_str += (
+                f"Candidate {idx+1}:\n"
+                f"  ID: {candidate_id}\n"
+                f"  Name: {candidate.get('name', 'N/A')}\n"
+                f"  Description: {candidate.get('description', 'N/A')}\n"
+                f"  CDM: {candidate.get('metadata', {}).get('cdm', 'N/A')}\n\n"
+            )
+
+        # --- Step 3: Invoke LLM Chain ---
+        try:
+            logger.debug("Invoking LLM for matching and ranking...")
+            llm_response_str = await self.llm_chain.ainvoke({
+                "element_name": element_name,
+                "element_description": element_description,
+                "cdm_context": cdm_context or "N/A",
+                "example_context": example_context or "N/A",
+                "process_name_context": process_name_context or "N/A",
+                "process_description_context": process_description_context or "N/A",
+                "candidate_pbts_details": candidate_details_str.strip(),
+                "top_k": top_k
+            })
+            logger.debug(f"LLM Raw Response: {llm_response_str}")
+
+        except Exception as e:
+            logger.error(f"Error invoking LLM chain: {e}", exc_info=True)
+            # Fallback: Return initial vector search results if LLM fails
+            logger.warning("LLM invocation failed, returning results based on initial vector similarity.")
+            initial_candidates.sort(key=lambda x: x.get('similarity', 0.0), reverse=True)
+            top_results_fallback = initial_candidates[:top_k]
+            matched_terms_output_fb = top_results_fallback
+            confidence_scores_output_fb = [term.get('similarity', 0.0) for term in top_results_fallback]
+            return matched_terms_output_fb, confidence_scores_output_fb
+
+        # --- Step 4: Parse LLM Response ---
+        try:
+            # Clean potential markdown/code blocks if necessary
+            if llm_response_str.strip().startswith("```json"):
+                 llm_response_str = llm_response_str.strip()[7:-3].strip()
+            elif llm_response_str.strip().startswith("```"):
+                 llm_response_str = llm_response_str.strip()[3:-3].strip()
+
+            llm_results_data = json.loads(llm_response_str)
+            ranked_candidates_from_llm = llm_results_data.get("ranked_candidates", [])
+
+            if not isinstance(ranked_candidates_from_llm, list):
+                 logger.error(f"LLM returned unexpected format for ranked_candidates: {type(ranked_candidates_from_llm)}")
+                 raise ValueError("LLM response for ranked_candidates was not a list.")
+
+            # Sort by score from LLM and take top_k
+            ranked_candidates_from_llm.sort(key=lambda x: x.get('score', 0.0), reverse=True)
+            top_llm_ranked_ids = {item.get('pbt_id'): item.get('score', 0.0) for item in ranked_candidates_from_llm[:top_k]}
+
+            # --- Step 5: Format Output ---
+            matched_terms_output = []
+            confidence_scores_output = []
+
+            # Retrieve full details for the top ranked IDs from the original candidates
+            for pbt_id, llm_score in top_llm_ranked_ids.items():
+                original_candidate = candidate_map.get(pbt_id)
+                if original_candidate:
+                    # Add LLM score and reasoning to metadata for transparency?
+                    original_candidate.setdefault('metadata', {})['llm_score'] = llm_score
+                    reasoning = next((item.get('reasoning', '') for item in ranked_candidates_from_llm if item.get('pbt_id') == pbt_id), '')
+                    original_candidate['metadata']['llm_reasoning'] = reasoning
+
+                    matched_terms_output.append(original_candidate)
+                    confidence_scores_output.append(llm_score) # Use LLM score as confidence
+                else:
+                    logger.warning(f"PBT ID '{pbt_id}' ranked by LLM but not found in initial candidates.")
             
-            score = candidate.get("similarity", 0.0) # Start with semantic similarity
-
-            # Keyword relevance boost (simple example)
-            if element_name.lower() in term_name or element_name.lower() in term_desc:
-                score += 0.05 # Small boost for keyword match
+            # Re-sort the final list just in case (should be sorted already)
+            # Create tuples of (term, score) for sorting
+            term_score_pairs = list(zip(matched_terms_output, confidence_scores_output))
+            term_score_pairs.sort(key=lambda pair: pair[1], reverse=True)
             
-            # CDM preference boost
-            if cdm_context and term_cdm == cdm_context.lower():
-                score += 0.1 # Boost if PBT's CDM matches the element's CDM context
+            # Unzip back into separate lists
+            if term_score_pairs:
+                 matched_terms_output, confidence_scores_output = zip(*term_score_pairs)
+                 matched_terms_output = list(matched_terms_output)
+                 confidence_scores_output = list(confidence_scores_output)
+            else:
+                 matched_terms_output = []
+                 confidence_scores_output = []
 
-            # Ensure score doesn't exceed 1.0 if you're adding boosts
-            score = min(score, 1.0) 
-            
-            candidate_with_final_score = candidate.copy()
-            candidate_with_final_score['final_score'] = score 
-            final_ranked_terms.append(candidate_with_final_score)
 
-        # Sort by the new 'final_score'
-        final_ranked_terms.sort(key=lambda x: x['final_score'], reverse=True)
-        
-        # Select top_k results
-        top_results = final_ranked_terms[:top_k]
+            logger.info(f"TermMatchingAgent (LLM Hybrid): Returning {len(matched_terms_output)} terms after LLM evaluation.")
+            return matched_terms_output, confidence_scores_output
 
-        # Prepare the output format
-        matched_terms_output = []
-        confidence_scores_output = []
-
-        for term in top_results:
-            # The 'similarity' from vector store is a good candidate for confidence,
-            # or use 'final_score' if your ranking logic produces a comparable metric.
-            # For this example, let's use 'final_score' as the confidence.
-            confidence = term.get('final_score', term.get('similarity', 0.0))
-            
-            # Ensure the term dictionary has the expected keys for TaggingResult
-            # The find_similar_vectors should already return 'id', 'name', 'description', 'metadata', 'similarity'
-            term_details_for_output = {
-                "id": term.get("id"),
-                "name": term.get("name"),
-                "description": term.get("description"),
-                "metadata": term.get("metadata", {}),
-                "similarity": term.get("similarity"), # Original semantic similarity
-                # You could add 'final_score' to metadata if needed for transparency
-            }
-            matched_terms_output.append(term_details_for_output)
-            confidence_scores_output.append(confidence)
-            
-        logger.info(f"TermMatchingAgent: Returning {len(matched_terms_output)} terms after ranking/filtering.")
-        return matched_terms_output, confidence_scores_output
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON response from LLM: {e}")
+            logger.error(f"LLM Response String was: {llm_response_str}")
+            # Fallback: Return initial vector search results
+            logger.warning("LLM response parsing failed, returning results based on initial vector similarity.")
+            initial_candidates.sort(key=lambda x: x.get('similarity', 0.0), reverse=True)
+            top_results_fallback = initial_candidates[:top_k]
+            matched_terms_output_fb = top_results_fallback
+            confidence_scores_output_fb = [term.get('similarity', 0.0) for term in top_results_fallback]
+            return matched_terms_output_fb, confidence_scores_output_fb
+        except Exception as e:
+            logger.error(f"Error processing LLM response: {e}", exc_info=True)
+            # Fallback: Return initial vector search results
+            logger.warning("LLM response processing failed, returning results based on initial vector similarity.")
+            initial_candidates.sort(key=lambda x: x.get('similarity', 0.0), reverse=True)
+            top_results_fallback = initial_candidates[:top_k]
+            matched_terms_output_fb = top_results_fallback
+            confidence_scores_output_fb = [term.get('similarity', 0.0) for term in top_results_fallback]
+            return matched_terms_output_fb, confidence_scores_output_fb
 
