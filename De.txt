@@ -1,226 +1,303 @@
-"""
-Application Settings - Configuration settings and utilities for the API.
-
-This module provides functions to retrieve and manage application settings, 
-including language model configuration, vector database selection, and other
-global settings.
-"""
-
-import logging
 import os
-from typing import Optional, Union, Dict, Any, TYPE_CHECKING
-from langchain_openai import AzureChatOpenAI
-from azure.identity import get_bearer_token_provider
-from app.config.environment import get_os_env
-from utils.auth_helper import get_azure_token_cached
-
-# TYPE_CHECKING is used to avoid circular imports during type checking
-if TYPE_CHECKING:
-    from app.core.vector_store import VectorStore
+import logging
+import time
+import threading
+import requests
+from typing import Optional, Dict, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
-def get_vector_db_type() -> str:
-    """
-    Get the vector database type from environment settings.
+class TokenCache:
+    """Thread-safe token cache for storing and retrieving Azure tokens."""
     
-    Returns:
-        str: Vector database type (always "chroma" to avoid pgvector issues)
-    """
-    # Always return "chroma" regardless of environment settings
-    # This ensures we always use ChromaDB and avoid proxy issues with pgvector
-    return "chroma"
+    _instance = None
+    _lock = threading.RLock()
+    
+    def __new__(cls):
+        """Implement singleton pattern."""
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super(TokenCache, cls).__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self):
+        """Initialize the token cache."""
+        if self._initialized:
+            return
+            
+        with self._lock:
+            if not self._initialized:
+                self._tokens = {}  # Format: {cache_key: (token, expiry_time)}
+                self._initialized = True
+                logger.info("Token cache initialized")
+    
+    def get(self, tenant_id: str, client_id: str, scope: str) -> Optional[str]:
+        """
+        Get a token from the cache if it exists and is not expired.
+        
+        Args:
+            tenant_id: Azure tenant ID
+            client_id: Azure client ID
+            scope: OAuth scope
+            
+        Returns:
+            Token if found and valid, None otherwise
+        """
+        cache_key = self._get_cache_key(tenant_id, client_id, scope)
+        
+        with self._lock:
+            if cache_key in self._tokens:
+                token, expiry_time = self._tokens[cache_key]
+                # Allow 5 minute buffer before expiration
+                if time.time() < expiry_time - 300:
+                    logger.debug(f"Token cache hit for {client_id[:8]}...")
+                    return token
+                else:
+                    logger.debug(f"Token expired for {client_id[:8]}...")
+                    # Remove expired token
+                    del self._tokens[cache_key]
+        
+        return None
+    
+    def set(self, tenant_id: str, client_id: str, scope: str, token: str, expires_in: int = 3600) -> None:
+        """
+        Store a token in the cache.
+        
+        Args:
+            tenant_id: Azure tenant ID
+            client_id: Azure client ID
+            scope: OAuth scope
+            token: The token to store
+            expires_in: Token expiration time in seconds
+        """
+        cache_key = self._get_cache_key(tenant_id, client_id, scope)
+        expiry_time = time.time() + expires_in
+        
+        with self._lock:
+            self._tokens[cache_key] = (token, expiry_time)
+            
+        logger.debug(f"Token cached for {client_id[:8]}... (expires in {expires_in}s)")
+    
+    def _get_cache_key(self, tenant_id: str, client_id: str, scope: str) -> str:
+        """Generate a cache key."""
+        return f"{tenant_id}:{client_id}:{scope}"
+    
+    def clear(self) -> None:
+        """Clear all tokens from the cache."""
+        with self._lock:
+            self._tokens.clear()
+        logger.info("Token cache cleared")
+    
+    def remove(self, tenant_id: str, client_id: str, scope: str) -> None:
+        """Remove a specific token from the cache."""
+        cache_key = self._get_cache_key(tenant_id, client_id, scope)
+        
+        with self._lock:
+            if cache_key in self._tokens:
+                del self._tokens[cache_key]
+                logger.debug(f"Token removed from cache for {client_id[:8]}...")
 
-def get_vector_store(vector_db_type: Optional[str] = None) -> 'VectorStore':
+# Initialize global token cache
+token_cache = TokenCache()
+
+def get_azure_token_cached(tenant_id: str, client_id: str, client_secret: str, 
+                          scope: str = "https://cognitiveservices.azure.com/.default") -> Optional[str]:
     """
-    Get the vector store implementation based on settings.
+    Get an Azure AD token with caching support.
+    This function first checks the cache before making a new token request.
     
     Args:
-        vector_db_type: Override the vector database type from environment
-    
+        tenant_id: Azure tenant ID
+        client_id: Azure client ID
+        client_secret: Azure client secret
+        scope: OAuth scope to request
+        
     Returns:
-        VectorStore: The vector store implementation (always ChromaDB)
+        Access token if successful, None otherwise
     """
-    from app.core.vector_store import VectorStore
+    # Check cache first
+    token = token_cache.get(tenant_id, client_id, scope)
+    if token:
+        return token
     
-    # Always use ChromaDB regardless of input parameter
-    from app.core.vector_store_chroma import ChromaDBVectorStore
-    persist_dir = os.environ.get("CHROMA_PERSIST_DIR", "./data/chroma_db")
-    collection_name = os.environ.get("CHROMA_COLLECTION", "business_terms")
-    logger.info(f"Using ChromaDB as vector store with collection '{collection_name}' in '{persist_dir}'")
-    return ChromaDBVectorStore(collection_name=collection_name, persist_dir=persist_dir)
-
-def get_llm(proxy_enabled: Optional[bool] = None) -> AzureChatOpenAI:
-    """
-    Get the language model for the application with cached token authentication.
-    
-    Args:
-        proxy_enabled: Override the PROXY_ENABLED setting in the config file
-    
-    Returns:
-        AzureChatOpenAI: The language model
-    """
-    # Get environment with proxy setting override if provided
-    env = get_os_env(proxy_enabled=proxy_enabled)
-    
-    logger.info(f"Setting up Azure OpenAI client with proxy enabled: {env.get('PROXY_ENABLED', 'True')}")
-    
+    # Cache miss - get new token
     try:
-        # Get tenant, client and secret info for token acquisition
+        logger.info(f"Token cache miss for {client_id[:8]}... - fetching new token")
+        
+        # OAuth2 token endpoint
+        token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+        
+        # Request body
+        data = {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "scope": scope,
+            "grant_type": "client_credentials"
+        }
+        
+        # Make the request
+        response = requests.post(
+            token_url, 
+            data=data,
+            timeout=30
+        )
+        
+        # Handle response
+        if response.status_code == 200:
+            token_data = response.json()
+            if "access_token" in token_data:
+                token = token_data["access_token"]
+                expires_in = token_data.get("expires_in", 3600)  # Default to 1 hour
+                
+                # Cache the token
+                token_cache.set(tenant_id, client_id, scope, token, expires_in)
+                
+                logger.info(f"New token acquired and cached (expires in {expires_in}s)")
+                return token
+            else:
+                logger.error("Token response did not contain access_token")
+                return None
+        else:
+            logger.error(f"Token request failed with status {response.status_code}: {response.text}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error getting Azure token: {e}")
+        return None
+
+def get_azure_token_manual(tenant_id: str, client_id: str, client_secret: str, 
+                          scope: str = "https://cognitiveservices.azure.com/.default") -> Optional[str]:
+    """
+    Manually get an Azure AD token using requests instead of the Azure SDK.
+    This function is kept for backward compatibility - use get_azure_token_cached instead.
+    
+    Args:
+        tenant_id: Azure tenant ID
+        client_id: Azure client ID
+        client_secret: Azure client secret
+        scope: OAuth scope to request
+        
+    Returns:
+        Access token if successful, None otherwise
+    """
+    return get_azure_token_cached(tenant_id, client_id, client_secret, scope)
+
+def refresh_token_if_needed(tenant_id: str, client_id: str, client_secret: str, 
+                           scope: str = "https://cognitiveservices.azure.com/.default",
+                           min_validity_seconds: int = 600) -> bool:
+    """
+    Check if a token is about to expire and refresh it if needed.
+    
+    Args:
+        tenant_id: Azure tenant ID
+        client_id: Azure client ID
+        client_secret: Azure client secret
+        scope: OAuth scope
+        min_validity_seconds: Minimum seconds of validity required
+        
+    Returns:
+        True if token was refreshed or is valid, False on error
+    """
+    # Get token from cache to check expiry
+    cache_key = token_cache._get_cache_key(tenant_id, client_id, scope)
+    
+    with token_cache._lock:
+        if cache_key in token_cache._tokens:
+            _, expiry_time = token_cache._tokens[cache_key]
+            time_left = expiry_time - time.time()
+            
+            # If token expires soon, refresh it
+            if time_left < min_validity_seconds:
+                logger.info(f"Token for {client_id[:8]}... expires in {time_left:.0f}s, refreshing")
+                
+                # Remove old token
+                del token_cache._tokens[cache_key]
+    
+    # Get a fresh token (will update cache)
+    token = get_azure_token_cached(tenant_id, client_id, client_secret, scope)
+    return token is not None
+
+# Global refresh thread reference
+_token_refresh_thread = None
+
+def start_token_refresh_service(refresh_interval: int = 300) -> threading.Thread:
+    """
+    Start a background thread that refreshes tokens periodically.
+    
+    Args:
+        refresh_interval: Interval between refresh checks in seconds
+        
+    Returns:
+        The background thread
+    """
+    def _token_refresh_worker():
+        from app.config.environment import get_os_env
+        
+        env = get_os_env()
         tenant_id = env.get("AZURE_TENANT_ID", "")
         client_id = env.get("AZURE_CLIENT_ID", "")
         client_secret = env.get("AZURE_CLIENT_SECRET", "")
         
-        # Get cached token (or new token if not in cache)
-        token = get_azure_token_cached(
-            tenant_id=tenant_id,
-            client_id=client_id, 
-            client_secret=client_secret,
-            scope="https://cognitiveservices.azure.com/.default"
-        )
-        
-        if token:
-            logger.info("Successfully obtained Azure token (using cache when available)")
-            # Create a simple callable token provider
-            token_provider = lambda: token
-        else:
-            logger.error("Failed to obtain Azure token")
-            return MockLLM()
+        while True:
+            try:
+                # Refresh the token if it's going to expire soon
+                refresh_token_if_needed(
+                    tenant_id=tenant_id,
+                    client_id=client_id,
+                    client_secret=client_secret
+                )
+            except Exception as e:
+                logger.error(f"Error in token refresh worker: {e}")
             
-    except Exception as e:
-        logger.error(f"Token acquisition failed: {e}")
-        return MockLLM()
+            # Sleep for the specified interval
+            time.sleep(refresh_interval)
     
-    # Get model configuration
-    model_name = env.get("MODEL_NAME", "gpt-4o")
-    temperature = float(env.get("TEMPERATURE", "0.3"))  # Lower temperature for more deterministic outputs
-    max_tokens = int(env.get("MAX_TOKENS", "2000"))
-    api_version = env.get("API_VERSION", "2023-05-15")
-    azure_endpoint = env.get("AZURE_ENDPOINT", "")
-    
-    logger.info(f"Using model: {model_name}, temperature: {temperature}, max_tokens: {max_tokens}")
-    
-    # Create and return the LLM
-    return AzureChatOpenAI(
-        model_name=model_name,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        api_version=api_version,
-        azure_endpoint=azure_endpoint,
-        azure_ad_token_provider=token_provider
+    # Create and start the thread
+    refresh_thread = threading.Thread(
+        target=_token_refresh_worker,
+        daemon=True,
+        name="TokenRefreshThread"
     )
+    refresh_thread.start()
+    logger.info(f"Token refresh service started (interval: {refresh_interval}s)")
+    
+    return refresh_thread
 
-# Mock LLM class for fallback when authentication fails
-class MockLLM:
-    """Mock LLM that logs errors instead of making API calls."""
-    
-    def __init__(self):
-        self.error_message = "Azure authentication failed. Using mock LLM."
-        logger.error(self.error_message)
-    
-    def invoke(self, *args, **kwargs):
-        logger.error(f"Cannot invoke LLM: {self.error_message}")
-        return "Azure authentication failed. Please check your proxy settings and credentials."
-    
-    async def ainvoke(self, *args, **kwargs):
-        logger.error(f"Cannot invoke LLM asynchronously: {self.error_message}")
-        return "Azure authentication failed. Please check your proxy settings and credentials."
-
-def get_app_settings() -> Dict[str, Any]:
+def initialize_token_caching(start_refresh_service: bool = True, 
+                            refresh_interval: int = 300) -> None:
     """
-    Get all application settings.
+    Initialize the token caching system and optionally start the refresh service.
     
-    Returns:
-        Dict[str, Any]: Dictionary containing all application settings
+    Args:
+        start_refresh_service: Whether to start the token refresh service
+        refresh_interval: Interval between refresh checks in seconds
     """
+    global _token_refresh_thread
+    
+    # Ensure token cache is initialized
+    _ = TokenCache()
+    
+    # Pre-cache a token for immediate use
+    from app.config.environment import get_os_env
+    
     env = get_os_env()
+    tenant_id = env.get("AZURE_TENANT_ID", "")
+    client_id = env.get("AZURE_CLIENT_ID", "")
+    client_secret = env.get("AZURE_CLIENT_SECRET", "")
     
-    # Vector database settings - always use ChromaDB
-    vector_db_type = "chroma"  # Force ChromaDB
-    vector_db_settings = {
-        "type": vector_db_type,
-        "persist_dir": env.get("CHROMA_PERSIST_DIR", "./data/chroma_db"),
-        "collection": env.get("CHROMA_COLLECTION", "business_terms")
-    }
+    token = get_azure_token_cached(
+        tenant_id=tenant_id,
+        client_id=client_id,
+        client_secret=client_secret
+    )
     
-    # PostgreSQL settings
-    pg_settings = {
-        "host": env.get("PG_HOST", "localhost"),
-        "port": int(env.get("PG_PORT", "5432")),
-        "database": env.get("PG_DB", "metadata_db"),
-        "user": env.get("PG_USER", "postgres"),
-        "db_schema": env.get("PG_SCHEMA", "ai_stitching_platform"),  # Changed from 'schema' to 'db_schema'
-        "min_connections": int(env.get("PG_MIN_CONNECTIONS", "2")),
-        "max_connections": int(env.get("PG_MAX_CONNECTIONS", "10"))
-    }
+    if token:
+        logger.info("Initial token cached successfully")
+    else:
+        logger.warning("Failed to cache initial token")
     
-    # OpenAI model settings
-    model_settings = {
-        "model": env.get("MODEL_NAME", "gpt-4o"),
-        "temperature": float(env.get("TEMPERATURE", "0.3")),
-        "max_tokens": int(env.get("MAX_TOKENS", "2000")),
-        "api_version": env.get("API_VERSION", "2023-05-15"),
-        "azure_endpoint": env.get("AZURE_ENDPOINT", "")
-    }
-    
-    # Proxy settings - default to enabled
-    proxy_settings = {
-        "enabled": env.get("PROXY_ENABLED", "True").lower() in ("true", "t", "1", "yes", "y"),
-        "domain": env.get("HTTPS_PROXY_DOMAIN", "")
-    }
-    
-    # General settings
-    general_settings = {
-        "similarity_threshold": float(env.get("SIMILARITY_THRESHOLD", "0.5")),
-        "monitoring_interval": int(env.get("MONITORING_INTERVAL", "300")),
-        "secured_endpoints": env.get("SECURED_ENDPOINTS", "False").lower() in ("true", "t", "1", "yes", "y")
-    }
-    
-    # Token caching settings
-    token_settings = {
-        "token_caching_enabled": True,
-        "token_refresh_interval": int(env.get("TOKEN_REFRESH_INTERVAL", "300")),
-        "token_validation_threshold": int(env.get("TOKEN_VALIDATION_THRESHOLD", "600"))
-    }
-    
-    return {
-        "version": "1.0.0",
-        "vector_database": vector_db_settings,
-        "postgresql": pg_settings,
-        "model": model_settings,
-        "proxy": proxy_settings,
-        "general": general_settings,
-        "token": token_settings
-    }
-
-def is_token_caching_enabled() -> bool:
-    """
-    Check if token caching is enabled.
-    
-    Returns:
-        bool: True if token caching is enabled
-    """
-    env = get_os_env()
-    return env.get("TOKEN_CACHING_ENABLED", "True").lower() in ("true", "t", "1", "yes", "y")
-
-def get_token_refresh_interval() -> int:
-    """
-    Get the token refresh interval in seconds.
-    
-    Returns:
-        int: Token refresh interval in seconds
-    """
-    env = get_os_env()
-    return int(env.get("TOKEN_REFRESH_INTERVAL", "300"))
-
-def get_token_validation_threshold() -> int:
-    """
-    Get the token validation threshold in seconds.
-    
-    This is the minimum remaining time a token must have before it's refreshed.
-    
-    Returns:
-        int: Token validation threshold in seconds
-    """
-    env = get_os_env()
-    return int(env.get("TOKEN_VALIDATION_THRESHOLD", "600"))
+    # Start the refresh service if requested
+    if start_refresh_service and not _token_refresh_thread:
+        _token_refresh_thread = start_token_refresh_service(refresh_interval)
