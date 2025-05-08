@@ -1,317 +1,813 @@
 """
-Main Application - Entry point for the Data Element Enhancement API.
+Performance Monitoring System for API endpoints and LLM operations.
 
-This module initializes and configures the FastAPI application, sets up routes,
-middleware, and monitoring, and handles command line arguments for configuration.
+This module provides functionality to track and analyze performance metrics
+for API calls, token acquisitions, and LLM operations.
 """
 
-import argparse
+import time
 import logging
-import os
-import sys
-from typing import Optional
-from fastapi import FastAPI, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-import uvicorn
+import threading
+import statistics
+import traceback
+import json
+from typing import Dict, List, Optional, Any, Callable, TypeVar, Union
+from functools import wraps
+from datetime import datetime, timedelta
 
-# Ensure parent directory is in path for module imports
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-from app.api.routes.enhancement import router as enhancement_router
-from app.api.routes.tagging import router as tagging_router # Original tagging router
-from app.api.routes.pbt_tagging import router as pbt_tagging_router # New PBT tagging router
-from app.api.routes.settings import router as settings_router
-from app.api.routes.dashboard import router as dashboard_router
-from app.config.environment import get_os_env, str_to_bool
-from app.core.system_monitor import start_monitoring, stop_monitoring
-from app.core.db_manager import DBManager
-from app.core.business_terms import BusinessTermManager
-from app.config.settings import get_vector_store # Ensures vector store (ChromaDB) is initialized
-from utils.auth_helper import initialize_token_caching
-
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [%(name)s:%(lineno)d] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout) # Log to stdout
-    ]
-)
 logger = logging.getLogger(__name__)
 
-# Make sure psutil is installed (for system monitoring)
-try:
-    import psutil
-except ImportError:
-    logger.warning("psutil not installed. System monitoring features might be limited. Installing...")
-    try:
-        import subprocess
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "psutil"])
-        import psutil
-        logger.info("psutil installed successfully.")
-    except Exception as e:
-        logger.error(f"Failed to install psutil: {e}. Monitoring might not work correctly.")
+# Type variable for generic function
+F = TypeVar('F', bound=Callable[..., Any])
 
-
-def create_application(
-    proxy_enabled: bool = True, 
-    monitoring_interval: int = 300,
-    # vector_db_type is effectively ignored as settings.py forces Chroma
-    vector_db_type: str = "chroma", 
-    chroma_dir: Optional[str] = None,
-    chroma_collection: Optional[str] = None
-) -> FastAPI:
-    """
-    Create and configure the FastAPI application.
-    """
-    logger.info("Creating FastAPI application...")
-    # Initialize environment settings (proxy, credentials, etc.)
-    env = get_os_env(proxy_enabled=proxy_enabled)
+class PerformanceMetrics:
+    """Thread-safe class to collect and analyze performance metrics."""
     
-    # Initialize token caching system - this will cache an initial token
-    # and start a background thread to refresh it
-    token_refresh_interval = int(env.get("TOKEN_REFRESH_INTERVAL", "300"))
-    initialize_token_caching(start_refresh_service=True, refresh_interval=token_refresh_interval)
-    logger.info(f"Token caching system initialized with refresh interval: {token_refresh_interval}s")
+    _instance = None
+    _lock = threading.RLock()
     
-    # Force ChromaDB as per project setup in settings.py
-    os.environ["VECTOR_DB_TYPE"] = "chroma"
-    if chroma_dir:
-        os.environ["CHROMA_PERSIST_DIR"] = chroma_dir
-    if chroma_collection:
-        os.environ["CHROMA_COLLECTION"] = chroma_collection
+    def __new__(cls):
+        """Implement singleton pattern."""
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super(PerformanceMetrics, cls).__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
     
-    logger.info(f"Proxy enabled: {env.get('PROXY_ENABLED')}")
-    logger.info(f"Vector DB type (forced): {os.environ['VECTOR_DB_TYPE']}")
-    logger.info(f"Chroma persist directory: {os.environ.get('CHROMA_PERSIST_DIR', './data/chroma_db')}")
-    logger.info(f"Chroma collection: {os.environ.get('CHROMA_COLLECTION', 'business_terms')}")
-    logger.info(f"Embedding model: {env.get('EMBEDDING_MODEL', 'text-embedding-3-small')}")
-
-
-    # Initialize PostgreSQL DBManager (for jobs, non-vector data)
-    db_manager = DBManager()
-    db_health = db_manager.health_check()
-    if db_health["status"] == "healthy":
-        pg_version_info = db_health.get('version', 'unknown version')
-        pg_version = pg_version_info.split(' ')[1] if len(pg_version_info.split(' ')) > 1 else pg_version_info
-        logger.info(f"PostgreSQL connection successful: Version {pg_version}")
-    else:
-        logger.error(f"PostgreSQL connection failed: {db_health.get('error', 'Unknown error')}")
-
-    # Initialize Vector Store (ChromaDB)
-    # This also initializes EmbeddingClient via BusinessTermManager if not already done
-    vector_store = get_vector_store() 
-    vector_store_health = vector_store.health_check()
-    logger.info(f"Vector Store (ChromaDB) status: {vector_store_health['status']}")
-    if vector_store_health['status'] != 'healthy':
-         logger.error(f"ChromaDB health check failed: {vector_store_health.get('error', 'Unknown error')}")
-
-    # Initialize BusinessTermManager (this also initializes EmbeddingClient)
-    business_term_manager = BusinessTermManager()
-    term_count = business_term_manager.get_term_count()
-    logger.info(f"BusinessTermManager initialized. Terms loaded from ChromaDB: {term_count}")
+    def __init__(self):
+        """Initialize the performance metrics collection."""
+        if self._initialized:
+            return
+            
+        with self._lock:
+            if not self._initialized:
+                # Category -> operation -> list of durations (ms)
+                self._metrics: Dict[str, Dict[str, List[float]]] = {}
+                
+                # Store recent failures
+                self._failures: List[Dict[str, Any]] = []
+                
+                # Store timing data by timestamp for time-series analysis
+                self._timeseries: Dict[str, List[Dict[str, Any]]] = {}
+                
+                # Timestamp of initialization
+                self._start_time = datetime.now()
+                
+                # Maximum number of samples to keep
+                self._max_samples = 1000
+                
+                # Maximum number of failures to keep
+                self._max_failures = 100
+                
+                # Automatic cleanup interval (seconds)
+                self._cleanup_interval = 3600  # 1 hour
+                
+                # Start cleanup thread
+                self._cleanup_thread = threading.Thread(
+                    target=self._cleanup_worker,
+                    daemon=True,
+                    name="PerformanceMetricsCleanup"
+                )
+                self._cleanup_thread.start()
+                
+                self._initialized = True
+                logger.info("Performance metrics collection initialized")
     
-    app = FastAPI(
-        title="Data Element Enhancement and Tagging API",
-        description="API for enhancing data elements, tagging with business terms, and PBT suggestions.",
-        version="1.1.0", # Updated version
-    )
+    def record(self, category: str, operation: str, duration_ms: float, metadata: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Record a performance metric.
+        
+        Args:
+            category: Category of the operation (e.g., 'token', 'llm', 'api')
+            operation: Name of the operation
+            duration_ms: Duration in milliseconds
+            metadata: Additional metadata for the operation
+        """
+        with self._lock:
+            # Initialize category if needed
+            if category not in self._metrics:
+                self._metrics[category] = {}
+            
+            # Initialize operation if needed
+            if operation not in self._metrics[category]:
+                self._metrics[category][operation] = []
+            
+            # Append duration
+            self._metrics[category][operation].append(duration_ms)
+            
+            # Limit list size to avoid memory issues
+            if len(self._metrics[category][operation]) > self._max_samples:
+                self._metrics[category][operation] = self._metrics[category][operation][-self._max_samples:]
+            
+            # Record in timeseries for time-based analysis
+            timestamp = datetime.now().isoformat()
+            if category not in self._timeseries:
+                self._timeseries[category] = []
+            
+            # Record time series data
+            self._timeseries[category].append({
+                'timestamp': timestamp,
+                'operation': operation,
+                'duration_ms': duration_ms,
+                'metadata': metadata or {}
+            })
+            
+            # Limit timeseries size
+            if len(self._timeseries[category]) > self._max_samples * 5:  # Allow more timeseries data
+                self._timeseries[category] = self._timeseries[category][-self._max_samples * 5:]
     
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"], # Adjust for production
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    def record_failure(self, category: str, operation: str, error: Exception, metadata: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Record an operation failure.
+        
+        Args:
+            category: Category of the operation
+            operation: Name of the operation
+            error: The exception that occurred
+            metadata: Additional metadata
+        """
+        with self._lock:
+            # Record failure
+            failure = {
+                'timestamp': datetime.now().isoformat(),
+                'category': category,
+                'operation': operation,
+                'error_type': type(error).__name__,
+                'error_message': str(error),
+                'traceback': traceback.format_exc(),
+                'metadata': metadata or {}
+            }
+            
+            self._failures.append(failure)
+            
+            # Limit failures list size
+            if len(self._failures) > self._max_failures:
+                self._failures = self._failures[-self._max_failures:]
     
-    # Mount static files for dashboard
-    static_dir_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
-    if not os.path.exists(static_dir_path):
-        os.makedirs(static_dir_path)
-        logger.info(f"Created static directory: {static_dir_path}")
-    app.mount("/static", StaticFiles(directory=static_dir_path), name="static")
+    def get_stats(self, category: Optional[str] = None, operation: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Get statistics for a category or operation.
+        
+        Args:
+            category: Category to get stats for (all if None)
+            operation: Operation to get stats for (all in category if None)
+            
+        Returns:
+            Dictionary with statistics
+        """
+        with self._lock:
+            if category and operation:
+                # Get stats for specific operation
+                if category in self._metrics and operation in self._metrics[category]:
+                    durations = self._metrics[category][operation]
+                    return self._calculate_stats(durations)
+                return {}
+            
+            elif category:
+                # Get stats for all operations in category
+                if category in self._metrics:
+                    result = {}
+                    for op_name, durations in self._metrics[category].items():
+                        result[op_name] = self._calculate_stats(durations)
+                    return result
+                return {}
+            
+            else:
+                # Get stats for all categories
+                result = {}
+                for cat_name, operations in self._metrics.items():
+                    cat_result = {}
+                    for op_name, durations in operations.items():
+                        cat_result[op_name] = self._calculate_stats(durations)
+                    result[cat_name] = cat_result
+                return result
     
-    # Include API routers
-    app.include_router(enhancement_router)
-    app.include_router(tagging_router) # Original tagging router
-    app.include_router(pbt_tagging_router) # New PBT tagging router
-    app.include_router(settings_router)
-    app.include_router(dashboard_router, prefix="/api") # Dashboard API routes
+    def get_failures(self, category: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+        """
+        Get recent failures.
+        
+        Args:
+            category: Category to filter by (optional)
+            limit: Maximum number of failures to return
+            
+        Returns:
+            List of failures
+        """
+        with self._lock:
+            if category:
+                # Filter by category
+                filtered = [f for f in self._failures if f['category'] == category]
+                return filtered[-limit:]
+            else:
+                # Return all failures (up to limit)
+                return self._failures[-limit:]
     
-    # Add performance monitoring endpoints (optional)
-    try:
-        from utils.performance_monitor import add_performance_endpoints
-        add_performance_endpoints(app)
-        logger.info("Performance monitoring endpoints added")
-    except ImportError:
-        logger.info("Performance monitoring module not available - skipping endpoint setup")
+    def get_timeseries(self, category: str, operation: Optional[str] = None, 
+                      hours: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        Get time series data.
+        
+        Args:
+            category: Category to get data for
+            operation: Operation to filter by (optional)
+            hours: Number of hours to look back (optional)
+            
+        Returns:
+            List of time series data points
+        """
+        with self._lock:
+            if category not in self._timeseries:
+                return []
+            
+            # Filter by category
+            timeseries = self._timeseries[category]
+            
+            # Filter by operation if specified
+            if operation:
+                timeseries = [t for t in timeseries if t['operation'] == operation]
+            
+            # Filter by time if specified
+            if hours:
+                cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+                timeseries = [t for t in timeseries if t['timestamp'] >= cutoff]
+            
+            return timeseries
     
-    if monitoring_interval > 0:
-        logger.info(f"Starting system monitoring. Interval: {monitoring_interval}s")
-        start_monitoring(interval=monitoring_interval)
-    else:
-        logger.info("System monitoring is disabled.")
-
-    @app.on_event("shutdown")
-    def shutdown_event():
-        logger.info("Application shutting down...")
-        if monitoring_interval > 0:
-            stop_monitoring()
-        # Add any other cleanup tasks here (e.g., closing DB connections if not pooled)
-        logger.info("Shutdown complete.")
-
-    @app.get("/health", tags=["System"])
-    async def health_check_endpoint():
-        """Provides a health check for the API and its dependencies."""
-        current_env = get_os_env() # Get current state of env vars
-        db_status = db_manager.health_check()
-        bt_manager_info = business_term_manager.get_vector_store_info()
-
-        # Add token caching status to health check
-        token_caching_status = {
-            "enabled": str_to_bool(current_env.get("TOKEN_CACHING_ENABLED", "True")),
-            "refresh_interval": int(current_env.get("TOKEN_REFRESH_INTERVAL", "300")),
-            "validation_threshold": int(current_env.get("TOKEN_VALIDATION_THRESHOLD", "600"))
-        }
-
-        return {
-            "status": "healthy",
-            "version": app.version,
-            "proxy_enabled": str_to_bool(current_env.get("PROXY_ENABLED", "False")),
-            "azure_endpoint": current_env.get("AZURE_ENDPOINT", "Not Set"),
-            "active_embedding_model": business_term_manager.embedding_client.embeddings_model,
-            "postgresql_status": db_status.get("status", "unknown"),
-            "vector_database_status": bt_manager_info.get("status", "unknown"),
-            "vector_database_type": bt_manager_info.get("type", "unknown"),
-            "business_terms_count": bt_manager_info.get("term_count", 0),
-            "token_caching": token_caching_status
-        }
-
-    @app.get("/", tags=["System"])
-    async def root_endpoint():
-        """Root endpoint providing basic API information."""
-        current_env = get_os_env()
-        bt_manager_info = business_term_manager.get_vector_store_info()
-        return {
-            "application_name": app.title,
-            "version": app.version,
-            "status": "API is operational",
-            "documentation_url": "/docs",
-            "dashboard_url": "/api/dashboard", # Path to HTML dashboard
-            "proxy_enabled": str_to_bool(current_env.get("PROXY_ENABLED", "False")),
-            "vector_database_info": bt_manager_info,
-            "token_caching_enabled": str_to_bool(current_env.get("TOKEN_CACHING_ENABLED", "True"))
+    def get_summary_report(self) -> Dict[str, Any]:
+        """
+        Get a summary report of all metrics.
+        
+        Returns:
+            Dictionary with summary statistics
+        """
+        with self._lock:
+            report = {
+                'system': {
+                    'uptime_seconds': (datetime.now() - self._start_time).total_seconds(),
+                    'metrics_collected': sum(
+                        len(durations) for operations in self._metrics.values() 
+                        for durations in operations.values()
+                    ),
+                    'failures_recorded': len(self._failures),
+                    'categories_tracked': list(self._metrics.keys())
+                },
+                'categories': {}
+            }
+            
+            # Calculate aggregate stats for each category
+            for category, operations in self._metrics.items():
+                total_ops = sum(len(durations) for durations in operations.values())
+                
+                if total_ops == 0:
+                    continue
+                
+                all_durations = []
+                for durations in operations.values():
+                    all_durations.extend(durations)
+                
+                # Only calculate percentiles if we have enough data
+                p90 = None
+                p95 = None
+                p99 = None
+                
+                if len(all_durations) >= 10:
+                    p90 = statistics.quantiles(all_durations, n=10)[8]
+                if len(all_durations) >= 20:
+                    p95 = statistics.quantiles(all_durations, n=20)[18]
+                if len(all_durations) >= 100:
+                    p99 = statistics.quantiles(all_durations, n=100)[98]
+                
+                report['categories'][category] = {
+                    'operations_count': len(operations),
+                    'total_calls': total_ops,
+                    'min_duration_ms': min(all_durations) if all_durations else 0,
+                    'max_duration_ms': max(all_durations) if all_durations else 0,
+                    'avg_duration_ms': statistics.mean(all_durations) if all_durations else 0,
+                    'p90_duration_ms': p90,
+                    'p95_duration_ms': p95,
+                    'p99_duration_ms': p99,
+                    'failure_count': len([f for f in self._failures if f['category'] == category])
+                }
+            
+            return report
+    
+    def reset(self) -> None:
+        """Reset all metrics."""
+        with self._lock:
+            self._metrics = {}
+            self._failures = []
+            self._timeseries = {}
+            self._start_time = datetime.now()
+            logger.info("Performance metrics reset")
+    
+    def _calculate_stats(self, durations: List[float]) -> Dict[str, Any]:
+        """
+        Calculate statistics for a list of durations.
+        
+        Args:
+            durations: List of duration values in milliseconds
+            
+        Returns:
+            Dictionary with statistics
+        """
+        if not durations:
+            return {
+                'count': 0,
+                'min_ms': None,
+                'max_ms': None,
+                'avg_ms': None,
+                'median_ms': None,
+                'p90_ms': None,
+                'p95_ms': None,
+                'p99_ms': None,
+                'std_dev_ms': None
+            }
+        
+        result = {
+            'count': len(durations),
+            'min_ms': min(durations),
+            'max_ms': max(durations),
+            'avg_ms': statistics.mean(durations)
         }
         
-    logger.info("FastAPI application created successfully.")
-    return app
-
-def parse_arguments():
-    parser = argparse.ArgumentParser(description="Data Element Enhancement and Tagging API")
-    parser.add_argument("--host", type=str, default=os.getenv("HOST", "0.0.0.0"), help="Host to bind")
-    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8000")), help="Port to bind")
-    parser.add_argument("--reload", action="store_true", help="Enable auto-reload (for development)")
+        # Calculate median and percentiles
+        if len(durations) >= 1:
+            result['median_ms'] = statistics.median(durations)
+        
+        if len(durations) >= 10:
+            try:
+                percentiles = statistics.quantiles(durations, n=100)
+                result['p90_ms'] = percentiles[89]
+                result['p95_ms'] = percentiles[94]
+                result['p99_ms'] = percentiles[98]
+            except Exception as e:
+                logger.warning(f"Error calculating percentiles: {e}")
+        
+        # Calculate standard deviation
+        if len(durations) >= 2:
+            try:
+                result['std_dev_ms'] = statistics.stdev(durations)
+            except Exception as e:
+                logger.warning(f"Error calculating standard deviation: {e}")
+        
+        return result
     
-    # Proxy settings
-    proxy_env = str_to_bool(os.getenv("PROXY_ENABLED", "True"))
-    parser.add_argument("--proxy", dest="proxy_enabled", action="store_true", default=proxy_env, help="Enable proxy")
-    parser.add_argument("--no-proxy", dest="proxy_enabled", action="store_false", help="Disable proxy")
+    def _cleanup_worker(self) -> None:
+        """Background worker to perform periodic cleanup of metrics."""
+        while True:
+            try:
+                # Sleep first, then cleanup
+                time.sleep(self._cleanup_interval)
+                
+                # Remove old timeseries data (older than 24 hours)
+                cutoff = (datetime.now() - timedelta(hours=24)).isoformat()
+                
+                with self._lock:
+                    for category in self._timeseries:
+                        self._timeseries[category] = [
+                            t for t in self._timeseries[category]
+                            if t['timestamp'] >= cutoff
+                        ]
+                
+                logger.debug("Cleaned up old performance metrics data")
+                
+            except Exception as e:
+                logger.error(f"Error in performance metrics cleanup: {e}")
+
+
+# Create global instance
+performance_metrics = PerformanceMetrics()
+
+def timed(category: str, operation: Optional[str] = None) -> Callable[[F], F]:
+    """
+    Decorator to time a function and record its performance.
     
-    # Monitoring
-    monitoring_env = int(os.getenv("MONITORING_INTERVAL", "300"))
-    parser.add_argument("--monitoring-interval", type=int, default=monitoring_env, help="System monitoring interval in seconds (0 to disable)")
-
-    # ChromaDB settings (vector_db_type is always chroma now)
-    parser.add_argument("--chroma-dir", type=str, default=os.getenv("CHROMA_PERSIST_DIR", "./data/chroma_db"), help="ChromaDB persistent directory")
-    parser.add_argument("--chroma-collection", type=str, default=os.getenv("CHROMA_COLLECTION", "business_terms"), help="ChromaDB collection name")
+    Args:
+        category: Category of the operation
+        operation: Name of the operation (defaults to function name)
+        
+    Returns:
+        Decorated function
+    """
+    def decorator(func: F) -> F:
+        @wraps(func)
+        def wrapper(*args, **kwargs) -> Any:
+            # Get operation name
+            op_name = operation or func.__name__
+            
+            # Record start time
+            start_time = time.time()
+            
+            try:
+                # Call the function
+                result = func(*args, **kwargs)
+                
+                # Calculate duration
+                duration_ms = (time.time() - start_time) * 1000.0
+                
+                # Record metric
+                performance_metrics.record(category, op_name, duration_ms)
+                
+                # Log for slow operations
+                if duration_ms > 1000:  # Log operations taking more than 1 second
+                    logger.warning(f"Slow operation: {category}.{op_name} took {duration_ms:.2f}ms")
+                
+                return result
+                
+            except Exception as e:
+                # Calculate duration even for failures
+                duration_ms = (time.time() - start_time) * 1000.0
+                
+                # Record metric with negative duration to indicate failure
+                performance_metrics.record(category, op_name, -duration_ms)
+                
+                # Record failure
+                performance_metrics.record_failure(category, op_name, e)
+                
+                # Re-raise the exception
+                raise
+        
+        return wrapper  # type: ignore
     
-    # Embedding model
-    parser.add_argument("--embedding-model", type=str, default=os.getenv("EMBEDDING_MODEL", "text-embedding-3-large"), help="OpenAI embedding model to use")
+    return decorator
 
-    # Token caching settings
-    parser.add_argument("--token-caching", dest="token_caching_enabled", action="store_true", default=True, help="Enable token caching")
-    parser.add_argument("--no-token-caching", dest="token_caching_enabled", action="store_false", help="Disable token caching")
-    parser.add_argument("--token-refresh-interval", type=int, default=int(os.getenv("TOKEN_REFRESH_INTERVAL", "300")), help="Token refresh interval in seconds")
-    parser.add_argument("--token-validation-threshold", type=int, default=int(os.getenv("TOKEN_VALIDATION_THRESHOLD", "600")), help="Minimum token validity time in seconds")
-
-    # Config file paths (can be overridden by environment variables)
-    parser.add_argument("--config-file", type=str, default=os.getenv("ENV_CONFIG_PATH", "env/config.env"), help="Path to config.env file")
-    parser.add_argument("--creds-file", type=str, default=os.getenv("ENV_CREDS_PATH", "env/credentials.env"), help="Path to credentials.env file")
-    parser.add_argument("--cert-file", type=str, default=os.getenv("ENV_CERT_PATH", "env/cacert.pem"), help="Path to cacert.pem file")
-
-    return parser.parse_args()
-
-# Application instance for Uvicorn if run directly
-# This ensures settings from args are applied if __name__ == "__main__"
-# Otherwise, a default app instance is created for imports.
-if os.getenv("_FASTAPI_RELOAD") == "true" or __name__ != "__main__":
-    # When reloading or importing, create a default app.
-    # Uvicorn reload will handle re-running __main__ block.
-    # Set environment variables that would normally be set by args for consistency
-    os.environ.setdefault("EMBEDDING_MODEL", "text-embedding-3-large")
-    os.environ.setdefault("TOKEN_CACHING_ENABLED", "True")
-    os.environ.setdefault("TOKEN_REFRESH_INTERVAL", "300")
-    os.environ.setdefault("TOKEN_VALIDATION_THRESHOLD", "600")
-    app = create_application(
-        proxy_enabled=str_to_bool(os.getenv("PROXY_ENABLED", "True")),
-        monitoring_interval=int(os.getenv("MONITORING_INTERVAL", "300")),
-        chroma_dir=os.getenv("CHROMA_PERSIST_DIR", "./data/chroma_db"),
-        chroma_collection=os.getenv("CHROMA_COLLECTION", "business_terms")
-    )
-
-if __name__ == "__main__":
-    args = parse_arguments()
-
-    # Set environment variables from arguments to be available for get_os_env()
-    # These will be picked up by OSEnv when get_os_env() is called within create_application()
-    os.environ["ENV_CONFIG_PATH"] = args.config_file
-    os.environ["ENV_CREDS_PATH"] = args.creds_file
-    os.environ["ENV_CERT_PATH"] = args.cert_file
-    os.environ["PROXY_ENABLED"] = str(args.proxy_enabled) # OSEnv expects string "True" or "False"
-    os.environ["MONITORING_INTERVAL"] = str(args.monitoring_interval)
-    os.environ["CHROMA_PERSIST_DIR"] = args.chroma_dir
-    os.environ["CHROMA_COLLECTION"] = args.chroma_collection
-    os.environ["EMBEDDING_MODEL"] = args.embedding_model # Ensure this is set for EmbeddingClient
+def timed_async(category: str, operation: Optional[str] = None):
+    """
+    Decorator to time an async function and record its performance.
     
-    # Token caching settings
-    os.environ["TOKEN_CACHING_ENABLED"] = str(args.token_caching_enabled)
-    os.environ["TOKEN_REFRESH_INTERVAL"] = str(args.token_refresh_interval)
-    os.environ["TOKEN_VALIDATION_THRESHOLD"] = str(args.token_validation_threshold)
-
-    # Log effective settings
-    logger.info(f"--- Effective Runtime Configuration ---")
-    logger.info(f"Host: {args.host}")
-    logger.info(f"Port: {args.port}")
-    logger.info(f"Reload: {args.reload}")
-    logger.info(f"Proxy Enabled: {args.proxy_enabled}")
-    logger.info(f"Monitoring Interval: {args.monitoring_interval}s")
-    logger.info(f"Chroma Persist Dir: {args.chroma_dir}")
-    logger.info(f"Chroma Collection: {args.chroma_collection}")
-    logger.info(f"Embedding Model: {args.embedding_model}")
-    logger.info(f"Token Caching Enabled: {args.token_caching_enabled}")
-    logger.info(f"Token Refresh Interval: {args.token_refresh_interval}s")
-    logger.info(f"Token Validation Threshold: {args.token_validation_threshold}s")
-    logger.info(f"Config File: {args.config_file}")
-    logger.info(f"Credentials File: {args.creds_file}")
-    logger.info(f"Certificate File: {args.cert_file}")
-    logger.info(f"------------------------------------")
-
-    # Create the application instance with parsed arguments
-    # This call to create_application will use the environment variables set just above
-    app_instance = create_application(
-        proxy_enabled=args.proxy_enabled,
-        monitoring_interval=args.monitoring_interval,
-        chroma_dir=args.chroma_dir,
-        chroma_collection=args.chroma_collection
-    )
+    Args:
+        category: Category of the operation
+        operation: Name of the operation (defaults to function name)
+        
+    Returns:
+        Decorated async function
+    """
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            # Get operation name
+            op_name = operation or func.__name__
+            
+            # Record start time
+            start_time = time.time()
+            
+            try:
+                # Call the function
+                result = await func(*args, **kwargs)
+                
+                # Calculate duration
+                duration_ms = (time.time() - start_time) * 1000.0
+                
+                # Record metric
+                performance_metrics.record(category, op_name, duration_ms)
+                
+                # Log for slow operations
+                if duration_ms > 1000:  # Log operations taking more than 1 second
+                    logger.warning(f"Slow operation: {category}.{op_name} took {duration_ms:.2f}ms")
+                
+                return result
+                
+            except Exception as e:
+                # Calculate duration even for failures
+                duration_ms = (time.time() - start_time) * 1000.0
+                
+                # Record metric with negative duration to indicate failure
+                performance_metrics.record(category, op_name, -duration_ms)
+                
+                # Record failure
+                performance_metrics.record_failure(category, op_name, e)
+                
+                # Re-raise the exception
+                raise
+        
+        return wrapper
     
-    # For Uvicorn reload to work correctly when __main__ is executed.
-    # It needs to find the 'app' variable in the module it's running.
-    if args.reload:
-        os.environ["_FASTAPI_RELOAD"] = "true" # Signal that we are in reload mode
-        # When reloading, uvicorn expects the app as a string "module:app_variable_name"
-        uvicorn.run("main:app_instance", host=args.host, port=args.port, reload=True)
-    else:
-        uvicorn.run(app_instance, host=args.host, port=args.port)
+    return decorator
+
+# Context manager for timing code blocks
+class TimedContext:
+    """
+    Context manager for timing code blocks.
+    
+    Example:
+        with TimedContext('api', 'process_request') as timer:
+            # Do some work
+            result = process_data()
+            timer.add_metadata('items_processed', len(result))
+    """
+    
+    def __init__(self, category: str, operation: str):
+        """
+        Initialize the context manager.
+        
+        Args:
+            category: Category of the operation
+            operation: Name of the operation
+        """
+        self.category = category
+        self.operation = operation
+        self.start_time = 0.0
+        self.metadata: Dict[str, Any] = {}
+    
+    def __enter__(self) -> 'TimedContext':
+        """Start timing."""
+        self.start_time = time.time()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """End timing and record metric."""
+        duration_ms = (time.time() - self.start_time) * 1000.0
+        
+        if exc_type is not None:
+            # Record failure
+            performance_metrics.record_failure(
+                self.category, 
+                self.operation, 
+                exc_val or Exception("Unknown error"),
+                self.metadata
+            )
+            
+            # Record negative duration to indicate failure
+            performance_metrics.record(
+                self.category, 
+                self.operation, 
+                -duration_ms,
+                self.metadata
+            )
+        else:
+            # Record successful operation
+            performance_metrics.record(
+                self.category, 
+                self.operation, 
+                duration_ms,
+                self.metadata
+            )
+    
+    def add_metadata(self, key: str, value: Any) -> None:
+        """
+        Add metadata to the operation.
+        
+        Args:
+            key: Metadata key
+            value: Metadata value
+        """
+        self.metadata[key] = value
+
+class AsyncTimedContext:
+    """
+    Async context manager for timing code blocks.
+    
+    Example:
+        async with AsyncTimedContext('api', 'process_request') as timer:
+            # Do some async work
+            result = await process_data()
+            timer.add_metadata('items_processed', len(result))
+    """
+    
+    def __init__(self, category: str, operation: str):
+        """
+        Initialize the context manager.
+        
+        Args:
+            category: Category of the operation
+            operation: Name of the operation
+        """
+        self.category = category
+        self.operation = operation
+        self.start_time = 0.0
+        self.metadata: Dict[str, Any] = {}
+    
+    async def __aenter__(self) -> 'AsyncTimedContext':
+        """Start timing."""
+        self.start_time = time.time()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        """End timing and record metric."""
+        duration_ms = (time.time() - self.start_time) * 1000.0
+        
+        if exc_type is not None:
+            # Record failure
+            performance_metrics.record_failure(
+                self.category, 
+                self.operation, 
+                exc_val or Exception("Unknown error"),
+                self.metadata
+            )
+            
+            # Record negative duration to indicate failure
+            performance_metrics.record(
+                self.category, 
+                self.operation, 
+                -duration_ms,
+                self.metadata
+            )
+        else:
+            # Record successful operation
+            performance_metrics.record(
+                self.category, 
+                self.operation, 
+                duration_ms,
+                self.metadata
+            )
+    
+    def add_metadata(self, key: str, value: Any) -> None:
+        """
+        Add metadata to the operation.
+        
+        Args:
+            key: Metadata key
+            value: Metadata value
+        """
+        self.metadata[key] = value
+
+def add_performance_endpoints(app):
+    """
+    Add performance metrics endpoints to a FastAPI app.
+    
+    Args:
+        app: FastAPI application instance
+    """
+    @app.get("/api/v1/metrics", tags=["Metrics"])
+    async def get_metrics_summary():
+        """Get a summary of all performance metrics."""
+        return performance_metrics.get_summary_report()
+    
+    @app.get("/api/v1/metrics/{category}", tags=["Metrics"])
+    async def get_category_metrics(category: str):
+        """Get metrics for a specific category."""
+        return performance_metrics.get_stats(category)
+    
+    @app.get("/api/v1/metrics/{category}/{operation}", tags=["Metrics"])
+    async def get_operation_metrics(category: str, operation: str):
+        """Get metrics for a specific operation."""
+        return performance_metrics.get_stats(category, operation)
+    
+    @app.get("/api/v1/metrics/failures", tags=["Metrics"])
+    async def get_failures(category: Optional[str] = None, limit: int = 20):
+        """Get recent operation failures."""
+        return performance_metrics.get_failures(category, limit)
+    
+    @app.get("/api/v1/metrics/timeseries/{category}", tags=["Metrics"])
+    async def get_timeseries(
+        category: str, 
+        operation: Optional[str] = None,
+        hours: Optional[int] = None
+    ):
+        """Get time series data for metrics."""
+        return performance_metrics.get_timeseries(category, operation, hours)
+    
+    @app.post("/api/v1/metrics/reset", tags=["Metrics"])
+    async def reset_metrics():
+        """Reset all metrics."""
+        performance_metrics.reset()
+        return {"status": "Metrics reset successfully"}
+    
+    logger.info("Performance metrics endpoints added to API")
+
+
+# Utility functions for timing specific operations
+
+def time_token_acquisition(operation: str = "azure_token"):
+    """
+    Time the acquisition of an Azure token.
+    
+    Args:
+        operation: Specific token operation name
+        
+    Returns:
+        Timing decorator
+    """
+    return timed("token", operation)
+
+def time_llm_operation(operation: str = "llm_invoke"):
+    """
+    Time an LLM operation.
+    
+    Args:
+        operation: Specific LLM operation name
+        
+    Returns:
+        Timing decorator
+    """
+    return timed("llm", operation)
+
+def time_embedding_operation(operation: str = "generate_embedding"):
+    """
+    Time an embedding operation.
+    
+    Args:
+        operation: Specific embedding operation name
+        
+    Returns:
+        Timing decorator
+    """
+    return timed("embedding", operation)
+
+def time_api_endpoint(operation: str = "api_call"):
+    """
+    Time an API endpoint.
+    
+    Args:
+        operation: Specific API operation name
+        
+    Returns:
+        Timing decorator
+    """
+    return timed("api", operation)
+
+async def time_async_llm_operation(operation: str = "llm_invoke_async"):
+    """
+    Time an async LLM operation.
+    
+    Args:
+        operation: Specific LLM operation name
+        
+    Returns:
+        Async timing decorator
+    """
+    return timed_async("llm", operation)
+
+async def time_async_api_endpoint(operation: str = "api_call_async"):
+    """
+    Time an async API endpoint.
+    
+    Args:
+        operation: Specific API operation name
+        
+    Returns:
+        Async timing decorator
+    """
+    return timed_async("api", operation)
+
+# Apply performance monitoring to token acquisition
+def apply_token_monitoring():
+    """
+    Apply performance monitoring to token acquisition functions.
+    This patches the auth_helper.py functions to add timing.
+    """
+    try:
+        import utils.auth_helper as auth_helper
+        
+        # Save original functions
+        original_get_token = auth_helper.get_azure_token_cached
+        
+        # Replace with timed versions
+        @timed("token", "get_azure_token_cached")
+        def timed_get_token(*args, **kwargs):
+            return original_get_token(*args, **kwargs)
+        
+        # Patch the module
+        auth_helper.get_azure_token_cached = timed_get_token
+        
+        logger.info("Token acquisition functions patched with performance monitoring")
+    except ImportError:
+        logger.warning("Could not apply token monitoring - auth_helper module not found")
+    except Exception as e:
+        logger.error(f"Error applying token monitoring: {e}")
+
+# Apply performance monitoring to LLM operations
+def apply_llm_monitoring():
+    """
+    Apply performance monitoring to LLM operations.
+    This patches the settings.py functions to add timing.
+    """
+    try:
+        from app.config.settings import get_llm as original_get_llm
+        import app.config.settings
+        
+        # Create a timed version
+        @timed("llm", "get_llm")
+        def timed_get_llm(*args, **kwargs):
+            return original_get_llm(*args, **kwargs)
+        
+        # Patch the module
+        app.config.settings.get_llm = timed_get_llm
+        
+        logger.info("LLM functions patched with performance monitoring")
+    except ImportError:
+        logger.warning("Could not apply LLM monitoring - settings module not found")
+    except Exception as e:
+        logger.error(f"Error applying LLM monitoring: {e}")
+
+# Initialize performance monitoring
+def initialize_performance_monitoring(app = None):
+    """
+    Initialize the performance monitoring system and optionally add endpoints.
+    
+    Args:
+        app: FastAPI application instance (optional)
+    """
+    # Ensure metrics singleton is initialized
+    _ = PerformanceMetrics()
+    
+    # Apply monitoring to token and LLM operations
+    apply_token_monitoring()
+    apply_llm_monitoring()
+    
+    # Add endpoints if app is provided
+    if app is not None:
+        add_performance_endpoints(app)
+    
+    logger.info("Performance monitoring system initialized")
