@@ -1,281 +1,348 @@
 """
-Main Application - Entry point for the Data Element Enhancement API.
-
-This module initializes and configures the FastAPI application, sets up routes,
-middleware, and monitoring, and handles command line arguments for configuration.
+Embedding Client for generating vector embeddings using Azure OpenAI.
+With fallback to local embedding generation when Azure authentication fails.
 """
 
-import argparse
 import logging
+import numpy as np
+import hashlib
+import json
 import os
-import sys
-from typing import Optional
-from fastapi import FastAPI, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-import uvicorn
+import time
+from typing import List, Dict, Any, Optional, Union, Tuple
+from pydantic import BaseModel
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+from openai import AzureOpenAI
+from app.config.environment import get_os_env
+from utils.auth_helper import get_azure_token_cached
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-# Ensure parent directory is in path for module imports
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-from app.api.routes.enhancement import router as enhancement_router
-from app.api.routes.tagging import router as tagging_router # Original tagging router
-from app.api.routes.pbt_tagging import router as pbt_tagging_router # New PBT tagging router
-from app.api.routes.settings import router as settings_router
-from app.api.routes.dashboard import router as dashboard_router
-from app.config.environment import get_os_env, str_to_bool
-from app.core.system_monitor import start_monitoring, stop_monitoring
-from app.core.db_manager import DBManager
-from app.core.business_terms import BusinessTermManager
-from app.config.settings import get_vector_store # Ensures vector store (ChromaDB) is initialized
-
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [%(name)s:%(lineno)d] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout) # Log to stdout
-    ]
-)
 logger = logging.getLogger(__name__)
 
-# Make sure psutil is installed (for system monitoring)
-try:
-    import psutil
-except ImportError:
-    logger.warning("psutil not installed. System monitoring features might be limited. Installing...")
-    try:
-        import subprocess
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "psutil"])
-        import psutil
-        logger.info("psutil installed successfully.")
-    except Exception as e:
-        logger.error(f"Failed to install psutil: {e}. Monitoring might not work correctly.")
+class MyDocument(BaseModel):
+    """Model representing a document with its embedding."""
+    id: str = ""
+    text: str = ""
+    embedding: List[float] = []
+    metadata: Dict[str, Any] = {}
 
 
-def create_application(
-    proxy_enabled: bool = True, 
-    monitoring_interval: int = 300,
-    vector_db_type: str = "chroma", 
-    chroma_dir: Optional[str] = None,
-    chroma_collection: Optional[str] = None
-) -> FastAPI:
-    """
-    Create and configure the FastAPI application.
-    """
-    logger.info("Creating FastAPI application...")
-    # Initialize environment settings (proxy, credentials, etc.)
-    env = get_os_env(proxy_enabled=proxy_enabled)
+class EmbeddingClient:
+    """Client for generating embeddings for documents using Azure OpenAI."""
     
-    # Initialize token caching system
-    from utils.auth_helper import initialize_token_caching
-    initialize_token_caching(start_refresh_service=True, refresh_interval=300)
-    logger.info("Token caching system initialized")
+    # Define model dimension mappings for reference only (not used for limiting)
+    MODEL_DIMENSIONS = {
+        "text-embedding-3-small": 1536,
+        "text-embedding-3-large": 3072,
+        "text-embedding-ada-002": 1536
+    }
     
-    # Force ChromaDB as per project setup in settings.py
-    os.environ["VECTOR_DB_TYPE"] = "chroma"
-    if chroma_dir:
-        os.environ["CHROMA_PERSIST_DIR"] = chroma_dir
-    if chroma_collection:
-        os.environ["CHROMA_COLLECTION"] = chroma_collection
-    
-    logger.info(f"Proxy enabled: {env.get('PROXY_ENABLED')}")
-    logger.info(f"Vector DB type (forced): {os.environ['VECTOR_DB_TYPE']}")
-    logger.info(f"Chroma persist directory: {os.environ.get('CHROMA_PERSIST_DIR', './data/chroma_db')}")
-    logger.info(f"Chroma collection: {os.environ.get('CHROMA_COLLECTION', 'business_terms')}")
-    logger.info(f"Embedding model: {env.get('EMBEDDING_MODEL', 'text-embedding-3-small')}")
-
-
-    # Initialize PostgreSQL DBManager (for jobs, non-vector data)
-    db_manager = DBManager()
-    db_health = db_manager.health_check()
-    if db_health["status"] == "healthy":
-        pg_version_info = db_health.get('version', 'unknown version')
-        pg_version = pg_version_info.split(' ')[1] if len(pg_version_info.split(' ')) > 1 else pg_version_info
-        logger.info(f"PostgreSQL connection successful: Version {pg_version}")
-    else:
-        logger.error(f"PostgreSQL connection failed: {db_health.get('error', 'Unknown error')}")
-
-    # Initialize Vector Store (ChromaDB)
-    # This also initializes EmbeddingClient via BusinessTermManager if not already done
-    vector_store = get_vector_store() 
-    vector_store_health = vector_store.health_check()
-    logger.info(f"Vector Store (ChromaDB) status: {vector_store_health['status']}")
-    if vector_store_health['status'] != 'healthy':
-         logger.error(f"ChromaDB health check failed: {vector_store_health.get('error', 'Unknown error')}")
-
-    # Initialize BusinessTermManager (this also initializes EmbeddingClient)
-    business_term_manager = BusinessTermManager()
-    term_count = business_term_manager.get_term_count()
-    logger.info(f"BusinessTermManager initialized. Terms loaded from ChromaDB: {term_count}")
-    
-    app = FastAPI(
-        title="Data Element Enhancement and Tagging API",
-        description="API for enhancing data elements, tagging with business terms, and PBT suggestions.",
-        version="1.1.0", # Updated version
-    )
-    
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"], # Adjust for production
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-    
-    # Mount static files for dashboard
-    static_dir_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
-    if not os.path.exists(static_dir_path):
-        os.makedirs(static_dir_path)
-        logger.info(f"Created static directory: {static_dir_path}")
-    app.mount("/static", StaticFiles(directory=static_dir_path), name="static")
-    
-    # Include API routers
-    app.include_router(enhancement_router)
-    app.include_router(tagging_router) # Original tagging router
-    app.include_router(pbt_tagging_router) # New PBT tagging router
-    app.include_router(settings_router)
-    app.include_router(dashboard_router, prefix="/api") # Dashboard API routes
-    
-    if monitoring_interval > 0:
-        logger.info(f"Starting system monitoring. Interval: {monitoring_interval}s")
-        start_monitoring(interval=monitoring_interval)
-    else:
-        logger.info("System monitoring is disabled.")
-
-    @app.on_event("shutdown")
-    def shutdown_event():
-        logger.info("Application shutting down...")
-        if monitoring_interval > 0:
-            stop_monitoring()
-        # Add any other cleanup tasks here (e.g., closing DB connections if not pooled)
-        logger.info("Shutdown complete.")
-
-    @app.get("/health", tags=["System"])
-    async def health_check_endpoint():
-        """Provides a health check for the API and its dependencies."""
-        current_env = get_os_env() # Get current state of env vars
-        db_status = db_manager.health_check()
-        bt_manager_info = business_term_manager.get_vector_store_info()
-
-        return {
-            "status": "healthy",
-            "version": app.version,
-            "proxy_enabled": str_to_bool(current_env.get("PROXY_ENABLED", "False")),
-            "azure_endpoint": current_env.get("AZURE_ENDPOINT", "Not Set"),
-            "active_embedding_model": business_term_manager.embedding_client.embeddings_model,
-            "postgresql_status": db_status.get("status", "unknown"),
-            "vector_database_status": bt_manager_info.get("status", "unknown"),
-            "vector_database_type": bt_manager_info.get("type", "unknown"),
-            "business_terms_count": bt_manager_info.get("term_count", 0)
-        }
-
-    @app.get("/", tags=["System"])
-    async def root_endpoint():
-        """Root endpoint providing basic API information."""
-        current_env = get_os_env()
-        bt_manager_info = business_term_manager.get_vector_store_info()
-        return {
-            "application_name": app.title,
-            "version": app.version,
-            "status": "API is operational",
-            "documentation_url": "/docs",
-            "dashboard_url": "/api/dashboard", # Path to HTML dashboard
-            "proxy_enabled": str_to_bool(current_env.get("PROXY_ENABLED", "False")),
-            "vector_database_info": bt_manager_info
-        }
+    def __init__(self, azure_api_version: str = "2023-05-15", embeddings_model: str = None):
+        """
+        Initialize the embedding client.
         
-    logger.info("FastAPI application created successfully.")
-    return app
-
-def parse_arguments():
-    parser = argparse.ArgumentParser(description="Data Element Enhancement and Tagging API")
-    parser.add_argument("--host", type=str, default=os.getenv("HOST", "0.0.0.0"), help="Host to bind")
-    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8000")), help="Port to bind")
-    parser.add_argument("--reload", action="store_true", help="Enable auto-reload (for development)")
+        Args:
+            azure_api_version: API version for Azure OpenAI
+            embeddings_model: Model to use for embeddings
+        """
+        self.env = get_os_env()
+        self.azure_api_version = azure_api_version
+        
+        # Get embedding model from environment or use default
+        self.embeddings_model = embeddings_model or self.env.get("EMBEDDING_MODEL", "text-embedding-3-small")
+        
+        # Path for cache directory
+        self.cache_dir = os.path.join(os.environ.get("CHROMA_PERSIST_DIR", "./data/chroma_db"), "embedding_cache")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        
+        logger.info(f"Initializing embedding client with model: {self.embeddings_model}")
+        
+        try:
+            self.direct_azure_client = self._get_direct_azure_client()
+            self.use_azure = True
+            logger.info(f"Embedding client initialized with Azure OpenAI model: {self.embeddings_model}")
+        except Exception as e:
+            logger.warning(f"Failed to initialize Azure OpenAI client: {e}. Using local embedding generation.")
+            self.direct_azure_client = None
+            self.use_azure = False
     
-    # Proxy settings
-    proxy_env = str_to_bool(os.getenv("PROXY_ENABLED", "True"))
-    parser.add_argument("--proxy", dest="proxy_enabled", action="store_true", default=proxy_env, help="Enable proxy")
-    parser.add_argument("--no-proxy", dest="proxy_enabled", action="store_false", help="Disable proxy")
+    def _get_direct_azure_client(self):
+        """Get the Azure OpenAI client for generating embeddings with token caching."""
+        try:
+            # Get tenant, client and secret info for token acquisition
+            tenant_id = self.env.get("AZURE_TENANT_ID", "")
+            client_id = self.env.get("AZURE_CLIENT_ID", "")
+            client_secret = self.env.get("AZURE_CLIENT_SECRET", "")
+            azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
+            
+            # Get cached token (or new token if not in cache)
+            token = get_azure_token_cached(
+                tenant_id=tenant_id,
+                client_id=client_id, 
+                client_secret=client_secret,
+                scope="https://cognitiveservices.azure.com/.default"
+            )
+            
+            if token:
+                logger.info("Successfully obtained Azure token for embeddings (using cache when available)")
+                
+                # Create client with token as API key
+                return AzureOpenAI(
+                    azure_endpoint=azure_endpoint,
+                    api_version=self.azure_api_version,
+                    api_key=token  # Use token as API key
+                )
+            else:
+                logger.error("Failed to obtain Azure token for embeddings")
+                raise ValueError("Failed to obtain Azure token")
+                
+        except Exception as e:
+            logger.error(f"Error initializing Azure OpenAI client: {e}")
+            raise
     
-    # Monitoring
-    monitoring_env = int(os.getenv("MONITORING_INTERVAL", "300"))
-    parser.add_argument("--monitoring-interval", type=int, default=monitoring_env, help="System monitoring interval in seconds (0 to disable)")
-
-    # ChromaDB settings (vector_db_type is always chroma now)
-    parser.add_argument("--chroma-dir", type=str, default=os.getenv("CHROMA_PERSIST_DIR", "./data/chroma_db"), help="ChromaDB persistent directory")
-    parser.add_argument("--chroma-collection", type=str, default=os.getenv("CHROMA_COLLECTION", "business_terms"), help="ChromaDB collection name")
+    def _generate_local_embedding(self, text: str) -> List[float]:
+        """
+        Generate a deterministic embedding locally when Azure OpenAI is unavailable.
+        This is a fallback method that creates consistent but less semantically meaningful embeddings.
+        
+        Args:
+            text: Text to generate embedding for
+            
+        Returns:
+            List of floats representing the embedding
+        """
+        # Check if we have a cached embedding for this text
+        cache_key = self._get_cache_key(text)
+        cached_embedding = self._get_cached_embedding(cache_key)
+        
+        if cached_embedding is not None:
+            logger.debug(f"Using cached embedding for text: {text[:50]}...")
+            return cached_embedding
+        
+        logger.info(f"Generating local embedding for text: {text[:50]}...")
+        
+        # Create a hash of the text
+        text_hash = hashlib.sha256(text.encode()).digest()
+        
+        # Use the hash to seed a random number generator
+        np.random.seed(int.from_bytes(text_hash[:4], byteorder='big'))
+        
+        # Generate a random embedding with the default dimension of 1536
+        # but this is just a default, not enforced as a limit
+        embedding = np.random.normal(0, 1, 1536).tolist()
+        
+        # Normalize the embedding to unit length
+        norm = np.linalg.norm(embedding)
+        if norm > 0:
+            embedding = [x / norm for x in embedding]
+        
+        # Save to cache
+        self._cache_embedding(cache_key, embedding)
+        
+        return embedding
     
-    # Embedding model
-    parser.add_argument("--embedding-model", type=str, default=os.getenv("EMBEDDING_MODEL", "text-embedding-3-large"), help="OpenAI embedding model to use")
-
-    # Config file paths (can be overridden by environment variables)
-    parser.add_argument("--config-file", type=str, default=os.getenv("ENV_CONFIG_PATH", "env/config.env"), help="Path to config.env file")
-    parser.add_argument("--creds-file", type=str, default=os.getenv("ENV_CREDS_PATH", "env/credentials.env"), help="Path to credentials.env file")
-    parser.add_argument("--cert-file", type=str, default=os.getenv("ENV_CERT_PATH", "env/cacert.pem"), help="Path to cacert.pem file")
-
-    return parser.parse_args()
-
-# Application instance for Uvicorn if run directly
-# This ensures settings from args are applied if __name__ == "__main__"
-# Otherwise, a default app instance is created for imports.
-if os.getenv("_FASTAPI_RELOAD") == "true" or __name__ != "__main__":
-    # When reloading or importing, create a default app.
-    # Uvicorn reload will handle re-running __main__ block.
-    # Set environment variables that would normally be set by args for consistency
-    os.environ.setdefault("EMBEDDING_MODEL", "text-embedding-3-large")
-    app = create_application(
-        proxy_enabled=str_to_bool(os.getenv("PROXY_ENABLED", "True")),
-        monitoring_interval=int(os.getenv("MONITORING_INTERVAL", "300")),
-        chroma_dir=os.getenv("CHROMA_PERSIST_DIR", "./data/chroma_db"),
-        chroma_collection=os.getenv("CHROMA_COLLECTION", "business_terms")
+    def _get_cache_key(self, text: str) -> str:
+        """Generate a cache key for a text."""
+        text_hash = hashlib.md5(text.encode()).hexdigest()
+        return f"{text_hash}.json"
+    
+    def _get_cached_embedding(self, cache_key: str) -> Optional[List[float]]:
+        """Get an embedding from the cache if it exists."""
+        cache_path = os.path.join(self.cache_dir, cache_key)
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'r') as f:
+                    data = json.load(f)
+                return data.get('embedding')
+            except Exception as e:
+                logger.warning(f"Error reading cached embedding: {e}")
+        return None
+    
+    def _cache_embedding(self, cache_key: str, embedding: List[float]) -> None:
+        """Save an embedding to the cache."""
+        cache_path = os.path.join(self.cache_dir, cache_key)
+        try:
+            with open(cache_path, 'w') as f:
+                json.dump({'embedding': embedding}, f)
+        except Exception as e:
+            logger.warning(f"Error caching embedding: {e}")
+    
+    @retry(
+        stop=stop_after_attempt(2),  # Reduced retries to fail faster
+        wait=wait_exponential(multiplier=1, min=1, max=5),
+        retry=retry_if_exception_type((Exception)),
+        reraise=True
     )
-
-if __name__ == "__main__":
-    args = parse_arguments()
-
-    # Set environment variables from arguments to be available for get_os_env()
-    # These will be picked up by OSEnv when get_os_env() is called within create_application()
-    os.environ["ENV_CONFIG_PATH"] = args.config_file
-    os.environ["ENV_CREDS_PATH"] = args.creds_file
-    os.environ["ENV_CERT_PATH"] = args.cert_file
-    os.environ["PROXY_ENABLED"] = str(args.proxy_enabled) # OSEnv expects string "True" or "False"
-    os.environ["MONITORING_INTERVAL"] = str(args.monitoring_interval)
-    os.environ["CHROMA_PERSIST_DIR"] = args.chroma_dir
-    os.environ["CHROMA_COLLECTION"] = args.chroma_collection
-    os.environ["EMBEDDING_MODEL"] = args.embedding_model # Ensure this is set for EmbeddingClient
-
-    # Log effective settings
-    logger.info(f"--- Effective Runtime Configuration ---")
-    logger.info(f"Host: {args.host}")
-    logger.info(f"Port: {args.port}")
-    logger.info(f"Reload: {args.reload}")
-    logger.info(f"Proxy Enabled: {args.proxy_enabled}")
-    logger.info(f"Monitoring Interval: {args.monitoring_interval}s")
-    logger.info(f"Chroma Persist Dir: {args.chroma_dir}")
-    logger.info(f"Chroma Collection: {args.chroma_collection}")
-    logger.info(f"Embedding Model: {args.embedding_model}")
-    logger.info(f"Config File: {args.config_file}")
-    logger.info(f"Credentials File: {args.creds_file}")
-    logger.info(f"Certificate File: {args.cert_file}")
-    logger.info(f"------------------------------------")
-
-    # Create the application instance with parsed arguments
-    # This call to create_application will use the environment variables set just above
-    app_instance = create_application(
-        proxy_enabled=args.proxy_enabled,
-        monitoring_interval=args.monitoring_interval,
-        chroma_dir=args.chroma_dir,
-        chroma_collection=args.chroma_collection
-    )
+    def generate_embeddings(self, doc: MyDocument, auto_reduce: bool = False) -> MyDocument:
+        """
+        Generate embeddings for a document with retry logic.
+        
+        Args:
+            doc: Document to generate embeddings for
+            auto_reduce: Whether to automatically reduce dimensions (ignored - kept for API compatibility)
+            
+        Returns:
+            Document with embedding
+        """
+        try:
+            # Check if text is empty
+            if not doc.text or len(doc.text.strip()) == 0:
+                logger.warning(f"Empty text for document ID: {doc.id}")
+                return doc
+            
+            # Use Azure OpenAI if available
+            if self.use_azure and self.direct_azure_client:
+                try:
+                    # Check local cache for this text first
+                    cache_key = self._get_cache_key(doc.text)
+                    cached_embedding = self._get_cached_embedding(cache_key)
+                    if cached_embedding is not None:
+                        logger.debug(f"Using cached embedding for '{doc.id}' from file cache")
+                        doc.embedding = cached_embedding
+                        return doc
+                    
+                    # Generate embedding using Azure OpenAI
+                    start_time = time.time()
+                    response = self.direct_azure_client.embeddings.create(
+                        model=self.embeddings_model,
+                        input=doc.text
+                    ).data[0].embedding
+                    
+                    # Log the dimension of the embedding for debugging and performance
+                    original_dim = len(response)
+                    generation_time = time.time() - start_time
+                    logger.debug(f"Generated Azure embedding for '{doc.id}' with dimension: {original_dim} in {generation_time:.2f}s")
+                    
+                    # Use the embedding as-is, no dimension reduction
+                    doc.embedding = response
+                    
+                    # Cache the embedding for future use
+                    self._cache_embedding(cache_key, response)
+                    
+                except Exception as azure_error:
+                    logger.warning(f"Azure embedding generation failed: {azure_error}. Using local fallback.")
+                    doc.embedding = self._generate_local_embedding(doc.text)
+            else:
+                # Use local embedding generation
+                doc.embedding = self._generate_local_embedding(doc.text)
+            
+            return doc
+        except Exception as e:
+            logger.error(f"Error generating embeddings (attempt will be retried): {e}")
+            raise
     
-    # For Uvicorn reload to work correctly when __main__ is executed.
-    # It needs to find the 'app' variable in the module it's running.
-    if args.reload:
-        os.environ["_FASTAPI_RELOAD"] = "true" # Signal that we are in reload mode
-        # When reloading, uvicorn expects the app as a string "module:app_variable_name"
-        uvicorn.run("main:app_instance", host=args.host, port=args.port, reload=True)
-    else:
-        uvicorn.run(app_instance, host=args.host, port=args.port)
-
+    def batch_generate_embeddings(self, docs: List[MyDocument], batch_size: int = 20, auto_reduce: bool = False) -> List[MyDocument]:
+        """
+        Generate embeddings for multiple documents in batches.
+        
+        Args:
+            docs: List of documents to generate embeddings for
+            batch_size: Number of documents to process in each batch
+            auto_reduce: Whether to automatically reduce dimensions (ignored - kept for API compatibility)
+            
+        Returns:
+            List of documents with embeddings
+        """
+        results = []
+        
+        # Process in batches to avoid rate limits
+        for i in range(0, len(docs), batch_size):
+            batch = docs[i:i + batch_size]
+            
+            for doc in batch:
+                try:
+                    doc_with_embedding = self.generate_embeddings(doc, auto_reduce=False)
+                    results.append(doc_with_embedding)
+                except Exception as e:
+                    logger.error(f"Error generating embedding for document {doc.id}: {e}")
+                    # Add the document without embedding
+                    results.append(doc)
+        
+        return results
+    
+    # Kept for API compatibility but not used for dimension reduction
+    def reduce_dimensions(self, embedding: List[float], target_dim: int) -> List[float]:
+        """
+        This method is kept for API compatibility but returns the original embedding.
+        No dimension reduction is performed.
+        
+        Args:
+            embedding: Original embedding vector
+            target_dim: Target dimension for the reduced vector (ignored)
+            
+        Returns:
+            Original embedding vector unchanged
+        """
+        logger.debug("Dimension reduction requested but disabled - returning original embedding")
+        return embedding
+    
+    # Kept for API compatibility but not used
+    def expand_dimensions(self, embedding: List[float], target_dim: int) -> List[float]:
+        """
+        This method is kept for API compatibility but returns the original embedding.
+        
+        Args:
+            embedding: Original embedding vector
+            target_dim: Target dimension for the expanded vector (ignored)
+            
+        Returns:
+            Original embedding vector unchanged
+        """
+        logger.debug("Dimension expansion requested but disabled - returning original embedding")
+        return embedding
+    
+    # Kept for API compatibility but not used
+    def adjust_embedding_dimension(self, embedding: List[float], target_dim: int) -> List[float]:
+        """
+        This method is kept for API compatibility but returns the original embedding.
+        
+        Args:
+            embedding: Original embedding vector
+            target_dim: Target dimension (ignored)
+        
+        Returns:
+            Original embedding vector unchanged
+        """
+        logger.debug("Embedding dimension adjustment requested but disabled - returning original embedding")
+        return embedding
+    
+    # Alias method with more descriptive name - supports both naming conventions
+    def generate_embeddings_for_document(self, doc: MyDocument, auto_reduce: bool = False) -> MyDocument:
+        """Alias for generate_embeddings."""
+        return self.generate_embeddings(doc, auto_reduce=False)
+    
+    def compute_similarity(self, embedding1: List[float], embedding2: List[float]) -> float:
+        """
+        Compute the cosine similarity between two embeddings.
+        
+        Args:
+            embedding1: First embedding vector
+            embedding2: Second embedding vector
+            
+        Returns:
+            Similarity score between 0 and 1
+        """
+        if not embedding1 or not embedding2:
+            return 0.0
+            
+        # Make sure embeddings have same dimension
+        min_dim = min(len(embedding1), len(embedding2))
+        if len(embedding1) != len(embedding2):
+            logger.warning(f"Embeddings have different dimensions: {len(embedding1)} vs {len(embedding2)}. Using first {min_dim} dimensions for comparison.")
+            embedding1 = embedding1[:min_dim]
+            embedding2 = embedding2[:min_dim]
+            
+        # Convert to numpy arrays
+        a = np.array(embedding1)
+        b = np.array(embedding2)
+        
+        # Compute cosine similarity
+        dot_product = np.dot(a, b)
+        norm_a = np.linalg.norm(a)
+        norm_b = np.linalg.norm(b)
+        
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+            
+        similarity = dot_product / (norm_a * norm_b)
+        return max(0.0, min(similarity, 1.0))  # Ensure in range [0, 1]
