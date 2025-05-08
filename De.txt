@@ -1,193 +1,280 @@
 """
-Enhanced Auth Helper - Implements token caching for improved performance.
+Main Application - Entry point for the Data Element Enhancement API.
 
-This module provides functions for retrieving and caching Azure AD tokens
-to eliminate redundant token acquisition requests across multiple calls.
+This module initializes and configures the FastAPI application, sets up routes,
+middleware, and monitoring, and handles command line arguments for configuration.
 """
 
-import os
-import time
+import argparse
 import logging
-import threading
-import requests
-from typing import Optional, Dict, Any, Tuple
+import os
+import sys
+from fastapi import FastAPI, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+import uvicorn
 
+# Ensure parent directory is in path for module imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from app.api.routes.enhancement import router as enhancement_router
+from app.api.routes.tagging import router as tagging_router # Original tagging router
+from app.api.routes.pbt_tagging import router as pbt_tagging_router # New PBT tagging router
+from app.api.routes.settings import router as settings_router
+from app.api.routes.dashboard import router as dashboard_router
+from app.config.environment import get_os_env, str_to_bool
+from app.core.system_monitor import start_monitoring, stop_monitoring
+from app.core.db_manager import DBManager
+from app.core.business_terms import BusinessTermManager
+from app.config.settings import get_vector_store # Ensures vector store (ChromaDB) is initialized
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(name)s:%(lineno)d] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout) # Log to stdout
+    ]
+)
 logger = logging.getLogger(__name__)
 
-class TokenCache:
-    """Thread-safe token cache for storing and retrieving Azure tokens."""
-    
-    _instance = None
-    _lock = threading.RLock()
-    
-    def __new__(cls):
-        """Implement singleton pattern."""
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = super(TokenCache, cls).__new__(cls)
-                    cls._instance._initialized = False
-        return cls._instance
-    
-    def __init__(self):
-        """Initialize the token cache."""
-        if self._initialized:
-            return
-            
-        with self._lock:
-            if not self._initialized:
-                self._tokens = {}  # Format: {cache_key: (token, expiry_time)}
-                self._initialized = True
-                logger.info("Token cache initialized")
-    
-    def get(self, tenant_id: str, client_id: str, scope: str) -> Optional[str]:
-        """
-        Get a token from the cache if it exists and is not expired.
-        
-        Args:
-            tenant_id: Azure tenant ID
-            client_id: Azure client ID
-            scope: OAuth scope
-            
-        Returns:
-            Token if found and valid, None otherwise
-        """
-        cache_key = self._get_cache_key(tenant_id, client_id, scope)
-        
-        with self._lock:
-            if cache_key in self._tokens:
-                token, expiry_time = self._tokens[cache_key]
-                # Allow 5 minute buffer before expiration
-                if time.time() < expiry_time - 300:
-                    logger.debug(f"Token cache hit for {client_id[:8]}...")
-                    return token
-                else:
-                    logger.debug(f"Token expired for {client_id[:8]}...")
-                    # Remove expired token
-                    del self._tokens[cache_key]
-        
-        return None
-    
-    def set(self, tenant_id: str, client_id: str, scope: str, token: str, expires_in: int = 3600) -> None:
-        """
-        Store a token in the cache.
-        
-        Args:
-            tenant_id: Azure tenant ID
-            client_id: Azure client ID
-            scope: OAuth scope
-            token: The token to store
-            expires_in: Token expiration time in seconds
-        """
-        cache_key = self._get_cache_key(tenant_id, client_id, scope)
-        expiry_time = time.time() + expires_in
-        
-        with self._lock:
-            self._tokens[cache_key] = (token, expiry_time)
-            
-        logger.debug(f"Token cached for {client_id[:8]}... (expires in {expires_in}s)")
-    
-    def _get_cache_key(self, tenant_id: str, client_id: str, scope: str) -> str:
-        """Generate a cache key."""
-        return f"{tenant_id}:{client_id}:{scope}"
-    
-    def clear(self) -> None:
-        """Clear all tokens from the cache."""
-        with self._lock:
-            self._tokens.clear()
-        logger.info("Token cache cleared")
-    
-    def remove(self, tenant_id: str, client_id: str, scope: str) -> None:
-        """Remove a specific token from the cache."""
-        cache_key = self._get_cache_key(tenant_id, client_id, scope)
-        
-        with self._lock:
-            if cache_key in self._tokens:
-                del self._tokens[cache_key]
-                logger.debug(f"Token removed from cache for {client_id[:8]}...")
-
-# Initialize global token cache
-token_cache = TokenCache()
-
-def get_azure_token_cached(tenant_id: str, client_id: str, client_secret: str, 
-                          scope: str = "https://cognitiveservices.azure.com/.default") -> Optional[str]:
-    """
-    Get an Azure AD token with caching support.
-    This function first checks the cache before making a new token request.
-    
-    Args:
-        tenant_id: Azure tenant ID
-        client_id: Azure client ID
-        client_secret: Azure client secret
-        scope: OAuth scope to request
-        
-    Returns:
-        Access token if successful, None otherwise
-    """
-    # Check cache first
-    token = token_cache.get(tenant_id, client_id, scope)
-    if token:
-        return token
-    
-    # Cache miss - get new token
+# Make sure psutil is installed (for system monitoring)
+try:
+    import psutil
+except ImportError:
+    logger.warning("psutil not installed. System monitoring features might be limited. Installing...")
     try:
-        logger.info(f"Token cache miss for {client_id[:8]}... - fetching new token")
-        
-        # OAuth2 token endpoint
-        token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
-        
-        # Request body
-        data = {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "scope": scope,
-            "grant_type": "client_credentials"
+        import subprocess
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "psutil"])
+        import psutil
+        logger.info("psutil installed successfully.")
+    except Exception as e:
+        logger.error(f"Failed to install psutil: {e}. Monitoring might not work correctly.")
+
+
+def create_application(
+    proxy_enabled: bool = True, 
+    monitoring_interval: int = 300,
+    # vector_db_type is effectively ignored as settings.py forces Chroma
+    vector_db_type: str = "chroma", 
+    chroma_dir: Optional[str] = None,
+    chroma_collection: Optional[str] = None
+) -> FastAPI:
+    """
+    Create and configure the FastAPI application.
+    """
+    logger.info("Creating FastAPI application...")
+    # Initialize environment settings (proxy, credentials, etc.)
+    env = get_os_env(proxy_enabled=proxy_enabled)
+    
+    # Initialize token caching system
+    from utils.auth_helper import initialize_token_caching
+    initialize_token_caching(start_refresh_service=True, refresh_interval=300)
+    logger.info("Token caching system initialized")
+    # Force ChromaDB as per project setup in settings.py
+    os.environ["VECTOR_DB_TYPE"] = "chroma"
+    if chroma_dir:
+        os.environ["CHROMA_PERSIST_DIR"] = chroma_dir
+    if chroma_collection:
+        os.environ["CHROMA_COLLECTION"] = chroma_collection
+    
+    logger.info(f"Proxy enabled: {env.get('PROXY_ENABLED')}")
+    logger.info(f"Vector DB type (forced): {os.environ['VECTOR_DB_TYPE']}")
+    logger.info(f"Chroma persist directory: {os.environ.get('CHROMA_PERSIST_DIR', './data/chroma_db')}")
+    logger.info(f"Chroma collection: {os.environ.get('CHROMA_COLLECTION', 'business_terms')}")
+    logger.info(f"Embedding model: {env.get('EMBEDDING_MODEL', 'text-embedding-3-small')}")
+
+
+    # Initialize PostgreSQL DBManager (for jobs, non-vector data)
+    db_manager = DBManager()
+    db_health = db_manager.health_check()
+    if db_health["status"] == "healthy":
+        pg_version_info = db_health.get('version', 'unknown version')
+        pg_version = pg_version_info.split(' ')[1] if len(pg_version_info.split(' ')) > 1 else pg_version_info
+        logger.info(f"PostgreSQL connection successful: Version {pg_version}")
+    else:
+        logger.error(f"PostgreSQL connection failed: {db_health.get('error', 'Unknown error')}")
+
+    # Initialize Vector Store (ChromaDB)
+    # This also initializes EmbeddingClient via BusinessTermManager if not already done
+    vector_store = get_vector_store() 
+    vector_store_health = vector_store.health_check()
+    logger.info(f"Vector Store (ChromaDB) status: {vector_store_health['status']}")
+    if vector_store_health['status'] != 'healthy':
+         logger.error(f"ChromaDB health check failed: {vector_store_health.get('error', 'Unknown error')}")
+
+    # Initialize BusinessTermManager (this also initializes EmbeddingClient)
+    business_term_manager = BusinessTermManager()
+    term_count = business_term_manager.get_term_count()
+    logger.info(f"BusinessTermManager initialized. Terms loaded from ChromaDB: {term_count}")
+    
+    app = FastAPI(
+        title="Data Element Enhancement and Tagging API",
+        description="API for enhancing data elements, tagging with business terms, and PBT suggestions.",
+        version="1.1.0", # Updated version
+    )
+    
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"], # Adjust for production
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    
+    # Mount static files for dashboard
+    static_dir_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
+    if not os.path.exists(static_dir_path):
+        os.makedirs(static_dir_path)
+        logger.info(f"Created static directory: {static_dir_path}")
+    app.mount("/static", StaticFiles(directory=static_dir_path), name="static")
+    
+    # Include API routers
+    app.include_router(enhancement_router)
+    app.include_router(tagging_router) # Original tagging router
+    app.include_router(pbt_tagging_router) # New PBT tagging router
+    app.include_router(settings_router)
+    app.include_router(dashboard_router, prefix="/api") # Dashboard API routes
+    
+    if monitoring_interval > 0:
+        logger.info(f"Starting system monitoring. Interval: {monitoring_interval}s")
+        start_monitoring(interval=monitoring_interval)
+    else:
+        logger.info("System monitoring is disabled.")
+
+    @app.on_event("shutdown")
+    def shutdown_event():
+        logger.info("Application shutting down...")
+        if monitoring_interval > 0:
+            stop_monitoring()
+        # Add any other cleanup tasks here (e.g., closing DB connections if not pooled)
+        logger.info("Shutdown complete.")
+
+    @app.get("/health", tags=["System"])
+    async def health_check_endpoint():
+        """Provides a health check for the API and its dependencies."""
+        current_env = get_os_env() # Get current state of env vars
+        db_status = db_manager.health_check()
+        bt_manager_info = business_term_manager.get_vector_store_info()
+
+        return {
+            "status": "healthy",
+            "version": app.version,
+            "proxy_enabled": str_to_bool(current_env.get("PROXY_ENABLED", "False")),
+            "azure_endpoint": current_env.get("AZURE_ENDPOINT", "Not Set"),
+            "active_embedding_model": business_term_manager.embedding_client.embeddings_model,
+            "postgresql_status": db_status.get("status", "unknown"),
+            "vector_database_status": bt_manager_info.get("status", "unknown"),
+            "vector_database_type": bt_manager_info.get("type", "unknown"),
+            "business_terms_count": bt_manager_info.get("term_count", 0)
+        }
+
+    @app.get("/", tags=["System"])
+    async def root_endpoint():
+        """Root endpoint providing basic API information."""
+        current_env = get_os_env()
+        bt_manager_info = business_term_manager.get_vector_store_info()
+        return {
+            "application_name": app.title,
+            "version": app.version,
+            "status": "API is operational",
+            "documentation_url": "/docs",
+            "dashboard_url": "/api/dashboard", # Path to HTML dashboard
+            "proxy_enabled": str_to_bool(current_env.get("PROXY_ENABLED", "False")),
+            "vector_database_info": bt_manager_info
         }
         
-        # Make the request
-        response = requests.post(
-            token_url, 
-            data=data,
-            timeout=30
-        )
-        
-        # Handle response
-        if response.status_code == 200:
-            token_data = response.json()
-            if "access_token" in token_data:
-                token = token_data["access_token"]
-                expires_in = token_data.get("expires_in", 3600)  # Default to 1 hour
-                
-                # Cache the token
-                token_cache.set(tenant_id, client_id, scope, token, expires_in)
-                
-                logger.info(f"New token acquired and cached (expires in {expires_in}s)")
-                return token
-            else:
-                logger.error("Token response did not contain access_token")
-                return None
-        else:
-            logger.error(f"Token request failed with status {response.status_code}: {response.text}")
-            return None
-            
-    except Exception as e:
-        logger.error(f"Error getting Azure token: {e}")
-        return None
+    logger.info("FastAPI application created successfully.")
+    return app
 
-# Original function (kept for backward compatibility)
-def get_azure_token_manual(tenant_id: str, client_id: str, client_secret: str, 
-                          scope: str = "https://cognitiveservices.azure.com/.default") -> Optional[str]:
-    """
-    Manually get an Azure AD token using requests instead of the Azure SDK.
-    This function is kept for backward compatibility - use get_azure_token_cached instead.
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Data Element Enhancement and Tagging API")
+    parser.add_argument("--host", type=str, default=os.getenv("HOST", "0.0.0.0"), help="Host to bind")
+    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8000")), help="Port to bind")
+    parser.add_argument("--reload", action="store_true", help="Enable auto-reload (for development)")
     
-    Args:
-        tenant_id: Azure tenant ID
-        client_id: Azure client ID
-        client_secret: Azure client secret
-        scope: OAuth scope to request
-        
-    Returns:
-        Access token if successful, None otherwise
-    """
-    return get_azure_token_cached(tenant_id, client_id, client_secret, scope)
+    # Proxy settings
+    proxy_env = str_to_bool(os.getenv("PROXY_ENABLED", "True"))
+    parser.add_argument("--proxy", dest="proxy_enabled", action="store_true", default=proxy_env, help="Enable proxy")
+    parser.add_argument("--no-proxy", dest="proxy_enabled", action="store_false", help="Disable proxy")
+    
+    # Monitoring
+    monitoring_env = int(os.getenv("MONITORING_INTERVAL", "300"))
+    parser.add_argument("--monitoring-interval", type=int, default=monitoring_env, help="System monitoring interval in seconds (0 to disable)")
+
+    # ChromaDB settings (vector_db_type is always chroma now)
+    parser.add_argument("--chroma-dir", type=str, default=os.getenv("CHROMA_PERSIST_DIR", "./data/chroma_db"), help="ChromaDB persistent directory")
+    parser.add_argument("--chroma-collection", type=str, default=os.getenv("CHROMA_COLLECTION", "business_terms"), help="ChromaDB collection name")
+    
+    # Embedding model
+    parser.add_argument("--embedding-model", type=str, default=os.getenv("EMBEDDING_MODEL", "text-embedding-3-large"), help="OpenAI embedding model to use")
+
+    # Config file paths (can be overridden by environment variables)
+    parser.add_argument("--config-file", type=str, default=os.getenv("ENV_CONFIG_PATH", "env/config.env"), help="Path to config.env file")
+    parser.add_argument("--creds-file", type=str, default=os.getenv("ENV_CREDS_PATH", "env/credentials.env"), help="Path to credentials.env file")
+    parser.add_argument("--cert-file", type=str, default=os.getenv("ENV_CERT_PATH", "env/cacert.pem"), help="Path to cacert.pem file")
+
+    return parser.parse_args()
+
+# Application instance for Uvicorn if run directly
+# This ensures settings from args are applied if __name__ == "__main__"
+# Otherwise, a default app instance is created for imports.
+if os.getenv("_FASTAPI_RELOAD") == "true" or __name__ != "__main__":
+    # When reloading or importing, create a default app.
+    # Uvicorn reload will handle re-running __main__ block.
+    # Set environment variables that would normally be set by args for consistency
+    os.environ.setdefault("EMBEDDING_MODEL", "text-embedding-3-large")
+    app = create_application(
+        proxy_enabled=str_to_bool(os.getenv("PROXY_ENABLED", "True")),
+        monitoring_interval=int(os.getenv("MONITORING_INTERVAL", "300")),
+        chroma_dir=os.getenv("CHROMA_PERSIST_DIR", "./data/chroma_db"),
+        chroma_collection=os.getenv("CHROMA_COLLECTION", "business_terms")
+    )
+
+if __name__ == "__main__":
+    args = parse_arguments()
+
+    # Set environment variables from arguments to be available for get_os_env()
+    # These will be picked up by OSEnv when get_os_env() is called within create_application()
+    os.environ["ENV_CONFIG_PATH"] = args.config_file
+    os.environ["ENV_CREDS_PATH"] = args.creds_file
+    os.environ["ENV_CERT_PATH"] = args.cert_file
+    os.environ["PROXY_ENABLED"] = str(args.proxy_enabled) # OSEnv expects string "True" or "False"
+    os.environ["MONITORING_INTERVAL"] = str(args.monitoring_interval)
+    os.environ["CHROMA_PERSIST_DIR"] = args.chroma_dir
+    os.environ["CHROMA_COLLECTION"] = args.chroma_collection
+    os.environ["EMBEDDING_MODEL"] = args.embedding_model # Ensure this is set for EmbeddingClient
+
+    # Log effective settings
+    logger.info(f"--- Effective Runtime Configuration ---")
+    logger.info(f"Host: {args.host}")
+    logger.info(f"Port: {args.port}")
+    logger.info(f"Reload: {args.reload}")
+    logger.info(f"Proxy Enabled: {args.proxy_enabled}")
+    logger.info(f"Monitoring Interval: {args.monitoring_interval}s")
+    logger.info(f"Chroma Persist Dir: {args.chroma_dir}")
+    logger.info(f"Chroma Collection: {args.chroma_collection}")
+    logger.info(f"Embedding Model: {args.embedding_model}")
+    logger.info(f"Config File: {args.config_file}")
+    logger.info(f"Credentials File: {args.creds_file}")
+    logger.info(f"Certificate File: {args.cert_file}")
+    logger.info(f"------------------------------------")
+
+    # Create the application instance with parsed arguments
+    # This call to create_application will use the environment variables set just above
+    app_instance = create_application(
+        proxy_enabled=args.proxy_enabled,
+        monitoring_interval=args.monitoring_interval,
+        chroma_dir=args.chroma_dir,
+        chroma_collection=args.chroma_collection
+    )
+    
+    # For Uvicorn reload to work correctly when __main__ is executed.
+    # It needs to find the 'app' variable in the module it's running.
+    if args.reload:
+        os.environ["_FASTAPI_RELOAD"] = "true" # Signal that we are in reload mode
+        # When reloading, uvicorn expects the app as a string "module:app_variable_name"
+        uvicorn.run("main:app_instance", host=args.host, port=args.port, reload=True)
+    else:
+        uvicorn.run(app_instance, host=args.host, port=args.port)
+
