@@ -1,198 +1,581 @@
-import logging
-import uuid
-from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
+"""
+Performance Monitoring System for API endpoints and LLM operations.
 
-from app.core.models import PBTTaggingRequest, PBTTaggingResponse, MatchedPBT
-from app.core.business_terms import BusinessTermManager
-from app.config.settings import get_llm
+This module provides functionality to track and analyze performance metrics
+for API calls, token acquisitions, and LLM operations.
+"""
+
+import time
+import logging
+import threading
+import statistics
+from typing import Dict, List, Optional, Any, Callable, TypeVar
+from functools import wraps
+from datetime import datetime, timedelta
+import traceback
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/v1/pbt", tags=["PBT Tagging"])
 
-# Dependency to get BusinessTermManager instance
-def get_business_term_manager() -> BusinessTermManager:
-    """Dependency to provide a BusinessTermManager instance."""
-    return BusinessTermManager()
+# Type variable for generic function
+F = TypeVar('F', bound=Callable[..., Any])
 
-@router.post("/tag", response_model=PBTTaggingResponse)
-async def find_preferred_business_terms(
-    request: PBTTaggingRequest,
-    bt_manager: BusinessTermManager = Depends(get_business_term_manager)
-):
-    """
-    Find and suggest Preferred Business Terms (PBTs) for a given item name and description.
-
-    This endpoint uses vector similarity search (via ChromaDB and text-embedding-3-large)
-    and a RAG (Retrieval Augmented Generation) pattern to provide relevant PBT suggestions.
-    Optional context like examples, process name, and process description can be provided
-    to improve the accuracy of the suggestions.
-    """
-    try:
-        logger.info(f"Received PBT tagging request for name: '{request.name}'")
-        logger.info(f"Description: '{request.description}'")
-        
-        # Log database term count for debugging
-        term_count = bt_manager.get_term_count()
-        logger.info(f"Terms in database: {term_count}")
-
-        # The BusinessTermManager.tag_element method is designed for enhancing DataElements
-        # and tagging them. We can leverage its underlying search and RAG capabilities.
-        # We'll pass the PBT request details as if it were a DataElement to be tagged.
-        # A unique ID is needed for the internal `tag_element` call.
-        temp_element_id = f"pbt_query_{uuid.uuid4()}"
-
-        # Combine examples into a single string if provided
-        example_context = ""
-        if request.examples:
-            example_context = " ".join(request.examples)
-            logger.debug(f"Using example context: {example_context[:200]}...")
-
-        # Initial tagging attempt with default threshold
-        logger.info(f"Performing initial tagging attempt")
-        tagging_result = await bt_manager.tag_element(
-            element_id=temp_element_id,
-            name=request.name, # Corresponds to element_name in TaggingRequest
-            description=request.description, # Corresponds to element_description
-            top_k=request.top_n,
-            cdm=None, # CDM filtering can be implemented within tag_element or its agent if needed
-            example=example_context,
-            process_name=request.process_name,
-            process_description=request.process_description,
-            threshold=0.2  # Start with lower threshold (0.2 instead of default 0.3)
-        )
-
-        # Transform the results from TaggingResult to PBTTaggingResponse format
-        matched_pbts_response: List[MatchedPBT] = []
-        if tagging_result and tagging_result.matching_terms:
-            for term_data in tagging_result.matching_terms:
-                # term_data is expected to be a dict with 'id', 'name', 'description', 'similarity', 'metadata'
-                pbt_id = term_data.get("id", "")
-                pbt_name = term_data.get("name", "Unknown PBT Name")
-                pbt_description = term_data.get("description", "No description available.")
-                similarity_score = term_data.get("similarity", 0.0)
-                metadata = term_data.get("metadata", {})
-                cdm = metadata.get("cdm") # Assuming 'cdm' is stored in metadata
-
-                matched_pbts_response.append(
-                    MatchedPBT(
-                        id=pbt_id,
-                        pbt_name=pbt_name,
-                        pbt_description=pbt_description,
-                        cdm=cdm,
-                        similarity_score=similarity_score,
-                        metadata=metadata # Include other metadata if useful
-                    )
-                )
-        
-        # If no matches found, try again with a much lower threshold
-        if not matched_pbts_response:
-            logger.info(f"No matches found initially, trying with lower threshold")
+class PerformanceMetrics:
+    """Thread-safe class to collect and analyze performance metrics."""
+    
+    _instance = None
+    _lock = threading.RLock()
+    
+    def __new__(cls):
+        """Implement singleton pattern."""
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super(PerformanceMetrics, cls).__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self):
+        """Initialize the performance metrics collection."""
+        if self._initialized:
+            return
             
-            # Try again with much lower threshold
-            fallback_result = await bt_manager.tag_element(
-                element_id=temp_element_id,
-                name=request.name,
-                description=request.description,
-                top_k=max(10, request.top_n * 2),  # Increase candidates
-                cdm=None,
-                example=example_context,
-                process_name=request.process_name,
-                process_description=request.process_description,
-                threshold=0.05  # Very low threshold
+        with self._lock:
+            if not self._initialized:
+                # Category -> operation -> list of durations (ms)
+                self._metrics: Dict[str, Dict[str, List[float]]] = {}
+                
+                # Store recent failures
+                self._failures: List[Dict[str, Any]] = []
+                
+                # Store timing data by timestamp for time-series analysis
+                self._timeseries: Dict[str, List[Dict[str, Any]]] = {}
+                
+                # Timestamp of initialization
+                self._start_time = datetime.now()
+                
+                # Maximum number of samples to keep
+                self._max_samples = 1000
+                
+                # Maximum number of failures to keep
+                self._max_failures = 100
+                
+                # Automatic cleanup interval (seconds)
+                self._cleanup_interval = 3600  # 1 hour
+                
+                # Start cleanup thread
+                self._cleanup_thread = threading.Thread(
+                    target=self._cleanup_worker,
+                    daemon=True,
+                    name="PerformanceMetricsCleanup"
+                )
+                self._cleanup_thread.start()
+                
+                self._initialized = True
+                logger.info("Performance metrics collection initialized")
+    
+    def record(self, category: str, operation: str, duration_ms: float, metadata: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Record a performance metric.
+        
+        Args:
+            category: Category of the operation (e.g., 'token', 'llm', 'api')
+            operation: Name of the operation
+            duration_ms: Duration in milliseconds
+            metadata: Additional metadata for the operation
+        """
+        with self._lock:
+            # Initialize category if needed
+            if category not in self._metrics:
+                self._metrics[category] = {}
+            
+            # Initialize operation if needed
+            if operation not in self._metrics[category]:
+                self._metrics[category][operation] = []
+            
+            # Append duration
+            self._metrics[category][operation].append(duration_ms)
+            
+            # Limit list size to avoid memory issues
+            if len(self._metrics[category][operation]) > self._max_samples:
+                self._metrics[category][operation] = self._metrics[category][operation][-self._max_samples:]
+            
+            # Record in timeseries for time-based analysis
+            timestamp = datetime.now().isoformat()
+            if category not in self._timeseries:
+                self._timeseries[category] = []
+            
+            # Record time series data
+            self._timeseries[category].append({
+                'timestamp': timestamp,
+                'operation': operation,
+                'duration_ms': duration_ms,
+                'metadata': metadata or {}
+            })
+            
+            # Limit timeseries size
+            if len(self._timeseries[category]) > self._max_samples * 5:  # Allow more timeseries data
+                self._timeseries[category] = self._timeseries[category][-self._max_samples * 5:]
+    
+    def record_failure(self, category: str, operation: str, error: Exception, metadata: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Record an operation failure.
+        
+        Args:
+            category: Category of the operation
+            operation: Name of the operation
+            error: The exception that occurred
+            metadata: Additional metadata
+        """
+        with self._lock:
+            # Record failure
+            failure = {
+                'timestamp': datetime.now().isoformat(),
+                'category': category,
+                'operation': operation,
+                'error_type': type(error).__name__,
+                'error_message': str(error),
+                'traceback': traceback.format_exc(),
+                'metadata': metadata or {}
+            }
+            
+            self._failures.append(failure)
+            
+            # Limit failures list size
+            if len(self._failures) > self._max_failures:
+                self._failures = self._failures[-self._max_failures:]
+    
+    def get_stats(self, category: Optional[str] = None, operation: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Get statistics for a category or operation.
+        
+        Args:
+            category: Category to get stats for (all if None)
+            operation: Operation to get stats for (all in category if None)
+            
+        Returns:
+            Dictionary with statistics
+        """
+        with self._lock:
+            if category and operation:
+                # Get stats for specific operation
+                if category in self._metrics and operation in self._metrics[category]:
+                    durations = self._metrics[category][operation]
+                    return self._calculate_stats(durations)
+                return {}
+            
+            elif category:
+                # Get stats for all operations in category
+                if category in self._metrics:
+                    result = {}
+                    for op_name, durations in self._metrics[category].items():
+                        result[op_name] = self._calculate_stats(durations)
+                    return result
+                return {}
+            
+            else:
+                # Get stats for all categories
+                result = {}
+                for cat_name, operations in self._metrics.items():
+                    cat_result = {}
+                    for op_name, durations in operations.items():
+                        cat_result[op_name] = self._calculate_stats(durations)
+                    result[cat_name] = cat_result
+                return result
+    
+    def get_failures(self, category: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+        """
+        Get recent failures.
+        
+        Args:
+            category: Category to filter by (optional)
+            limit: Maximum number of failures to return
+            
+        Returns:
+            List of failures
+        """
+        with self._lock:
+            if category:
+                # Filter by category
+                filtered = [f for f in self._failures if f['category'] == category]
+                return filtered[-limit:]
+            else:
+                # Return all failures (up to limit)
+                return self._failures[-limit:]
+    
+    def get_timeseries(self, category: str, operation: Optional[str] = None, 
+                      hours: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        Get time series data.
+        
+        Args:
+            category: Category to get data for
+            operation: Operation to filter by (optional)
+            hours: Number of hours to look back (optional)
+            
+        Returns:
+            List of time series data points
+        """
+        with self._lock:
+            if category not in self._timeseries:
+                return []
+            
+            # Filter by category
+            timeseries = self._timeseries[category]
+            
+            # Filter by operation if specified
+            if operation:
+                timeseries = [t for t in timeseries if t['operation'] == operation]
+            
+            # Filter by time if specified
+            if hours:
+                cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+                timeseries = [t for t in timeseries if t['timestamp'] >= cutoff]
+            
+            return timeseries
+    
+    def get_summary_report(self) -> Dict[str, Any]:
+        """
+        Get a summary report of all metrics.
+        
+        Returns:
+            Dictionary with summary statistics
+        """
+        with self._lock:
+            report = {
+                'system': {
+                    'uptime_seconds': (datetime.now() - self._start_time).total_seconds(),
+                    'metrics_collected': sum(
+                        len(durations) for operations in self._metrics.values() 
+                        for durations in operations.values()
+                    ),
+                    'failures_recorded': len(self._failures),
+                    'categories_tracked': list(self._metrics.keys())
+                },
+                'categories': {}
+            }
+            
+            # Calculate aggregate stats for each category
+            for category, operations in self._metrics.items():
+                total_ops = sum(len(durations) for durations in operations.values())
+                
+                if total_ops == 0:
+                    continue
+                
+                all_durations = []
+                for durations in operations.values():
+                    all_durations.extend(durations)
+                
+                report['categories'][category] = {
+                    'operations_count': len(operations),
+                    'total_calls': total_ops,
+                    'min_duration_ms': min(all_durations) if all_durations else 0,
+                    'max_duration_ms': max(all_durations) if all_durations else 0,
+                    'avg_duration_ms': statistics.mean(all_durations) if all_durations else 0,
+                    'p90_duration_ms': statistics.quantiles(all_durations, n=10)[8] if len(all_durations) >= 10 else None,
+                    'p95_duration_ms': statistics.quantiles(all_durations, n=20)[18] if len(all_durations) >= 20 else None,
+                    'p99_duration_ms': statistics.quantiles(all_durations, n=100)[98] if len(all_durations) >= 100 else None,
+                    'failure_count': len([f for f in self._failures if f['category'] == category])
+                }
+            
+            return report
+    
+    def reset(self) -> None:
+        """Reset all metrics."""
+        with self._lock:
+            self._metrics = {}
+            self._failures = []
+            self._timeseries = {}
+            self._start_time = datetime.now()
+            logger.info("Performance metrics reset")
+    
+    def _calculate_stats(self, durations: List[float]) -> Dict[str, Any]:
+        """
+        Calculate statistics for a list of durations.
+        
+        Args:
+            durations: List of duration values in milliseconds
+            
+        Returns:
+            Dictionary with statistics
+        """
+        if not durations:
+            return {
+                'count': 0,
+                'min_ms': None,
+                'max_ms': None,
+                'avg_ms': None,
+                'median_ms': None,
+                'p90_ms': None,
+                'p95_ms': None,
+                'p99_ms': None,
+                'std_dev_ms': None
+            }
+        
+        result = {
+            'count': len(durations),
+            'min_ms': min(durations),
+            'max_ms': max(durations),
+            'avg_ms': statistics.mean(durations)
+        }
+        
+        # Calculate median and percentiles
+        if len(durations) >= 1:
+            result['median_ms'] = statistics.median(durations)
+        
+        if len(durations) >= 10:
+            percentiles = statistics.quantiles(durations, n=100)
+            result['p90_ms'] = percentiles[89]
+            result['p95_ms'] = percentiles[94]
+            result['p99_ms'] = percentiles[98]
+        
+        # Calculate standard deviation
+        if len(durations) >= 2:
+            result['std_dev_ms'] = statistics.stdev(durations)
+        
+        return result
+    
+    def _cleanup_worker(self) -> None:
+        """Background worker to perform periodic cleanup of metrics."""
+        while True:
+            try:
+                # Sleep first, then cleanup
+                time.sleep(self._cleanup_interval)
+                
+                # Remove old timeseries data (older than 24 hours)
+                cutoff = (datetime.now() - timedelta(hours=24)).isoformat()
+                
+                with self._lock:
+                    for category in self._timeseries:
+                        self._timeseries[category] = [
+                            t for t in self._timeseries[category]
+                            if t['timestamp'] >= cutoff
+                        ]
+                
+                logger.debug("Cleaned up old performance metrics data")
+                
+            except Exception as e:
+                logger.error(f"Error in performance metrics cleanup: {e}")
+
+
+# Create global instance
+performance_metrics = PerformanceMetrics()
+
+def timed(category: str, operation: Optional[str] = None) -> Callable[[F], F]:
+    """
+    Decorator to time a function and record its performance.
+    
+    Args:
+        category: Category of the operation
+        operation: Name of the operation (defaults to function name)
+        
+    Returns:
+        Decorated function
+    """
+    def decorator(func: F) -> F:
+        @wraps(func)
+        def wrapper(*args, **kwargs) -> Any:
+            # Get operation name
+            op_name = operation or func.__name__
+            
+            # Record start time
+            start_time = time.time()
+            
+            try:
+                # Call the function
+                result = func(*args, **kwargs)
+                
+                # Calculate duration
+                duration_ms = (time.time() - start_time) * 1000.0
+                
+                # Record metric
+                performance_metrics.record(category, op_name, duration_ms)
+                
+                # Log for slow operations
+                if duration_ms > 1000:  # Log operations taking more than 1 second
+                    logger.warning(f"Slow operation: {category}.{op_name} took {duration_ms:.2f}ms")
+                
+                return result
+                
+            except Exception as e:
+                # Calculate duration even for failures
+                duration_ms = (time.time() - start_time) * 1000.0
+                
+                # Record metric with negative duration to indicate failure
+                performance_metrics.record(category, op_name, -duration_ms)
+                
+                # Record failure
+                performance_metrics.record_failure(category, op_name, e)
+                
+                # Re-raise the exception
+                raise
+        
+        return wrapper  # type: ignore
+    
+    return decorator
+
+async def timed_async(category: str, operation: Optional[str] = None) -> Callable[[F], F]:
+    """
+    Decorator to time an async function and record its performance.
+    
+    Args:
+        category: Category of the operation
+        operation: Name of the operation (defaults to function name)
+        
+    Returns:
+        Decorated async function
+    """
+    def decorator(func: F) -> F:
+        @wraps(func)
+        async def wrapper(*args, **kwargs) -> Any:
+            # Get operation name
+            op_name = operation or func.__name__
+            
+            # Record start time
+            start_time = time.time()
+            
+            try:
+                # Call the function
+                result = await func(*args, **kwargs)
+                
+                # Calculate duration
+                duration_ms = (time.time() - start_time) * 1000.0
+                
+                # Record metric
+                performance_metrics.record(category, op_name, duration_ms)
+                
+                # Log for slow operations
+                if duration_ms > 1000:  # Log operations taking more than 1 second
+                    logger.warning(f"Slow operation: {category}.{op_name} took {duration_ms:.2f}ms")
+                
+                return result
+                
+            except Exception as e:
+                # Calculate duration even for failures
+                duration_ms = (time.time() - start_time) * 1000.0
+                
+                # Record metric with negative duration to indicate failure
+                performance_metrics.record(category, op_name, -duration_ms)
+                
+                # Record failure
+                performance_metrics.record_failure(category, op_name, e)
+                
+                # Re-raise the exception
+                raise
+        
+        return wrapper  # type: ignore
+    
+    return decorator
+
+# Context manager for timing code blocks
+class TimedContext:
+    """
+    Context manager for timing code blocks.
+    
+    Example:
+        with TimedContext('api', 'process_request') as timer:
+            # Do some work
+            result = process_data()
+            timer.add_metadata('items_processed', len(result))
+    """
+    
+    def __init__(self, category: str, operation: str):
+        """
+        Initialize the context manager.
+        
+        Args:
+            category: Category of the operation
+            operation: Name of the operation
+        """
+        self.category = category
+        self.operation = operation
+        self.start_time = 0.0
+        self.metadata: Dict[str, Any] = {}
+    
+    def __enter__(self) -> 'TimedContext':
+        """Start timing."""
+        self.start_time = time.time()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """End timing and record metric."""
+        duration_ms = (time.time() - self.start_time) * 1000.0
+        
+        if exc_type is not None:
+            # Record failure
+            performance_metrics.record_failure(
+                self.category, 
+                self.operation, 
+                exc_val or Exception("Unknown error"),
+                self.metadata
             )
             
-            # Process fallback results
-            if fallback_result and fallback_result.matching_terms:
-                for term_data in fallback_result.matching_terms:
-                    pbt_id = term_data.get("id", "")
-                    pbt_name = term_data.get("name", "Unknown PBT Name")
-                    pbt_description = term_data.get("description", "No description available.")
-                    similarity_score = term_data.get("similarity", 0.0)
-                    metadata = term_data.get("metadata", {})
-                    cdm = metadata.get("cdm")
-                    
-                    # Add fallback annotation to metadata
-                    metadata["fallback_search"] = True
-                    
-                    matched_pbts_response.append(
-                        MatchedPBT(
-                            id=pbt_id,
-                            pbt_name=pbt_name,
-                            pbt_description=pbt_description,
-                            cdm=cdm,
-                            similarity_score=similarity_score,
-                            metadata=metadata
-                        )
-                    )
-                
-                logger.info(f"Fallback search found {len(matched_pbts_response)} potential matches")
-        
-        response_message = tagging_result.message if tagging_result else "PBT tagging process completed."
-        if tagging_result and tagging_result.modeling_required and not matched_pbts_response:
-            response_message = "No suitable PBTs found. Consider modeling a new term."
-        elif not matched_pbts_response:
-             response_message = "No PBTs found matching the criteria."
-        elif len(matched_pbts_response) > 0 and any(p.metadata.get("fallback_search", False) for p in matched_pbts_response):
-             response_message = f"Found {len(matched_pbts_response)} potential PBTs using extended search."
-
-        # If we have matches, use LLM to enhance the response with insights
-                # If we have matches, use LLM to enhance the response with insights
-        if matched_pbts_response and len(matched_pbts_response) > 0:
-            try:
-                llm = get_llm()
-                if llm:
-                    # Format matches for LLM
-                    matches_text = "\n".join([
-                        f"Match {i+1}:\nName: {m.pbt_name}\nDescription: {m.pbt_description}\nScore: {m.similarity_score:.3f}"
-                        for i, m in enumerate(matched_pbts_response[:5])
-                    ])
-                    
-                    insight_prompt = f"""
-        You are a data governance expert. Explain how these business terms might be relevant to the data element:
-
-        Data Element:
-        Name: {request.name}
-        Description: {request.description}
-
-        Matched Business Terms:
-        {matches_text}
-
-        Provide an insightful 1-2 sentence explanation of the match quality and applicability.
+            # Record negative duration to indicate failure
+            performance_metrics.record(
+                self.category, 
+                self.operation, 
+                -duration_ms,
+                self.metadata
+            )
+        else:
+            # Record successful operation
+            performance_metrics.record(
+                self.category, 
+                self.operation, 
+                duration_ms,
+                self.metadata
+            )
+    
+    def add_metadata(self, key: str, value: Any) -> None:
         """
-                    
-                    # Get LLM insight
-                    insight = await llm.ainvoke(insight_prompt)
-                    if insight:
-                        try:
-                            # Handle different types of response objects
-                            if hasattr(insight, 'content'):
-                                # Handle AIMessage and similar objects
-                                response_message = str(insight.content).strip()
-                            elif isinstance(insight, str):
-                                # Handle string responses
-                                response_message = insight.strip()
-                            else:
-                                # Convert other types to string
-                                response_message = str(insight).strip()
-                            logger.info("Added LLM insight to response")
-                        except Exception as extract_error:
-                            logger.warning(f"Error extracting content from LLM response: {extract_error}")
-                            # Continue with default message
-            except Exception as e:
-                logger.warning(f"Error getting LLM insight: {e}")
-                # Continue with default message
+        Add metadata to the operation.
+        
+        Args:
+            key: Metadata key
+            value: Metadata value
+        """
+        self.metadata[key] = value
 
-        return PBTTaggingResponse(
-            input_name=request.name,
-            input_description=request.description,
-            matched_pbts=matched_pbts_response,
-            message=response_message
-        )
-
-    except HTTPException:
-        # Re-raise HTTPException directly
-        raise
-    except Exception as e:
-        logger.error(f"Error during PBT tagging for name '{request.name}': {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during PBT tagging: {str(e)}")
+# Create endpoint for performance metrics API
+def add_performance_endpoints(app):
+    """
+    Add performance metrics endpoints to a FastAPI app.
+    
+    Args:
+        app: FastAPI application instance
+    """
+    @app.get("/api/v1/metrics", tags=["Metrics"])
+    async def get_metrics_summary():
+        """Get a summary of all performance metrics."""
+        return performance_metrics.get_summary_report()
+    
+    @app.get("/api/v1/metrics/{category}", tags=["Metrics"])
+    async def get_category_metrics(category: str):
+        """Get metrics for a specific category."""
+        return performance_metrics.get_stats(category)
+    
+    @app.get("/api/v1/metrics/{category}/{operation}", tags=["Metrics"])
+    async def get_operation_metrics(category: str, operation: str):
+        """Get metrics for a specific operation."""
+        return performance_metrics.get_stats(category, operation)
+    
+    @app.get("/api/v1/metrics/failures", tags=["Metrics"])
+    async def get_failures(category: Optional[str] = None, limit: int = 20):
+        """Get recent operation failures."""
+        return performance_metrics.get_failures(category, limit)
+    
+    @app.get("/api/v1/metrics/timeseries/{category}", tags=["Metrics"])
+    async def get_timeseries(
+        category: str, 
+        operation: Optional[str] = None,
+        hours: Optional[int] = None
+    ):
+        """Get time series data for metrics."""
+        return performance_metrics.get_timeseries(category, operation, hours)
+    
+    @app.post("/api/v1/metrics/reset", tags=["Metrics"])
+    async def reset_metrics():
+        """Reset all metrics."""
+        performance_metrics.reset()
+        return {"status": "Metrics reset successfully"}
+    
+    logger.info("Performance metrics endpoints added to API")
