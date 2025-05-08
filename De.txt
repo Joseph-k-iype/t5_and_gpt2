@@ -1,129 +1,211 @@
 """
-Result preparation node for the Agentic RAG system.
+Synonym expansion node for the Agentic RAG system.
 
-This module implements the result preparation node for the Agentic RAG system,
-which finalizes the results and formats them for return to the client.
+This module implements the synonym expansion node for the Agentic RAG system,
+which expands queries with business term synonyms to improve retrieval accuracy.
 """
 
 import logging
-from typing import Dict, Any, List, Tuple
+import json
+import time
+from typing import Dict, Any, List, Optional
+
+from app.config.settings import get_llm
+from app.core.embedding import MyDocument
+from app.utils.text_processing import BUSINESS_TERM_MAPPINGS, expand_business_terms
 
 logger = logging.getLogger(__name__)
 
-def result_preparation(state: Dict[str, Any]) -> Dict[str, Any]:
+async def synonym_expansion(state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Prepare the final results to be returned to the calling function.
+    Expand the query with synonyms to improve retrieval.
+    This is particularly helpful for business terms that can be expressed in multiple ways.
     
     Args:
         state: Current graph state
         
     Returns:
-        Updated state with finalized results
+        Updated state with expanded query results
     """
-    logger.info("Preparing final results")
+    element_name = state.get('element_name', 'Unknown')
+    logger.info(f"Expanding query with synonyms for: {element_name}")
     
     try:
-        # Extract top candidates
-        top_candidates = state.get("top_candidates", [])
+        bt_manager = state.get("_bt_manager")
+        if not bt_manager:
+            raise ValueError("Business term manager not available in state")
         
-        # Determine if modeling is required based on:
-        # 1. Having no candidates
-        # 2. Having candidates but all with low scores
-        has_candidates = len(top_candidates) > 0
-        has_good_match = any((c.get("final_score") or 0) >= 0.7 for c in top_candidates)
+        # Extract the element name and description
+        element_name = state.get("element_name", "").lower()
+        element_desc = state.get("element_description", "").lower()
         
-        modeling_required = not has_candidates or not has_good_match
+        # Generate expanded terms using predefined mappings
+        expanded_terms = []
         
-        # Format results for return
-        matching_terms = []
-        confidence_scores = []
+        # Check if any key terms are in the mappings
+        for term, synonyms in BUSINESS_TERM_MAPPINGS.items():
+            if term in element_name or term in element_desc:
+                for synonym in synonyms:
+                    # Create a new query by replacing the term with the synonym
+                    expanded_name = element_name.replace(term, synonym)
+                    if expanded_name != element_name:
+                        expanded_terms.append(expanded_name)
         
-        for candidate in top_candidates:
-            # Format the term in the expected format
-            term = {
-                "id": candidate.get("id", ""),
-                "name": candidate.get("name", ""),
-                "description": candidate.get("description", ""),
-                "metadata": candidate.get("metadata", {}).copy(),
-                "similarity": candidate.get("final_score", 0.0)
-            }
+        # Use expanded_terms from query state if available
+        query_info = state.get('query', {})
+        query_expanded_terms = query_info.get('expanded_terms', [])
+        if query_expanded_terms:
+            expanded_terms.extend(query_expanded_terms)
             
-            # Add reasoning to metadata
-            if candidate.get("reasoning"):
-                term["metadata"]["reasoning"] = candidate.get("reasoning", "")
-            
-            # Add vector and semantic scores
-            term["metadata"]["vector_score"] = candidate.get("vector_score", 0.0)
-            term["metadata"]["semantic_score"] = candidate.get("semantic_score", 0.0)
-            term["metadata"]["keyword_score"] = candidate.get("keyword_score", 0.0)
-            
-            matching_terms.append(term)
-            confidence_scores.append(candidate.get("final_score", 0.0))
+        # Remove duplicates
+        expanded_terms = list(set(expanded_terms))
         
-        # Prepare message
-        if modeling_required:
-            if not has_candidates:
-                message = "No matching terms found. Consider modeling a new term."
+        # Use LLM for more sophisticated expansion if we have few expanded terms
+        if len(expanded_terms) < 3:
+            try:
+                llm = get_llm()
+                
+                prompt = f"""
+                You are an expert in business terminology and data governance.
+                Generate alternative phrasings and related terms for the following data element:
+                
+                Element Name: {state.get('element_name', '')}
+                Element Description: {state.get('element_description', '')}
+                
+                Task:
+                1. Generate 3-5 alternative ways to express this concept in business terminology
+                2. Focus on common synonyms for business terms
+                3. Consider industry-specific alternatives if applicable
+                
+                Provide your response as a JSON list of strings, for example:
+                ["alternative term 1", "alternative term 2", "alternative term 3"]
+                
+                Ensure that your response is ONLY the JSON list, with no additional text.
+                """
+                
+                expansion_response = await llm.ainvoke(prompt)
+                
+                # Extract JSON list from response
+                llm_expansions = _extract_list_from_llm_response(expansion_response)
+                if llm_expansions:
+                    expanded_terms.extend(llm_expansions)
+                    # Remove duplicates again
+                    expanded_terms = list(set(expanded_terms))
+            except Exception as e:
+                logger.warning(f"Error using LLM for synonym expansion: {e}")
+        
+        # Update state with expanded terms
+        state["query"]["expanded_terms"] = expanded_terms
+        
+        # If we have expanded terms, try retrieval with them
+        if expanded_terms:
+            logger.info(f"Generated {len(expanded_terms)} expanded terms")
+            
+            # Combine expanded terms into a query
+            expanded_query = " ".join([state.get("element_name", "")] + expanded_terms)
+            expanded_query_doc = MyDocument(id=f"expanded_{state.get('element_id', 'unknown')}", text=expanded_query)
+            
+            # Generate embedding
+            start_time = time.time()
+            embedding_client = bt_manager.embedding_client
+            embedded_query = embedding_client.generate_embeddings(expanded_query_doc)
+            embedding_time = time.time() - start_time
+            logger.debug(f"Expanded query embedding took {embedding_time:.2f}s")
+            
+            if embedded_query and embedded_query.embedding:
+                # Perform vector search with expanded query
+                search_start = time.time()
+                expanded_results = bt_manager.vector_store.find_similar_vectors(
+                    query_vector=embedded_query.embedding,
+                    top_k=max(state.get('top_k', 3) * 2, 10),
+                    threshold=state.get('threshold', 0.5) - 0.1
+                )
+                search_time = time.time() - search_start
+                logger.debug(f"Expanded query search took {search_time:.2f}s")
+                
+                # Add any new results to candidates
+                if state.get("candidates") is None:
+                    state["candidates"] = []
+                    
+                current_ids = {c.get("id", "") for c in state.get("candidates", [])}
+                for result in expanded_results:
+                    if result.get("id", "") not in current_ids:
+                        state["candidates"].append({
+                            "id": result.get("id", ""),
+                            "name": result.get("name", ""),
+                            "description": result.get("description", ""),
+                            "metadata": result.get("metadata", {}),
+                            "vector_score": result.get("similarity", 0.0) * 0.9,  # Slight penalty for expanded results
+                            "keyword_score": 0.0,
+                            "semantic_score": None,
+                            "final_score": None,
+                            "reasoning": None
+                        })
+                        current_ids.add(result.get("id", ""))
+                
+                state["expanded_results"] = expanded_results
+                logger.info(f"Expanded query found {len(expanded_results)} results")
             else:
-                message = "Found potential matches, but confidence is low. Consider modeling a new term."
+                state["expanded_results"] = []
         else:
-            message = f"Found {len(matching_terms)} relevant business terms with high confidence."
+            state["expanded_results"] = []
         
-        # Prepare return state
-        state["result"] = {
-            "matching_terms": matching_terms,
-            "confidence_scores": confidence_scores,
-            "modeling_required": modeling_required,
-            "message": message
-        }
-        
-        logger.info(f"Result preparation complete: {message}")
         return state
         
     except Exception as e:
-        logger.error(f"Error in result preparation: {e}", exc_info=True)
-        state["error"] = f"Result preparation failed: {str(e)}"
-        
-        # Create minimal result to avoid downstream errors
-        state["result"] = {
-            "matching_terms": [],
-            "confidence_scores": [],
-            "modeling_required": True,
-            "message": f"Error preparing results: {str(e)}"
-        }
-        
+        logger.error(f"Error in synonym expansion: {e}", exc_info=True)
+        state["error"] = f"Synonym expansion failed: {str(e)}"
+        state["expanded_results"] = []
         return state
 
-def format_term_for_output(term: Dict[str, Any]) -> Dict[str, Any]:
+def _extract_list_from_llm_response(response: str) -> List[str]:
     """
-    Format a term for output to the client.
+    Extract a list of strings from LLM response text.
     
     Args:
-        term: Internal term representation
+        response: LLM response text
         
     Returns:
-        Client-ready term format
+        Extracted list of strings or empty list if extraction failed
     """
-    # Create a clean copy
-    output_term = {
-        "id": term.get("id", ""),
-        "name": term.get("name", ""),
-        "description": term.get("description", ""),
-        "similarity": term.get("final_score", 0.0),
-        "metadata": {}
-    }
+    try:
+        # Try direct JSON parsing first
+        parsed = json.loads(response)
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed]
+        return []
+    except json.JSONDecodeError:
+        # Try to find JSON-like pattern in the response
+        import re
+        try:
+            # Find text that looks like a list
+            list_match = re.search(r'\[(.*)\]', response, re.DOTALL)
+            if list_match:
+                # Try to parse the list content
+                list_content = f"[{list_match.group(1)}]"
+                parsed = json.loads(list_content)
+                if isinstance(parsed, list):
+                    return [str(item) for item in parsed]
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        
+        # If all parsing fails, try to extract items manually
+        try:
+            # Look for quoted strings that might be list items
+            quoted_items = re.findall(r'"([^"]*)"', response)
+            if quoted_items:
+                return quoted_items
+                
+            # If no quoted items, try splitting by commas and cleaning
+            lines = [line.strip() for line in response.split('\n')]
+            items = []
+            for line in lines:
+                if line.startswith('- ') or line.startswith('* '):
+                    items.append(line[2:].strip())
+            
+            if items:
+                return items
+        except Exception:
+            pass
     
-    # Copy metadata
-    if term.get("metadata"):
-        output_term["metadata"] = term.get("metadata", {}).copy()
-    
-    # Add reasoning to metadata
-    if term.get("reasoning"):
-        output_term["metadata"]["reasoning"] = term.get("reasoning", "")
-    
-    # Add component scores to metadata
-    output_term["metadata"]["vector_score"] = term.get("vector_score", 0.0)
-    output_term["metadata"]["semantic_score"] = term.get("semantic_score", 0.0)
-    output_term["metadata"]["keyword_score"] = term.get("keyword_score", 0.0)
-    
-    return output_term
+    return []
