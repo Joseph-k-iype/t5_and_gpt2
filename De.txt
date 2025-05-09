@@ -7,18 +7,19 @@ import chardet
 import pandas as pd
 import networkx as nx
 import numpy as np
-from typing import Optional, Any, Dict, List, Union, Tuple, Callable, Sequence, Annotated, TypedDict
+from typing import Optional, Any, Dict, List, Union, Tuple, Callable, Sequence, Annotated, TypedDict, cast
 from pathlib import Path
 from dotenv import dotenv_values
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider, ClientSecretCredential
 from openai import AzureOpenAI
 from pydantic import BaseModel, Field, field_validator  # Updated for Pydantic v2
 from langchain_openai import AzureChatOpenAI  # Updated import path
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage, AIMessage
 from langchain_core.tools import tool, BaseTool
 from langchain_core.documents import Document  # Updated import path
 from langchain_core.runnables import RunnableConfig
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationChain, LLMChain
 from langchain.vectorstores import Chroma
@@ -27,6 +28,7 @@ from chromadb.config import Settings
 from chromadb.utils import embedding_functions
 from collections import namedtuple
 import re
+import json
 from langgraph.graph import StateGraph, END  # For LangGraph
 from langgraph.graph.message import add_messages  # For LangGraph message handling
 from langgraph.prebuilt import create_react_agent  # For creating the React agent
@@ -449,11 +451,12 @@ class ReactAgent:
     def _create_agent(self):
         # Define custom system message
         system_message = """
-        You are an expert AI system that assists with data classification. You can analyze the semantic meaning of 
-        names and descriptions to match them with the appropriate categories in our database. 
-        
-        When a user provides a name and description, use the pbt_classifier tool to find the most contextually 
-        relevant match from the database. Provide a brief explanation of why the match is appropriate.
+        You are an expert business terminology standardization system. Your task is to map user-provided terms 
+        and descriptions to the organization's Preferred Business Terms (PBT).
+
+        When a user provides a name and description, use the pbt_classifier tool to find the most appropriate 
+        standard business term from the database. Provide a brief explanation of why this standard term 
+        matches the user's input, focusing on conceptual alignment rather than just keyword matching.
         """
         
         # Create the React agent
@@ -467,7 +470,7 @@ class ReactAgent:
     def classify(self, name: str, description: str) -> Dict:
         """Use the agent to classify the input."""
         try:
-            input_message = f"Please classify the following: Name: {name}, Description: {description}"
+            input_message = f"Please map the following to a standard Preferred Business Term: Name: {name}, Description: {description}"
             result = self.agent.invoke({"messages": [HumanMessage(content=input_message)]})
             
             # The last message contains the final response
@@ -482,6 +485,86 @@ class ReactAgent:
             logger.error(f"Error in agent classification: {e}")
             return {"status": "error", "message": str(e)}
 
+## Confidence Evaluator Agent Class
+class ConfidenceEvaluatorAgent:
+    def __init__(self, env: OSEnv):
+        self.env = env
+        self.model = self._setup_llm()
+        self.chain = self._create_confidence_chain()
+    
+    def _setup_llm(self):
+        token_provider = get_bearer_token_provider(
+            self.env.credential,
+            "https://cognitiveservices.azure.com/.default"
+        )
+        model_name = self.env.get("MODEL_NAME", "gpt-4o")
+        temperature = float(self.env.get("TEMPERATURE", "0.2"))  # Lower temperature for more deterministic confidence scores
+        api_version = self.env.get("API_VERSION", "2024-05-01-preview")
+        azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
+        
+        return AzureChatOpenAI(
+            model_name=model_name,
+            temperature=temperature,
+            api_version=api_version,
+            azure_endpoint=azure_endpoint,
+            azure_ad_token_provider=token_provider
+        )
+    
+    def _create_confidence_chain(self):
+        # Define prompt for confidence evaluation
+        prompt = ChatPromptTemplate.from_messages([
+            SystemMessage(content="""
+            You are an expert system that evaluates the confidence of matches between user-provided terms and standard
+            Preferred Business Terms (PBT). Analyze the semantic similarity, contextual relevance, and overall 
+            appropriateness of the match.
+            
+            Provide a confidence score between 0 and 100, where:
+            - 0-20: Very low confidence. The match seems arbitrary or incorrect.
+            - 21-40: Low confidence. There's a vague relationship but likely not the best match.
+            - 41-60: Moderate confidence. There's a reasonable connection but potentially better alternatives.
+            - 61-80: High confidence. The match is strong and likely appropriate.
+            - 81-100: Very high confidence. The match is excellent and almost certainly correct.
+            
+            Return your evaluation as a JSON object with the following fields:
+            - confidence_score: (number between 0-100)
+            - explanation: (string explaining your reasoning)
+            """),
+            HumanMessage(content="""
+            User Input: {user_input}
+            
+            Matched PBT: 
+            ID: {pbt_id}
+            Name: {pbt_name}
+            Definition: {pbt_definition}
+            
+            Evaluate the confidence of this match.
+            """)
+        ])
+        
+        # Create the chain
+        return prompt | self.model | JsonOutputParser()
+    
+    def evaluate_confidence(self, user_input: str, pbt_match: Dict) -> Dict:
+        """Evaluate the confidence of a match between user input and a PBT."""
+        try:
+            result = self.chain.invoke({
+                "user_input": user_input,
+                "pbt_id": pbt_match.get("id", ""),
+                "pbt_name": pbt_match.get("PBT_NAME", ""),
+                "pbt_definition": pbt_match.get("PBT_DEFINITION", "")
+            })
+            
+            return {
+                "confidence_score": result.get("confidence_score", 0),
+                "explanation": result.get("explanation", "No explanation provided")
+            }
+        except Exception as e:
+            logger.error(f"Error in confidence evaluation: {e}")
+            return {
+                "confidence_score": 0,
+                "explanation": f"Error evaluating confidence: {str(e)}"
+            }
+
 ## Data Classifier Class
 class DataClassifier:
     def __init__(self, config_file=CONFIG_PATH, creds_file=CREDS_PATH, cert_file=CERT_PATH):
@@ -490,6 +573,7 @@ class DataClassifier:
         self.pbt_manager = PBTDataManager(self.embedding_client)
         self.chatbot = AzureChatbot(config_file, creds_file, cert_file)
         self.react_agent = None  # Will be initialized after loading data
+        self.confidence_agent = ConfidenceEvaluatorAgent(self.env)
     
     def load_data(self, csv_path: str) -> None:
         """Load the PBT data from CSV."""
@@ -506,10 +590,17 @@ class DataClassifier:
             logger.warning("No similar items found")
             return {"status": "error", "message": "No similar items found"}
         
+        # Evaluate confidence
+        confidence_result = self.confidence_agent.evaluate_confidence(
+            combined_input, 
+            similar_items[0]
+        )
+        
         return {
             "status": "success",
             "best_match": similar_items[0],
-            "similar_items": similar_items
+            "similar_items": similar_items,
+            "confidence": confidence_result
         }
     
     def classify_with_llm(self, name: str, description: str, top_n: int = 5) -> Dict:
@@ -532,17 +623,30 @@ class DataClassifier:
         ])
         
         if best_match:
+            # Evaluate confidence
+            confidence_result = self.confidence_agent.evaluate_confidence(
+                combined_input, 
+                best_match
+            )
+            
             return {
                 "status": "success",
                 "best_match": best_match,
-                "similar_items": similar_items
+                "similar_items": similar_items,
+                "confidence": confidence_result
             }
         
         # Fallback to embedding similarity
+        confidence_result = self.confidence_agent.evaluate_confidence(
+            combined_input, 
+            similar_items[0]
+        )
+        
         return {
             "status": "success",
             "best_match": similar_items[0],
-            "similar_items": similar_items
+            "similar_items": similar_items,
+            "confidence": confidence_result
         }
     
     def classify_with_agent(self, name: str, description: str) -> Dict:
@@ -551,7 +655,51 @@ class DataClassifier:
             logger.error("React agent not initialized. Call load_data() first.")
             return {"status": "error", "message": "React agent not initialized"}
         
-        return self.react_agent.classify(name, description)
+        agent_result = self.react_agent.classify(name, description)
+        
+        if agent_result.get("status") == "error":
+            return agent_result
+        
+        # Extract the best match from the agent's result
+        # This assumes the agent's tool returns a result with similar format to other methods
+        # We'll get this from the "full_trace" which contains all messages including tool outputs
+        full_trace = agent_result.get("full_trace", {})
+        messages = full_trace.get("messages", [])
+        
+        # Find the tool message with the classification result
+        best_match = None
+        for message in messages:
+            if isinstance(message, ToolMessage) and message.name == "pbt_classifier":
+                try:
+                    tool_content = json.loads(message.content)
+                    if tool_content.get("status") == "success":
+                        best_match = tool_content.get("best_match")
+                        break
+                except:
+                    pass
+        
+        # If we couldn't find a best match in the tool results, fall back to embedding similarity
+        if best_match is None:
+            logger.warning("Could not extract best match from agent result, falling back to embedding similarity")
+            combined_input = f"{name} - {description}"
+            similar_items = self.pbt_manager.find_similar_items(combined_input, top_n=5)
+            
+            if not similar_items:
+                return {"status": "error", "message": "No similar items found"}
+            
+            best_match = similar_items[0]
+        
+        # Evaluate confidence
+        combined_input = f"{name} - {description}"
+        confidence_result = self.confidence_agent.evaluate_confidence(
+            combined_input, 
+            best_match
+        )
+        
+        # Add confidence to the agent's result
+        agent_result["confidence"] = confidence_result
+        
+        return agent_result
     
     def classify(self, name: str, description: str, method: str = "agent") -> Dict:
         """Classify using the specified method."""
