@@ -1,1583 +1,874 @@
-import os
-import sys
-import uuid
-import json
+"""
+PostgreSQL Database Manager with pgvector extension support and schema awareness.
+Handles connection pooling, vector operations, and database initialization.
+"""
+
 import logging
-import chardet
-import pandas as pd
-import networkx as nx
-import numpy as np
-from typing import Optional, Any, Dict, List, Union, Tuple, Callable, Sequence, Annotated, TypedDict, cast
-from pathlib import Path
-from dotenv import dotenv_values
-from azure.identity import DefaultAzureCredential, get_bearer_token_provider, ClientSecretCredential
-from openai import AzureOpenAI
-from pydantic import BaseModel, Field, field_validator  # Updated for Pydantic v2
-from langchain_openai import AzureChatOpenAI  # Updated import path
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage, AIMessage
-from langchain_core.tools import tool, BaseTool
-from langchain_core.documents import Document  # Updated import path
-from langchain_core.runnables import RunnableConfig
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationChain, LLMChain
-from langchain.prompts import PromptTemplate
-# Updated imports for ChromaDB integration and LangGraph
-from langchain_chroma import Chroma
-from chromadb.config import Settings as ChromaSettings
-from chromadb.utils import embedding_functions
-from collections import namedtuple
+import os
+import time
 import re
-import json
+from contextlib import contextmanager
+from typing import List, Dict, Any, Optional, Generator, Tuple
 
-# LangGraph imports for memory and graph management
-from langgraph.graph import StateGraph, END
-from langgraph.graph.message import add_messages
-from langgraph.prebuilt import create_react_agent
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.checkpoint.base import empty_checkpoint
-from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+import psycopg2
+from psycopg2 import pool
+from psycopg2.extras import execute_values, DictCursor, Json
+from sqlalchemy import create_engine, text, MetaData, Table, Column, String, Float, JSON, Integer
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+from app.config.environment import get_os_env
+
 logger = logging.getLogger(__name__)
 
-ENV_DIR = "env"
-CONFIG_PATH = f"{ENV_DIR}/config.env"
-CREDS_PATH = f"{ENV_DIR}/credentials.env"
-CERT_PATH = f"{ENV_DIR}/cacert.pem"
+Base = declarative_base()
 
-Triple = namedtuple("Triple", ["subject", "predicate", "object"])
+# Schema name - this should match what you used in setup_db.py
+SCHEMA_NAME = "ai_stitching_platform"
 
-## Helper Functions
-def is_file_readable(filepath: str)->bool:
-    """Check if a file is readable."""
-    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
-        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
-    return True
-
-def str_to_bool(s: str)->bool:
-    """Convert a string to a boolean."""
-    if s== 'True':
-        return True
-    elif s== 'False':
-        return False
-    else:
-        raise ValueError(f"Invalid boolean value: {s}")
-
-def serialize_message(message):
-    """Serialize a LangChain message object to a JSON-serializable dict."""
-    if isinstance(message, BaseMessage):
-        return {
-            "type": message.type,
-            "content": message.content,
-            "additional_kwargs": message.additional_kwargs
-        }
-    elif isinstance(message, list):
-        return [serialize_message(m) for m in message]
-    elif isinstance(message, dict):
-        return {k: serialize_message(v) for k, v in message.items()}
-    return message
-
-## Agent State for LangGraph
-class AgentState(TypedDict):
-    """The state of the agent."""
-    messages: List[BaseMessage]
-    context: Dict[str, Any]
-    memory: Dict[str, Any]
-
-## OSEnv class
-class OSEnv:
-    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
-        self.var_list = []
-        self.bulk_set(config_file, True)
-        self.bulk_set(creds_file, False)
-        self.set_certificate_path(certificate_path)
-        if str_to_bool(self.get("PROXY_ENABLED", "False")):
-            self.set_proxy()
+class DBManager:
+    """PostgreSQL Database Manager with pgvector support and schema awareness."""
+    
+    _instance = None
+    
+    def __new__(cls):
+        """Singleton pattern to ensure only one instance of the database connection pool."""
+        if cls._instance is None:
+            cls._instance = super(DBManager, cls).__new__(cls)
+            # Initialize tracking variables here to avoid race conditions
+            cls._instance.connection_attempts = 0
+            cls._instance.successful_connections = 0
+            cls._instance.failed_connections = 0
+            cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self):
+        """Initialize the PostgreSQL connection and pgvector extension."""
+        if self._initialized:
+            return
         
-        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
-            self.token = self.get_azure_token()
-        else:
-            self.token = None
+        # Ensure connection tracking attributes exist
+        if not hasattr(self, 'connection_attempts'):
+            self.connection_attempts = 0
+        if not hasattr(self, 'successful_connections'):
+            self.successful_connections = 0
+        if not hasattr(self, 'failed_connections'):
+            self.failed_connections = 0
         
-        self.credential = self._get_credential()
+        self.env = get_os_env()
         
-    def _get_credential(self):
-        if str_to_bool(self.get("USE_MANAGED_IDENTITY", "False")):
-            return DefaultAzureCredential()
-        else:
-            return ClientSecretCredential(tenant_id=self.get("AZURE_TENANT_ID"), client_id=self.get("AZURE_CLIENT_ID"), client_secret=self.get("AZURE_CLIENT_SECRET"))
-    
-    def set_certificate_path(self, path: str):
-        try:
-            if not os.path.isabs(path):
-                path = os.path.abspath(path)
-            if not is_file_readable(path):
-                raise FileNotFoundError(f"The file '{path}' does not exist or is not readable")
-            
-            self.set("REQUESTS_CA_BUNDLE", path)
-            self.set("SSL_CERT_FILE", path)
-            self.set("CURL_CA_BUNDLE", path)
-        except Exception as e:
-            logger.error(f"Error setting certificate path: {e}")
-            raise
-    
-    def bulk_set(self, dotenvfile: str, print_val: bool = False)->None:
-        try:
-            if not os.path.isabs(dotenvfile):
-                dotenvfile = os.path.abspath(dotenvfile)
-            if not is_file_readable(dotenvfile):
-                raise FileNotFoundError(f"The file '{dotenvfile}' does not exist or is not readable")
-            temp_dict = dotenv_values(dotenvfile)
-            for key, value in temp_dict.items():
-                self.set(key, value, print_val)
-            del temp_dict
-        except Exception as e:
-            logger.error(f"Error loading environment variables from {dotenvfile}: {e}")
-            raise
-    
-    def set(self, key: str, value: str, print_val: bool = False)->None:
-        try:
-            os.environ[key] = value
-            if key not in self.var_list:
-                self.var_list.append(key)
-            if print_val:
-                logger.info(f"{key}: {value}")
-        except Exception as e:
-            logger.error(f"Error setting environment variable {key}: {e}")
-            raise
-    
-    def get(self, key: str, default: Optional[str] = None)->str:
-        try:
-            return os.environ.get(key, default)
-        except Exception as e:
-            logger.error(f"Error getting environment variable {key}: {e}")
-            raise
-    
-    def set_proxy(self) -> None:
-        try:
-            ad_username = self.get("AD_USERNAME")
-            ad_password = self.get("AD_USER_PW")
-            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
-            if not all([ad_username, ad_password, proxy_domain]):
-                raise ValueError("Proxy settings are incomplete")
-            proxy_url = f"https://{ad_username}:{ad_password}@{proxy_domain}"
-            self.set("HTTP_PROXY", proxy_url, print_val=False)
-            self.set("HTTPS_PROXY", proxy_url, print_val=False)
-            no_proxy_domains = [
-                'cognitiveservices.azure.com',
-                'search.windows.net',
-                'openai.azure.com',
-                'core.windows.net',
-                'azurewebsites.net'
-            ]
-            self.set("NO_PROXY", ",".join(no_proxy_domains), print_val=False)
-        except Exception as e:
-            logger.error(f"Error setting proxy: {e}")
-            raise
-    
-    def get_azure_token(self) -> str:
-        try:
-            credential = ClientSecretCredential(
-                tenant_id=self.get("AZURE_TENANT_ID"),
-                client_id=self.get("AZURE_CLIENT_ID"),
-                client_secret=self.get("AZURE_CLIENT_SECRET")
-            )
-            token = credential.get_token("https://cognitiveservices.azure.com/.default")
-            self.set("AZURE_TOKEN", token.token, print_val=False)
-            logger.info("Azure token set")
-            return token.token
-        except Exception as e:
-            logger.error(f"Error retrieving Azure token: {e}")
-            return None
-    
-    def list_env_vars(self)->None:
-        for var in self.var_list:
-            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET'}:
-                logger.info(f"{var}: [REDACTED]")
-            else:
-                logger.info(f"{var}: {os.getenv(var)}")
-
-
-## embedding class + Document class
-class MyDocument(BaseModel):
-    id: str = ""
-    text: str = ""
-    embedding: List[float] = Field(default_factory=list)
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-    synonyms: List[str] = Field(default_factory=list)
-
-class EmbeddingClient:
-    def __init__(self, env: OSEnv, azure_api_version: str = "2024-05-01-preview", embeddings_model: str = "text-embedding-3-large"):
-        self.env = env
-        self.azure_api_version = azure_api_version
-        self.embeddings_model = embeddings_model
-        self.direct_azure_client = self._get_direct_azure_client()
-        # Deployment name may be different from model name
-        self.deployment_name = self.env.get("EMBEDDING_DEPLOYMENT_NAME", embeddings_model)
+        # Schema name - can be overridden by environment variable
+        self.schema_name = os.environ.get("PG_SCHEMA", SCHEMA_NAME)
         
-        # Initialize the LLM for generating synonyms
-        self._setup_llm()
-    
-    def _get_direct_azure_client(self):
-        token_provider = get_bearer_token_provider(
-            self.env.credential,
-            "https://cognitiveservices.azure.com/.default"
-        )
-        return AzureOpenAI(
-            azure_endpoint=self.env.get("AZURE_ENDPOINT", ""),
-            api_version=self.azure_api_version,
-            azure_ad_token_provider=token_provider
-        )
-    
-    def generate_embeddings(self, doc: MyDocument)->MyDocument:
-        try:
-            response = self.direct_azure_client.embeddings.create(
-                model=self.deployment_name,  # Use deployment name instead of model name
-                input=doc.text,
-                encoding_format="float"  # Explicitly specify the format
-            ).data[0].embedding
-            doc.embedding = response
-            return doc
-        except Exception as e:
-            logger.error(f"Error generating embeddings: {e}")
-            return doc
-    
-    def batch_generate_embeddings(self, docs: List[MyDocument]) -> List[MyDocument]:
-        """Generate embeddings for a batch of documents."""
-        try:
-            # Process in batches of 16 to avoid limits
-            batch_size = 16
-            batched_docs = []
-            
-            for i in range(0, len(docs), batch_size):
-                batch = docs[i:i + batch_size]
-                texts = [doc.text for doc in batch]
-                
-                response = self.direct_azure_client.embeddings.create(
-                    model=self.deployment_name,  # Use deployment name instead of model name
-                    input=texts,
-                    encoding_format="float"  # Explicitly specify the format
-                )
-                
-                for j, embedding_data in enumerate(response.data):
-                    batch[j].embedding = embedding_data.embedding
-                
-                batched_docs.extend(batch)
-                logger.info(f"Generated embeddings for batch {i//batch_size + 1} of {(len(docs) - 1)//batch_size + 1}")
-            
-            return batched_docs
-        except Exception as e:
-            logger.error(f"Error generating batch embeddings: {e}")
-            raise
-    
-    def _setup_llm(self):
-        """Set up the LLM for generating synonyms."""
-        try:
-            token_provider = get_bearer_token_provider(
-                self.env.credential,
-                "https://cognitiveservices.azure.com/.default"
-            )
-            model_name = self.env.get("MODEL_NAME", "gpt-4o")
-            temperature = 0.5  # Good balance for creativity in synonyms
-            api_version = self.env.get("API_VERSION", "2024-05-01-preview")
-            azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
-            
-            self.llm = AzureChatOpenAI(
-                model_name=model_name,
-                temperature=temperature,
-                max_tokens=300,
-                api_version=api_version,
-                azure_endpoint=azure_endpoint,
-                azure_ad_token_provider=token_provider
-            )
-            logger.info("LLM for synonym generation initialized")
-        except Exception as e:
-            logger.error(f"Error setting up LLM for synonym generation: {e}")
-            self.llm = None
-    
-    def generate_synonyms(self, term_name: str, term_definition: str, max_synonyms: int = 10) -> List[str]:
-        """Generate synonyms for a business term using the LLM."""
-        if not self.llm:
-            logger.warning("LLM not initialized, cannot generate synonyms")
-            return []
+        # Get PostgreSQL connection details
+        self.pg_host = self.env.get("PG_HOST", "localhost")
+        self.pg_port = int(self.env.get("PG_PORT", "5432"))
+        self.pg_user = self.env.get("PG_USER", "postgres")
+        self.pg_password = self.env.get("PG_PASSWORD", "postgres")
+        self.pg_db = self.env.get("PG_DB", "metadata_db")
         
-        try:
-            prompt = f"""
-            Generate {max_synonyms} alternative terms, phrases or synonyms that business users might use when referring to this business term:
-            
-            Term: {term_name}
-            Definition: {term_definition}
-            
-            Provide ONLY a comma-separated list of alternative terms or phrases that a user might use when referring to this concept.
-            These should be different ways to express the same concept, including industry jargon, abbreviations, and common variations.
-            DO NOT provide explanations - ONLY the comma-separated list of terms.
-            """
-            
-            response = self.llm.invoke(prompt)
-            
-            # Parse the response to extract the list of synonyms
-            synonyms_text = response.content.strip()
-            
-            # Split by comma and clean up each synonym
-            synonyms = [syn.strip() for syn in synonyms_text.split(',')]
-            
-            # Remove duplicates and empty strings
-            synonyms = list(set([syn for syn in synonyms if syn]))
-            
-            logger.info(f"Generated {len(synonyms)} synonyms for '{term_name}'")
-            return synonyms
-            
-        except Exception as e:
-            logger.error(f"Error generating synonyms for '{term_name}': {e}")
-            return []
-    
-    def get_langchain_embeddings(self):
-        """Get a langchain compatible embeddings object for use with Chroma."""
-        class AzureEmbeddings:
-            def __init__(self, client):
-                self.client = client
-            
-            def embed_documents(self, texts):
-                docs = [MyDocument(id=str(i), text=text) for i, text in enumerate(texts)]
-                embedded_docs = self.client.batch_generate_embeddings(docs)
-                return [doc.embedding for doc in embedded_docs]
-            
-            def embed_query(self, text):
-                doc = MyDocument(id="query", text=text)
-                embedded_doc = self.client.generate_embeddings(doc)
-                return embedded_doc.embedding
+        # Configure connection pooling
+        self.min_connections = int(self.env.get("PG_MIN_CONNECTIONS", "2"))
+        self.max_connections = int(self.env.get("PG_MAX_CONNECTIONS", "10"))
         
-        return AzureEmbeddings(self)
-
-## ChromaDB Vector Store Manager Class
-class ChromaVectorStore:
-    def __init__(self, embedding_client: EmbeddingClient, persist_directory: str = "./chroma_db", collection_name: str = "pbt_data"):
-        self.embedding_client = embedding_client
-        self.persist_directory = persist_directory
-        self.collection_name = collection_name
-        self.embedding_function = self.embedding_client.get_langchain_embeddings()
+        # Initialize connection pool and engine
+        self._setup_connection_pool()
+        self._setup_sqlalchemy()
         
-        # Create the directory if it doesn't exist
-        os.makedirs(persist_directory, exist_ok=True)
+        # Initialize database schema if needed
+        try:
+            self._verify_schema()
+        except Exception as e:
+            logger.error(f"Error verifying schema: {e}")
+            # Continue anyway - the schema might already exist
         
-        # Create ChromaDB settings with telemetry disabled
-        chroma_settings = ChromaSettings(
-            anonymized_telemetry=False,  # Disable telemetry
-            allow_reset=True,
-            is_persistent=True
-        )
-        
-        # Initialize the vector store with telemetry disabled using the latest import
-        # from langchain_chroma instead of the deprecated langchain.vectorstores
-        self.vectorstore = Chroma(
-            collection_name=collection_name,
-            embedding_function=self.embedding_function,
-            persist_directory=persist_directory,
-            client_settings=chroma_settings
-        )
-        
-        logger.info(f"Initialized Chroma vector store at {persist_directory} with collection {collection_name} (telemetry disabled)")
+        self._initialized = True
+        logger.info(f"Database manager initialized with host={self.pg_host}, port={self.pg_port}, db={self.pg_db}, schema={self.schema_name}")
     
-    def add_documents(self, docs: List[Document], ids: Optional[List[str]] = None):
-        """Add documents to the vector store in batches."""
+    def _setup_connection_pool(self):
+        """Set up a connection pool for PostgreSQL."""
         try:
-            if not ids:
-                ids = [str(uuid.uuid4()) for _ in range(len(docs))]
-            
-            # Process in batches to avoid overwhelming the database
-            batch_size = 100  # Adjust based on document size and available memory
-            
-            for i in range(0, len(docs), batch_size):
-                batch_docs = docs[i:i + batch_size]
-                batch_ids = ids[i:i + batch_size]
-                
-                self.vectorstore.add_documents(documents=batch_docs, ids=batch_ids)
-                logger.info(f"Added batch {i//batch_size + 1} of {(len(docs) - 1)//batch_size + 1} to Chroma vector store")
-            
-            # Note: Since Chroma 0.4.x, persistence is automatic and we don't need to call persist()
-            logger.info(f"Added total of {len(docs)} documents to Chroma vector store")
-            return ids
-        except Exception as e:
-            logger.error(f"Error adding documents to vector store: {e}")
-            raise
-    
-    def add_texts(self, texts: List[str], metadatas: Optional[List[Dict]] = None, ids: Optional[List[str]] = None):
-        """Add texts to the vector store in batches."""
-        try:
-            if not ids:
-                ids = [str(uuid.uuid4()) for _ in range(len(texts))]
-            
-            # Process in batches
-            batch_size = 100  # Adjust based on text size and available memory
-            
-            for i in range(0, len(texts), batch_size):
-                batch_texts = texts[i:i + batch_size]
-                batch_ids = ids[i:i + batch_size]
-                
-                # Handle metadata batching
-                batch_metadatas = None
-                if metadatas:
-                    batch_metadatas = metadatas[i:i + batch_size]
-                
-                self.vectorstore.add_texts(
-                    texts=batch_texts, 
-                    metadatas=batch_metadatas, 
-                    ids=batch_ids
-                )
-                logger.info(f"Added text batch {i//batch_size + 1} of {(len(texts) - 1)//batch_size + 1} to Chroma vector store")
-            
-            # Note: Since Chroma 0.4.x, persistence is automatic
-            logger.info(f"Added total of {len(texts)} texts to Chroma vector store")
-            return ids
-        except Exception as e:
-            logger.error(f"Error adding texts to vector store: {e}")
-            raise
-    
-    def similarity_search(self, query: str, k: int = 5, filter: Optional[Dict] = None) -> List[Document]:
-        """Search for similar documents."""
-        try:
-            return self.vectorstore.similarity_search(query, k=k, filter=filter)
-        except Exception as e:
-            logger.error(f"Error searching vector store: {e}")
-            return []
-    
-    def similarity_search_with_score(self, query: str, k: int = 5, filter: Optional[Dict] = None) -> List[Tuple[Document, float]]:
-        """Search for similar documents with scores."""
-        try:
-            return self.vectorstore.similarity_search_with_score(query, k=k, filter=filter)
-        except Exception as e:
-            logger.error(f"Error searching vector store with scores: {e}")
-            return []
-    
-    def max_marginal_relevance_search(self, query: str, k: int = 5, fetch_k: int = 20, 
-                                     lambda_mult: float = 0.5, filter: Optional[Dict] = None) -> List[Document]:
-        """Search with maximal marginal relevance."""
-        try:
-            return self.vectorstore.max_marginal_relevance_search(
-                query=query, k=k, fetch_k=fetch_k, lambda_mult=lambda_mult, filter=filter
-            )
-        except Exception as e:
-            logger.error(f"Error with MMR search: {e}")
-            return []
-    
-    def as_retriever(self, search_type: str = "similarity", search_kwargs: Optional[Dict] = None):
-        """Get the vector store as a retriever."""
-        return self.vectorstore.as_retriever(search_type=search_type, search_kwargs=search_kwargs)
-    
-    def delete(self, ids: Optional[List[str]] = None):
-        """Delete documents from the vector store."""
-        try:
-            if ids:
-                self.vectorstore.delete(ids=ids)
-                logger.info(f"Deleted specific documents with IDs from vector store")
-            else:
-                # Modern approach for newer Chroma versions
-                if hasattr(self.vectorstore, 'delete_collection'):
-                    # Use the integrated method if available
-                    self.vectorstore.delete_collection()
-                    # Reinitialize after deletion
-                    self.vectorstore = Chroma(
-                        collection_name=self.collection_name,
-                        embedding_function=self.embedding_function,
-                        persist_directory=self.persist_directory
-                    )
-                else:
-                    # Attempt to use client interface if available 
-                    try:
-                        if hasattr(self.vectorstore, '_client'):
-                            self.vectorstore._client.delete_collection(self.collection_name)
-                            # Reinitialize after deletion
-                            self.vectorstore = Chroma(
-                                collection_name=self.collection_name,
-                                embedding_function=self.embedding_function,
-                                persist_directory=self.persist_directory
-                            )
-                    except Exception as e:
-                        logger.error(f"Error deleting collection via client: {e}")
-                        raise
-                
-                logger.info(f"Deleted entire collection from vector store")
-        except Exception as e:
-            logger.error(f"Error deleting from vector store: {e}")
-            raise
-
-## PBT Data Manager Class with ChromaDB integration
-class PBTDataManager:
-    def __init__(self, embedding_client: EmbeddingClient, persist_directory: str = "./chroma_db"):
-        self.embedding_client = embedding_client
-        self.pbt_data = []
-        self.concept_hierarchy = {}  # Maps specific terms to their broader categories
-        
-        # Initialize ChromaDB vector store
-        self.vector_store = ChromaVectorStore(
-            embedding_client=embedding_client,
-            persist_directory=persist_directory,
-            collection_name="pbt_data"
-        )
-    
-    def load_csv(self, csv_path: str) -> None:
-        """Load PBT data from CSV file and store in ChromaDB with synonyms as metadata."""
-        try:
-            # Import explicitly here to ensure it's available
-            from langchain_community.vectorstores.utils import filter_complex_metadata
-            
-            df = pd.read_csv(csv_path)
-            if not all(col in df.columns for col in ['id', 'PBT_NAME', 'PBT_DEFINITION']):
-                raise ValueError("CSV file must contain columns: id, PBT_NAME, PBT_DEFINITION")
-            
-            # Convert DataFrame to list of dictionaries
-            self.pbt_data = df.to_dict('records')
-            
-            # Create documents for embedding with synonyms
-            all_docs = []
-            all_ids = []
-            
-            # Process in smaller batches for both synonym generation and ChromaDB ingestion
-            synonym_batch_size = 10  # For LLM synonym generation
-            chroma_batch_size = 100  # For ChromaDB ingestion
-            
-            # First generate all documents with synonyms
-            for i in range(0, len(self.pbt_data), synonym_batch_size):
-                batch = self.pbt_data[i:i + synonym_batch_size]
-                batch_docs = []
-                batch_ids = []
-                
-                logger.info(f"Generating synonyms for batch {i//synonym_batch_size + 1} of {(len(self.pbt_data) - 1)//synonym_batch_size + 1}")
-                
-                for item in batch:
-                    # Generate synonyms for this term
-                    synonyms = self.embedding_client.generate_synonyms(
-                        term_name=item['PBT_NAME'],
-                        term_definition=item['PBT_DEFINITION']
-                    )
-                    
-                    # Convert the list of synonyms to a comma-separated string
-                    synonyms_str = ", ".join(synonyms) if synonyms else ""
-                    
-                    # Create the combined text including synonyms
-                    combined_text = f"{item['PBT_NAME']} - {item['PBT_DEFINITION']}"
-                    
-                    # Store synonyms in a format that ChromaDB can handle (no lists)
-                    # We'll also store the count to make it easier to parse later
-                    metadata = {
-                        'id': str(item['id']),
-                        'name': item['PBT_NAME'],
-                        'definition': item['PBT_DEFINITION'],
-                        'synonyms_str': synonyms_str,  # Store as string instead of list
-                        'synonym_count': len(synonyms)
-                    }
-                    
-                    # Create a document with synonyms in metadata as a string
-                    doc = Document(
-                        page_content=combined_text,
-                        metadata=metadata
-                    )
-                    batch_docs.append(doc)
-                    batch_ids.append(str(item['id']))
-                
-                all_docs.extend(batch_docs)
-                all_ids.extend(batch_ids)
-            
-            # Apply filter_complex_metadata to ensure metadata is compatible with ChromaDB
-            filtered_docs = filter_complex_metadata(all_docs)
-            logger.info(f"Filtered {len(all_docs)} documents to remove complex metadata types")
-            
-            # Now add filtered documents to ChromaDB in batches
-            for i in range(0, len(filtered_docs), chroma_batch_size):
-                batch_docs = filtered_docs[i:i + chroma_batch_size]
-                batch_ids = all_ids[i:i + chroma_batch_size]
-                
-                self.vector_store.add_documents(batch_docs, ids=batch_ids)
-                logger.info(f"Added document batch {i//chroma_batch_size + 1} of {(len(filtered_docs) - 1)//chroma_batch_size + 1} to ChromaDB")
-            
-            # Build concept hierarchy using embeddings-based clustering
-            self._build_concept_hierarchy()
-            
-            logger.info(f"Loaded {len(self.pbt_data)} PBT records with synonyms from CSV into ChromaDB")
-        except Exception as e:
-            logger.error(f"Error loading CSV into ChromaDB: {e}")
-            raise
-    
-    def _build_concept_hierarchy(self):
-        """Build a concept hierarchy based on the similarity between terms."""
-        try:
-            # We'll use ChromaDB to get embeddings
-            # First we need to retrieve all documents with embeddings
-            all_docs = self.vector_store.similarity_search("", k=len(self.pbt_data) + 1)
-            
-            # Calculate similarity matrix between all terms
-            # We need to get the embeddings first
-            embeddings = []
-            doc_ids = []
-            
-            for i, doc in enumerate(all_docs):
-                # We need to query the document embeddings from ChromaDB
-                # We can use the document ID to retrieve the embedding
-                doc_id = doc.metadata.get('id')
-                if doc_id:
-                    doc_ids.append(doc_id)
-                    
-                    # For now, we'll just create a dummy document and get its embedding
-                    # This is not ideal, but we need to work with what ChromaDB gives us
-                    doc_text = doc.page_content
-                    dummy_doc = MyDocument(id=doc_id, text=doc_text)
-                    embedded_doc = self.embedding_client.generate_embeddings(dummy_doc)
-                    embeddings.append(embedded_doc.embedding)
-            
-            # Now we can calculate the similarity matrix
-            similarity_matrix = np.zeros((len(embeddings), len(embeddings)))
-            
-            for i in range(len(embeddings)):
-                for j in range(len(embeddings)):
-                    if i != j:  # Skip self-comparison
-                        similarity_matrix[i, j] = cosine_similarity(
-                            [embeddings[i]], 
-                            [embeddings[j]]
-                        )[0][0]
-            
-            # Identify broader terms (terms that are similar to many other terms)
-            avg_similarities = np.mean(similarity_matrix, axis=1)
-            
-            # Calculate term specificity (lower means more specific)
-            term_generality = {}
-            term_lengths = []
-            
-            for i, doc_id in enumerate(doc_ids):
-                # Find the corresponding PBT data item
-                item = next((item for item in self.pbt_data if str(item['id']) == doc_id), None)
-                if item:
-                    # Calculate term specificity based on:
-                    # 1. Average similarity to other terms
-                    # 2. Term name length (shorter terms tend to be more general)
-                    name_length = len(item['PBT_NAME'].split())
-                    term_lengths.append(name_length)
-                    
-                    term_generality[doc_id] = {
-                        'avg_similarity': float(avg_similarities[i]),
-                        'name_length': name_length,
-                        'id': item['id'],
-                        'name': item['PBT_NAME']
-                    }
-            
-            # Normalize term lengths
-            max_length = max(term_lengths) if term_lengths else 1
-            for term_id, data in term_generality.items():
-                # Score where higher means more general
-                data['generality_score'] = data['avg_similarity'] * (1 - (data['name_length'] / max_length))
-            
-            # Sort terms by generality score (higher is more general)
-            sorted_terms = sorted(
-                term_generality.items(), 
-                key=lambda x: x[1]['generality_score'], 
-                reverse=True
+            self.connection_pool = pool.ThreadedConnectionPool(
+                minconn=self.min_connections,
+                maxconn=self.max_connections,
+                host=self.pg_host,
+                port=self.pg_port,
+                user=self.pg_user,
+                password=self.pg_password,
+                database=self.pg_db
             )
             
-            # Take the top 20% as broader terms
-            broader_terms_count = max(1, int(len(sorted_terms) * 0.2))
-            broader_terms = [term[0] for term in sorted_terms[:broader_terms_count]]
-            
-            # Store concept hierarchy
-            self.concept_hierarchy = {
-                'broader_terms': [item for item in self.pbt_data 
-                                if str(item['id']) in broader_terms],
-                'term_generality': term_generality
-            }
-            
-            logger.info(f"Built concept hierarchy with {len(broader_terms)} broader terms")
-        except Exception as e:
-            logger.error(f"Error building concept hierarchy: {e}")
-            self.concept_hierarchy = {'broader_terms': [], 'term_generality': {}}
-    
-    def find_similar_items(self, query_text: str, top_n: int = 5, include_broader_terms: bool = True) -> List[Dict]:
-        """Find the most similar PBT items to the query text, including broader terms."""
-        try:
-            # First, try to find exact matches or matches with synonyms
-            # We'll use a special filter that checks synonyms in metadata
-            filter_condition = None
-            exact_matches = []
-            
-            # Get documents with metadata that contains synonyms matching parts of the query
-            doc_score_pairs = self.vector_store.similarity_search_with_score(
-                query_text, 
-                k=top_n * 2  # Get more results initially to account for filtering
-            )
-            
-            # Process results to check for synonym matches
-            for doc, score in doc_score_pairs:
-                doc_id = doc.metadata.get('id')
-                synonyms_str = doc.metadata.get('synonyms_str', "")
-                
-                # Split the synonyms string back into a list
-                synonyms = [s.strip() for s in synonyms_str.split(',')] if synonyms_str else []
-                
-                # Check if any part of the query matches a synonym
-                query_terms = set(query_text.lower().split())
-                
-                synonym_match = False
-                for synonym in synonyms:
-                    if not synonym:
-                        continue
-                    synonym_terms = set(synonym.lower().split())
-                    if query_terms.intersection(synonym_terms):
-                        synonym_match = True
-                        break
-                
-                # Find the corresponding PBT data item
-                item = next((item.copy() for item in self.pbt_data if str(item['id']) == doc_id), None)
-                
-                if item:
-                    item['similarity_score'] = float(score)
-                    item['match_type'] = 'specific'
-                    
-                    # Boost score for synonym matches
-                    if synonym_match:
-                        item['similarity_score'] *= 1.2  # 20% boost for synonym matches
-                        item['synonym_match'] = True
-                    
-                    exact_matches.append(item)
-            
-            # Sort by adjusted score and take top_n
-            exact_matches.sort(key=lambda x: x['similarity_score'], reverse=True)
-            specific_results = exact_matches[:top_n]
-            
-            final_results = specific_results
-            
-            # Include broader terms if requested
-            if include_broader_terms and self.concept_hierarchy.get('broader_terms'):
-                # Get broader terms that might be applicable
-                broader_matches = []
-                
-                # Calculate similarity to broader terms
-                for broader_term in self.concept_hierarchy.get('broader_terms', []):
-                    # Skip terms already in the specific results
-                    if any(r['id'] == broader_term['id'] for r in specific_results):
-                        continue
-                    
-                    # Search for similarity to the broader term
-                    broader_query = f"{broader_term['PBT_NAME']} - {broader_term['PBT_DEFINITION']}"
-                    doc_score_pairs = self.vector_store.similarity_search_with_score(broader_query, k=1)
-                    
-                    if doc_score_pairs:
-                        doc, score = doc_score_pairs[0]
-                        
-                        # Only include broader terms with reasonable similarity
-                        if score > 0.5:  # Threshold can be adjusted
-                            result = broader_term.copy()
-                            result['similarity_score'] = float(score)
-                            result['match_type'] = 'broader'
-                            broader_matches.append(result)
-                
-                # Sort broader matches by similarity
-                broader_matches.sort(key=lambda x: x['similarity_score'], reverse=True)
-                
-                # Take up to 3 broader matches
-                broader_matches = broader_matches[:3]
-                
-                # Add broader matches to results
-                final_results = specific_results + broader_matches
-            
-            return final_results
-        except Exception as e:
-            logger.error(f"Error finding similar items: {e}")
-            return []
-
-## AzureChatbot components with LangGraph memory integration
-class AzureChatbot:
-    def __init__(self, config_file=CONFIG_PATH, creds_file=CREDS_PATH, cert_file=CERT_PATH):
-        self.env = OSEnv(config_file, creds_file, cert_file)
-        self._setup_chat_model()
-        
-        # Create a persistent memory store using LangGraph's memory saver
-        self.memory_saver = MemorySaver()
-        
-        # Initialize conversation buffer memory
-        self.memory = ConversationBufferMemory()
-        self.conversation = ConversationChain(llm=self.llm, memory=self.memory, verbose=True)
-    
-    def _setup_chat_model(self):
-        try:
-            token_provider = get_bearer_token_provider(
-                self.env.credential,
-                "https://cognitiveservices.azure.com/.default"
-            )
-            model_name = self.env.get("MODEL_NAME", "gpt-4o")
-            temperature = float(self.env.get("TEMPERATURE", "0.7"))
-            max_tokens = int(self.env.get("MAX_TOKENS", "800"))
-            api_version = self.env.get("API_VERSION", "2024-05-01-preview")
-            azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
-            
-            self.llm = AzureChatOpenAI(
-                model_name=model_name,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                api_version=api_version,
-                azure_endpoint=azure_endpoint,
-                azure_ad_token_provider=token_provider
-            )
-        except Exception as e:
-            logger.error(f"Error setting up chatbot: {e}")
-            raise
-    
-    def classify_with_llm(self, user_input: str, pbt_options: List[Dict]) -> Dict:
-        """Use the LLM to classify the user input against the PBT options."""
-        try:
-            # Create a prompt for the classification
-            prompt_template = """
-            You are an expert in data classification. You need to map a user input to the most relevant category in a database.
-
-            User Input: {user_input}
-
-            Available Categories:
-            {pbt_options}
-
-            Please analyze the user input and determine which category is the most contextually relevant match.
-            Return only the ID of the best matching category. Do not include any explanations or additional text.
-            """
-            
-            # Format the PBT options
-            formatted_options = "\n".join([
-                f"ID: {option['id']}, Name: {option['name']}, Definition: {option['definition']}" 
-                for option in pbt_options
-            ])
-            
-            # Create a prompt message
-            prompt = prompt_template.format(
-                user_input=user_input,
-                pbt_options=formatted_options
-            )
-            
-            # Get the classification from the LLM
-            response = self.llm.invoke(prompt)
-            
-            # Extract the ID from the response
-            result_id = response.content.strip()
-            
-            # Find the matching option
-            for option in pbt_options:
-                if str(option['id']) == result_id:
-                    return option
-            
-            # If no exact match is found
-            logger.warning(f"No exact match found for ID: {result_id}. Returning best guess.")
-            return pbt_options[0]  # Return the first option as a fallback
-            
-        except Exception as e:
-            logger.error(f"Error in LLM classification: {e}")
-            return None
-
-
-## LangGraph React Agent Class with Memory Integration
-class ReactAgent:
-    def __init__(self, env: OSEnv, pbt_manager: PBTDataManager):
-        self.env = env
-        self.pbt_manager = pbt_manager
-        
-        # Set up persistent memory with MemorySaver
-        self.memory_saver = MemorySaver()
-        
-        self.model = self._setup_llm()
-        self.tools = self._setup_tools()
-        self.agent = self._create_agent()
-    
-    def _setup_llm(self):
-        token_provider = get_bearer_token_provider(
-            self.env.credential,
-            "https://cognitiveservices.azure.com/.default"
-        )
-        model_name = self.env.get("MODEL_NAME", "gpt-4o")
-        temperature = float(self.env.get("TEMPERATURE", "0.3"))
-        api_version = self.env.get("API_VERSION", "2024-05-01-preview")
-        azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
-        
-        return AzureChatOpenAI(
-            model_name=model_name,
-            temperature=temperature,
-            api_version=api_version,
-            azure_endpoint=azure_endpoint,
-            azure_ad_token_provider=token_provider
-        )
-    
-    def _setup_tools(self):
-        return [PBTClassifierTool(pbt_manager=self.pbt_manager)]
-    
-    def _create_agent(self):
-        # Define custom system message
-        system_message = """
-        You are an expert business terminology standardization system. Your task is to map user-provided terms 
-        and descriptions to the organization's Preferred Business Terms (PBT).
-
-        When a user provides a name and description, use the pbt_classifier tool to find the most appropriate 
-        standard business terms from the database. 
-        
-        The tool will return both specific matches and broader category matches. Consider both types when making 
-        your recommendation. For example, "drawdown client account number" might match to both specific terms 
-        like "Account Number" and broader categories like "Account Identifier" or "Customer Account".
-        
-        Explain why the matches are appropriate, focusing on conceptual alignment rather than just keyword matching.
-        Always mention both specific and broader matches in your response when available.
-        
-        You also have access to memory of previous classifications. Reference past similar classifications if relevant.
-        """
-        
-        # Create the React agent with memory
-        return create_react_agent(
-            self.model,
-            self.tools,
-            prompt=system_message,
-            checkpointer=self.memory_saver
-        )
-    
-    def _get_user_id(self, name: str, description: str) -> str:
-        """Generate a consistent user ID for memory lookup based on input."""
-        return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{name}:{description}"))
-    
-    def save_to_memory(self, session_id: str, name: str, description: str, result: Dict):
-        """Save classification result to memory for future reference."""
-        try:
-            # Create a simplified memory entry
-            memory_entry = {
-                "input": {
-                    "name": name,
-                    "description": description,
-                },
-                "output": {
-                    "best_match": result.get("best_match", {}).get("PBT_NAME", ""),
-                    "best_match_id": result.get("best_match", {}).get("id", ""),
-                    "confidence": result.get("confidence", {}).get("confidence_score", 0)
-                },
-                "timestamp": pd.Timestamp.now().isoformat()
-            }
-            
-            # Save to memory store
-            user_id = self._get_user_id(name, description)
-            namespace = f"classification:{user_id}"
-            
-            # Updated to use correct method signature for MemorySaver
-            # Create a proper config object with thread_id
-            config = {"configurable": {"thread_id": session_id}}
-            
-            # Create an empty checkpoint and add our data to it
-            checkpoint = empty_checkpoint()
-            checkpoint["channel_values"][namespace] = memory_entry
-            
-            # Use the put method with the correct signature
-            self.memory_saver.put(
-                config=config,
-                checkpoint=checkpoint,
-                metadata={"source": "input", "step": -1},
-                new_versions={}
-            )
-            
-            logger.info(f"Saved classification result to memory with ID {session_id} in namespace {namespace}")
-        except Exception as e:
-            logger.error(f"Error saving to memory: {e}")
-    
-    def get_from_memory(self, session_id: str, name: str, description: str) -> Optional[Dict]:
-        """Retrieve classification from memory if it exists."""
-        try:
-            user_id = self._get_user_id(name, description)
-            namespace = f"classification:{user_id}"
-            
-            # Create a proper config object with thread_id
-            config = {"configurable": {"thread_id": session_id}}
-            
-            # Use the get method instead of get_tuple
-            checkpoint = self.memory_saver.get(config)
-            
-            if checkpoint and namespace in checkpoint.get("channel_values", {}):
-                return checkpoint["channel_values"][namespace]
-            
-            return None
-        except Exception as e:
-            logger.error(f"Error retrieving from memory: {e}")
-            return None
-    
-    def classify(self, name: str, description: str) -> Dict:
-        """Use the agent to classify the input."""
-        try:
-            # Generate a unique ID for this classification session
-            session_id = str(uuid.uuid4())
-            
-            # Check if we have a similar classification in memory
-            memory_entry = self.get_from_memory(session_id, name, description)
-            
-            input_message = f"""
-            Please map the following to standard Preferred Business Terms, including both specific and broader category matches:
-            
-            Name: {name}
-            Description: {description}
-            
-            Provide both specific matches and broader category matches when available.
-            """
-            
-            # If we have a memory entry, include it in the message
-            if memory_entry:
-                input_message += f"""
-                
-                I've previously classified similar input with the following result:
-                Previous Input: {memory_entry['input']['name']} - {memory_entry['input']['description']}
-                Previous Match: {memory_entry['output']['best_match']} (ID: {memory_entry['output']['best_match_id']})
-                Previous Confidence: {memory_entry['output']['confidence']}
-                """
-            
-            # Create a config with thread_id for the checkpointer
-            config = {"configurable": {"thread_id": session_id}}
-            
-            result = self.agent.invoke(
-                {"messages": [HumanMessage(content=input_message)]},
-                config=config
-            )
-            
-            # The last message contains the final response
-            final_message = result.get("messages", [])[-1] if result.get("messages") else None
-            final_content = ""
-            
-            if hasattr(final_message, 'content'):
-                final_content = final_message.content
-            elif isinstance(final_message, dict) and 'content' in final_message:
-                final_content = final_message['content']
-            elif final_message is not None:
-                final_content = str(final_message)
-            
-            # Extract any information about synonym matches
-            synonym_matches = []
-            for message in result.get("messages", []):
-                if message.type == "tool" and hasattr(message, 'content') and "synonym_match" in message.content:
-                    try:
-                        content = json.loads(message.content)
-                        if isinstance(content, dict) and content.get("similar_items"):
-                            for item in content.get("similar_items", []):
-                                if item.get("synonym_match"):
-                                    synonym_matches.append({
-                                        "term": item.get("PBT_NAME", ""),
-                                        "id": item.get("id", ""),
-                                        "score": item.get("similarity_score", 0)
-                                    })
-                    except:
-                        pass
-            
-            # Include information about synonym matches in the response
-            if synonym_matches:
-                final_content += "\n\nNote: Some terms were matched via synonyms in our database."
-            
-            # Manually serialize messages to avoid JSON issues
-            serialized_result = {"messages": []}
-            
-            # Process each message
-            for msg in result.get("messages", []):
-                serialized_msg = {}
-                
-                # Handle different message types and formats
-                if hasattr(msg, 'content'):
-                    serialized_msg["content"] = msg.content
-                    serialized_msg["type"] = getattr(msg, "type", "unknown")
-                    
-                    # Handle tool calls
-                    if hasattr(msg, 'tool_calls') and msg.tool_calls:
-                        serialized_msg["tool_calls"] = []
-                        for tool_call in msg.tool_calls:
-                            if isinstance(tool_call, dict):
-                                serialized_msg["tool_calls"].append(tool_call)
-                    
-                    # Handle additional kwargs
-                    if hasattr(msg, 'additional_kwargs') and msg.additional_kwargs:
-                        serialized_msg["additional_kwargs"] = msg.additional_kwargs
-                        
-                    # Handle name (for tool messages)
-                    if hasattr(msg, 'name'):
-                        serialized_msg["name"] = msg.name
-                
-                elif isinstance(msg, dict):
-                    # If message is already a dict, just copy the relevant fields
-                    for key in ['content', 'type', 'tool_calls', 'additional_kwargs', 'name']:
-                        if key in msg:
-                            serialized_msg[key] = msg[key]
-                
-                # Only add non-empty messages
-                if serialized_msg:
-                    serialized_result["messages"].append(serialized_msg)
-            
-            # Extract the best match from the agent's result
-            full_trace = serialized_result
-            messages = full_trace.get("messages", [])
-            
-            # Find the tool message with the classification result
-            best_match = None
-            specific_matches = []
-            broader_matches = []
-            
-            for message in messages:
-                if message.get("type") == "tool" and message.get("name", message.get("additional_kwargs", {}).get("name")) == "pbt_classifier":
-                    try:
-                        # Try to parse the content
-                        if isinstance(message.get("content"), str):
-                            tool_content = json.loads(message.get("content", "{}"))
-                            
-                            if tool_content.get("status") == "success":
-                                best_match = tool_content.get("best_match")
-                                specific_matches = tool_content.get("specific_matches", [])
-                                broader_matches = tool_content.get("broader_matches", [])
-                                break
-                    except json.JSONDecodeError:
-                        logger.warning("Failed to parse tool content JSON")
-                    except Exception as e:
-                        logger.warning(f"Error processing tool message: {e}")
-            
-            # If we couldn't find a best match in the tool results, fall back to embedding similarity
-            if best_match is None:
-                logger.warning("Could not extract best match from agent result, falling back to embedding similarity")
-                similar_items = self.pbt_manager.find_similar_items(f"{name} - {description}", top_n=5, include_broader_terms=True)
-                
-                if not similar_items:
-                    return {"status": "error", "message": "No similar items found"}
-                
-                best_match = similar_items[0]
-                specific_matches = [item for item in similar_items if item.get('match_type') == 'specific']
-                broader_matches = [item for item in similar_items if item.get('match_type') == 'broader']
-                
-                # If no match types specified, treat all as specific
-                if not specific_matches and not broader_matches:
-                    specific_matches = similar_items
-            
-            # Create final response
-            response = {
-                "status": "success",
-                "agent_response": final_content,
-                "best_match": best_match,
-                "specific_matches": specific_matches,
-                "broader_matches": broader_matches
-            }
-            
-            # Save to memory for future use
-            self.save_to_memory(session_id, name, description, response)
-            
-            return response
-        except Exception as e:
-            logger.error(f"Error in agent classification: {e}")
-            return {"status": "error", "message": str(e)}
-
-
-## LangGraph React Agent Tool
-class PBTClassifierTool(BaseTool):
-    name: str = Field("pbt_classifier")
-    description: str = Field("Classifies user input against PBT (Preferred Business Terms) database entries")
-    pbt_manager: PBTDataManager = Field(exclude=True)
-    
-    def __init__(self, pbt_manager: PBTDataManager):
-        # Initialize with proper field values
-        super().__init__(name="pbt_classifier", 
-                        description="Classifies user input against PBT (Preferred Business Terms) database entries. Include parameter 'return_broader_terms=True' to get both specific and broader business terms.",
-                        pbt_manager=pbt_manager)
-        
-    def _run(self, name: str, description: str, return_broader_terms: bool = True) -> dict:
-        """Classify the input against the PBT data."""
-        combined_input = f"{name} - {description}"
-        similar_items = self.pbt_manager.find_similar_items(
-            combined_input, 
-            top_n=5, 
-            include_broader_terms=return_broader_terms
-        )
-        
-        if not similar_items:
-            return {"status": "error", "message": "No similar items found"}
-        
-        # Group results by match type
-        specific_matches = [item for item in similar_items if item.get('match_type') == 'specific']
-        broader_matches = [item for item in similar_items if item.get('match_type') == 'broader']
-        
-        # Identify items matched via synonyms
-        synonym_matches = [item for item in similar_items if item.get('synonym_match', False)]
-        
-        # If no specific grouping, treat all as specific
-        if not specific_matches and not broader_matches:
-            specific_matches = similar_items
-        
-        result = {
-            "status": "success",
-            "best_match": similar_items[0] if similar_items else None,
-            "specific_matches": specific_matches,
-            "broader_matches": broader_matches,
-            "similar_items": similar_items
-        }
-        
-        # Add synonym match information if available
-        if synonym_matches:
-            # Note: We won't include the actual synonyms list as it isn't stored directly anymore
-            result["synonym_matches"] = [
-                {
-                    "id": item.get("id", ""),
-                    "name": item.get("PBT_NAME", ""),
-                    "score": item.get("similarity_score", 0)
-                } for item in synonym_matches
-            ]
-        
-        return result
-
-
-## Confidence Evaluator Agent Class
-class ConfidenceEvaluatorAgent:
-    def __init__(self, env: OSEnv):
-        self.env = env
-        self.model = self._setup_llm()
-        self.chain = self._create_confidence_chain()
-        
-        # Set up memory for remembering past evaluations
-        self.memory_saver = MemorySaver()
-    
-    def _setup_llm(self):
-        token_provider = get_bearer_token_provider(
-            self.env.credential,
-            "https://cognitiveservices.azure.com/.default"
-        )
-        model_name = self.env.get("MODEL_NAME", "gpt-4o")
-        temperature = float(self.env.get("TEMPERATURE", "0.2"))  # Lower temperature for more deterministic confidence scores
-        api_version = self.env.get("API_VERSION", "2024-05-01-preview")
-        azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
-        
-        return AzureChatOpenAI(
-            model_name=model_name,
-            temperature=temperature,
-            api_version=api_version,
-            azure_endpoint=azure_endpoint,
-            azure_ad_token_provider=token_provider
-        )
-    
-    def _create_confidence_chain(self):
-        # Define prompt for confidence evaluation
-        prompt = ChatPromptTemplate.from_messages([
-            SystemMessage(content="""
-            You are an expert system that evaluates the confidence of matches between user-provided terms and standard
-            Preferred Business Terms (PBT). Analyze the semantic similarity, contextual relevance, and overall 
-            appropriateness of the match.
-            
-            Provide a confidence score between 0 and 100, where:
-            - 0-20: Very low confidence. The match seems arbitrary or incorrect.
-            - 21-40: Low confidence. There's a vague relationship but likely not the best match.
-            - 41-60: Moderate confidence. There's a reasonable connection but potentially better alternatives.
-            - 61-80: High confidence. The match is strong and likely appropriate.
-            - 81-100: Very high confidence. The match is excellent and almost certainly correct.
-            
-            Return your evaluation as a JSON object with the following fields:
-            - confidence_score: (number between 0-100)
-            - explanation: (string explaining your reasoning)
-            """),
-            HumanMessage(content="""
-            User Input: {user_input}
-            
-            Matched PBT: 
-            ID: {pbt_id}
-            Name: {pbt_name}
-            Definition: {pbt_definition}
-            
-            Evaluate the confidence of this match.
-            """)
-        ])
-        
-        # Create the chain
-        return prompt | self.model
-    
-    def _get_memory_key(self, user_input: str, pbt_id: str) -> str:
-        """Generate a consistent memory key for retrieving past evaluations."""
-        return f"confidence:{user_input.strip().lower()}:{pbt_id}"
-    
-    def evaluate_confidence(self, user_input: str, pbt_match: Dict) -> Dict:
-        """Evaluate the confidence of a match between user input and a PBT."""
-        try:
-            # Generate a memory key for this evaluation
-            memory_key = self._get_memory_key(user_input, str(pbt_match.get("id", "")))
-            session_id = "confidence_evaluations"  # A common session for all confidence evals
-            
-            # Create a proper config object with thread_id
-            config = {"configurable": {"thread_id": session_id}}
-            
-            # Try to get from memory
-            try:
-                # Get from memory using the correct method
-                checkpoint = self.memory_saver.get(config)
-                
-                if checkpoint and memory_key in checkpoint.get("channel_values", {}):
-                    cached_result = checkpoint["channel_values"][memory_key]
-                    logger.info(f"Found cached confidence evaluation: {cached_result}")
-                    return cached_result
-            except Exception as mem_error:
-                logger.warning(f"Error retrieving from memory: {mem_error}")
-            
-            # Call the LLM if not in memory
-            llm_response = self.chain.invoke({
-                "user_input": user_input,
-                "pbt_id": pbt_match.get("id", ""),
-                "pbt_name": pbt_match.get("PBT_NAME", ""),
-                "pbt_definition": pbt_match.get("PBT_DEFINITION", "")
-            })
-            
-            # Extract JSON data from the response
-            content = llm_response.content
-            
-            # Handle possible JSON formatting issues
-            try:
-                # Try direct JSON parsing first
-                result = json.loads(content)
-            except json.JSONDecodeError:
-                # If that fails, try to extract JSON using regex
-                import re
-                json_pattern = r'\{.*\}'
-                match = re.search(json_pattern, content, re.DOTALL)
-                
-                if match:
-                    try:
-                        result = json.loads(match.group(0))
-                    except json.JSONDecodeError:
-                        # If regex extraction fails, create a default result with explanation
-                        result = {
-                            "confidence_score": 50,
-                            "explanation": "Could not parse confidence score from LLM output. Using default medium confidence. Original response: " + content[:100] + "..."
-                        }
-                else:
-                    # If no JSON-like structure found, create a default result with explanation
-                    result = {
-                        "confidence_score": 50,
-                        "explanation": "Could not parse confidence score from LLM output. Using default medium confidence. Original response: " + content[:100] + "..."
-                    }
-            
-            # Ensure the result has the expected fields
-            if "confidence_score" not in result:
-                result["confidence_score"] = 50
-            if "explanation" not in result:
-                result["explanation"] = "No explanation provided"
-            
-            # Convert confidence score to integer if it's a string
-            if isinstance(result["confidence_score"], str):
+            # Set search path for all connections in the pool
+            for i in range(self.min_connections):
+                conn = self.connection_pool.getconn()
                 try:
-                    result["confidence_score"] = int(result["confidence_score"])
-                except ValueError:
-                    result["confidence_score"] = 50
-            
-            # Save to memory using the correct method
-            try:
-                # Create or update the checkpoint
-                checkpoint = self.memory_saver.get(config) or empty_checkpoint()
-                checkpoint["channel_values"][memory_key] = result
-                
-                # Use the put method with the correct signature
-                self.memory_saver.put(
-                    config=config,
-                    checkpoint=checkpoint,
-                    metadata={"source": "input", "step": -1},
-                    new_versions={}
-                )
-                
-                logger.info(f"Saved confidence evaluation to memory with key {memory_key}")
-            except Exception as mem_error:
-                logger.warning(f"Error saving to memory: {mem_error}")
-            
-            return result
-            
+                    with conn.cursor() as cursor:
+                        # This is the critical line - set search path to include both schemas
+                        cursor.execute(f"SET search_path TO {self.schema_name}, public")
+                        conn.commit()
+                        logger.info(f"Initialized connection with search path: {self.schema_name}, public")
+                finally:
+                    self.connection_pool.putconn(conn)
+                    
+            logger.info(f"Connection pool created with {self.min_connections}-{self.max_connections} connections")
         except Exception as e:
-            logger.error(f"Error in confidence evaluation: {e}")
-            return {
-                "confidence_score": 50,
-                "explanation": f"Error evaluating confidence: {str(e)}"
-            }
-
-
-## Data Classifier Class
-class DataClassifier:
-    def __init__(self, config_file=CONFIG_PATH, creds_file=CREDS_PATH, cert_file=CERT_PATH):
-        self.env = OSEnv(config_file, creds_file, cert_file)
-        self.embedding_client = EmbeddingClient(self.env)
-        self.pbt_manager = PBTDataManager(self.embedding_client, persist_directory="./chroma_db")
-        self.chatbot = AzureChatbot(config_file, creds_file, cert_file)
-        self.react_agent = None  # Will be initialized after loading data
-        self.confidence_agent = ConfidenceEvaluatorAgent(self.env)
+            logger.error(f"Failed to create connection pool: {e}")
+            self.connection_pool = None
     
-    def load_data(self, csv_path: str) -> None:
-        """Load the PBT data from CSV."""
-        self.pbt_manager.load_csv(csv_path)
-        # Initialize the React agent after data is loaded
-        self.react_agent = ReactAgent(self.env, self.pbt_manager)
+    def _setup_sqlalchemy(self):
+        """Set up SQLAlchemy engine for ORM operations."""
+        try:
+            db_url = f"postgresql://{self.pg_user}:{self.pg_password}@{self.pg_host}:{self.pg_port}/{self.pg_db}"
+            self.engine = create_engine(db_url, pool_pre_ping=True)
+            self.Session = sessionmaker(bind=self.engine)
+            logger.info("SQLAlchemy engine initialized")
+        except Exception as e:
+            logger.error(f"Failed to create SQLAlchemy engine: {e}")
+            self.engine = None
+            self.Session = None
     
-    def classify_with_embeddings(self, name: str, description: str, top_n: int = 5) -> Dict:
-        """Classify using embedding similarity."""
-        combined_input = f"{name} - {description}"
-        similar_items = self.pbt_manager.find_similar_items(combined_input, top_n=top_n)
-        
-        if not similar_items:
-            logger.warning("No similar items found")
-            return {"status": "error", "message": "No similar items found"}
-        
-        # Evaluate confidence
-        confidence_result = self.confidence_agent.evaluate_confidence(
-            combined_input, 
-            similar_items[0]
-        )
-        
-        return {
-            "status": "success",
-            "best_match": similar_items[0],
-            "similar_items": similar_items,
-            "confidence": confidence_result
-        }
-    
-    def classify_with_llm(self, name: str, description: str, top_n: int = 5) -> Dict:
-        """Classify using LLM."""
-        # First get similar items with embeddings
-        combined_input = f"{name} - {description}"
-        similar_items = self.pbt_manager.find_similar_items(combined_input, top_n=top_n)
-        
-        if not similar_items:
-            logger.warning("No similar items found")
-            return {"status": "error", "message": "No similar items found"}
-        
-        # Use LLM for final classification among top candidates
-        best_match = self.chatbot.classify_with_llm(combined_input, [
-            {
-                'id': item['id'],
-                'name': item['PBT_NAME'],
-                'definition': item['PBT_DEFINITION']
-            } for item in similar_items
-        ])
-        
-        if best_match:
-            # Evaluate confidence
-            confidence_result = self.confidence_agent.evaluate_confidence(
-                combined_input, 
-                best_match
+    def _verify_schema(self):
+        """Verify that the schema exists and create it if it doesn't."""
+        try:
+            # Use direct connection to avoid recursive get_connection calls
+            conn = psycopg2.connect(
+                host=self.pg_host,
+                port=self.pg_port,
+                user=self.pg_user,
+                password=self.pg_password,
+                database=self.pg_db
             )
+            conn.autocommit = True  # Set autocommit for schema creation
             
-            return {
-                "status": "success",
-                "best_match": best_match,
-                "similar_items": similar_items,
-                "confidence": confidence_result
-            }
-        
-        # Fallback to embedding similarity
-        confidence_result = self.confidence_agent.evaluate_confidence(
-            combined_input, 
-            similar_items[0]
-        )
-        
-        return {
-            "status": "success",
-            "best_match": similar_items[0],
-            "similar_items": similar_items,
-            "confidence": confidence_result
-        }
+            try:
+                with conn.cursor() as cursor:
+                    # Check if schema exists
+                    cursor.execute(f"SELECT 1 FROM information_schema.schemata WHERE schema_name = '{self.schema_name}'")
+                    schema_exists = cursor.fetchone() is not None
+                    
+                    if not schema_exists:
+                        logger.warning(f"Schema '{self.schema_name}' does not exist. Creating it...")
+                        cursor.execute(f"CREATE SCHEMA {self.schema_name}")
+                        logger.info(f"Schema '{self.schema_name}' created successfully")
+                    else:
+                        logger.info(f"Schema '{self.schema_name}' already exists")
+                    
+                    # Check if pgvector extension exists
+                    cursor.execute("SELECT 1 FROM pg_extension WHERE extname = 'vector'")
+                    vector_extension_exists = cursor.fetchone() is not None
+                    
+                    if not vector_extension_exists:
+                        logger.warning("pgvector extension does not exist. Creating it...")
+                        try:
+                            cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                            logger.info("pgvector extension created successfully")
+                        except Exception as e:
+                            logger.error(f"Error creating pgvector extension: {e}")
+                            logger.error("You may need to install the extension on the database server")
+                    else:
+                        logger.info("pgvector extension already exists")
+                        
+                    # Set search path to include our schema
+                    cursor.execute(f"SET search_path TO {self.schema_name}, public")
+                    
+                    # Check if business_terms table exists
+                    cursor.execute(f"SELECT 1 FROM information_schema.tables WHERE table_schema = '{self.schema_name}' AND table_name = 'business_terms'")
+                    table_exists = cursor.fetchone() is not None
+                    
+                    # Create tables if they don't exist
+                    if not table_exists:
+                        logger.warning(f"Table '{self.schema_name}.business_terms' does not exist. Creating it...")
+                        
+                        # Get vector dimension size - default to 1536 for text-embedding-3-small
+                        embedding_model = self.env.get("EMBEDDING_MODEL", "text-embedding-3-small")
+                        if embedding_model == "text-embedding-3-large":
+                            # Use max allowed pgvector dimension (2000) for reduction
+                            vector_dim = 2000  # pgvector limit is 2000
+                        else:
+                            vector_dim = 1536  # Other models default to 1536
+                        
+                        try:
+                            cursor.execute(f"""
+                            CREATE TABLE {self.schema_name}.business_terms (
+                                id VARCHAR(255) PRIMARY KEY,
+                                name TEXT NOT NULL,
+                                description TEXT NOT NULL,
+                                embedding vector({vector_dim}) NOT NULL,
+                                metadata JSONB DEFAULT '{{}}',
+                                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                            )
+                            """)
+                            
+                            # Create index on embedding using cosine distance
+                            cursor.execute(f"""
+                            CREATE INDEX business_terms_embedding_idx 
+                            ON {self.schema_name}.business_terms 
+                            USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)
+                            """)
+                            
+                            # Create index on name for text search
+                            cursor.execute(f"""
+                            CREATE INDEX business_terms_name_idx 
+                            ON {self.schema_name}.business_terms 
+                            USING btree (name)
+                            """)
+                            
+                            logger.info(f"Table '{self.schema_name}.business_terms' created successfully")
+                        except Exception as e:
+                            logger.error(f"Error creating business_terms table: {e}")
+                    else:
+                        # Check the vector dimension in the existing table
+                        try:
+                            cursor.execute("""
+                            SELECT 
+                                a.attname, 
+                                format_type(a.atttypid, a.atttypmod)
+                            FROM pg_catalog.pg_attribute a
+                            WHERE a.attrelid = 'business_terms'::regclass
+                            AND a.attname = 'embedding'
+                            AND a.attnum > 0 
+                            AND NOT a.attisdropped
+                            """)
+                            
+                            embedding_info = cursor.fetchone()
+                            if embedding_info:
+                                # Get the dimension from the type
+                                match = re.search(r'vector\((\d+)\)', embedding_info[1])
+                                if match:
+                                    dimension = int(match.group(1))
+                                    logger.info(f"Table has vector dimension: {dimension}")
+                        except Exception as e:
+                            logger.warning(f"Could not check vector dimension: {e}")
+                    
+                    # Check if jobs table exists
+                    cursor.execute(f"SELECT 1 FROM information_schema.tables WHERE table_schema = '{self.schema_name}' AND table_name = 'jobs'")
+                    jobs_table_exists = cursor.fetchone() is not None
+                    
+                    if not jobs_table_exists:
+                        logger.warning(f"Table '{self.schema_name}.jobs' does not exist. Creating it...")
+                        try:
+                            cursor.execute(f"""
+                            CREATE TABLE {self.schema_name}.jobs (
+                                id VARCHAR(255) PRIMARY KEY,
+                                job_type VARCHAR(50) NOT NULL,
+                                status VARCHAR(50) NOT NULL,
+                                data JSONB DEFAULT '{{}}',
+                                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                            )
+                            """)
+                            
+                            # Create index on job_type and status
+                            cursor.execute(f"""
+                            CREATE INDEX jobs_type_status_idx 
+                            ON {self.schema_name}.jobs 
+                            USING btree (job_type, status)
+                            """)
+                            
+                            logger.info(f"Table '{self.schema_name}.jobs' created successfully")
+                        except Exception as e:
+                            logger.error(f"Error creating jobs table: {e}")
+                    
+                    # Check if system_stats table exists
+                    cursor.execute(f"SELECT 1 FROM information_schema.tables WHERE table_schema = '{self.schema_name}' AND table_name = 'system_stats'")
+                    stats_table_exists = cursor.fetchone() is not None
+                    
+                    if not stats_table_exists:
+                        logger.warning(f"Table '{self.schema_name}.system_stats' does not exist. Creating it...")
+                        try:
+                            cursor.execute(f"""
+                            CREATE TABLE {self.schema_name}.system_stats (
+                                id SERIAL PRIMARY KEY,
+                                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                cpu_usage FLOAT NOT NULL,
+                                memory_usage FLOAT NOT NULL,
+                                db_size BIGINT NOT NULL,
+                                active_connections INTEGER NOT NULL,
+                                enhancement_jobs_count INTEGER NOT NULL,
+                                tagging_jobs_count INTEGER NOT NULL,
+                                pbt_tagging_jobs_count INTEGER NOT NULL DEFAULT 0
+                            )
+                            """)
+                            
+                            # Create index on timestamp
+                            cursor.execute(f"""
+                            CREATE INDEX system_stats_timestamp_idx 
+                            ON {self.schema_name}.system_stats 
+                            USING btree (timestamp)
+                            """)
+                            
+                            logger.info(f"Table '{self.schema_name}.system_stats' created successfully")
+                        except Exception as e:
+                            logger.error(f"Error creating system_stats table: {e}")
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.error(f"Error verifying schema: {e}")
+            raise
     
-    def classify_with_agent(self, name: str, description: str) -> Dict:
-        """Classify using the LangGraph React agent."""
-        if not self.react_agent:
-            logger.error("React agent not initialized. Call load_data() first.")
-            return {"status": "error", "message": "React agent not initialized"}
+    @contextmanager
+    def get_connection(self) -> Generator:
+        """Get a connection from the pool with automatic cleanup."""
+        conn = None
         
-        agent_result = self.react_agent.classify(name, description)
+        # Safely increment connection attempts
+        if hasattr(self, 'connection_attempts'):
+            self.connection_attempts += 1
         
-        if agent_result.get("status") == "error":
-            return agent_result
-        
-        # The best match should already be in the agent_result
-        best_match = agent_result.get("best_match")
-        
-        # Evaluate confidence for the best match
-        if best_match:
-            combined_input = f"{name} - {description}"
-            confidence_result = self.confidence_agent.evaluate_confidence(
-                combined_input, 
-                best_match
-            )
+        try:
+            if self.connection_pool is None:
+                # Try to recreate the pool if it's None
+                self._setup_connection_pool()
+                if self.connection_pool is None:
+                    raise Exception("Connection pool could not be created")
+                
+            conn = self.connection_pool.getconn()
             
-            # Add confidence to result
-            agent_result["confidence"] = confidence_result
+            # Set search path to include our schema
+            with conn.cursor() as cursor:
+                cursor.execute(f"SET search_path TO {self.schema_name}, public")
+            
+            # Safely increment successful connections
+            if hasattr(self, 'successful_connections'):
+                self.successful_connections += 1
+                
+            yield conn
+        except Exception as e:
+            # Safely increment failed connections
+            if hasattr(self, 'failed_connections'):
+                self.failed_connections += 1
+                
+            logger.error(f"Error getting database connection: {e}")
+            raise
+        finally:
+            if conn is not None:
+                self.connection_pool.putconn(conn)
+    
+    @contextmanager
+    def get_session(self) -> Generator:
+        """Get a SQLAlchemy session with automatic cleanup."""
+        if self.Session is None:
+            raise ValueError("SQLAlchemy Session not initialized")
+            
+        session = self.Session()
+        try:
+            # Set search path
+            session.execute(text(f"SET search_path TO {self.schema_name}, public"))
+            yield session
+        finally:
+            session.close()
+    
+    def health_check(self) -> Dict[str, Any]:
+        """Check the health of the database connection."""
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    # Check connection
+                    cursor.execute("SELECT version()")
+                    version = cursor.fetchone()[0]
+                    
+                    # Check pgvector extension
+                    cursor.execute("SELECT * FROM pg_extension WHERE extname = 'vector'")
+                    vector_enabled = cursor.fetchone() is not None
+                    
+                    # Get database size
+                    cursor.execute(f"SELECT pg_database_size('{self.pg_db}')")
+                    db_size = cursor.fetchone()[0]
+                    
+                    # Get schema existence
+                    cursor.execute(f"SELECT 1 FROM information_schema.schemata WHERE schema_name = '{self.schema_name}'")
+                    schema_exists = cursor.fetchone() is not None
+                    
+                    # Get table counts - use full schema qualified name to avoid search_path issues
+                    table_exists = False
+                    terms_count = 0
+                    
+                    try:
+                        cursor.execute(f"SELECT 1 FROM information_schema.tables WHERE table_schema = '{self.schema_name}' AND table_name = 'business_terms'")
+                        table_exists = cursor.fetchone() is not None
+                        
+                        if table_exists:
+                            cursor.execute(f"SELECT COUNT(*) FROM {self.schema_name}.business_terms")
+                            terms_count = cursor.fetchone()[0]
+                    except Exception as e:
+                        logger.warning(f"Error checking business_terms table: {e}")
+                    
+                    # Get connection stats
+                    cursor.execute("SELECT count(*) FROM pg_stat_activity WHERE datname = %s", (self.pg_db,))
+                    active_connections = cursor.fetchone()[0]
+                    
+                    # Get the connection stats, safely handling missing attributes
+                    connection_stats = {
+                        "attempts": getattr(self, 'connection_attempts', 0),
+                        "successful": getattr(self, 'successful_connections', 0),
+                        "failed": getattr(self, 'failed_connections', 0)
+                    }
+                    
+                    # Check vector dimension if table exists
+                    vector_dim = None
+                    if table_exists:
+                        try:
+                            cursor.execute("""
+                            SELECT 
+                                a.attname, 
+                                format_type(a.atttypid, a.atttypmod)
+                            FROM pg_catalog.pg_attribute a
+                            WHERE a.attrelid = 'business_terms'::regclass
+                            AND a.attname = 'embedding'
+                            AND a.attnum > 0 
+                            AND NOT a.attisdropped
+                            """)
+                            
+                            embedding_info = cursor.fetchone()
+                            if embedding_info:
+                                # Get the dimension from the type
+                                match = re.search(r'vector\((\d+)\)', embedding_info[1])
+                                if match:
+                                    vector_dim = int(match.group(1))
+                        except Exception as e:
+                            logger.warning(f"Could not check vector dimension: {e}")
+                    
+                    return {
+                        "status": "healthy",
+                        "version": version,
+                        "vector_enabled": vector_enabled,
+                        "schema_exists": schema_exists,
+                        "schema_name": self.schema_name,
+                        "db_size_mb": round(db_size / (1024 * 1024), 2),
+                        "terms_count": terms_count,
+                        "active_connections": active_connections,
+                        "connection_pool_stats": connection_stats,
+                        "vector_dimension": vector_dim
+                    }
+        except Exception as e:
+            logger.error(f"Health check failed: {e}")
+            return {
+                "status": "unhealthy",
+                "error": str(e)
+            }
+    
+    def store_vector(self, id: str, name: str, description: str, embedding: List[float], metadata: Dict = None) -> bool:
+        """
+        Store a vector in the database.
         
-        return agent_result
+        Args:
+            id: Unique identifier for the term
+            name: Name of the term
+            description: Description of the term
+            embedding: Vector embedding as a list of floats
+            metadata: Additional metadata as a dictionary
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    # Convert embedding to PostgreSQL vector format
+                    pg_vector = f"[{','.join(map(str, embedding))}]"
+                    
+                    # Insert or update the term
+                    cursor.execute(f"""
+                    INSERT INTO {self.schema_name}.business_terms (id, name, description, embedding, metadata, updated_at)
+                    VALUES (%s, %s, %s, %s::vector, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (id) 
+                    DO UPDATE SET 
+                        name = EXCLUDED.name,
+                        description = EXCLUDED.description,
+                        embedding = EXCLUDED.embedding,
+                        metadata = EXCLUDED.metadata,
+                        updated_at = CURRENT_TIMESTAMP
+                    """, (id, name, description, pg_vector, Json(metadata or {})))
+                    
+                    conn.commit()
+                    return True
+        except Exception as e:
+            logger.error(f"Error storing vector: {e}")
+            return False
     
-    def classify(self, name: str, description: str, method: str = "agent") -> Dict:
-        """Classify using the specified method."""
-        if method == "embeddings":
-            return self.classify_with_embeddings(name, description)
-        elif method == "llm":
-            return self.classify_with_llm(name, description)
-        elif method == "agent":
-            return self.classify_with_agent(name, description)
-        else:
-            logger.error(f"Unknown classification method: {method}")
-            return {"status": "error", "message": f"Unknown classification method: {method}"}
-
-
-## Main Application Class
-class AIClassificationApp:
-    def __init__(self, csv_path: str, config_file=CONFIG_PATH, creds_file=CREDS_PATH, cert_file=CERT_PATH):
-        self.classifier = DataClassifier(config_file, creds_file, cert_file)
+    def batch_store_vectors(self, items: List[Dict[str, Any]]) -> int:
+        """
+        Store multiple vectors in the database.
         
-        # Initialize persistence directories
-        os.makedirs("./chroma_db", exist_ok=True)
+        Args:
+            items: List of dictionaries with id, name, description, embedding, and optional metadata
+            
+        Returns:
+            int: Number of items successfully stored
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    data = []
+                    for item in items:
+                        # Convert embedding to PostgreSQL vector format
+                        pg_vector = f"[{','.join(map(str, item['embedding']))}]"
+                        
+                        data.append((
+                            item['id'],
+                            item['name'],
+                            item['description'],
+                            pg_vector,
+                            Json(item.get('metadata', {})),
+                            'CURRENT_TIMESTAMP'
+                        ))
+                    
+                    # Use execute_values for efficient batch insert
+                    execute_values(cursor, f"""
+                    INSERT INTO {self.schema_name}.business_terms (id, name, description, embedding, metadata, updated_at)
+                    VALUES %s
+                    ON CONFLICT (id) 
+                    DO UPDATE SET 
+                        name = EXCLUDED.name,
+                        description = EXCLUDED.description,
+                        embedding = EXCLUDED.embedding,
+                        metadata = EXCLUDED.metadata,
+                        updated_at = EXCLUDED.updated_at
+                    """, data, template="(%s, %s, %s, %s::vector, %s, %s)")
+                    
+                    conn.commit()
+                    return len(items)
+        except Exception as e:
+            logger.error(f"Error batch storing vectors: {e}")
+            return 0
+    
+    def find_similar_vectors(self, query_vector: List[float], top_k: int = 5, threshold: float = 0.5) -> List[Dict[str, Any]]:
+        """
+        Find similar vectors in the database.
         
-        # Load data - this will also initialize ChromaDB and the React agent
-        self.classifier.load_data(csv_path)
-        logger.info("AI Classification App initialized with ChromaDB persistence")
+        Args:
+            query_vector: Vector to compare against
+            top_k: Number of results to return
+            threshold: Minimum similarity threshold (0-1)
+            
+        Returns:
+            List of dictionaries with id, name, description, similarity, and metadata
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor(cursor_factory=DictCursor) as cursor:
+                    # Convert query vector to PostgreSQL vector format
+                    pg_vector = f"[{','.join(map(str, query_vector))}]"
+                    
+                    # Query for similar vectors using cosine similarity
+                    cursor.execute(f"""
+                    SELECT 
+                        id, 
+                        name, 
+                        description, 
+                        metadata,
+                        1 - (embedding <=> %s::vector) as similarity
+                    FROM {self.schema_name}.business_terms
+                    WHERE 1 - (embedding <=> %s::vector) >= %s
+                    ORDER BY similarity DESC
+                    LIMIT %s
+                    """, (pg_vector, pg_vector, threshold, top_k))
+                    
+                    results = []
+                    for row in cursor.fetchall():
+                        results.append({
+                            "id": row["id"],
+                            "name": row["name"],
+                            "description": row["description"],
+                            "similarity": float(row["similarity"]),
+                            "metadata": row["metadata"]
+                        })
+                    
+                    return results
+        except Exception as e:
+            logger.error(f"Error finding similar vectors: {e}")
+            return []
     
-    def classify_input(self, name: str, description: str, method: str = "agent") -> Dict:
-        """Classify user input against PBT data using the specified method."""
-        result = self.classifier.classify(name, description, method)
+    def get_all_terms(self) -> List[Dict[str, Any]]:
+        """
+        Get all business terms from the database.
         
-        # Ensure result is JSON serializable (no Message objects)
-        if isinstance(result, dict) and "full_trace" in result and isinstance(result["full_trace"], dict):
-            # Already serialized
-            pass
-        else:
-            # Attempt to serialize any message objects
-            result = json.loads(json.dumps(result, default=lambda o: o.__dict__ if hasattr(o, "__dict__") else str(o)))
+        Returns:
+            List of dictionaries with id, name, description, and metadata
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor(cursor_factory=DictCursor) as cursor:
+                    cursor.execute(f"""
+                    SELECT id, name, description, metadata
+                    FROM {self.schema_name}.business_terms
+                    """)
+                    
+                    return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error getting all terms: {e}")
+            return []
+    
+    def get_term_by_id(self, term_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get a specific business term by ID.
         
-        return result
+        Args:
+            term_id: ID of the term to retrieve
+            
+        Returns:
+            Dictionary with term details or None if not found
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor(cursor_factory=DictCursor) as cursor:
+                    cursor.execute(f"""
+                    SELECT id, name, description, metadata
+                    FROM {self.schema_name}.business_terms
+                    WHERE id = %s
+                    """, (term_id,))
+                    
+                    row = cursor.fetchone()
+                    if row:
+                        return dict(row)
+                    return None
+        except Exception as e:
+            logger.error(f"Error getting term by ID: {e}")
+            return None
     
-    def batch_classify(self, inputs: List[Dict], method: str = "agent") -> List[Dict]:
-        """Batch classify multiple inputs."""
-        results = []
-        for input_item in inputs:
-            result = self.classify_input(
-                input_item.get('name', ''),
-                input_item.get('description', ''),
-                method
-            )
-            results.append({
-                "input": input_item,
-                "classification": result
-            })
-        return results
-
-
-# Example usage
-def main():
-    # Example configuration
-    csv_path = "path/to/your/pbt_data.csv"
+    def delete_term(self, term_id: str) -> bool:
+        """
+        Delete a business term from the database.
+        
+        Args:
+            term_id: ID of the term to delete
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(f"""
+                    DELETE FROM {self.schema_name}.business_terms
+                    WHERE id = %s
+                    """, (term_id,))
+                    
+                    conn.commit()
+                    return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error deleting term: {e}")
+            return False
     
-    # Initialize the app - this will create ChromaDB persistence
-    app = AIClassificationApp(csv_path)
+    def store_job(self, job_id: str, job_type: str, status: str, data: Dict[str, Any]) -> bool:
+        """
+        Store a job in the database.
+        
+        Args:
+            job_id: Unique identifier for the job
+            job_type: Type of job (enhancement, tagging)
+            status: Status of the job
+            data: Job data as a dictionary
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(f"""
+                    INSERT INTO {self.schema_name}.jobs (id, job_type, status, data, updated_at)
+                    VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (id) 
+                    DO UPDATE SET 
+                        status = EXCLUDED.status,
+                        data = EXCLUDED.data,
+                        updated_at = CURRENT_TIMESTAMP
+                    """, (job_id, job_type, status, Json(data)))
+                    
+                    conn.commit()
+                    return True
+        except Exception as e:
+            logger.error(f"Error storing job: {e}")
+            return False
     
-    # Example classification using React agent with memory
-    result = app.classify_input(
-        "Machine Learning Algorithm", 
-        "A computational method that uses statistical techniques to enable machines to improve through experience"
-    )
+    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get a job from the database.
+        
+        Args:
+            job_id: ID of the job to retrieve
+            
+        Returns:
+            Dictionary with job details or None if not found
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor(cursor_factory=DictCursor) as cursor:
+                    cursor.execute(f"""
+                    SELECT id, job_type, status, created_at, updated_at, data
+                    FROM {self.schema_name}.jobs
+                    WHERE id = %s
+                    """, (job_id,))
+                    
+                    row = cursor.fetchone()
+                    if row:
+                        return dict(row)
+                    return None
+        except Exception as e:
+            logger.error(f"Error getting job: {e}")
+            return None
     
-    print(json.dumps(result, indent=2))
+    def get_jobs_by_type_and_status(self, job_type: str, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Get jobs by type and optional status.
+        
+        Args:
+            job_type: Type of jobs to retrieve
+            status: Optional status filter
+            
+        Returns:
+            List of dictionaries with job details
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor(cursor_factory=DictCursor) as cursor:
+                    if status:
+                        cursor.execute(f"""
+                        SELECT id, job_type, status, created_at, updated_at, data
+                        FROM {self.schema_name}.jobs
+                        WHERE job_type = %s AND status = %s
+                        ORDER BY updated_at DESC
+                        """, (job_type, status))
+                    else:
+                        cursor.execute(f"""
+                        SELECT id, job_type, status, created_at, updated_at, data
+                        FROM {self.schema_name}.jobs
+                        WHERE job_type = %s
+                        ORDER BY updated_at DESC
+                        """, (job_type,))
+                    
+                    return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error getting jobs by type and status: {e}")
+            return []
     
-    # Example batch classification
-    batch_results = app.batch_classify([
-        {
-            "name": "Neural Network",
-            "description": "A computing system inspired by biological neural networks that can learn from examples"
-        },
-        {
-            "name": "Decision Tree",
-            "description": "A tree-like model of decisions where each internal node represents a test on an attribute"
-        }
-    ])
+    def delete_job(self, job_id: str) -> bool:
+        """
+        Delete a job from the database.
+        
+        Args:
+            job_id: ID of the job to delete
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(f"""
+                    DELETE FROM {self.schema_name}.jobs
+                    WHERE id = %s
+                    """, (job_id,))
+                    
+                    conn.commit()
+                    return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error deleting job: {e}")
+            return False
     
-    print(json.dumps(batch_results, indent=2))
-
-
-if __name__ == "__main__":
-    main()
+    def record_system_stats(self, cpu_usage: float, memory_usage: float, 
+                           enhancement_jobs_count: int, tagging_jobs_count: int,
+                           pbt_tagging_jobs_count: int = 0) -> bool:
+        """
+        Record system statistics for monitoring.
+        
+        Args:
+            cpu_usage: CPU usage percentage
+            memory_usage: Memory usage percentage
+            enhancement_jobs_count: Number of enhancement jobs
+            tagging_jobs_count: Number of tagging jobs
+            pbt_tagging_jobs_count: Number of PBT tagging jobs
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    # Get database size
+                    cursor.execute(f"SELECT pg_database_size('{self.pg_db}')")
+                    db_size = cursor.fetchone()[0]
+                    
+                    # Get active connections
+                    cursor.execute("SELECT count(*) FROM pg_stat_activity WHERE datname = %s", (self.pg_db,))
+                    active_connections = cursor.fetchone()[0]
+                    
+                    # Insert stats
+                    cursor.execute(f"""
+                    INSERT INTO {self.schema_name}.system_stats 
+                    (cpu_usage, memory_usage, db_size, active_connections, 
+                     enhancement_jobs_count, tagging_jobs_count, pbt_tagging_jobs_count)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """, (cpu_usage, memory_usage, db_size, active_connections, 
+                          enhancement_jobs_count, tagging_jobs_count, pbt_tagging_jobs_count))
+                    
+                    conn.commit()
+                    return True
+        except Exception as e:
+            logger.error(f"Error recording system stats: {e}")
+            return False
+    
+    def get_system_stats(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Get recent system statistics.
+        
+        Args:
+            limit: Maximum number of records to retrieve
+            
+        Returns:
+            List of dictionaries with system statistics
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor(cursor_factory=DictCursor) as cursor:
+                    cursor.execute(f"""
+                    SELECT timestamp, cpu_usage, memory_usage, db_size, 
+                           active_connections, enhancement_jobs_count, tagging_jobs_count,
+                           pbt_tagging_jobs_count
+                    FROM {self.schema_name}.system_stats
+                    ORDER BY timestamp DESC
+                    LIMIT %s
+                    """, (limit,))
+                    
+                    return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error getting system stats: {e}")
+            return []
+    
+    def compute_cosine_similarity(self, vector1: List[float], vector2: List[float]) -> float:
+        """
+        Compute cosine similarity between two vectors.
+        
+        Args:
+            vector1: First vector
+            vector2: Second vector
+            
+        Returns:
+            float: Cosine similarity between 0 and 1
+        """
+        # Check if vectors have same dimension
+        if len(vector1) != len(vector2):
+            # Use the smaller dimension
+            min_dim = min(len(vector1), len(vector2))
+            vector1 = vector1[:min_dim]
+            vector2 = vector2[:min_dim]
+            logger.warning(f"Vectors had different dimensions, truncated to {min_dim}")
+        
+        # Convert to numpy arrays
+        a = np.array(vector1)
+        b = np.array(vector2)
+        
+        # Compute cosine similarity
+        dot_product = np.dot(a, b)
+        norm_a = np.linalg.norm(a)
+        norm_b = np.linalg.norm(b)
+        
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        
+        similarity = dot_product / (norm_a * norm_b)
+        return max(0.0, min(similarity, 1.0))  # Ensure in range [0, 1]
