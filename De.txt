@@ -1,192 +1,588 @@
 """
-Term Matching Agent - Agent for finding matching business terms using advanced strategies.
+PBT Tagging API - Routes for tagging data elements with Preferred Business Terms (PBTs).
 
-This module provides the TermMatchingAgent for finding matching business terms
-for data elements, using vector similarity search enhanced with LLM evaluation.
+This module provides API endpoints for tagging data elements with PBTs using 
+a LangGraph-based ReactAgent classification system.
 """
 
 import logging
 import uuid
-from typing import List, Dict, Any, Optional, Tuple
-import numpy as np
-from app.core.embedding import MyDocument
+import json
+from typing import Dict, Any, List, Optional
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends, Query
+from pydantic import Field
+
+# LangGraph and LangChain imports
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.tools import BaseTool
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.base import empty_checkpoint
+from langgraph.prebuilt import create_react_agent
+
+from app.core.models import (
+    PBTTaggingRequest,
+    PBTTaggingResponse,
+    MatchedPBT,
+    PBTQueryContext
+)
+from app.core.business_terms import BusinessTermManager
+from app.config.settings import get_llm
+
+router = APIRouter(prefix="/api/v1/pbt", tags=["pbt-tagging"])
+
+# In-memory cache for current jobs for fast access
+pbt_tagging_jobs: Dict[str, Dict[str, Any]] = {}
 
 logger = logging.getLogger(__name__)
 
-class TermMatchingAgent:
-    """
-    Agent for matching terms using embedding similarity and LLM evaluation.
-    """
+class PBTClassifierTool(BaseTool):
+    """Tool for classifying input against PBT database entries."""
+    name: str = "pbt_classifier"
+    description: str = "Classifies user input against PBT (Preferred Business Terms) database entries"
+    term_manager: BusinessTermManager = Field(exclude=True)
     
-    def __init__(self, term_manager):
-        """
-        Initialize the term matching agent.
-        
-        Args:
-            term_manager: The business term manager
-        """
+    def __init__(self, term_manager: BusinessTermManager):
+        super().__init__(
+            name="pbt_classifier",
+            description="Classifies user input against PBT database entries. Include parameter 'return_broader_terms=True' to get both specific and broader business terms."
+        )
         self.term_manager = term_manager
-        logger.info("Term matching agent initialized")
     
-    async def find_matching_terms(
-        self, 
-        element_id: str, 
-        element_name: str, 
-        element_description: str,
-        top_k: int = 5, 
-        cdm_context: Optional[str] = None,
-        example_context: Optional[str] = None,
-        process_name_context: Optional[str] = None,
-        process_description_context: Optional[str] = None,
-        initial_threshold: float = 0.2
-    ) -> Tuple[List[Dict[str, Any]], List[float]]:
+    def _run(self, name: str, description: str, return_broader_terms: bool = True) -> Dict:
+        """Classify the input against the PBT data."""
+        # Use tag_element method from BusinessTermManager
+        element_id = str(uuid.uuid4())
+        # This is synchronous for now - convert to async if needed
+        tagging_result = self.term_manager.tag_element(
+            element_id=element_id,
+            name=name,
+            description=description,
+            top_k=5,
+            threshold=0.2,
+            include_broader_terms=return_broader_terms
+        )
+        
+        # Process the tagging result to extract similar items
+        similar_items = []
+        for term, score in zip(tagging_result.matching_terms, tagging_result.confidence_scores):
+            similar_items.append({
+                "id": term.get("id", ""),
+                "PBT_NAME": term.get("name", ""),
+                "PBT_DEFINITION": term.get("description", ""),
+                "similarity_score": score,
+                "match_type": term.get("match_type", "specific"),
+                "metadata": term.get("metadata", {})
+            })
+        
+        # Group items by match type
+        specific_matches = [item for item in similar_items if item.get("match_type") == "specific"]
+        broader_matches = [item for item in similar_items if item.get("match_type") == "broader"]
+        
+        # If no specific grouping, treat all as specific
+        if not specific_matches and not broader_matches:
+            specific_matches = similar_items
+        
+        result = {
+            "status": "success",
+            "best_match": similar_items[0] if similar_items else None,
+            "specific_matches": specific_matches,
+            "broader_matches": broader_matches,
+            "similar_items": similar_items,
+            "modeling_required": tagging_result.modeling_required,
+            "message": tagging_result.message
+        }
+        
+        return result
+
+class PBTTagger:
+    """
+    Tagger for classifying input terms using the ReactAgent.
+    """
+    _instance = None
+    
+    def __new__(cls, *args, **kwargs):
+        """Singleton pattern to ensure one instance."""
+        if cls._instance is None:
+            cls._instance = super(PBTTagger, cls).__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self, llm=None):
+        """Initialize the PBT tagger."""
+        if self._initialized:
+            return
+            
+        self._initialized = True
+        self.llm = llm or get_llm()
+        self.business_term_manager = BusinessTermManager()
+        
+        # Initialize memory for persistent conversations
+        self.memory_saver = MemorySaver()
+        
+        # Initialize tools
+        self.tools = self._setup_tools()
+        
+        # Create React agent
+        self.agent = self._create_agent()
+        
+        logger.info("PBT tagger initialized")
+    
+    def _setup_tools(self):
+        """Set up tools for the React agent."""
+        return [PBTClassifierTool(term_manager=self.business_term_manager)]
+    
+    def _create_agent(self):
+        """Create the React agent."""
+        # Define custom system message
+        system_message = """
+        You are an expert business terminology standardization system. Your task is to map user-provided terms 
+        and descriptions to the organization's Preferred Business Terms (PBT).
+
+        When a user provides a name and description, use the pbt_classifier tool to find the most appropriate 
+        standard business terms from the database. 
+        
+        The tool will return both specific matches and broader category matches. Consider both types when making 
+        your recommendation. For example, "drawdown client account number" might match to both specific terms 
+        like "Account Number" and broader categories like "Account Identifier" or "Customer Account".
+        
+        Explain why the matches are appropriate, focusing on conceptual alignment rather than just keyword matching.
+        Always mention both specific and broader matches in your response when available.
+        
+        You also have access to memory of previous classifications. Reference past similar classifications if relevant.
         """
-        Find matching terms for a data element using vector similarity search.
+        
+        # Create the React agent with memory
+        return create_react_agent(
+            self.llm,
+            self.tools,
+            system_message=system_message
+        )
+    
+    def _get_user_id(self, name: str, description: str) -> str:
+        """Generate a consistent user ID for memory lookup based on input."""
+        return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{name}:{description}"))
+    
+    async def tag(self, name: str, description: str, top_n: int = 5, 
+                 examples: Optional[List[str]] = None,
+                 process_name: Optional[str] = None,
+                 process_description: Optional[str] = None) -> PBTTaggingResponse:
+        """
+        Tag an item with PBTs using the React agent.
         
         Args:
-            element_id: ID of the element
-            element_name: Name of the element
-            element_description: Description of the element
-            top_k: Number of top matches to return
-            cdm_context: Optional CDM context
-            example_context: Optional example context
-            process_name_context: Optional process name context
-            process_description_context: Optional process description context
-            initial_threshold: Initial similarity threshold
+            name: Name of the item to tag
+            description: Description of the item to tag
+            top_n: Number of top PBTs to return
+            examples: Optional list of example values or contexts
+            process_name: Optional name of the business process
+            process_description: Optional description of the business process
             
         Returns:
-            Tuple of (matching_terms, confidence_scores)
+            PBTTaggingResponse object with matched PBTs
         """
         try:
-            # Construct query with all context
-            query_text = f"Name: {element_name}. Description: {element_description}."
-            if example_context:
-                query_text += f" Example: {example_context}."
-            if process_name_context:
-                query_text += f" Process Name: {process_name_context}."
-            if process_description_context:
-                query_text += f" Process Description: {process_description_context}."
-            if cdm_context:
-                query_text += f" CDM: {cdm_context}."
+            # Generate a unique ID for this classification session
+            session_id = str(uuid.uuid4())
             
-            # Create embedding for query
-            doc = MyDocument(id=element_id, text=query_text)
-            doc_with_embedding = self.term_manager.embedding_client.generate_embeddings(doc)
+            # Prepare input message
+            examples_text = ""
+            if examples and len(examples) > 0:
+                examples_text = f"\nExamples: {', '.join(examples)}"
+                
+            process_text = ""
+            if process_name:
+                process_text += f"\nProcess Name: {process_name}"
+            if process_description:
+                process_text += f"\nProcess Description: {process_description}"
             
-            if not doc_with_embedding.embedding:
-                logger.error(f"Failed to generate embedding for element {element_id}")
-                return [], []
+            input_message = f"""
+            Please map the following to standard Preferred Business Terms, including both specific and broader category matches:
             
-            # Find similar vectors
-            similar_terms = self.term_manager.vector_store.find_similar_vectors(
-                query_vector=doc_with_embedding.embedding,
-                top_k=top_k * 2,  # Get more to filter
-                threshold=initial_threshold * 0.5  # Lower threshold for more results
+            Name: {name}
+            Description: {description}{examples_text}{process_text}
+            
+            Provide both specific matches and broader category matches when available.
+            """
+            
+            # Create a config with thread_id for the checkpointer
+            config = {
+                "configurable": {
+                    "thread_id": session_id,
+                    "session_id": session_id
+                }
+            }
+            
+            # Call the agent
+            result = await self.agent.ainvoke(
+                {"messages": [HumanMessage(content=input_message)]},
+                config=config
             )
             
-            # Filter and process results
-            matching_terms = []
-            confidence_scores = []
+            # Extract the classification results
+            matched_pbts = self._extract_pbts_from_result(result, top_n)
             
-            for term in similar_terms:
-                # Extract term data
-                term_id = term.get("id", "")
-                name = term.get("name", "")
-                description = term.get("description", "")
-                similarity = term.get("similarity", 0.0)
-                metadata = term.get("metadata", {})
-                
-                # Apply CDM-based boost if CDM context matches
-                if cdm_context and metadata.get("cdm") == cdm_context:
-                    similarity *= 1.2  # 20% boost for matching CDM
-                
-                # Check for synonyms in metadata (if present)
-                synonym_match = False
-                if metadata.get("synonyms_str"):
-                    synonyms = [s.strip() for s in metadata.get("synonyms_str", "").split(",")]
-                    query_terms = set(query_text.lower().split())
+            # Create response
+            response = PBTTaggingResponse(
+                input_name=name,
+                input_description=description,
+                matched_pbts=matched_pbts,
+                message=self._extract_agent_message(result)
+            )
+            
+            return response
+        except Exception as e:
+            logger.error(f"Error in PBT tagging: {e}")
+            raise
+    
+    def _extract_pbts_from_result(self, result: Dict, top_n: int) -> List[MatchedPBT]:
+        """Extract PBTs from the agent's result."""
+        matched_pbts = []
+        
+        # Find tool message with similar items
+        for message in result.get("messages", []):
+            if hasattr(message, "name") and message.name == "pbt_classifier":
+                try:
+                    content = json.loads(message.content)
                     
-                    for synonym in synonyms:
-                        if not synonym:
-                            continue
-                        synonym_terms = set(synonym.lower().split())
-                        if query_terms.intersection(synonym_terms):
-                            synonym_match = True
-                            similarity *= 1.1  # 10% boost for synonym match
-                            break
-                
-                # Add term to results
-                matching_terms.append({
-                    "id": term_id,
-                    "name": name,
-                    "description": description,
-                    "metadata": metadata,
-                    "synonym_match": synonym_match
-                })
-                confidence_scores.append(similarity)
-            
-            # Sort by confidence
-            combined = list(zip(matching_terms, confidence_scores))
-            combined.sort(key=lambda x: x[1], reverse=True)
-            
-            # Take top_k
-            top_matches = combined[:top_k]
-            
-            if not top_matches:
-                logger.warning(f"No matching terms found for element {element_id}")
-                return [], []
-            
-            # Unzip
-            matching_terms, confidence_scores = zip(*top_matches)
-            
-            return list(matching_terms), list(confidence_scores)
+                    # Extract similar items, prioritizing specific matches
+                    similar_items = []
+                    
+                    # Add specific matches first
+                    if "specific_matches" in content:
+                        similar_items.extend(content["specific_matches"])
+                    
+                    # Add broader matches next
+                    if "broader_matches" in content:
+                        similar_items.extend(content["broader_matches"])
+                    
+                    # If no categorized matches, use all similar items
+                    if not similar_items and "similar_items" in content:
+                        similar_items = content["similar_items"]
+                    
+                    # Convert to MatchedPBT objects
+                    for item in similar_items[:top_n]:
+                        pbt = MatchedPBT(
+                            id=str(item.get("id", "")),
+                            pbt_name=item.get("PBT_NAME", ""),
+                            pbt_description=item.get("PBT_DEFINITION", ""),
+                            cdm=item.get("metadata", {}).get("cdm"),
+                            similarity_score=item.get("similarity_score", 0.0),
+                            metadata=item.get("metadata", {})
+                        )
+                        matched_pbts.append(pbt)
+                except Exception as e:
+                    logger.error(f"Error extracting PBTs from tool message: {e}")
         
-        except Exception as e:
-            logger.error(f"Error finding matching terms: {e}")
-            return [], []
-    
-    async def evaluate_match_confidence(
-        self, 
-        element_name: str, 
-        element_description: str,
-        term_name: str,
-        term_description: str
-    ) -> float:
-        """
-        Evaluate the confidence of a match between an element and a term.
-        
-        Args:
-            element_name: Name of the element
-            element_description: Description of the element
-            term_name: Name of the term
-            term_description: Description of the term
-            
-        Returns:
-            Confidence score between 0 and 1
-        """
-        try:
-            # Use vector similarity as a baseline
-            element_embedding = self.term_manager.embedding_client.generate_embeddings(
-                MyDocument(id="element", text=f"{element_name} - {element_description}")
-            ).embedding
-            
-            term_embedding = self.term_manager.embedding_client.generate_embeddings(
-                MyDocument(id="term", text=f"{term_name} - {term_description}")
-            ).embedding
-            
-            if not element_embedding or not term_embedding:
-                return 0.5  # Default confidence
-            
-            # Calculate cosine similarity
-            similarity = self.term_manager.compute_similarity(
-                element_embedding, term_embedding
+        # If no PBTs found from tools, extract from the final message
+        if not matched_pbts:
+            # Use a fallback approach by directly searching for similar terms
+            query = PBTQueryContext(
+                id=str(uuid.uuid4()),
+                name=result.get("messages", [])[-1].content if result.get("messages") else "",
+                description=""
             )
             
-            # Add some noise to avoid exact same scores
-            confidence = min(0.99, max(0.01, similarity * 0.8 + 0.1 + np.random.normal(0, 0.05)))
+            # Use direct BusinessTermManager search
+            search_results = self.business_term_manager.search_terms(query.name, limit=top_n)
             
-            return confidence
+            for item in search_results:
+                metadata = {}
+                if hasattr(item, "metadata"):
+                    metadata = item.metadata
+                
+                matched_pbts.append(
+                    MatchedPBT(
+                        id=str(item.id),
+                        pbt_name=item.name,
+                        pbt_description=item.description,
+                        cdm=metadata.get("cdm"),
+                        similarity_score=0.5,  # Default score
+                        metadata=metadata
+                    )
+                )
         
+        return matched_pbts
+    
+    def _extract_agent_message(self, result: Dict) -> str:
+        """Extract the agent's final message."""
+        messages = result.get("messages", [])
+        if messages:
+            final_message = messages[-1]
+            if hasattr(final_message, "content"):
+                return final_message.content
+        
+        return "No explanation provided by the agent."
+
+
+def get_pbt_tagger() -> PBTTagger:
+    """
+    Get the PBT tagger instance.
+    
+    Returns:
+        PBTTagger: The PBT tagger
+    """
+    llm = get_llm()
+    return PBTTagger(llm)
+
+
+@router.post("/tag", response_model=PBTTaggingResponse)
+async def tag_with_pbt(request: PBTTaggingRequest, tagger: PBTTagger = Depends(get_pbt_tagger)):
+    """
+    Tag an item with Preferred Business Terms (PBTs).
+    
+    This is a synchronous operation that returns the tagging results directly.
+    
+    Args:
+        request: PBT tagging request
+        tagger: PBT tagger instance
+        
+    Returns:
+        PBTTaggingResponse with matched PBTs
+    """
+    try:
+        logger.info(f"PBT tagging request received for item: {request.name}")
+        
+        # Call the tagger
+        response = await tagger.tag(
+            name=request.name,
+            description=request.description,
+            top_n=request.top_n,
+            examples=request.examples,
+            process_name=request.process_name,
+            process_description=request.process_description
+        )
+        
+        return response
+    except Exception as e:
+        logger.error(f"Error in PBT tagging: {e}")
+        raise HTTPException(status_code=500, detail=f"Error in PBT tagging: {str(e)}")
+
+
+@router.post("/tag-async", response_model=Dict[str, Any])
+async def tag_with_pbt_async(
+    request: PBTTaggingRequest,
+    background_tasks: BackgroundTasks,
+    tagger: PBTTagger = Depends(get_pbt_tagger)
+):
+    """
+    Tag an item with Preferred Business Terms (PBTs) asynchronously.
+    
+    This is an asynchronous operation that will run in the background.
+    
+    Args:
+        request: PBT tagging request
+        background_tasks: FastAPI background tasks
+        tagger: PBT tagger instance
+        
+    Returns:
+        Dictionary with job_id for tracking the request
+    """
+    try:
+        # Generate a unique ID for the job
+        job_id = str(uuid.uuid4())
+        logger.info(f"Async PBT tagging request received: {job_id}")
+        
+        # Initialize job status
+        pbt_tagging_jobs[job_id] = {
+            "status": "pending",
+            "request": request.dict(),
+            "result": None,
+            "error": None
+        }
+        
+        # Add task to background
+        background_tasks.add_task(
+            run_pbt_tagging_job,
+            job_id=job_id,
+            name=request.name,
+            description=request.description,
+            top_n=request.top_n,
+            examples=request.examples,
+            process_name=request.process_name,
+            process_description=request.process_description,
+            tagger=tagger
+        )
+        
+        return {
+            "job_id": job_id,
+            "status": "pending"
+        }
+    except Exception as e:
+        logger.error(f"Error starting async PBT tagging job: {e}")
+        raise HTTPException(status_code=500, detail=f"Error starting job: {str(e)}")
+
+
+@router.get("/status/{job_id}", response_model=Dict[str, Any])
+async def get_pbt_tagging_status(job_id: str):
+    """
+    Get the status of an asynchronous PBT tagging job.
+    
+    Args:
+        job_id: ID of the job to check
+        
+    Returns:
+        Dictionary with job status and results if available
+    """
+    if job_id not in pbt_tagging_jobs:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    
+    job = pbt_tagging_jobs[job_id]
+    
+    response = {
+        "job_id": job_id,
+        "status": job["status"],
+        "result": job.get("result"),
+        "error": job.get("error")
+    }
+    
+    return response
+
+
+@router.post("/batch", response_model=List[Dict[str, Any]])
+async def batch_tag_with_pbt(
+    requests: List[PBTTaggingRequest],
+    background_tasks: BackgroundTasks,
+    tagger: PBTTagger = Depends(get_pbt_tagger)
+):
+    """
+    Tag multiple items with PBTs in batch mode.
+    
+    Returns a list of job IDs that can be used to check status.
+    
+    Args:
+        requests: List of PBT tagging requests
+        background_tasks: FastAPI background tasks
+        tagger: PBT tagger instance
+        
+    Returns:
+        List of dictionaries with job_id and status
+    """
+    job_ids = []
+    
+    for request in requests:
+        try:
+            # Generate a unique ID for the job
+            job_id = str(uuid.uuid4())
+            logger.info(f"Batch PBT tagging request added: {job_id}")
+            
+            # Initialize job status
+            pbt_tagging_jobs[job_id] = {
+                "status": "pending",
+                "request": request.dict(),
+                "result": None,
+                "error": None
+            }
+            
+            # Add task to background
+            background_tasks.add_task(
+                run_pbt_tagging_job,
+                job_id=job_id,
+                name=request.name,
+                description=request.description,
+                top_n=request.top_n,
+                examples=request.examples,
+                process_name=request.process_name,
+                process_description=request.process_description,
+                tagger=tagger
+            )
+            
+            job_ids.append({
+                "job_id": job_id,
+                "status": "pending",
+                "input": {
+                    "name": request.name,
+                    "description": request.description
+                }
+            })
         except Exception as e:
-            logger.error(f"Error evaluating match confidence: {e}")
-            return 0.5  # Default confidence
+            logger.error(f"Error adding batch job for {request.name}: {e}")
+            job_ids.append({
+                "job_id": "error",
+                "status": "error",
+                "error": str(e),
+                "input": {
+                    "name": request.name,
+                    "description": request.description
+                }
+            })
+    
+    return job_ids
+
+
+@router.delete("/job/{job_id}", response_model=Dict[str, Any])
+async def delete_pbt_tagging_job(job_id: str):
+    """
+    Delete a PBT tagging job from memory.
+    
+    Args:
+        job_id: ID of the job to delete
+        
+    Returns:
+        Dictionary with status message
+    """
+    if job_id not in pbt_tagging_jobs:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    
+    # Check if job is still running
+    if pbt_tagging_jobs[job_id]["status"] == "in_progress":
+        raise HTTPException(status_code=400, detail="Cannot delete a job that is in progress")
+    
+    # Delete the job
+    del pbt_tagging_jobs[job_id]
+    
+    return {
+        "message": f"Job {job_id} deleted successfully"
+    }
+
+
+async def run_pbt_tagging_job(
+    job_id: str,
+    name: str,
+    description: str,
+    top_n: int,
+    examples: Optional[List[str]],
+    process_name: Optional[str],
+    process_description: Optional[str],
+    tagger: PBTTagger
+):
+    """
+    Run a PBT tagging job in the background.
+    
+    Args:
+        job_id: ID of the job
+        name: Name of the item to tag
+        description: Description of the item to tag
+        top_n: Number of top PBTs to return
+        examples: Optional list of example values or contexts
+        process_name: Optional name of the business process
+        process_description: Optional description of the business process
+        tagger: PBT tagger instance
+    """
+    logger.info(f"Starting PBT tagging job: {job_id}")
+    
+    try:
+        # Update job status
+        pbt_tagging_jobs[job_id]["status"] = "in_progress"
+        
+        # Call the tagger
+        response = await tagger.tag(
+            name=name,
+            description=description,
+            top_n=top_n,
+            examples=examples,
+            process_name=process_name,
+            process_description=process_description
+        )
+        
+        # Update job status
+        pbt_tagging_jobs[job_id]["status"] = "completed"
+        pbt_tagging_jobs[job_id]["result"] = response.dict()
+        
+        logger.info(f"PBT tagging job completed: {job_id}")
+    except Exception as e:
+        logger.error(f"Error in PBT tagging job {job_id}: {e}")
+        
+        # Update job status
+        pbt_tagging_jobs[job_id]["status"] = "failed"
+        pbt_tagging_jobs[job_id]["error"] = str(e)
