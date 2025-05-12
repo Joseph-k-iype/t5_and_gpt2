@@ -1,347 +1,529 @@
 """
-Authentication helper functions for working with Azure AD tokens and API security.
+PBT Data Manager for loading, managing, and searching PBT data.
 """
 
 import os
 import logging
-import time
-import threading
-import requests
-import secrets
-import string
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List, Union
-from fastapi import Depends, HTTPException, status, Security
-from fastapi.security import APIKeyHeader, OAuth2PasswordBearer
-from jose import JWTError, jwt
-from pydantic import BaseModel
+import uuid
+import pandas as pd
+import numpy as np
+from typing import List, Dict, Any, Optional, Tuple, Set
+from sklearn.metrics.pairwise import cosine_similarity
+from langchain_core.documents import Document
 from app.config.settings import get_settings
+from app.core.services.embeddings import get_embedding_service
+from app.core.vector_store.chroma_store import get_chroma_store
+from app.core.models.pbt import PBT, MatchedPBT, MatchType, PBTStatistics
 
 logger = logging.getLogger(__name__)
 
-# Models for token handling
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-    expires_at: datetime
-
-
-class TokenData(BaseModel):
-    username: Optional[str] = None
-    scopes: List[str] = []
-
-
-class TokenCache:
-    """Thread-safe token cache for storing and retrieving Azure tokens."""
+class PBTManager:
+    """Manager for Preferred Business Terms (PBT) data."""
     
     _instance = None
-    _lock = threading.RLock()
     
     def __new__(cls):
         """Implement singleton pattern."""
         if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = super(TokenCache, cls).__new__(cls)
-                    cls._instance._initialized = False
+            cls._instance = super(PBTManager, cls).__new__(cls)
+            cls._instance._initialized = False
         return cls._instance
     
     def __init__(self):
-        """Initialize the token cache."""
+        """Initialize the PBT manager."""
         if self._initialized:
             return
             
-        with self._lock:
-            if not self._initialized:
-                self._tokens = {}  # Format: {cache_key: (token, expiry_time)}
-                self._initialized = True
-                logger.info("Token cache initialized")
+        self._initialized = True
+        self.settings = get_settings()
+        self.embedding_service = get_embedding_service()
+        self.vector_store = get_chroma_store()
+        
+        # PBT data
+        self.pbt_data = []
+        self.concept_hierarchy = {}
+        
+        logger.info("PBT Manager initialized")
     
-    def get(self, tenant_id: str, client_id: str, scope: str) -> Optional[str]:
+    async def load_csv(self, csv_path: Optional[str] = None, reload: bool = False) -> Dict[str, Any]:
         """
-        Get a token from the cache if it exists and is not expired.
+        Load PBT data from CSV file and store in vector store with synonyms.
         
         Args:
-            tenant_id: Azure tenant ID
-            client_id: Azure client ID
-            scope: OAuth scope
+            csv_path: Path to the CSV file
+            reload: Whether to reload the data if already loaded
             
         Returns:
-            Token if found and valid, None otherwise
+            Dict with load status and count
         """
-        cache_key = self._get_cache_key(tenant_id, client_id, scope)
+        try:
+            # Use provided path or default from settings
+            file_path = csv_path or self.settings.pbt_csv_path
+            
+            # Check if data is already loaded and reload flag is not set
+            if not reload and len(self.pbt_data) > 0:
+                logger.info("PBT data already loaded. Use reload=True to force reload.")
+                return {
+                    "status": "success", 
+                    "message": "PBT data already loaded", 
+                    "total_loaded": len(self.pbt_data)
+                }
+            
+            # Ensure the file exists
+            if not os.path.exists(file_path):
+                logger.error(f"CSV file not found: {file_path}")
+                return {"status": "error", "message": f"CSV file not found: {file_path}", "total_loaded": 0}
+            
+            # Load the CSV file
+            df = pd.read_csv(file_path)
+            
+            # Check for required columns
+            required_columns = {'id', 'PBT_NAME', 'PBT_DEFINITION'}
+            if not required_columns.issubset(df.columns):
+                missing = required_columns - set(df.columns)
+                logger.error(f"CSV file missing required columns: {missing}")
+                return {
+                    "status": "error", 
+                    "message": f"CSV file missing required columns: {missing}", 
+                    "total_loaded": 0
+                }
+            
+            # Add CDM column if not already present
+            if 'CDM' not in df.columns:
+                logger.warning("CSV file does not contain CDM column. Adding empty CDM values.")
+                df['CDM'] = None
+            
+            # Convert DataFrame to list of dictionaries
+            self.pbt_data = df.to_dict('records')
+            
+            # Delete all existing data in the vector store
+            self.vector_store.delete()
+            
+            # Create documents for embedding with synonyms
+            all_docs = []
+            all_ids = []
+            
+            # Process in smaller batches for synonym generation
+            synonym_batch_size = 10
+            for i in range(0, len(self.pbt_data), synonym_batch_size):
+                batch = self.pbt_data[i:i + synonym_batch_size]
+                batch_docs = []
+                batch_ids = []
+                
+                logger.info(f"Generating synonyms for batch {i//synonym_batch_size + 1} of {(len(self.pbt_data) - 1)//synonym_batch_size + 1}")
+                
+                # Refresh token before processing each batch
+                from app.core.auth.auth_helper import refresh_token_if_needed, get_azure_token_cached
+                
+                # Explicitly refresh token
+                token_refreshed = refresh_token_if_needed(
+                    tenant_id=self.settings.azure.tenant_id,
+                    client_id=self.settings.azure.client_id,
+                    client_secret=self.settings.azure.client_secret,
+                    scope="https://cognitiveservices.azure.com/.default",
+                    min_validity_seconds=1800  # 30 minutes
+                )
+                
+                if not token_refreshed:
+                    # Try to get a fresh token
+                    token = get_azure_token_cached(
+                        tenant_id=self.settings.azure.tenant_id, 
+                        client_id=self.settings.azure.client_id,
+                        client_secret=self.settings.azure.client_secret
+                    )
+                    if not token:
+                        logger.error("Failed to refresh Azure token during PBT data loading")
+                        raise ValueError("Failed to get Azure token")
+                
+                # Reinitialize embedding service with fresh token
+                self.embedding_service = get_embedding_service(force_refresh=True)
+                
+                for item in batch:
+                    # Generate synonyms for this term
+                    synonyms = self.embedding_service.generate_synonyms(
+                        term_name=item['PBT_NAME'],
+                        term_definition=item['PBT_DEFINITION']
+                    )
+                    
+                    # Convert synonyms to a comma-separated string
+                    synonyms_str = ", ".join(synonyms) if synonyms else ""
+                    
+                    # Combined text including the term, definition, and CDM (if available)
+                    combined_text = f"{item['PBT_NAME']} - {item['PBT_DEFINITION']}"
+                    if 'CDM' in item and item['CDM']:
+                        combined_text += f" - {item['CDM']}"
+                    
+                    # Create metadata
+                    metadata = {
+                        'id': str(item['id']),
+                        'name': item['PBT_NAME'],
+                        'definition': item['PBT_DEFINITION'],
+                        'cdm': item.get('CDM', ''),
+                        'synonyms_str': synonyms_str,
+                        'synonym_count': len(synonyms)
+                    }
+                    
+                    # Create a document
+                    doc = Document(
+                        page_content=combined_text,
+                        metadata=metadata
+                    )
+                    
+                    batch_docs.append(doc)
+                    batch_ids.append(str(item['id']))
+                
+                all_docs.extend(batch_docs)
+                all_ids.extend(batch_ids)
+            
+            # Process documents in batches for embedding and storage
+            chunk_size = 50
+            for i in range(0, len(all_docs), chunk_size):
+                # Refresh token before processing each batch
+                refresh_token_if_needed(
+                    tenant_id=self.settings.azure.tenant_id,
+                    client_id=self.settings.azure.client_id,
+                    client_secret=self.settings.azure.client_secret,
+                    min_validity_seconds=1800  # 30 minutes
+                )
+                
+                # Get chunk of documents and IDs
+                chunk_docs = all_docs[i:i + chunk_size]
+                chunk_ids = all_ids[i:i + chunk_size]
+                
+                # Add to vector store
+                self.vector_store.add_documents(chunk_docs, ids=chunk_ids)
+                logger.info(f"Added document chunk {i//chunk_size + 1} of {(len(all_docs) - 1)//chunk_size + 1} to ChromaDB")
+            
+            # Build concept hierarchy
+            await self._build_concept_hierarchy()
+            
+            logger.info(f"Loaded {len(self.pbt_data)} PBT records with synonyms from CSV into vector store")
+            
+            return {
+                "status": "success", 
+                "message": f"Loaded {len(self.pbt_data)} PBT records", 
+                "total_loaded": len(self.pbt_data)
+            }
         
-        with self._lock:
-            if cache_key in self._tokens:
-                token, expiry_time = self._tokens[cache_key]
-                # Allow 5 minute buffer before expiration
-                if time.time() < expiry_time - 300:
-                    logger.debug(f"Token cache hit for {client_id[:8]}...")
-                    return token
-                else:
-                    logger.debug(f"Token expired for {client_id[:8]}...")
-                    # Remove expired token
-                    del self._tokens[cache_key]
-        
-        return None
+        except Exception as e:
+            logger.error(f"Error loading CSV: {e}")
+            return {"status": "error", "message": f"Error loading CSV: {str(e)}", "total_loaded": 0}
     
-    def set(self, tenant_id: str, client_id: str, scope: str, token: str, expires_in: int = 3600) -> None:
+    async def _build_concept_hierarchy(self):
         """
-        Store a token in the cache.
+        Build a concept hierarchy based on the similarity between terms.
+        This identifies broader and more specific terms.
+        """
+        try:
+            # Get all documents with embeddings
+            all_docs = self.vector_store.similarity_search("", k=len(self.pbt_data) + 1)
+            
+            # Prepare for similarity calculation
+            embeddings = []
+            doc_ids = []
+            doc_texts = []
+            
+            for doc in all_docs:
+                doc_id = doc.metadata.get('id')
+                if doc_id:
+                    doc_ids.append(doc_id)
+                    doc_texts.append(doc.page_content)
+                    
+                    # Create a dummy document to get the embedding
+                    query_text = doc.page_content
+                    doc_embedding = self.embedding_service.generate_embedding(
+                        self.embedding_service.Document(id=doc_id, text=query_text)
+                    ).embedding
+                    
+                    embeddings.append(doc_embedding)
+            
+            # Calculate similarity matrix
+            similarity_matrix = np.zeros((len(embeddings), len(embeddings)))
+            
+            for i in range(len(embeddings)):
+                for j in range(len(embeddings)):
+                    if i != j:  # Skip self-comparison
+                        similarity_matrix[i, j] = cosine_similarity(
+                            [embeddings[i]], 
+                            [embeddings[j]]
+                        )[0][0]
+            
+            # Calculate average similarities (higher means more general)
+            avg_similarities = np.mean(similarity_matrix, axis=1)
+            
+            # Calculate term specificity factors
+            term_generality = {}
+            term_lengths = []
+            
+            for i, doc_id in enumerate(doc_ids):
+                # Find the corresponding PBT data item
+                item = next((item for item in self.pbt_data if str(item['id']) == doc_id), None)
+                if item:
+                    # Calculate term specificity based on term length and average similarity
+                    name_length = len(item['PBT_NAME'].split())
+                    term_lengths.append(name_length)
+                    
+                    term_generality[doc_id] = {
+                        'avg_similarity': float(avg_similarities[i]),
+                        'name_length': name_length,
+                        'id': item['id'],
+                        'name': item['PBT_NAME'],
+                        'cdm': item.get('CDM', '')
+                    }
+            
+            # Normalize term lengths
+            max_length = max(term_lengths) if term_lengths else 1
+            for term_id, data in term_generality.items():
+                # Higher score means more general
+                data['generality_score'] = data['avg_similarity'] * (1 - (data['name_length'] / max_length))
+            
+            # Sort terms by generality score
+            sorted_terms = sorted(
+                term_generality.items(), 
+                key=lambda x: x[1]['generality_score'], 
+                reverse=True
+            )
+            
+            # Take the top 20% as broader terms
+            broader_terms_count = max(1, int(len(sorted_terms) * 0.2))
+            broader_terms = [term[0] for term in sorted_terms[:broader_terms_count]]
+            
+            # Store in concept hierarchy
+            self.concept_hierarchy = {
+                'broader_terms': [item for item in self.pbt_data 
+                                if str(item['id']) in broader_terms],
+                'term_generality': term_generality
+            }
+            
+            logger.info(f"Built concept hierarchy with {len(broader_terms)} broader terms")
+        
+        except Exception as e:
+            logger.error(f"Error building concept hierarchy: {e}")
+            self.concept_hierarchy = {'broader_terms': [], 'term_generality': {}}
+    
+    async def find_similar_items(self, query_text: str, top_n: int = 5, include_broader_terms: bool = True) -> List[MatchedPBT]:
+        """
+        Find the most similar PBT items to the query text.
         
         Args:
-            tenant_id: Azure tenant ID
-            client_id: Azure client ID
-            scope: OAuth scope
-            token: The token to store
-            expires_in: Token expiration time in seconds
+            query_text: Text to search for
+            top_n: Number of results to return
+            include_broader_terms: Whether to include broader terms
+            
+        Returns:
+            List of matched PBT items
         """
-        cache_key = self._get_cache_key(tenant_id, client_id, scope)
-        expiry_time = time.time() + expires_in
-        
-        with self._lock:
-            self._tokens[cache_key] = (token, expiry_time)
+        try:
+            # Get similar documents with scores
+            doc_score_pairs = self.vector_store.similarity_search_with_score(
+                query_text, 
+                k=top_n * 2  # Get more results initially
+            )
             
-        logger.debug(f"Token cached for {client_id[:8]}... (expires in {expires_in}s)")
-    
-    def _get_cache_key(self, tenant_id: str, client_id: str, scope: str) -> str:
-        """Generate a cache key."""
-        return f"{tenant_id}:{client_id}:{scope}"
-    
-    def clear(self) -> None:
-        """Clear all tokens from the cache."""
-        with self._lock:
-            self._tokens.clear()
-        logger.info("Token cache cleared")
-    
-    def remove(self, tenant_id: str, client_id: str, scope: str) -> None:
-        """Remove a specific token from the cache."""
-        cache_key = self._get_cache_key(tenant_id, client_id, scope)
-        
-        with self._lock:
-            if cache_key in self._tokens:
-                del self._tokens[cache_key]
-                logger.debug(f"Token removed from cache for {client_id[:8]}...")
-
-
-# Initialize global token cache
-token_cache = TokenCache()
-
-def get_azure_token_cached(tenant_id: str, client_id: str, client_secret: str, 
-                          scope: str = "https://cognitiveservices.azure.com/.default") -> Optional[str]:
-    """
-    Get an Azure AD token with caching support.
-    This function first checks the cache before making a new token request.
-    
-    Args:
-        tenant_id: Azure tenant ID
-        client_id: Azure client ID
-        client_secret: Azure client secret
-        scope: OAuth scope to request
-        
-    Returns:
-        Access token if successful, None otherwise
-    """
-    # Check cache first
-    token = token_cache.get(tenant_id, client_id, scope)
-    if token:
-        return token
-    
-    # Cache miss - get new token
-    try:
-        logger.info(f"Token cache miss for {client_id[:8]}... - fetching new token")
-        
-        # OAuth2 token endpoint
-        token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
-        
-        # Request body
-        data = {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "scope": scope,
-            "grant_type": "client_credentials"
-        }
-        
-        # Make the request
-        response = requests.post(
-            token_url, 
-            data=data,
-            timeout=30
-        )
-        
-        # Handle response
-        if response.status_code == 200:
-            token_data = response.json()
-            if "access_token" in token_data:
-                token = token_data["access_token"]
-                expires_in = token_data.get("expires_in", 3600)  # Default to 1 hour
-                
-                # Cache the token
-                token_cache.set(tenant_id, client_id, scope, token, expires_in)
-                
-                logger.info(f"New token acquired and cached (expires in {expires_in}s)")
-                return token
-            else:
-                logger.error("Token response did not contain access_token")
-                return None
-        else:
-            logger.error(f"Token request failed with status {response.status_code}: {response.text}")
-            return None
+            # Process results to check for synonym matches
+            exact_matches = []
             
-    except Exception as e:
-        logger.error(f"Error getting Azure token: {e}")
-        return None
-
-
-def refresh_token_if_needed(tenant_id: str, client_id: str, client_secret: str, 
-                           scope: str = "https://cognitiveservices.azure.com/.default",
-                           min_validity_seconds: int = 600) -> bool:
-    """
-    Check if a token is about to expire and refresh it if needed.
-    
-    Args:
-        tenant_id: Azure tenant ID
-        client_id: Azure client ID
-        client_secret: Azure client secret
-        scope: OAuth scope
-        min_validity_seconds: Minimum seconds of validity required
-        
-    Returns:
-        True if token was refreshed or is valid, False on error
-    """
-    # Get token from cache to check expiry
-    cache_key = token_cache._get_cache_key(tenant_id, client_id, scope)
-    
-    with token_cache._lock:
-        if cache_key in token_cache._tokens:
-            _, expiry_time = token_cache._tokens[cache_key]
-            time_left = expiry_time - time.time()
-            
-            # If token expires soon, refresh it
-            if time_left < min_validity_seconds:
-                logger.info(f"Token for {client_id[:8]}... expires in {time_left:.0f}s, refreshing")
+            for doc, score in doc_score_pairs:
+                doc_id = doc.metadata.get('id')
+                synonyms_str = doc.metadata.get('synonyms_str', "")
                 
-                # Remove old token
-                del token_cache._tokens[cache_key]
+                # Split synonyms string into a list
+                synonyms = [s.strip() for s in synonyms_str.split(',')] if synonyms_str else []
+                
+                # Check for synonym matches
+                query_terms = set(query_text.lower().split())
+                
+                synonym_match = False
+                matched_synonym = None
+                
+                for synonym in synonyms:
+                    if not synonym:
+                        continue
+                    synonym_terms = set(synonym.lower().split())
+                    if query_terms.intersection(synonym_terms):
+                        synonym_match = True
+                        matched_synonym = synonym
+                        break
+                
+                # Find the corresponding PBT data item
+                item = next((dict(item) for item in self.pbt_data if str(item['id']) == doc_id), None)
+                
+                if item:
+                    # Create MatchedPBT object
+                    matched_pbt = MatchedPBT(
+                        id=str(item['id']),
+                        name=item['PBT_NAME'],
+                        definition=item['PBT_DEFINITION'],
+                        cdm=item.get('CDM'),
+                        match_type=MatchType.SPECIFIC,
+                        similarity_score=float(score),
+                        synonym_match=synonym_match,
+                        matched_synonym=matched_synonym if synonym_match else None
+                    )
+                    
+                    # Boost score for synonym matches
+                    if synonym_match:
+                        matched_pbt.similarity_score *= 1.2  # 20% boost
+                    
+                    exact_matches.append(matched_pbt)
+            
+            # Sort by score and take top_n
+            exact_matches.sort(key=lambda x: x.similarity_score, reverse=True)
+            specific_results = exact_matches[:top_n]
+            
+            final_results = specific_results
+            
+            # Include broader terms if requested
+            if include_broader_terms and self.concept_hierarchy.get('broader_terms'):
+                broader_matches = []
+                
+                for broader_term in self.concept_hierarchy.get('broader_terms', []):
+                    # Skip terms already in specific results
+                    if any(r.id == str(broader_term['id']) for r in specific_results):
+                        continue
+                    
+                    # Create MatchedPBT object
+                    matched_pbt = MatchedPBT(
+                        id=str(broader_term['id']),
+                        name=broader_term['PBT_NAME'],
+                        definition=broader_term['PBT_DEFINITION'],
+                        cdm=broader_term.get('CDM'),
+                        match_type=MatchType.BROADER,
+                        similarity_score=0.5,  # Default score for broader terms
+                        synonym_match=False
+                    )
+                    
+                    broader_matches.append(matched_pbt)
+                
+                # Sort broader matches by name length (shorter names are usually more general)
+                broader_matches.sort(key=lambda x: len(x.name.split()), reverse=False)
+                
+                # Take up to 3 broader matches
+                broader_matches = broader_matches[:3]
+                
+                # Add broader matches to results
+                final_results = specific_results + broader_matches
+            
+            return final_results
+        
+        except Exception as e:
+            logger.error(f"Error finding similar items: {e}")
+            return []
     
-    # Get a fresh token (will update cache)
-    token = get_azure_token_cached(tenant_id, client_id, client_secret, scope)
-    return token is not None
-
-
-# Global refresh thread reference
-_token_refresh_thread = None
-
-def start_token_refresh_service(refresh_interval: int = 300) -> threading.Thread:
-    """
-    Start a background thread that refreshes tokens periodically.
-    
-    Args:
-        refresh_interval: Interval between refresh checks in seconds
+    async def get_pbt_by_id(self, pbt_id: str) -> Optional[PBT]:
+        """
+        Get a PBT by its ID.
         
-    Returns:
-        The background thread
-    """
-    def _token_refresh_worker():
-        settings = get_settings()
-        
-        tenant_id = settings.azure.tenant_id
-        client_id = settings.azure.client_id
-        client_secret = settings.azure.client_secret
-        
-        while True:
-            try:
-                # Refresh the token if it's going to expire soon
-                refresh_token_if_needed(
-                    tenant_id=tenant_id,
-                    client_id=client_id,
-                    client_secret=client_secret
+        Args:
+            pbt_id: PBT ID
+            
+        Returns:
+            PBT if found, None otherwise
+        """
+        try:
+            item = next((item for item in self.pbt_data if str(item['id']) == pbt_id), None)
+            if item:
+                # Get synonyms from vector store
+                filter_dict = {"id": pbt_id}
+                docs = self.vector_store.similarity_search("", k=1, filter=filter_dict)
+                
+                synonyms = []
+                if docs:
+                    synonyms_str = docs[0].metadata.get('synonyms_str', "")
+                    synonyms = [s.strip() for s in synonyms_str.split(',')] if synonyms_str else []
+                
+                return PBT(
+                    id=str(item['id']),
+                    PBT_NAME=item['PBT_NAME'],
+                    PBT_DEFINITION=item['PBT_DEFINITION'],
+                    CDM=item.get('CDM'),
+                    synonyms=synonyms
                 )
-            except Exception as e:
-                logger.error(f"Error in token refresh worker: {e}")
-            
-            # Sleep for the specified interval
-            time.sleep(refresh_interval)
-    
-    # Create and start the thread
-    refresh_thread = threading.Thread(
-        target=_token_refresh_worker,
-        daemon=True,
-        name="TokenRefreshThread"
-    )
-    refresh_thread.start()
-    logger.info(f"Token refresh service started (interval: {refresh_interval}s)")
-    
-    return refresh_thread
-
-
-# API Key security
-settings = get_settings()
-api_key_header = APIKeyHeader(name=settings.security.api_key_header, auto_error=False)
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", auto_error=False)
-
-# Hard-coded API keys for demo purposes - in production, store in a secure database
-API_KEYS = {
-    "dev": "dev-api-key-123",
-    "test": "test-api-key-456",
-    "admin": "admin-api-key-789"
-}
-
-# Generate a secret key if not provided
-def generate_secret_key(length=32):
-    """Generate a random secret key."""
-    alphabet = string.ascii_letters + string.digits
-    return ''.join(secrets.choice(alphabet) for _ in range(length))
-
-SECRET_KEY = settings.security.secret_key or generate_secret_key()
-ALGORITHM = settings.security.algorithm
-ACCESS_TOKEN_EXPIRE_MINUTES = settings.security.access_token_expire_minutes
-
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    """Create a JWT access token."""
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
-
-async def verify_api_key(api_key: str = Security(api_key_header)):
-    """
-    API key verification is disabled.
-    This function always returns True for all API keys.
-    """
-    return True
-
-
-async def get_current_user(token: str = Depends(oauth2_scheme)):
-    """Get the current user from the JWT token."""
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    
-    if token is None:
-        raise credentials_exception
-    
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise credentials_exception
-        token_data = TokenData(username=username)
-    except JWTError:
-        raise credentials_exception
-    
-    # In a real system, you would look up the user in a database
-    # For this example, we'll just create a simple user object
-    if token_data.username:
-        user = {"username": token_data.username}
-        return user
+            return None
         
-    raise credentials_exception
+        except Exception as e:
+            logger.error(f"Error getting PBT by ID: {e}")
+            return None
+    
+    async def get_statistics(self) -> PBTStatistics:
+        """
+        Get statistics about the PBT data.
+        
+        Returns:
+            Statistics about the PBT data
+        """
+        try:
+            total_count = len(self.pbt_data)
+            
+            # Get vector store stats
+            vector_store_stats = self.vector_store.get_collection_stats()
+            indexed_count = vector_store_stats.get("document_count", 0)
+            if isinstance(indexed_count, str):
+                indexed_count = total_count  # Fallback if we couldn't get accurate count
+            
+            # Count PBTs by CDM category
+            cdm_categories = {}
+            for item in self.pbt_data:
+                cdm = item.get('CDM', '')
+                if not cdm:
+                    cdm = "Uncategorized"
+                if cdm in cdm_categories:
+                    cdm_categories[cdm] += 1
+                else:
+                    cdm_categories[cdm] = 1
+            
+            # Count PBTs with synonyms
+            has_synonyms_count = 0
+            total_synonyms = 0
+            
+            # Query the vector store for synonym counts
+            for item in self.pbt_data:
+                filter_dict = {"id": str(item['id'])}
+                docs = self.vector_store.similarity_search("", k=1, filter=filter_dict)
+                
+                if docs:
+                    synonym_count = docs[0].metadata.get('synonym_count', 0)
+                    if synonym_count > 0:
+                        has_synonyms_count += 1
+                        total_synonyms += synonym_count
+            
+            # Calculate average synonyms per PBT
+            avg_synonyms = total_synonyms / max(1, total_count)
+            
+            # Get top CDM categories
+            top_cdm = sorted(
+                [{"category": k, "count": v} for k, v in cdm_categories.items()],
+                key=lambda x: x["count"],
+                reverse=True
+            )[:5]
+            
+            return PBTStatistics(
+                total_pbt_count=total_count,
+                indexed_count=indexed_count,
+                cdm_categories=cdm_categories,
+                has_synonyms_count=has_synonyms_count,
+                average_synonyms_per_pbt=avg_synonyms,
+                top_cdm_categories=top_cdm
+            )
+        
+        except Exception as e:
+            logger.error(f"Error getting statistics: {e}")
+            return PBTStatistics(
+                total_pbt_count=0,
+                indexed_count=0,
+                cdm_categories={},
+                has_synonyms_count=0,
+                average_synonyms_per_pbt=0,
+                top_cdm_categories=[]
+            )
+
+
+# Get the PBT manager instance
+def get_pbt_manager() -> PBTManager:
+    """
+    Get the PBT manager instance.
+    
+    Returns:
+        PBTManager: PBT manager instance
+    """
+    return PBTManager()
