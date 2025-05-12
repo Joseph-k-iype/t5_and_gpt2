@@ -1,589 +1,341 @@
 """
-PBT Tagging API - Routes for tagging data elements with Preferred Business Terms (PBTs).
-
-This module provides API endpoints for tagging data elements with PBTs using 
-a LangGraph-based ReactAgent classification system.
+System monitoring module for collecting and storing performance metrics.
+This can be run as a separate process or integrated with the main application.
 """
 
 import logging
-import uuid
-import json
-from typing import Dict, Any, List, Optional
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends, Query
-from pydantic import Field
-
-# LangGraph and LangChain imports
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
-from langchain_core.tools import BaseTool
-from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.checkpoint.base import empty_checkpoint
-from langgraph.prebuilt import create_react_agent
-
-from app.core.models import (
-    PBTTaggingRequest,
-    PBTTaggingResponse,
-    MatchedPBT,
-    PBTQueryContext
-)
-from app.core.business_terms import BusinessTermManager
-from app.config.settings import get_llm
-
-router = APIRouter(prefix="/api/v1/pbt", tags=["pbt-tagging"])
-
-# In-memory cache for current jobs for fast access
-pbt_tagging_jobs: Dict[str, Dict[str, Any]] = {}
+import time
+import threading
+import psutil
+from typing import Dict, Any, Optional
+from app.core.db_manager import DBManager
+from app.api.routes.enhancement import enhancement_jobs
+from app.api.routes.tagging import tagging_jobs
+from app.api.routes.pbt_tagging import pbt_tagging_jobs
 
 logger = logging.getLogger(__name__)
 
-class PBTClassifierTool(BaseTool):
-    """Tool for classifying input against PBT database entries."""
-    name: str = "pbt_classifier"
-    description: str = "Classifies user input against PBT (Preferred Business Terms) database entries"
+class SystemMonitor:
+    """System monitoring service for collecting and storing performance metrics."""
     
-    def __init__(self, term_manager: BusinessTermManager):
-        """Initialize the PBT classifier tool."""
-        self.term_manager = term_manager
-        # Initialize the base tool with name and description
-        super().__init__(
-            name=self.name,
-            description=self.description
-        )
-    
-    def _run(self, name: str, description: str, return_broader_terms: bool = True) -> Dict:
-        """Classify the input against the PBT data."""
-        # Use tag_element method from BusinessTermManager
-        element_id = str(uuid.uuid4())
-        # This is synchronous for now - convert to async if needed
-        tagging_result = self.term_manager.tag_element(
-            element_id=element_id,
-            name=name,
-            description=description,
-            top_k=5,
-            threshold=0.2,
-            include_broader_terms=return_broader_terms
-        )
-        
-        # Process the tagging result to extract similar items
-        similar_items = []
-        for term, score in zip(tagging_result.matching_terms, tagging_result.confidence_scores):
-            similar_items.append({
-                "id": term.get("id", ""),
-                "PBT_NAME": term.get("name", ""),
-                "PBT_DEFINITION": term.get("description", ""),
-                "similarity_score": score,
-                "match_type": term.get("match_type", "specific"),
-                "metadata": term.get("metadata", {})
-            })
-        
-        # Group items by match type
-        specific_matches = [item for item in similar_items if item.get("match_type") == "specific"]
-        broader_matches = [item for item in similar_items if item.get("match_type") == "broader"]
-        
-        # If no specific grouping, treat all as specific
-        if not specific_matches and not broader_matches:
-            specific_matches = similar_items
-        
-        result = {
-            "status": "success",
-            "best_match": similar_items[0] if similar_items else None,
-            "specific_matches": specific_matches,
-            "broader_matches": broader_matches,
-            "similar_items": similar_items,
-            "modeling_required": tagging_result.modeling_required,
-            "message": tagging_result.message
-        }
-        
-        return result
-
-class PBTTagger:
-    """
-    Tagger for classifying input terms using the ReactAgent.
-    """
     _instance = None
     
-    def __new__(cls, *args, **kwargs):
-        """Singleton pattern to ensure one instance."""
+    def __new__(cls):
+        """Singleton pattern to ensure only one monitoring instance."""
         if cls._instance is None:
-            cls._instance = super(PBTTagger, cls).__new__(cls)
+            cls._instance = super(SystemMonitor, cls).__new__(cls)
             cls._instance._initialized = False
         return cls._instance
     
-    def __init__(self, llm=None):
-        """Initialize the PBT tagger."""
+    def __init__(self):
+        """Initialize the system monitor."""
         if self._initialized:
             return
             
         self._initialized = True
-        self.llm = llm or get_llm()
-        self.business_term_manager = BusinessTermManager()
+        self.db_manager = DBManager()
+        self.monitoring_thread = None
+        self.stop_event = threading.Event()
+        self.interval = 300  # Collect metrics every 5 minutes by default
         
-        # Initialize memory for persistent conversations
-        self.memory_saver = MemorySaver()
-        
-        # Initialize tools
-        self.tools = self._setup_tools()
-        
-        # Create React agent
-        self.agent = self._create_agent()
-        
-        logger.info("PBT tagger initialized")
+        logger.info("System monitor initialized")
     
-    def _setup_tools(self):
-        """Set up tools for the React agent."""
-        return [PBTClassifierTool(term_manager=self.business_term_manager)]
-    
-    def _create_agent(self):
-        """Create the React agent."""
-        # Define custom system message
-        system_message = """
-        You are an expert business terminology standardization system. Your task is to map user-provided terms 
-        and descriptions to the organization's Preferred Business Terms (PBT).
-
-        When a user provides a name and description, use the pbt_classifier tool to find the most appropriate 
-        standard business terms from the database. 
-        
-        The tool will return both specific matches and broader category matches. Consider both types when making 
-        your recommendation. For example, "drawdown client account number" might match to both specific terms 
-        like "Account Number" and broader categories like "Account Identifier" or "Customer Account".
-        
-        Explain why the matches are appropriate, focusing on conceptual alignment rather than just keyword matching.
-        Always mention both specific and broader matches in your response when available.
-        
-        You also have access to memory of previous classifications. Reference past similar classifications if relevant.
+    def start(self, interval: int = 300):
         """
-        
-        # Create the React agent with memory
-        return create_react_agent(
-            self.llm,
-            self.tools,
-            system_message=system_message
-        )
-    
-    def _get_user_id(self, name: str, description: str) -> str:
-        """Generate a consistent user ID for memory lookup based on input."""
-        return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{name}:{description}"))
-    
-    async def tag(self, name: str, description: str, top_n: int = 5, 
-                 examples: Optional[List[str]] = None,
-                 process_name: Optional[str] = None,
-                 process_description: Optional[str] = None) -> PBTTaggingResponse:
-        """
-        Tag an item with PBTs using the React agent.
+        Start the monitoring thread.
         
         Args:
-            name: Name of the item to tag
-            description: Description of the item to tag
-            top_n: Number of top PBTs to return
-            examples: Optional list of example values or contexts
-            process_name: Optional name of the business process
-            process_description: Optional description of the business process
-            
+            interval: Interval in seconds between metrics collection
+        """
+        if self.monitoring_thread and self.monitoring_thread.is_alive():
+            logger.warning("Monitoring thread is already running")
+            return
+        
+        self.interval = interval
+        self.stop_event.clear()
+        self.monitoring_thread = threading.Thread(target=self._monitoring_loop, daemon=True)
+        self.monitoring_thread.start()
+        
+        logger.info(f"System monitoring started with {interval}s interval")
+    
+    def stop(self):
+        """Stop the monitoring thread."""
+        if not self.monitoring_thread or not self.monitoring_thread.is_alive():
+            logger.warning("Monitoring thread is not running")
+            return
+        
+        self.stop_event.set()
+        self.monitoring_thread.join(timeout=5)
+        
+        if self.monitoring_thread.is_alive():
+            logger.warning("Monitoring thread could not be stopped gracefully")
+        else:
+            logger.info("System monitoring stopped")
+    
+    def _monitoring_loop(self):
+        """Main monitoring loop that collects metrics at regular intervals."""
+        while not self.stop_event.is_set():
+            try:
+                self.collect_and_store_metrics()
+                
+                # Sleep until next interval or until stop event is set
+                self.stop_event.wait(self.interval)
+            except Exception as e:
+                logger.error(f"Error in monitoring loop: {e}")
+                # Sleep a bit before retrying
+                time.sleep(10)
+    
+    def collect_metrics(self) -> Dict[str, Any]:
+        """
+        Collect system metrics.
+        
         Returns:
-            PBTTaggingResponse object with matched PBTs
+            Dict containing system metrics
         """
         try:
-            # Generate a unique ID for this classification session
-            session_id = str(uuid.uuid4())
+            # Get CPU and memory usage
+            cpu_percent = psutil.cpu_percent(interval=1)
+            memory = psutil.virtual_memory()
+            memory_percent = memory.percent
             
-            # Prepare input message
-            examples_text = ""
-            if examples and len(examples) > 0:
-                examples_text = f"\nExamples: {', '.join(examples)}"
-                
-            process_text = ""
-            if process_name:
-                process_text += f"\nProcess Name: {process_name}"
-            if process_description:
-                process_text += f"\nProcess Description: {process_description}"
+            # Get job counts
+            enhancement_jobs_count = len(enhancement_jobs)
+            tagging_jobs_count = len(tagging_jobs)
+            pbt_tagging_jobs_count = len(pbt_tagging_jobs)
             
-            input_message = f"""
-            Please map the following to standard Preferred Business Terms, including both specific and broader category matches:
+            return {
+                "cpu_usage": cpu_percent,
+                "memory_usage": memory_percent,
+                "enhancement_jobs_count": enhancement_jobs_count,
+                "tagging_jobs_count": tagging_jobs_count,
+                "pbt_tagging_jobs_count": pbt_tagging_jobs_count
+            }
+        except Exception as e:
+            logger.error(f"Error collecting metrics: {e}")
+            return {
+                "cpu_usage": 0.0,
+                "memory_usage": 0.0,
+                "enhancement_jobs_count": 0,
+                "tagging_jobs_count": 0,
+                "pbt_tagging_jobs_count": 0
+            }
+    
+    def collect_and_store_metrics(self) -> bool:
+        """
+        Collect and store system metrics in the database.
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Collect metrics
+            metrics = self.collect_metrics()
             
-            Name: {name}
-            Description: {description}{examples_text}{process_text}
+            # Store in database
+            success = self.db_manager.record_system_stats(
+                cpu_usage=metrics["cpu_usage"],
+                memory_usage=metrics["memory_usage"],
+                enhancement_jobs_count=metrics["enhancement_jobs_count"],
+                tagging_jobs_count=metrics["tagging_jobs_count"],
+                pbt_tagging_jobs_count=metrics["pbt_tagging_jobs_count"]
+            )
             
-            Provide both specific matches and broader category matches when available.
-            """
+            if success:
+                logger.debug("System metrics recorded successfully")
+            else:
+                logger.warning("Failed to record system metrics")
             
-            # Create a config with thread_id for the checkpointer
-            config = {
-                "configurable": {
-                    "thread_id": session_id,
-                    "session_id": session_id
+            return success
+        except Exception as e:
+            logger.error(f"Error collecting and storing metrics: {e}")
+            return False
+    
+    def get_recent_metrics(self, limit: int = 24) -> list:
+        """
+        Get recent system metrics from the database.
+        
+        Args:
+            limit: Maximum number of records to retrieve
+            
+        Returns:
+            List of dictionaries containing metrics
+        """
+        try:
+            return self.db_manager.get_system_stats(limit=limit)
+        except Exception as e:
+            logger.error(f"Error retrieving system metrics: {e}")
+            return []
+    
+    def get_disk_usage(self) -> Dict[str, Any]:
+        """
+        Get disk usage statistics.
+        
+        Returns:
+            Dict with disk usage statistics
+        """
+        try:
+            disk_usage = psutil.disk_usage('/')
+            return {
+                "total_gb": round(disk_usage.total / (1024 * 1024 * 1024), 2),
+                "used_gb": round(disk_usage.used / (1024 * 1024 * 1024), 2),
+                "free_gb": round(disk_usage.free / (1024 * 1024 * 1024), 2),
+                "percent": disk_usage.percent
+            }
+        except Exception as e:
+            logger.error(f"Error getting disk usage: {e}")
+            return {
+                "total_gb": 0,
+                "used_gb": 0,
+                "free_gb": 0,
+                "percent": 0
+            }
+    
+    def get_network_stats(self) -> Dict[str, Any]:
+        """
+        Get network statistics.
+        
+        Returns:
+            Dict with network statistics
+        """
+        try:
+            # Get initial counters
+            net_io_counters_start = psutil.net_io_counters()
+            
+            # Wait for a short period to calculate rates
+            time.sleep(1)
+            
+            # Get updated counters
+            net_io_counters_end = psutil.net_io_counters()
+            
+            # Calculate rates
+            bytes_sent = net_io_counters_end.bytes_sent - net_io_counters_start.bytes_sent
+            bytes_recv = net_io_counters_end.bytes_recv - net_io_counters_start.bytes_recv
+            
+            return {
+                "bytes_sent_per_sec": bytes_sent,
+                "bytes_recv_per_sec": bytes_recv,
+                "total_sent_gb": round(net_io_counters_end.bytes_sent / (1024 * 1024 * 1024), 2),
+                "total_recv_gb": round(net_io_counters_end.bytes_recv / (1024 * 1024 * 1024), 2)
+            }
+        except Exception as e:
+            logger.error(f"Error getting network stats: {e}")
+            return {
+                "bytes_sent_per_sec": 0,
+                "bytes_recv_per_sec": 0,
+                "total_sent_gb": 0,
+                "total_recv_gb": 0
+            }
+    
+    def get_system_info(self) -> Dict[str, Any]:
+        """
+        Get system information.
+        
+        Returns:
+            Dict with system information
+        """
+        try:
+            boot_time = psutil.boot_time()
+            uptime_seconds = time.time() - boot_time
+            
+            # Format uptime as days, hours, minutes
+            days = int(uptime_seconds // (24 * 3600))
+            hours = int((uptime_seconds % (24 * 3600)) // 3600)
+            minutes = int((uptime_seconds % 3600) // 60)
+            
+            cpu_count = psutil.cpu_count()
+            cpu_physical = psutil.cpu_count(logical=False)
+            
+            return {
+                "boot_time": boot_time,
+                "uptime": {
+                    "days": days,
+                    "hours": hours,
+                    "minutes": minutes,
+                    "total_seconds": int(uptime_seconds)
+                },
+                "cpu": {
+                    "logical_count": cpu_count,
+                    "physical_count": cpu_physical
+                },
+                "memory": {
+                    "total_gb": round(psutil.virtual_memory().total / (1024 * 1024 * 1024), 2)
                 }
             }
-            
-            # Call the agent
-            result = await self.agent.ainvoke(
-                {"messages": [HumanMessage(content=input_message)]},
-                config=config
-            )
-            
-            # Extract the classification results
-            matched_pbts = self._extract_pbts_from_result(result, top_n)
-            
-            # Create response
-            response = PBTTaggingResponse(
-                input_name=name,
-                input_description=description,
-                matched_pbts=matched_pbts,
-                message=self._extract_agent_message(result)
-            )
-            
-            return response
         except Exception as e:
-            logger.error(f"Error in PBT tagging: {e}")
-            raise
-    
-    def _extract_pbts_from_result(self, result: Dict, top_n: int) -> List[MatchedPBT]:
-        """Extract PBTs from the agent's result."""
-        matched_pbts = []
-        
-        # Find tool message with similar items
-        for message in result.get("messages", []):
-            if hasattr(message, "name") and message.name == "pbt_classifier":
-                try:
-                    content = json.loads(message.content)
-                    
-                    # Extract similar items, prioritizing specific matches
-                    similar_items = []
-                    
-                    # Add specific matches first
-                    if "specific_matches" in content:
-                        similar_items.extend(content["specific_matches"])
-                    
-                    # Add broader matches next
-                    if "broader_matches" in content:
-                        similar_items.extend(content["broader_matches"])
-                    
-                    # If no categorized matches, use all similar items
-                    if not similar_items and "similar_items" in content:
-                        similar_items = content["similar_items"]
-                    
-                    # Convert to MatchedPBT objects
-                    for item in similar_items[:top_n]:
-                        pbt = MatchedPBT(
-                            id=str(item.get("id", "")),
-                            pbt_name=item.get("PBT_NAME", ""),
-                            pbt_description=item.get("PBT_DEFINITION", ""),
-                            cdm=item.get("metadata", {}).get("cdm"),
-                            similarity_score=item.get("similarity_score", 0.0),
-                            metadata=item.get("metadata", {})
-                        )
-                        matched_pbts.append(pbt)
-                except Exception as e:
-                    logger.error(f"Error extracting PBTs from tool message: {e}")
-        
-        # If no PBTs found from tools, extract from the final message
-        if not matched_pbts:
-            # Use a fallback approach by directly searching for similar terms
-            query = PBTQueryContext(
-                id=str(uuid.uuid4()),
-                name=result.get("messages", [])[-1].content if result.get("messages") else "",
-                description=""
-            )
-            
-            # Use direct BusinessTermManager search
-            search_results = self.business_term_manager.search_terms(query.name, limit=top_n)
-            
-            for item in search_results:
-                metadata = {}
-                if hasattr(item, "metadata"):
-                    metadata = item.metadata
-                
-                matched_pbts.append(
-                    MatchedPBT(
-                        id=str(item.id),
-                        pbt_name=item.name,
-                        pbt_description=item.description,
-                        cdm=metadata.get("cdm"),
-                        similarity_score=0.5,  # Default score
-                        metadata=metadata
-                    )
-                )
-        
-        return matched_pbts
-    
-    def _extract_agent_message(self, result: Dict) -> str:
-        """Extract the agent's final message."""
-        messages = result.get("messages", [])
-        if messages:
-            final_message = messages[-1]
-            if hasattr(final_message, "content"):
-                return final_message.content
-        
-        return "No explanation provided by the agent."
+            logger.error(f"Error getting system info: {e}")
+            return {
+                "boot_time": 0,
+                "uptime": {
+                    "days": 0,
+                    "hours": 0,
+                    "minutes": 0,
+                    "total_seconds": 0
+                },
+                "cpu": {
+                    "logical_count": 0,
+                    "physical_count": 0
+                },
+                "memory": {
+                    "total_gb": 0
+                }
+            }
 
+# Create a singleton instance
+system_monitor = SystemMonitor()
 
-def get_pbt_tagger() -> PBTTagger:
+def start_monitoring(interval: int = 300):
     """
-    Get the PBT tagger instance.
-    
-    Returns:
-        PBTTagger: The PBT tagger
-    """
-    llm = get_llm()
-    return PBTTagger(llm)
-
-
-@router.post("/tag", response_model=PBTTaggingResponse)
-async def tag_with_pbt(request: PBTTaggingRequest, tagger: PBTTagger = Depends(get_pbt_tagger)):
-    """
-    Tag an item with Preferred Business Terms (PBTs).
-    
-    This is a synchronous operation that returns the tagging results directly.
+    Start the system monitoring as a background process.
     
     Args:
-        request: PBT tagging request
-        tagger: PBT tagger instance
-        
-    Returns:
-        PBTTaggingResponse with matched PBTs
+        interval: Interval in seconds between metrics collection
     """
-    try:
-        logger.info(f"PBT tagging request received for item: {request.name}")
-        
-        # Call the tagger
-        response = await tagger.tag(
-            name=request.name,
-            description=request.description,
-            top_n=request.top_n,
-            examples=request.examples,
-            process_name=request.process_name,
-            process_description=request.process_description
-        )
-        
-        return response
-    except Exception as e:
-        logger.error(f"Error in PBT tagging: {e}")
-        raise HTTPException(status_code=500, detail=f"Error in PBT tagging: {str(e)}")
+    system_monitor.start(interval=interval)
 
+def stop_monitoring():
+    """Stop the system monitoring."""
+    system_monitor.stop()
 
-@router.post("/tag-async", response_model=Dict[str, Any])
-async def tag_with_pbt_async(
-    request: PBTTaggingRequest,
-    background_tasks: BackgroundTasks,
-    tagger: PBTTagger = Depends(get_pbt_tagger)
-):
+def get_recent_metrics(limit: int = 24):
     """
-    Tag an item with Preferred Business Terms (PBTs) asynchronously.
-    
-    This is an asynchronous operation that will run in the background.
+    Get recent system metrics.
     
     Args:
-        request: PBT tagging request
-        background_tasks: FastAPI background tasks
-        tagger: PBT tagger instance
+        limit: Maximum number of records to retrieve
         
     Returns:
-        Dictionary with job_id for tracking the request
+        List of dictionaries containing metrics
+    """
+    return system_monitor.get_recent_metrics(limit=limit)
+
+def get_system_health():
+    """
+    Get a comprehensive system health overview.
+    
+    Returns:
+        Dict with system health information
     """
     try:
-        # Generate a unique ID for the job
-        job_id = str(uuid.uuid4())
-        logger.info(f"Async PBT tagging request received: {job_id}")
-        
-        # Initialize job status
-        pbt_tagging_jobs[job_id] = {
-            "status": "pending",
-            "request": request.dict(),
-            "result": None,
-            "error": None
-        }
-        
-        # Add task to background
-        background_tasks.add_task(
-            run_pbt_tagging_job,
-            job_id=job_id,
-            name=request.name,
-            description=request.description,
-            top_n=request.top_n,
-            examples=request.examples,
-            process_name=request.process_name,
-            process_description=request.process_description,
-            tagger=tagger
-        )
+        metrics = system_monitor.collect_metrics()
+        disk = system_monitor.get_disk_usage()
+        network = system_monitor.get_network_stats()
+        system_info = system_monitor.get_system_info()
         
         return {
-            "job_id": job_id,
-            "status": "pending"
+            "status": "healthy",
+            "metrics": metrics,
+            "disk": disk,
+            "network": network,
+            "system_info": system_info,
+            "jobs": {
+                "enhancement": metrics["enhancement_jobs_count"],
+                "tagging": metrics["tagging_jobs_count"],
+                "pbt_tagging": metrics["pbt_tagging_jobs_count"]
+            }
         }
     except Exception as e:
-        logger.error(f"Error starting async PBT tagging job: {e}")
-        raise HTTPException(status_code=500, detail=f"Error starting job: {str(e)}")
-
-
-@router.get("/status/{job_id}", response_model=Dict[str, Any])
-async def get_pbt_tagging_status(job_id: str):
-    """
-    Get the status of an asynchronous PBT tagging job.
-    
-    Args:
-        job_id: ID of the job to check
-        
-    Returns:
-        Dictionary with job status and results if available
-    """
-    if job_id not in pbt_tagging_jobs:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-    
-    job = pbt_tagging_jobs[job_id]
-    
-    response = {
-        "job_id": job_id,
-        "status": job["status"],
-        "result": job.get("result"),
-        "error": job.get("error")
-    }
-    
-    return response
-
-
-@router.post("/batch", response_model=List[Dict[str, Any]])
-async def batch_tag_with_pbt(
-    requests: List[PBTTaggingRequest],
-    background_tasks: BackgroundTasks,
-    tagger: PBTTagger = Depends(get_pbt_tagger)
-):
-    """
-    Tag multiple items with PBTs in batch mode.
-    
-    Returns a list of job IDs that can be used to check status.
-    
-    Args:
-        requests: List of PBT tagging requests
-        background_tasks: FastAPI background tasks
-        tagger: PBT tagger instance
-        
-    Returns:
-        List of dictionaries with job_id and status
-    """
-    job_ids = []
-    
-    for request in requests:
-        try:
-            # Generate a unique ID for the job
-            job_id = str(uuid.uuid4())
-            logger.info(f"Batch PBT tagging request added: {job_id}")
-            
-            # Initialize job status
-            pbt_tagging_jobs[job_id] = {
-                "status": "pending",
-                "request": request.dict(),
-                "result": None,
-                "error": None
-            }
-            
-            # Add task to background
-            background_tasks.add_task(
-                run_pbt_tagging_job,
-                job_id=job_id,
-                name=request.name,
-                description=request.description,
-                top_n=request.top_n,
-                examples=request.examples,
-                process_name=request.process_name,
-                process_description=request.process_description,
-                tagger=tagger
-            )
-            
-            job_ids.append({
-                "job_id": job_id,
-                "status": "pending",
-                "input": {
-                    "name": request.name,
-                    "description": request.description
-                }
-            })
-        except Exception as e:
-            logger.error(f"Error adding batch job for {request.name}: {e}")
-            job_ids.append({
-                "job_id": "error",
-                "status": "error",
-                "error": str(e),
-                "input": {
-                    "name": request.name,
-                    "description": request.description
-                }
-            })
-    
-    return job_ids
-
-
-@router.delete("/job/{job_id}", response_model=Dict[str, Any])
-async def delete_pbt_tagging_job(job_id: str):
-    """
-    Delete a PBT tagging job from memory.
-    
-    Args:
-        job_id: ID of the job to delete
-        
-    Returns:
-        Dictionary with status message
-    """
-    if job_id not in pbt_tagging_jobs:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-    
-    # Check if job is still running
-    if pbt_tagging_jobs[job_id]["status"] == "in_progress":
-        raise HTTPException(status_code=400, detail="Cannot delete a job that is in progress")
-    
-    # Delete the job
-    del pbt_tagging_jobs[job_id]
-    
-    return {
-        "message": f"Job {job_id} deleted successfully"
-    }
-
-
-async def run_pbt_tagging_job(
-    job_id: str,
-    name: str,
-    description: str,
-    top_n: int,
-    examples: Optional[List[str]],
-    process_name: Optional[str],
-    process_description: Optional[str],
-    tagger: PBTTagger
-):
-    """
-    Run a PBT tagging job in the background.
-    
-    Args:
-        job_id: ID of the job
-        name: Name of the item to tag
-        description: Description of the item to tag
-        top_n: Number of top PBTs to return
-        examples: Optional list of example values or contexts
-        process_name: Optional name of the business process
-        process_description: Optional description of the business process
-        tagger: PBT tagger instance
-    """
-    logger.info(f"Starting PBT tagging job: {job_id}")
-    
-    try:
-        # Update job status
-        pbt_tagging_jobs[job_id]["status"] = "in_progress"
-        
-        # Call the tagger
-        response = await tagger.tag(
-            name=name,
-            description=description,
-            top_n=top_n,
-            examples=examples,
-            process_name=process_name,
-            process_description=process_description
-        )
-        
-        # Update job status
-        pbt_tagging_jobs[job_id]["status"] = "completed"
-        pbt_tagging_jobs[job_id]["result"] = response.dict()
-        
-        logger.info(f"PBT tagging job completed: {job_id}")
-    except Exception as e:
-        logger.error(f"Error in PBT tagging job {job_id}: {e}")
-        
-        # Update job status
-        pbt_tagging_jobs[job_id]["status"] = "failed"
-        pbt_tagging_jobs[job_id]["error"] = str(e)
+        logger.error(f"Error getting system health: {e}")
+        return {
+            "status": "error",
+            "error": str(e)
+        }
