@@ -1,643 +1,357 @@
 """
-PBT Tagging API - Routes for tagging data elements with Preferred Business Terms (PBTs).
+Environment Configuration - Utilities for managing environment variables and configuration.
 
-This module provides API endpoints for tagging data elements with PBTs using 
-a LangGraph-based ReactAgent classification system.
+This module provides utilities for loading and managing environment variables,
+handling proxy configuration, and accessing credentials for external services.
 """
 
+import os
+import sys
 import logging
-import uuid
-import json
-import asyncio
-from typing import Dict, Any, List, Optional, Tuple, Union
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends, Query
-from pydantic import Field
+import chardet
+from typing import Optional, Any, Dict, List, Union
+from pathlib import Path
+from dotenv import dotenv_values
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider, ClientSecretCredential
 
-# LangGraph and LangChain imports
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage, ToolMessage
-from langchain_core.tools import BaseTool
-from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.prebuilt import create_react_agent
-
-from app.core.models import (
-    PBTTaggingRequest,
-    PBTTaggingResponse,
-    MatchedPBT,
-    PBTQueryContext
-)
-from app.core.business_terms import BusinessTermManager
-from app.config.settings import get_llm
-
-router = APIRouter(prefix="/api/v1/pbt", tags=["pbt-tagging"])
-
-# In-memory cache for current jobs for fast access
-pbt_tagging_jobs: Dict[str, Dict[str, Any]] = {}
-
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-class PBTClassifierTool(BaseTool):
-    """Tool for classifying input against PBT database entries."""
-    name: str = "pbt_classifier"
-    description: str = "Classifies user input against PBT (Preferred Business Terms) database entries"
-    
-    # Define term_manager as a regular field
-    term_manager: BusinessTermManager
+# Default environment file locations
+ENV_DIR = "env"
+CONFIG_PATH = f"{ENV_DIR}/config.env"
+CREDS_PATH = f"{ENV_DIR}/credentials.env"
+CERT_PATH = f"{ENV_DIR}/cacert.pem"
 
-    async def _arun(self, name: str, description: str, return_broader_terms: bool = True) -> Dict:
-        """Classify the input against the PBT data asynchronously."""
-        element_id = str(uuid.uuid4())
-        
-        # Use await with the async tag_element method
-        tagging_result = await self.term_manager.tag_element(
-            element_id=element_id,
-            name=name,
-            description=description,
-            top_k=5,
-            threshold=0.2,
-            include_broader_terms=return_broader_terms
-        )
-        
-        # Process the result
-        similar_items = []
-        for term, score in zip(tagging_result.matching_terms, tagging_result.confidence_scores):
-            similar_items.append({
-                "id": term.get("id", ""),
-                "PBT_NAME": term.get("name", ""),
-                "PBT_DEFINITION": term.get("description", ""),
-                "similarity_score": score,
-                "match_type": term.get("match_type", "specific"),
-                "metadata": term.get("metadata", {})
-            })
-        
-        # Group items by match type
-        specific_matches = [item for item in similar_items if item.get("match_type") == "specific"]
-        broader_matches = [item for item in similar_items if item.get("match_type") == "broader"]
-        
-        # If no specific grouping, treat all as specific
-        if not specific_matches and not broader_matches:
-            specific_matches = similar_items
-        
-        result = {
-            "status": "success",
-            "best_match": similar_items[0] if similar_items else None,
-            "specific_matches": specific_matches,
-            "broader_matches": broader_matches,
-            "similar_items": similar_items,
-            "modeling_required": tagging_result.modeling_required,
-            "message": tagging_result.message
-        }
-        
-        return result
-    
-    def _run(self, name: str, description: str, return_broader_terms: bool = True) -> Dict:
-        """
-        Synchronous wrapper for the asynchronous _arun method.
-        """
-        try:
-            # Try to get or create an event loop
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                # If no event loop exists, create a new one
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-            
-            # Run the async method in the synchronous context
-            if loop.is_running():
-                # Use nest_asyncio if available
-                try:
-                    import nest_asyncio
-                    nest_asyncio.apply()
-                    return asyncio.run(self._arun(name, description, return_broader_terms))
-                except ImportError:
-                    logger.warning("nest_asyncio not available, using alternate method")
-                    # If nest_asyncio is not available, use an alternate approach
-                    future = asyncio.run_coroutine_threadsafe(
-                        self._arun(name, description, return_broader_terms),
-                        loop
-                    )
-                    return future.result(timeout=30)  # 30-second timeout
-            else:
-                # If the loop is not running, we can use run_until_complete
-                return loop.run_until_complete(self._arun(name, description, return_broader_terms))
-        except Exception as e:
-            # Fallback solution - return a minimal result
-            logger.error(f"Error in synchronous tool execution: {e}", exc_info=True)
-            return {
-                "status": "error",
-                "error": str(e),
-                "similar_items": [],
-                "best_match": None,
-                "specific_matches": [],
-                "broader_matches": [],
-                "modeling_required": True,
-                "message": f"Error in synchronous tool execution: {str(e)}"
-            }
-
-
-class PBTTagger:
+def is_file_readable(filepath: str) -> bool:
     """
-    Tagger for classifying input terms using the ReactAgent.
+    Check if a file is readable.
+    
+    Args:
+        filepath: Path to the file
+        
+    Returns:
+        bool: True if readable, raises FileNotFoundError otherwise
+    
+    Raises:
+        FileNotFoundError: If file doesn't exist or isn't readable
     """
-    _instance = None
-    
-    def __new__(cls, *args, **kwargs):
-        """Singleton pattern to ensure one instance."""
-        if cls._instance is None:
-            cls._instance = super(PBTTagger, cls).__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
-    
-    def __init__(self, llm=None):
-        """Initialize the PBT tagger."""
-        if self._initialized:
-            return
-            
-        self._initialized = True
-        self.llm = llm or get_llm()
-        self.business_term_manager = BusinessTermManager()
-        
-        # Initialize memory for persistent conversations
-        self.memory_saver = MemorySaver()
-        
-        # Initialize tools
-        self.tools = self._setup_tools()
-        
-        # Create React agent
-        self.agent = self._create_agent()
-        
-        logger.info("PBT tagger initialized")
-    
-    def _setup_tools(self):
-        """Set up tools for the React agent."""
-        return [PBTClassifierTool(term_manager=self.business_term_manager)]
-    
-    def _create_agent(self):
-        """Create the React agent."""
-        # Define the agent prompt (system message)
-        system_prompt = """
-        You are an expert business terminology standardization system. Your task is to map user-provided terms 
-        and descriptions to the organization's Preferred Business Terms (PBT).
+    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
+        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
+    return True
 
-        When a user provides a name and description, use the pbt_classifier tool to find the most appropriate 
-        standard business terms from the database. 
-        
-        The tool will return both specific matches and broader category matches. Consider both types when making 
-        your recommendation. For example, "drawdown client account number" might match to both specific terms 
-        like "Account Number" and broader categories like "Account Identifier" or "Customer Account".
-        
-        Explain why the matches are appropriate, focusing on conceptual alignment rather than just keyword matching.
-        Always mention both specific and broader matches in your response when available.
-        
-        You also have access to memory of previous classifications. Reference past similar classifications if relevant.
-        """
-        
-        # Create the React agent with the correct API
-        # In the latest LangGraph API, we pass prompt as a string (system message)
-        return create_react_agent(
-            model=self.llm,
-            tools=self.tools,
-            prompt=system_prompt,  # Pass the system prompt directly as a string
-            checkpointer=self.memory_saver  # Add memory for conversation persistence
-        )
+def str_to_bool(s: str) -> bool:
+    """
+    Convert a string to a boolean value.
     
-    def _get_user_id(self, name: str, description: str) -> str:
-        """Generate a consistent user ID for memory lookup based on input."""
-        return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{name}:{description}"))
+    Args:
+        s: String to convert
+        
+    Returns:
+        bool: Converted boolean value
+        
+    Raises:
+        ValueError: If string can't be converted to boolean
+    """
+    if s.lower() in ('true', 't', 'yes', 'y', '1'):
+        return True
+    elif s.lower() in ('false', 'f', 'no', 'n', '0'):
+        return False
+    else:
+        raise ValueError(f"Invalid boolean value: {s}")
+
+class OSEnv:
+    """
+    Environment variable manager for application configuration.
     
-    async def tag(self, name: str, description: str, top_n: int = 5, 
-                 examples: Optional[List[str]] = None,
-                 process_name: Optional[str] = None,
-                 process_description: Optional[str] = None) -> PBTTaggingResponse:
+    This class provides methods for loading, accessing, and managing environment
+    variables from multiple sources, including .env files and the OS environment.
+    """
+    
+    def __init__(self, config_file: str, creds_file: str, certificate_path: str, proxy_enabled: Optional[bool] = None):
         """
-        Tag an item with PBTs using the React agent.
+        Initialize environment configuration.
         
         Args:
-            name: Name of the item to tag
-            description: Description of the item to tag
-            top_n: Number of top PBTs to return
-            examples: Optional list of example values or contexts
-            process_name: Optional name of the business process
-            process_description: Optional description of the business process
+            config_file: Path to configuration .env file
+            creds_file: Path to credentials .env file
+            certificate_path: Path to SSL certificate
+            proxy_enabled: Override the PROXY_ENABLED setting
+        """
+        self.var_list = []
+        self.bulk_set(config_file, True)
+        self.bulk_set(creds_file, False)
+        self.set_certificate_path(certificate_path)
+        
+        # Handle proxy_enabled override
+        if proxy_enabled is not None:
+            self.set("PROXY_ENABLED", str(proxy_enabled))
+            logger.info(f"Proxy enabled setting overridden to: {proxy_enabled}")
+        
+        # Set proxy if enabled
+        proxy_enabled_env = str_to_bool(self.get("PROXY_ENABLED", "False"))
+        if proxy_enabled_env:
+            self.set_proxy()
+            logger.info("Proxy settings applied")
+        else:
+            logger.info("Running without proxy")
+        
+        # Handle secured endpoints
+        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
+            self.token = self.get_azure_token()
+        else:
+            self.token = None
+        
+        self.credential = self._get_credential()
+        
+        # Set PostgreSQL environment variables if not already set
+        self._set_postgres_defaults()
+        
+    def _set_postgres_defaults(self):
+        """Set default PostgreSQL environment variables if not already set."""
+        # Default PostgreSQL configuration
+        postgres_defaults = {
+            "PG_HOST": self.get("PG_HOST", "localhost"),
+            "PG_PORT": self.get("PG_PORT", "5432"),
+            "PG_USER": self.get("PG_USER", "postgres"),
+            "PG_PASSWORD": self.get("PG_PASSWORD", "postgres"),
+            "PG_DB": self.get("PG_DB", "metadata_db")
+        }
+        
+        # Set defaults if not already set
+        for key, value in postgres_defaults.items():
+            if not self.get(key):
+                self.set(key, value)
+                
+        # Log PostgreSQL configuration (without password)
+        logger.info(f"PostgreSQL configuration: host={self.get('PG_HOST')}, port={self.get('PG_PORT')}, db={self.get('PG_DB')}, user={self.get('PG_USER')}")
+        
+        # Vector database configuration
+        vector_db_type = self.get("VECTOR_DB_TYPE", "chroma").lower()  # Default to chroma
+        logger.info(f"Vector database type: {vector_db_type}")
+        
+        if vector_db_type == "chroma":
+            # Set defaults for ChromaDB
+            chroma_defaults = {
+                "CHROMA_PERSIST_DIR": self.get("CHROMA_PERSIST_DIR", "./data/chroma_db"),
+                "CHROMA_COLLECTION": self.get("CHROMA_COLLECTION", "business_terms")
+            }
             
+            # Set defaults if not already set
+            for key, value in chroma_defaults.items():
+                if not self.get(key):
+                    self.set(key, value)
+                    
+            logger.info(f"ChromaDB configuration: persist_dir={self.get('CHROMA_PERSIST_DIR')}, collection={self.get('CHROMA_COLLECTION')}")
+    
+    def _get_credential(self):
+        """
+        Get the appropriate Azure credential.
+        
         Returns:
-            PBTTaggingResponse object with matched PBTs
+            Azure credential instance
+        """
+        if str_to_bool(self.get("USE_MANAGED_IDENTITY", "False")):
+            logger.info("Using DefaultAzureCredential (managed identity)")
+            return DefaultAzureCredential()
+        else:
+            logger.info("Using ClientSecretCredential")
+            return ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID"), 
+                client_id=self.get("AZURE_CLIENT_ID"), 
+                client_secret=self.get("AZURE_CLIENT_SECRET")
+            )
+    
+    def set_certificate_path(self, path: str):
+        """
+        Set the certificate path for SSL verification.
+        
+        Args:
+            path: Path to SSL certificate
         """
         try:
-            # Generate a unique ID for this classification session
-            session_id = str(uuid.uuid4())
+            if not os.path.isabs(path):
+                path = os.path.abspath(path)
             
-            # Prepare input message
-            examples_text = ""
-            if examples and len(examples) > 0:
-                examples_text = f"\nExamples: {', '.join(examples)}"
-                
-            process_text = ""
-            if process_name:
-                process_text += f"\nProcess Name: {process_name}"
-            if process_description:
-                process_text += f"\nProcess Description: {process_description}"
-            
-            input_message = f"""
-            Please map the following to standard Preferred Business Terms, including both specific and broader category matches:
-            
-            Name: {name}
-            Description: {description}{examples_text}{process_text}
-            
-            Provide both specific matches and broader category matches when available.
-            """
-            
-            # Create a config with thread_id for the checkpointer
-            config = {
-                "configurable": {
-                    "thread_id": session_id,
-                    "session_id": session_id
-                }
-            }
-            
-            # Call the agent with the input message as a HumanMessage
-            human_message = HumanMessage(content=input_message)
-            result = await self.agent.ainvoke(
-                {"messages": [human_message]},
-                config=config
-            )
-            
-            # Extract the classification results
-            matched_pbts = self._extract_pbts_from_result(result, top_n)
-            
-            # Create response
-            response = PBTTaggingResponse(
-                input_name=name,
-                input_description=description,
-                matched_pbts=matched_pbts,
-                message=self._extract_agent_message(result)
-            )
-            
-            return response
+            if os.path.exists(path):
+                if is_file_readable(path):
+                    self.set("REQUESTS_CA_BUNDLE", path)
+                    self.set("SSL_CERT_FILE", path)
+                    self.set("CURL_CA_BUNDLE", path)
+                    logger.info(f"Certificate path set to {path}")
+                else:
+                    logger.warning(f"Certificate file {path} exists but is not readable")
+            else:
+                logger.warning(f"Certificate file {path} not found, using system certificates")
         except Exception as e:
-            logger.error(f"Error in PBT tagging: {e}")
+            logger.error(f"Error setting certificate path: {e}")
             raise
     
-    def _extract_pbts_from_result(self, result: Dict, top_n: int) -> List[MatchedPBT]:
-        """Extract PBTs from the agent's result."""
-        matched_pbts = []
+    def bulk_set(self, dotenvfile: str, print_val: bool = False) -> None:
+        """
+        Load environment variables from a dotenv file.
         
-        # Find tool messages with similar items
-        messages = result.get("messages", [])
-        for message in messages:
-            # Check if this is a ToolMessage
-            if isinstance(message, ToolMessage):
-                try:
-                    # Parse the content as JSON
-                    content = json.loads(message.content)
-                    
-                    # Extract similar items, prioritizing specific matches
-                    similar_items = []
-                    
-                    # Add specific matches first
-                    if "specific_matches" in content:
-                        similar_items.extend(content["specific_matches"])
-                    
-                    # Add broader matches next
-                    if "broader_matches" in content:
-                        similar_items.extend(content["broader_matches"])
-                    
-                    # If no categorized matches, use all similar items
-                    if not similar_items and "similar_items" in content:
-                        similar_items = content["similar_items"]
-                    
-                    # Convert to MatchedPBT objects
-                    for item in similar_items[:top_n]:
-                        pbt = MatchedPBT(
-                            id=str(item.get("id", "")),
-                            pbt_name=item.get("PBT_NAME", ""),
-                            pbt_description=item.get("PBT_DEFINITION", ""),
-                            cdm=item.get("metadata", {}).get("cdm"),
-                            similarity_score=item.get("similarity_score", 0.0),
-                            metadata=item.get("metadata", {})
-                        )
-                        matched_pbts.append(pbt)
-                except Exception as e:
-                    logger.error(f"Error extracting PBTs from tool message: {e}")
-        
-        # If no PBTs found from tools, extract from the final message
-        if not matched_pbts:
-            # Use a fallback approach by directly searching for similar terms
-            last_message_content = ""
-            for message in reversed(messages):
-                if isinstance(message, AIMessage):
-                    last_message_content = message.content
-                    break
-            
-            query = PBTQueryContext(
-                id=str(uuid.uuid4()),
-                name=last_message_content,
-                description=""
-            )
-            
-            # Use direct BusinessTermManager search
-            search_results = self.business_term_manager.search_terms(query.name, limit=top_n)
-            
-            for item in search_results:
-                metadata = {}
-                if hasattr(item, "metadata"):
-                    metadata = item.metadata
-                
-                matched_pbts.append(
-                    MatchedPBT(
-                        id=str(item.id),
-                        pbt_name=item.name,
-                        pbt_description=item.description,
-                        cdm=metadata.get("cdm"),
-                        similarity_score=0.5,  # Default score
-                        metadata=metadata
-                    )
-                )
-        
-        return matched_pbts
-    
-    def _extract_agent_message(self, result: Dict) -> str:
-        """Extract the agent's final message."""
-        # Get the messages list
-        messages = result.get("messages", [])
-        
-        # Find the last AIMessage that isn't a ToolMessage
-        for message in reversed(messages):
-            if isinstance(message, AIMessage) and not isinstance(message, ToolMessage):
-                return message.content
-        
-        return "No explanation provided by the agent."
-
-
-def get_pbt_tagger() -> PBTTagger:
-    """
-    Get the PBT tagger instance.
-    
-    Returns:
-        PBTTagger: The PBT tagger
-    """
-    llm = get_llm()
-    return PBTTagger(llm)
-
-
-@router.post("/tag", response_model=PBTTaggingResponse)
-async def tag_with_pbt(request: PBTTaggingRequest, tagger: PBTTagger = Depends(get_pbt_tagger)):
-    """
-    Tag an item with Preferred Business Terms (PBTs).
-    
-    This is a synchronous operation that returns the tagging results directly.
-    
-    Args:
-        request: PBT tagging request
-        tagger: PBT tagger instance
-        
-    Returns:
-        PBTTaggingResponse with matched PBTs
-    """
-    try:
-        logger.info(f"PBT tagging request received for item: {request.name}")
-        
-        # Call the tagger
-        response = await tagger.tag(
-            name=request.name,
-            description=request.description,
-            top_n=request.top_n,
-            examples=request.examples,
-            process_name=request.process_name,
-            process_description=request.process_description
-        )
-        
-        return response
-    except Exception as e:
-        logger.error(f"Error in PBT tagging: {e}")
-        raise HTTPException(status_code=500, detail=f"Error in PBT tagging: {str(e)}")
-
-
-@router.post("/tag-async", response_model=Dict[str, Any])
-async def tag_with_pbt_async(
-    request: PBTTaggingRequest,
-    background_tasks: BackgroundTasks,
-    tagger: PBTTagger = Depends(get_pbt_tagger)
-):
-    """
-    Tag an item with Preferred Business Terms (PBTs) asynchronously.
-    
-    This is an asynchronous operation that will run in the background.
-    
-    Args:
-        request: PBT tagging request
-        background_tasks: FastAPI background tasks
-        tagger: PBT tagger instance
-        
-    Returns:
-        Dictionary with job_id for tracking the request
-    """
-    try:
-        # Generate a unique ID for the job
-        job_id = str(uuid.uuid4())
-        logger.info(f"Async PBT tagging request received: {job_id}")
-        
-        # Initialize job status
-        pbt_tagging_jobs[job_id] = {
-            "status": "pending",
-            "request": request.dict(),
-            "result": None,
-            "error": None
-        }
-        
-        # Add task to background
-        background_tasks.add_task(
-            run_pbt_tagging_job,
-            job_id=job_id,
-            name=request.name,
-            description=request.description,
-            top_n=request.top_n,
-            examples=request.examples,
-            process_name=request.process_name,
-            process_description=request.process_description,
-            tagger=tagger
-        )
-        
-        return {
-            "job_id": job_id,
-            "status": "pending"
-        }
-    except Exception as e:
-        logger.error(f"Error starting async PBT tagging job: {e}")
-        raise HTTPException(status_code=500, detail=f"Error starting job: {str(e)}")
-
-
-@router.get("/status/{job_id}", response_model=Dict[str, Any])
-async def get_pbt_tagging_status(job_id: str):
-    """
-    Get the status of an asynchronous PBT tagging job.
-    
-    Args:
-        job_id: ID of the job to check
-        
-    Returns:
-        Dictionary with job status and results if available
-    """
-    if job_id not in pbt_tagging_jobs:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-    
-    job = pbt_tagging_jobs[job_id]
-    
-    response = {
-        "job_id": job_id,
-        "status": job["status"],
-        "result": job.get("result"),
-        "error": job.get("error")
-    }
-    
-    return response
-
-
-@router.post("/batch", response_model=List[Dict[str, Any]])
-async def batch_tag_with_pbt(
-    requests: List[PBTTaggingRequest],
-    background_tasks: BackgroundTasks,
-    tagger: PBTTagger = Depends(get_pbt_tagger)
-):
-    """
-    Tag multiple items with PBTs in batch mode.
-    
-    Returns a list of job IDs that can be used to check status.
-    
-    Args:
-        requests: List of PBT tagging requests
-        background_tasks: FastAPI background tasks
-        tagger: PBT tagger instance
-        
-    Returns:
-        List of dictionaries with job_id and status
-    """
-    job_ids = []
-    
-    for request in requests:
+        Args:
+            dotenvfile: Path to .env file
+            print_val: Whether to print values to logs
+        """
         try:
-            # Generate a unique ID for the job
-            job_id = str(uuid.uuid4())
-            logger.info(f"Batch PBT tagging request added: {job_id}")
+            if not os.path.isabs(dotenvfile):
+                dotenvfile = os.path.abspath(dotenvfile)
             
-            # Initialize job status
-            pbt_tagging_jobs[job_id] = {
-                "status": "pending",
-                "request": request.dict(),
-                "result": None,
-                "error": None
-            }
-            
-            # Add task to background
-            background_tasks.add_task(
-                run_pbt_tagging_job,
-                job_id=job_id,
-                name=request.name,
-                description=request.description,
-                top_n=request.top_n,
-                examples=request.examples,
-                process_name=request.process_name,
-                process_description=request.process_description,
-                tagger=tagger
-            )
-            
-            job_ids.append({
-                "job_id": job_id,
-                "status": "pending",
-                "input": {
-                    "name": request.name,
-                    "description": request.description
-                }
-            })
+            if os.path.exists(dotenvfile) and is_file_readable(dotenvfile):
+                temp_dict = dotenv_values(dotenvfile)
+                for key, value in temp_dict.items():
+                    self.set(key, value, print_val)
+                del temp_dict
+                logger.info(f"Loaded environment from {dotenvfile}")
+            else:
+                logger.warning(f"Environment file {dotenvfile} not found or not readable, skipping")
         except Exception as e:
-            logger.error(f"Error adding batch job for {request.name}: {e}")
-            job_ids.append({
-                "job_id": "error",
-                "status": "error",
-                "error": str(e),
-                "input": {
-                    "name": request.name,
-                    "description": request.description
-                }
-            })
+            logger.error(f"Error loading environment variables from {dotenvfile}: {e}")
+            raise
     
-    return job_ids
+    def set(self, key: str, value: str, print_val: bool = False) -> None:
+        """
+        Set an environment variable.
+        
+        Args:
+            key: Environment variable name
+            value: Environment variable value
+            print_val: Whether to print value to logs
+        """
+        try:
+            os.environ[key] = value
+            if key not in self.var_list:
+                self.var_list.append(key)
+            if print_val:
+                if key in {'AZURE_CLIENT_SECRET', 'AD_USER_PW', 'PG_PASSWORD'}:
+                    logger.info(f"{key}: [REDACTED]")
+                else:
+                    logger.info(f"{key}: {value}")
+        except Exception as e:
+            logger.error(f"Error setting environment variable {key}: {e}")
+            raise
+    
+    def get(self, key: str, default: Optional[str] = None) -> str:
+        """
+        Get an environment variable.
+        
+        Args:
+            key: Environment variable name
+            default: Default value if not found
+            
+        Returns:
+            str: Environment variable value or default
+        """
+        try:
+            return os.environ.get(key, default)
+        except Exception as e:
+            logger.error(f"Error getting environment variable {key}: {e}")
+            raise
+    
+    def set_proxy(self) -> None:
+        """
+        Set up proxy configuration for HTTP requests.
+        """
+        try:
+            ad_username = self.get("AD_USERNAME")
+            ad_password = self.get("AD_USER_PW")
+            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
+            
+            if not all([ad_username, ad_password, proxy_domain]):
+                logger.error("Proxy settings are incomplete, cannot configure proxy")
+                raise ValueError("Proxy settings are incomplete. Check AD_USERNAME, AD_USER_PW, and HTTPS_PROXY_DOMAIN")
+            
+            # Use http:// instead of https:// as the proxy only supports HTTP
+            proxy_url = f"http://{ad_username}:{ad_password}@{proxy_domain}"
+            self.set("HTTP_PROXY", proxy_url, print_val=False)
+            self.set("HTTPS_PROXY", proxy_url, print_val=False)
+            
+            # Set no_proxy domains
+            no_proxy_domains = [
+                'cognitiveservices.azure.com',
+                'search.windows.net',
+                'openai.azure.com',
+                'core.windows.net',
+                'azurewebsites.net'
+            ]
+            
+            # Add any custom NO_PROXY entries from environment
+            custom_no_proxy = self.get("CUSTOM_NO_PROXY", "")
+            if custom_no_proxy:
+                no_proxy_domains.extend(custom_no_proxy.split(","))
+            
+            # Add PostgreSQL host to NO_PROXY if it's not localhost
+            pg_host = self.get("PG_HOST")
+            if pg_host and pg_host not in ["localhost", "127.0.0.1"]:
+                no_proxy_domains.append(pg_host)
+            
+            self.set("NO_PROXY", ",".join(no_proxy_domains), print_val=False)
+            logger.info("Proxy settings configured with HTTP protocol")
+            logger.info(f"NO_PROXY domains: {', '.join(no_proxy_domains)}")
+        except Exception as e:
+            logger.error(f"Error setting proxy: {e}")
+            raise
+    
+    def get_azure_token(self) -> str:
+        """
+        Get an Azure AD token for authenticated API calls.
+        
+        Returns:
+            str: Azure AD token
+        """
+        try:
+            credential = ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID"),
+                client_id=self.get("AZURE_CLIENT_ID"),
+                client_secret=self.get("AZURE_CLIENT_SECRET")
+            )
+            token = credential.get_token("https://cognitiveservices.azure.com/.default")
+            self.set("AZURE_TOKEN", token.token, print_val=False)
+            logger.info("Azure token set successfully")
+            return token.token
+        except Exception as e:
+            logger.error(f"Error retrieving Azure token: {e}")
+            return None
+    
+    def list_env_vars(self) -> None:
+        """
+        List all environment variables (with sensitive values redacted).
+        """
+        for var in self.var_list:
+            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET', 'PG_PASSWORD'}:
+                logger.info(f"{var}: [REDACTED]")
+            else:
+                logger.info(f"{var}: {os.getenv(var)}")
 
+# Singleton instance for application-wide access
+_os_env_instance = None
 
-@router.delete("/job/{job_id}", response_model=Dict[str, Any])
-async def delete_pbt_tagging_job(job_id: str):
+def get_os_env(
+    config_file: str = CONFIG_PATH, 
+    creds_file: str = CREDS_PATH, 
+    certificate_path: str = CERT_PATH,
+    proxy_enabled: Optional[bool] = None
+) -> OSEnv:
     """
-    Delete a PBT tagging job from memory.
+    Get the OSEnv instance.
     
     Args:
-        job_id: ID of the job to delete
+        config_file: Path to configuration file
+        creds_file: Path to credentials file
+        certificate_path: Path to SSL certificate
+        proxy_enabled: Override the PROXY_ENABLED setting in the config file
         
     Returns:
-        Dictionary with status message
+        OSEnv: Environment variable manager instance
     """
-    if job_id not in pbt_tagging_jobs:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    global _os_env_instance
+    if _os_env_instance is None:
+        _os_env_instance = OSEnv(config_file, creds_file, certificate_path, proxy_enabled)
+    elif proxy_enabled is not None and proxy_enabled != str_to_bool(_os_env_instance.get("PROXY_ENABLED", "False")):
+        # If proxy_enabled changes, recreate the instance
+        logger.info("Re-initializing environment with new proxy settings")
+        _os_env_instance = OSEnv(config_file, creds_file, certificate_path, proxy_enabled)
     
-    # Check if job is still running
-    if pbt_tagging_jobs[job_id]["status"] == "in_progress":
-        raise HTTPException(status_code=400, detail="Cannot delete a job that is in progress")
-    
-    # Delete the job
-    del pbt_tagging_jobs[job_id]
-    
-    return {
-        "message": f"Job {job_id} deleted successfully"
-    }
-
-
-async def run_pbt_tagging_job(
-    job_id: str,
-    name: str,
-    description: str,
-    top_n: int,
-    examples: Optional[List[str]],
-    process_name: Optional[str],
-    process_description: Optional[str],
-    tagger: PBTTagger
-):
-    """
-    Run a PBT tagging job in the background.
-    
-    Args:
-        job_id: ID of the job
-        name: Name of the item to tag
-        description: Description of the item to tag
-        top_n: Number of top PBTs to return
-        examples: Optional list of example values or contexts
-        process_name: Optional name of the business process
-        process_description: Optional description of the business process
-        tagger: PBT tagger instance
-    """
-    logger.info(f"Starting PBT tagging job: {job_id}")
-    
-    try:
-        # Update job status
-        pbt_tagging_jobs[job_id]["status"] = "in_progress"
-        
-        # Call the tagger
-        response = await tagger.tag(
-            name=name,
-            description=description,
-            top_n=top_n,
-            examples=examples,
-            process_name=process_name,
-            process_description=process_description
-        )
-        
-        # Update job status
-        pbt_tagging_jobs[job_id]["status"] = "completed"
-        pbt_tagging_jobs[job_id]["result"] = response.dict()
-        
-        logger.info(f"PBT tagging job completed: {job_id}")
-    except Exception as e:
-        logger.error(f"Error in PBT tagging job {job_id}: {e}")
-        
-        # Update job status
-        pbt_tagging_jobs[job_id]["status"] = "failed"
-        pbt_tagging_jobs[job_id]["error"] = str(e)
+    return _os_env_instance
