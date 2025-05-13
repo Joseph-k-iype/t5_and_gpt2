@@ -1,553 +1,852 @@
-"""
-PBT Data Manager for loading, managing, and searching PBT data.
-"""
-
 import os
-import logging
+import sys
 import uuid
+import json
+import logging
+import chardet
 import pandas as pd
+import networkx as nx
 import numpy as np
-from typing import List, Dict, Any, Optional, Tuple, Set
-from sklearn.metrics.pairwise import cosine_similarity
+from typing import Optional, Any, Dict, List, Union, TypedDict
+from pathlib import Path
+from dotenv import dotenv_values
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider, ClientSecretCredential
+from openai import AzureOpenAI
+from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationChain, LLMChain
 from langchain_core.documents import Document
-from app.config.settings import get_settings
-from app.core.services.embeddings import get_embedding_service
-from app.core.vector_store.chroma_store import get_chroma_store
-from app.core.models.pbt import PBT, MatchedPBT, MatchType, PBTStatistics
+from langchain_chroma import Chroma
+from langchain_core.prompts import PromptTemplate, ChatPromptTemplate
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+import rdflib
+from rdflib import Graph, Literal, URIRef
+from rdflib.namespace import RDF, RDFS
+from langchain_community.graphs import RdfGraph
+import chromadb
+from chromadb.config import Settings
+from langchain.chains import GraphSparqlQAChain
+from langgraph.graph import END, StateGraph
+from pydantic import BaseModel, Field
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-class PBTManager:
-    """Manager for Preferred Business Terms (PBT) data."""
+# Environment settings from original code
+ENV_DIR = "env"
+CONFIG_PATH = f"{ENV_DIR}/config.env"
+CREDS_PATH = f"{ENV_DIR}/credentials.env"
+CERT_PATH = f"{ENV_DIR}/cacert.pem"
+
+class Triple:
+    def __init__(self, subject, predicate, object_):
+        self.subject = subject
+        self.predicate = predicate
+        self.object = object_
     
-    _instance = None
-    
-    def __new__(cls):
-        """Implement singleton pattern."""
-        if cls._instance is None:
-            cls._instance = super(PBTManager, cls).__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
-    
-    def __init__(self):
-        """Initialize the PBT manager."""
-        if self._initialized:
-            return
-            
-        self._initialized = True
-        self.settings = get_settings()
-        self.embedding_service = get_embedding_service()
-        self.vector_store = get_chroma_store()
+    def __str__(self):
+        return f"{self.subject} {self.predicate} {self.object}"
+
+class OSEnv:
+    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
+        self.var_list = []
+        self.bulk_set(config_file, True)
+        self.bulk_set(creds_file, False)
+        self.set_certificate_path(certificate_path)
+        if str_to_bool(self.get("PROXY_ENABLED", "False")):
+            self.set_proxy()
         
-        # PBT data
-        self.pbt_data = []
-        self.concept_hierarchy = {}
+        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
+            self.token = self.get_azure_token()
+        else:
+            self.token = None
         
-        logger.info("PBT Manager initialized")
-    
-    async def load_csv(self, csv_path: Optional[str] = None, reload: bool = False) -> Dict[str, Any]:
-        """
-        Load PBT data from CSV file and store in vector store with synonyms.
+        # Initialize credential for reuse
+        self.credential = self._get_credential()
         
-        Args:
-            csv_path: Path to the CSV file
-            reload: Whether to reload the data if already loaded
-            
-        Returns:
-            Dict with load status and count
-        """
-        try:
-            # Use provided path or default from settings
-            file_path = csv_path or self.settings.pbt_csv_path
-            
-            # Check if data is already loaded and reload flag is not set
-            if not reload and len(self.pbt_data) > 0:
-                logger.info("PBT data already loaded. Use reload=True to force reload.")
-                return {
-                    "status": "success", 
-                    "message": "PBT data already loaded", 
-                    "total_loaded": len(self.pbt_data)
-                }
-            
-            # Ensure the file exists
-            if not os.path.exists(file_path):
-                logger.error(f"CSV file not found: {file_path}")
-                return {"status": "error", "message": f"CSV file not found: {file_path}", "total_loaded": 0}
-            
-            # Load the CSV file
-            df = pd.read_csv(file_path)
-            
-            # Check for required columns
-            required_columns = {'id', 'PBT_NAME', 'PBT_DEFINITION'}
-            if not required_columns.issubset(df.columns):
-                missing = required_columns - set(df.columns)
-                logger.error(f"CSV file missing required columns: {missing}")
-                return {
-                    "status": "error", 
-                    "message": f"CSV file missing required columns: {missing}", 
-                    "total_loaded": 0
-                }
-            
-            # Add CDM column if not already present
-            if 'CDM' not in df.columns:
-                logger.warning("CSV file does not contain CDM column. Adding empty CDM values.")
-                df['CDM'] = None
-            
-            # Convert DataFrame to list of dictionaries
-            self.pbt_data = df.to_dict('records')
-            
-            # Delete all existing data in the vector store
-            self.vector_store.delete()
-            
-            # Create documents for embedding with synonyms
-            all_docs = []
-            all_ids = []
-            
-            # Process in smaller batches for synonym generation
-            synonym_batch_size = 10
-            for i in range(0, len(self.pbt_data), synonym_batch_size):
-                batch = self.pbt_data[i:i + synonym_batch_size]
-                batch_docs = []
-                batch_ids = []
-                
-                logger.info(f"Generating synonyms for batch {i//synonym_batch_size + 1} of {(len(self.pbt_data) - 1)//synonym_batch_size + 1}")
-                
-                # Refresh token before processing each batch
-                from app.core.auth.auth_helper import refresh_token_if_needed, get_azure_token_cached
-                
-                # Explicitly refresh token
-                token_refreshed = refresh_token_if_needed(
-                    tenant_id=self.settings.azure.tenant_id,
-                    client_id=self.settings.azure.client_id,
-                    client_secret=self.settings.azure.client_secret,
-                    scope="https://cognitiveservices.azure.com/.default",
-                    min_validity_seconds=1800  # 30 minutes
-                )
-                
-                if not token_refreshed:
-                    # Try to get a fresh token
-                    token = get_azure_token_cached(
-                        tenant_id=self.settings.azure.tenant_id, 
-                        client_id=self.settings.azure.client_id,
-                        client_secret=self.settings.azure.client_secret
-                    )
-                    if not token:
-                        logger.error("Failed to refresh Azure token during PBT data loading")
-                        raise ValueError("Failed to get Azure token")
-                
-                # Reinitialize embedding service with fresh token
-                self.embedding_service = get_embedding_service(force_refresh=True)
-                
-                for item in batch:
-                    # Generate synonyms for this term
-                    synonyms = self.embedding_service.generate_synonyms(
-                        term_name=item['PBT_NAME'],
-                        term_definition=item['PBT_DEFINITION']
-                    )
-                    
-                    # Convert synonyms to a comma-separated string
-                    synonyms_str = ", ".join(synonyms) if synonyms else ""
-                    
-                    # Combined text including the term, definition, and CDM (if available)
-                    combined_text = f"{item['PBT_NAME']} - {item['PBT_DEFINITION']}"
-                    if 'CDM' in item and item['CDM']:
-                        combined_text += f" - {item['CDM']}"
-                    
-                    # Create metadata
-                    metadata = {
-                        'id': str(item['id']),
-                        'name': item['PBT_NAME'],
-                        'definition': item['PBT_DEFINITION'],
-                        'cdm': item.get('CDM', ''),
-                        'synonyms_str': synonyms_str,
-                        'synonym_count': len(synonyms)
-                    }
-                    
-                    # Create a document
-                    doc = Document(
-                        page_content=combined_text,
-                        metadata=metadata
-                    )
-                    
-                    batch_docs.append(doc)
-                    batch_ids.append(str(item['id']))
-                
-                all_docs.extend(batch_docs)
-                all_ids.extend(batch_ids)
-            
-            # Process documents in batches for embedding and storage
-            chunk_size = 50
-            for i in range(0, len(all_docs), chunk_size):
-                # Refresh token before processing each batch
-                refresh_token_if_needed(
-                    tenant_id=self.settings.azure.tenant_id,
-                    client_id=self.settings.azure.client_id,
-                    client_secret=self.settings.azure.client_secret,
-                    min_validity_seconds=1800  # 30 minutes
-                )
-                
-                # Get chunk of documents and IDs
-                chunk_docs = all_docs[i:i + chunk_size]
-                chunk_ids = all_ids[i:i + chunk_size]
-                
-                # Add to vector store
-                self.vector_store.add_documents(chunk_docs, ids=chunk_ids)
-                logger.info(f"Added document chunk {i//chunk_size + 1} of {(len(all_docs) - 1)//chunk_size + 1} to ChromaDB")
-            
-            # Build concept hierarchy
-            await self._build_concept_hierarchy()
-            
-            logger.info(f"Loaded {len(self.pbt_data)} PBT records with synonyms from CSV into vector store")
-            
-            return {
-                "status": "success", 
-                "message": f"Loaded {len(self.pbt_data)} PBT records", 
-                "total_loaded": len(self.pbt_data)
-            }
-        
-        except Exception as e:
-            logger.error(f"Error loading CSV: {e}")
-            return {"status": "error", "message": f"Error loading CSV: {str(e)}", "total_loaded": 0}
-    
-    async def _build_concept_hierarchy(self):
-        """
-        Build a concept hierarchy based on the similarity between terms.
-        This identifies broader and more specific terms.
-        """
-        try:
-            # Get all documents with embeddings
-            all_docs = self.vector_store.similarity_search("", k=len(self.pbt_data) + 1)
-            
-            # Prepare for similarity calculation
-            embeddings = []
-            doc_ids = []
-            doc_texts = []
-            
-            for doc in all_docs:
-                doc_id = doc.metadata.get('id')
-                if doc_id:
-                    doc_ids.append(doc_id)
-                    doc_texts.append(doc.page_content)
-                    
-                    # Create a dummy document to get the embedding
-                    query_text = doc.page_content
-                    doc_embedding = self.embedding_service.generate_embedding(
-                        self.embedding_service.Document(id=doc_id, text=query_text)
-                    ).embedding
-                    
-                    embeddings.append(doc_embedding)
-            
-            # Calculate similarity matrix
-            similarity_matrix = np.zeros((len(embeddings), len(embeddings)))
-            
-            for i in range(len(embeddings)):
-                for j in range(len(embeddings)):
-                    if i != j:  # Skip self-comparison
-                        similarity_matrix[i, j] = cosine_similarity(
-                            [embeddings[i]], 
-                            [embeddings[j]]
-                        )[0][0]
-            
-            # Calculate average similarities (higher means more general)
-            avg_similarities = np.mean(similarity_matrix, axis=1)
-            
-            # Calculate term specificity factors
-            term_generality = {}
-            term_lengths = []
-            
-            for i, doc_id in enumerate(doc_ids):
-                # Find the corresponding PBT data item
-                item = next((item for item in self.pbt_data if str(item['id']) == doc_id), None)
-                if item:
-                    # Calculate term specificity based on term length and average similarity
-                    name_length = len(item['PBT_NAME'].split())
-                    term_lengths.append(name_length)
-                    
-                    term_generality[doc_id] = {
-                        'avg_similarity': float(avg_similarities[i]),
-                        'name_length': name_length,
-                        'id': item['id'],
-                        'name': item['PBT_NAME'],
-                        'cdm': item.get('CDM', '')
-                    }
-            
-            # Normalize term lengths
-            max_length = max(term_lengths) if term_lengths else 1
-            for term_id, data in term_generality.items():
-                # Higher score means more general
-                data['generality_score'] = data['avg_similarity'] * (1 - (data['name_length'] / max_length))
-            
-            # Sort terms by generality score
-            sorted_terms = sorted(
-                term_generality.items(), 
-                key=lambda x: x[1]['generality_score'], 
-                reverse=True
+    def _get_credential(self):
+        if str_to_bool(self.get("USE_MANAGED_IDENTITY", "False")):
+            return DefaultAzureCredential()
+        else:
+            return ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID"), 
+                client_id=self.get("AZURE_CLIENT_ID"), 
+                client_secret=self.get("AZURE_CLIENT_SECRET")
             )
-            
-            # Take the top 20% as broader terms
-            broader_terms_count = max(1, int(len(sorted_terms) * 0.2))
-            broader_terms = [term[0] for term in sorted_terms[:broader_terms_count]]
-            
-            # Store in concept hierarchy
-            self.concept_hierarchy = {
-                'broader_terms': [item for item in self.pbt_data 
-                                if str(item['id']) in broader_terms],
-                'term_generality': term_generality
-            }
-            
-            logger.info(f"Built concept hierarchy with {len(broader_terms)} broader terms")
-        
-        except Exception as e:
-            logger.error(f"Error building concept hierarchy: {e}")
-            self.concept_hierarchy = {'broader_terms': [], 'term_generality': {}}
     
-    async def find_similar_items(self, query_text: str, top_n: int = 5, include_broader_terms: bool = True) -> List[Any]:
-        """
-        Find the most similar PBT items to the query text.
-        
-        Args:
-            query_text: Text to search for
-            top_n: Number of results to return
-            include_broader_terms: Whether to include broader terms
-            
-        Returns:
-            List of matched PBT items as dictionaries with original field names
-        """
+    def set_certificate_path(self, path: str):
         try:
-            # Get similar documents with scores
-            logger.info(f"Finding similar items for: {query_text}")
-            doc_score_pairs = self.vector_store.similarity_search_with_score(
-                query_text, 
-                k=top_n * 2  # Get more results initially
+            if not os.path.isabs(path):
+                path = os.path.abspath(path)
+            if not is_file_readable(path):
+                raise FileNotFoundError(f"The file '{path}' does not exist or is not readable")
+            
+            self.set("REQUESTS_CA_BUNDLE", path)
+            self.set("SSL_CERT_FILE", path)
+            self.set("CURL_CA_BUNDLE", path)
+        except Exception as e:
+            logger.error(f"Error setting certificate path: {e}")
+            raise
+    
+    def bulk_set(self, dotenvfile: str, print_val: bool = False)->None:
+        try:
+            if not os.path.isabs(dotenvfile):
+                dotenvfile = os.path.abspath(dotenvfile)
+            if not is_file_readable(dotenvfile):
+                raise FileNotFoundError(f"The file '{dotenvfile}' does not exist or is not readable")
+                
+            temp_dict = dotenv_values(dotenvfile)
+            for key, value in temp_dict.items():
+                self.set(key, value, print_val)
+            del temp_dict
+        except Exception as e:
+            logger.error(f"Error loading environment variables from {dotenvfile}: {e}")
+            raise
+    
+    def set(self, key: str, value: str, print_val: bool = False)->None:
+        try:
+            os.environ[key] = value
+            if key not in self.var_list:
+                self.var_list.append(key)
+            if print_val:
+                logger.info(f"{key}: {value}")
+        except Exception as e:
+            logger.error(f"Error setting environment variable {key}: {e}")
+            raise
+    
+    def get(self, key: str, default: Optional[str] = None)->str:
+        try:
+            return os.environ.get(key, default)
+        except Exception as e:
+            logger.error(f"Error getting environment variable {key}: {e}")
+            raise
+    
+    def set_proxy(self) -> None:
+        try:
+            ad_username = self.get("AD_USERNAME")
+            ad_password = self.get("AD_USER_PW")
+            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
+            if not all([ad_username, ad_password, proxy_domain]):
+                raise ValueError("Proxy settings are incomplete")
+            proxy_url = f"https://{ad_username}:{ad_password}@{proxy_domain}"
+            self.set("HTTP_PROXY", proxy_url, print_val=False)
+            self.set("HTTPS_PROXY", proxy_url, print_val=False)
+            no_proxy_domains = [
+                'cognitiveservices.azure.com',
+                'search.windows.net',
+                'openai.azure.com',
+                'core.windows.net',
+                'azurewebsites.net'
+            ]
+            self.set("NO_PROXY", ",".join(no_proxy_domains), print_val=False)
+        except Exception as e:
+            logger.error(f"Error setting proxy: {e}")
+            raise
+    
+    def get_azure_token(self) -> str:
+        try:
+            credential = ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID"),
+                client_id=self.get("AZURE_CLIENT_ID"),
+                client_secret=self.get("AZURE_CLIENT_SECRET")
             )
-            
-            logger.info(f"Found {len(doc_score_pairs)} similar documents")
-            
-            # Process results to check for synonym matches
-            exact_matches = []
-            
-            for doc, score in doc_score_pairs:
-                doc_id = doc.metadata.get('id')
-                synonyms_str = doc.metadata.get('synonyms_str', "")
-                
-                # Split synonyms string into a list
-                synonyms = [s.strip() for s in synonyms_str.split(',')] if synonyms_str else []
-                
-                # Check for synonym matches
-                query_terms = set(query_text.lower().split())
-                
-                synonym_match = False
-                matched_synonym = None
-                
-                for synonym in synonyms:
-                    if not synonym:
-                        continue
-                    synonym_terms = set(synonym.lower().split())
-                    if query_terms.intersection(synonym_terms):
-                        synonym_match = True
-                        matched_synonym = synonym
-                        break
-                
-                # Find the corresponding PBT data item
-                item = next((dict(item) for item in self.pbt_data if str(item['id']) == doc_id), None)
-                
-                if item:
-                    # Make sure required fields are present and are valid strings
-                    if 'PBT_NAME' not in item or not isinstance(item['PBT_NAME'], str):
-                        logger.warning(f"Invalid PBT_NAME in item {doc_id}: {item.get('PBT_NAME')}")
-                        continue
-                        
-                    if 'PBT_DEFINITION' not in item or not isinstance(item['PBT_DEFINITION'], str):
-                        logger.warning(f"Invalid PBT_DEFINITION in item {doc_id}: {item.get('PBT_DEFINITION')}")
-                        continue
-                    
-                    # Create a dictionary with all the needed fields using original field names
-                    match_dict = {
-                        "id": str(item['id']),
-                        "PBT_NAME": item['PBT_NAME'],
-                        "PBT_DEFINITION": item['PBT_DEFINITION'],
-                        "CDM": item.get('CDM', ""),
-                        "match_type": "specific",
-                        "similarity_score": float(score),
-                        "synonym_match": synonym_match,
-                        "matched_synonym": matched_synonym if synonym_match else ""
-                    }
-                    
-                    # Boost score for synonym matches
-                    if synonym_match:
-                        match_dict["similarity_score"] *= 1.2  # 20% boost
-                    
-                    exact_matches.append(match_dict)
-            
-            # Sort by score and take top_n
-            exact_matches.sort(key=lambda x: x["similarity_score"], reverse=True)
-            specific_results = exact_matches[:top_n]
-            
-            final_results = specific_results
-            
-            # Include broader terms if requested
-            if include_broader_terms and self.concept_hierarchy.get('broader_terms'):
-                broader_matches = []
-                
-                for broader_term in self.concept_hierarchy.get('broader_terms', []):
-                    # Skip terms already in specific results
-                    if any(r["id"] == str(broader_term['id']) for r in specific_results):
-                        continue
-                    
-                    # Make sure required fields are present and are valid strings
-                    if 'PBT_NAME' not in broader_term or not isinstance(broader_term['PBT_NAME'], str):
-                        logger.warning(f"Invalid PBT_NAME in broader term {broader_term.get('id')}: {broader_term.get('PBT_NAME')}")
-                        continue
-                        
-                    if 'PBT_DEFINITION' not in broader_term or not isinstance(broader_term['PBT_DEFINITION'], str):
-                        logger.warning(f"Invalid PBT_DEFINITION in broader term {broader_term.get('id')}: {broader_term.get('PBT_DEFINITION')}")
-                        continue
-                    
-                    # Create dictionary with all the needed fields
-                    broader_match = {
-                        "id": str(broader_term['id']),
-                        "PBT_NAME": broader_term['PBT_NAME'],
-                        "PBT_DEFINITION": broader_term['PBT_DEFINITION'],
-                        "CDM": broader_term.get('CDM', ""),
-                        "match_type": "broader",
-                        "similarity_score": 0.5,  # Default score for broader terms
-                        "synonym_match": False,
-                        "matched_synonym": ""
-                    }
-                    
-                    broader_matches.append(broader_match)
-                
-                # Sort broader matches by name length (shorter names are usually more general)
-                broader_matches.sort(key=lambda x: len(x["PBT_NAME"].split()), reverse=False)
-                
-                # Take up to 3 broader matches
-                broader_matches = broader_matches[:3]
-                
-                # Add broader matches to results
-                final_results = specific_results + broader_matches
-            
-            logger.info(f"Returning {len(final_results)} similar items (specific: {len(specific_results)}, broader: {len(final_results) - len(specific_results)})")
-            
-            return final_results
-        
+            token = credential.get_token("https://cognitiveservices.azure.com/.default")
+            self.set("AZURE_TOKEN", token.token, print_val=False)
+            logger.info("Azure token set")
+            return token.token
         except Exception as e:
-            logger.error(f"Error finding similar items: {e}")
-            return []
+            logger.error(f"Error retrieving Azure token: {e}")
+            return None
+
+def is_file_readable(filepath: str)->bool:
+    """Check if a file is readable."""
+    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
+        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
+    return True
+
+def str_to_bool(s: str)->bool:
+    """Convert a string to a boolean."""
+    if s == 'True':
+        return True
+    elif s == 'False':
+        return False
+    else:
+        raise ValueError(f"Invalid boolean value: {s}")
+
+class TTLParser:
+    """
+    Parser for TTL (Turtle) files that extracts triples and creates RDF graphs.
+    """
     
-    async def get_pbt_by_id(self, pbt_id: str) -> Optional[PBT]:
+    def __init__(self, ttl_file: str):
         """
-        Get a PBT by its ID.
+        Initialize the parser with a TTL file path.
         
         Args:
-            pbt_id: PBT ID
-            
-        Returns:
-            PBT if found, None otherwise
+            ttl_file: Path to the TTL file to parse
         """
-        try:
-            item = next((item for item in self.pbt_data if str(item['id']) == pbt_id), None)
-            if item:
-                # Get synonyms from vector store
-                filter_dict = {"id": pbt_id}
-                docs = self.vector_store.similarity_search("", k=1, filter=filter_dict)
-                
-                synonyms = []
-                if docs:
-                    synonyms_str = docs[0].metadata.get('synonyms_str', "")
-                    synonyms = [s.strip() for s in synonyms_str.split(',')] if synonyms_str else []
-                
-                return PBT(
-                    id=str(item['id']),
-                    PBT_NAME=item['PBT_NAME'],
-                    PBT_DEFINITION=item['PBT_DEFINITION'],
-                    CDM=item.get('CDM'),
-                    synonyms=synonyms
-                )
-            return None
+        self.ttl_file = ttl_file
+        self.rdf_graph = None
+        self.nx_graph = None
+        self.namespaces = {}
+        self.triples = []
         
+    def parse(self):
+        """
+        Parse the TTL file and create both RDF and NetworkX graphs.
+        """
+        logger.info(f"Parsing TTL file: {self.ttl_file}")
+        
+        # Check if the file exists
+        if not os.path.exists(self.ttl_file):
+            raise FileNotFoundError(f"TTL file not found: {self.ttl_file}")
+        
+        # Create a new RDF graph
+        self.rdf_graph = rdflib.Graph()
+        
+        # Parse the TTL file
+        try:
+            self.rdf_graph.parse(self.ttl_file, format="turtle")
+            logger.info(f"Successfully parsed TTL file with {len(self.rdf_graph)} triples")
         except Exception as e:
-            logger.error(f"Error getting PBT by ID: {e}")
-            return None
-    
-    async def get_statistics(self) -> PBTStatistics:
-        """
-        Get statistics about the PBT data.
+            logger.error(f"Error parsing TTL file: {e}")
+            raise
         
-        Returns:
-            Statistics about the PBT data
-        """
-        try:
-            total_count = len(self.pbt_data)
+        # Extract namespaces
+        self.namespaces = dict(self.rdf_graph.namespaces())
+        logger.info(f"Found {len(self.namespaces)} namespaces")
+        
+        # Create a NetworkX directed graph
+        self.nx_graph = nx.DiGraph()
+        
+        # Add all triples to the NetworkX graph and store them
+        for s, p, o in self.rdf_graph:
+            subject_str = str(s)
+            predicate_str = str(p)
+            object_str = str(o)
             
-            # Get vector store stats
-            vector_store_stats = self.vector_store.get_collection_stats()
-            indexed_count = vector_store_stats.get("document_count", 0)
-            if isinstance(indexed_count, str):
-                indexed_count = total_count  # Fallback if we couldn't get accurate count
+            # Store the triple
+            self.triples.append(Triple(subject_str, predicate_str, object_str))
             
-            # Count PBTs by CDM category
-            cdm_categories = {}
-            for item in self.pbt_data:
-                cdm = item.get('CDM', '')
-                if not cdm:
-                    cdm = "Uncategorized"
-                if cdm in cdm_categories:
-                    cdm_categories[cdm] += 1
+            # Add nodes to the graph
+            if subject_str not in self.nx_graph:
+                self.nx_graph.add_node(subject_str)
+            
+            # Add literals as node attributes, URIs as edges
+            if isinstance(o, Literal):
+                # Get the Python value
+                value = o.value if hasattr(o, 'value') else str(o)
+                
+                # Add as node attribute
+                if predicate_str not in self.nx_graph.nodes[subject_str]:
+                    self.nx_graph.nodes[subject_str][predicate_str] = [value]
                 else:
-                    cdm_categories[cdm] = 1
-            
-            # Count PBTs with synonyms
-            has_synonyms_count = 0
-            total_synonyms = 0
-            
-            # Query the vector store for synonym counts
-            for item in self.pbt_data:
-                filter_dict = {"id": str(item['id'])}
-                docs = self.vector_store.similarity_search("", k=1, filter=filter_dict)
+                    self.nx_graph.nodes[subject_str][predicate_str].append(value)
+            else:
+                # Add the object as a node if it doesn't exist
+                if object_str not in self.nx_graph:
+                    self.nx_graph.add_node(object_str)
                 
-                if docs:
-                    synonym_count = docs[0].metadata.get('synonym_count', 0)
-                    if synonym_count > 0:
-                        has_synonyms_count += 1
-                        total_synonyms += synonym_count
-            
-            # Calculate average synonyms per PBT
-            avg_synonyms = total_synonyms / max(1, total_count)
-            
-            # Get top CDM categories
-            top_cdm = sorted(
-                [{"category": k, "count": v} for k, v in cdm_categories.items()],
-                key=lambda x: x["count"],
-                reverse=True
-            )[:5]
-            
-            return PBTStatistics(
-                total_pbt_count=total_count,
-                indexed_count=indexed_count,
-                cdm_categories=cdm_categories,
-                has_synonyms_count=has_synonyms_count,
-                average_synonyms_per_pbt=avg_synonyms,
-                top_cdm_categories=top_cdm
-            )
+                # Add an edge from subject to object
+                self.nx_graph.add_edge(subject_str, object_str, relation=predicate_str)
         
-        except Exception as e:
-            logger.error(f"Error getting statistics: {e}")
-            return PBTStatistics(
-                total_pbt_count=0,
-                indexed_count=0,
-                cdm_categories={},
-                has_synonyms_count=0,
-                average_synonyms_per_pbt=0,
-                top_cdm_categories=[]
-            )
-
-
-# Get the PBT manager instance
-def get_pbt_manager() -> PBTManager:
-    """
-    Get the PBT manager instance.
+        logger.info(f"Created NetworkX graph with {len(self.nx_graph.nodes)} nodes and {len(self.nx_graph.edges)} edges")
+        
+        return self.rdf_graph, self.nx_graph
     
-    Returns:
-        PBTManager: PBT manager instance
+    def get_ontology_schema(self):
+        """Extract and return the schema of the ontology in a structured format"""
+        schema = {
+            "classes": [],
+            "properties": [],
+            "class_hierarchy": {},
+            "property_domains_ranges": {}
+        }
+        
+        # Get classes
+        for cls in self.rdf_graph.subjects(RDF.type, RDFS.Class):
+            class_info = {
+                "uri": str(cls),
+                "label": str(self.rdf_graph.value(cls, RDFS.label)) if self.rdf_graph.value(cls, RDFS.label) else self._get_name_from_uri(str(cls)),
+                "comment": str(self.rdf_graph.value(cls, RDFS.comment)) if self.rdf_graph.value(cls, RDFS.comment) else ""
+            }
+            schema["classes"].append(class_info)
+            
+            # Get subclass relationships
+            subclasses = list(self.rdf_graph.subjects(RDFS.subClassOf, cls))
+            if subclasses:
+                schema["class_hierarchy"][str(cls)] = [str(sc) for sc in subclasses]
+        
+        # Get properties
+        for prop in self.rdf_graph.subjects(RDF.type, RDF.Property):
+            prop_info = {
+                "uri": str(prop),
+                "label": str(self.rdf_graph.value(prop, RDFS.label)) if self.rdf_graph.value(prop, RDFS.label) else self._get_name_from_uri(str(prop)),
+                "comment": str(self.rdf_graph.value(prop, RDFS.comment)) if self.rdf_graph.value(prop, RDFS.comment) else ""
+            }
+            schema["properties"].append(prop_info)
+            
+            # Get domain and range
+            domain = self.rdf_graph.value(prop, RDFS.domain)
+            range_ = self.rdf_graph.value(prop, RDFS.range)
+            
+            if domain or range_:
+                schema["property_domains_ranges"][str(prop)] = {
+                    "domain": str(domain) if domain else None,
+                    "range": str(range_) if range_ else None
+                }
+                
+        return schema
+    
+    def get_ontology_as_text(self):
+        """Convert the ontology schema to a human-readable text description"""
+        schema = self.get_ontology_schema()
+        text = "ONTOLOGY SCHEMA:\n\n"
+        
+        # Classes
+        text += "CLASSES:\n"
+        for cls in schema["classes"]:
+            text += f"- Class: {cls['label']} ({cls['uri']})\n"
+            if cls['comment']:
+                text += f"  Description: {cls['comment']}\n"
+        
+        # Properties
+        text += "\nPROPERTIES:\n"
+        for prop in schema["properties"]:
+            text += f"- Property: {prop['label']} ({prop['uri']})\n"
+            if prop['comment']:
+                text += f"  Description: {prop['comment']}\n"
+            
+            # Add domain and range information
+            if prop['uri'] in schema["property_domains_ranges"]:
+                domain_range = schema["property_domains_ranges"][prop['uri']]
+                if domain_range['domain']:
+                    domain_name = self._get_name_from_uri(domain_range['domain'])
+                    text += f"  Domain: {domain_name}\n"
+                if domain_range['range']:
+                    range_name = self._get_name_from_uri(domain_range['range'])
+                    text += f"  Range: {range_name}\n"
+        
+        # Class hierarchy
+        if schema["class_hierarchy"]:
+            text += "\nCLASS HIERARCHY:\n"
+            for parent, children in schema["class_hierarchy"].items():
+                parent_name = self._get_name_from_uri(parent)
+                text += f"- {parent_name} has subclasses:\n"
+                for child in children:
+                    child_name = self._get_name_from_uri(child)
+                    text += f"  - {child_name}\n"
+        
+        return text
+    
+    def _get_name_from_uri(self, uri):
+        """Extract a readable name from a URI"""
+        # Try to use namespace prefixes
+        for prefix, namespace in self.namespaces.items():
+            if uri.startswith(namespace):
+                return f"{prefix}:{uri[len(namespace):]}"
+        
+        # If URI can't be simplified, extract the last part after the last slash or hash
+        if '#' in uri:
+            return uri.split('#')[-1]
+        elif '/' in uri:
+            return uri.split('/')[-1]
+        
+        return uri
+    
+    def to_documents(self):
+        """Convert RDF triples to LangChain Document objects for vector storage"""
+        documents = []
+        
+        # Convert each triple to a document
+        for s, p, o in self.rdf_graph:
+            subject_str = str(s)
+            predicate_str = str(p)
+            object_str = str(o)
+            
+            # Create a human-readable representation of the triple
+            if isinstance(o, Literal):
+                content = f"The {self._get_name_from_uri(subject_str)} has {self._get_name_from_uri(predicate_str)} with value {object_str}"
+                triple_type = "literal"
+            else:
+                content = f"The {self._get_name_from_uri(subject_str)} has relationship {self._get_name_from_uri(predicate_str)} with {self._get_name_from_uri(object_str)}"
+                triple_type = "uri"
+            
+            # Create metadata
+            metadata = {
+                "subject": subject_str,
+                "predicate": predicate_str,
+                "object": object_str,
+                "triple_type": triple_type
+            }
+            
+            doc = Document(page_content=content, metadata=metadata)
+            documents.append(doc)
+        
+        logger.info(f"Created {len(documents)} documents from RDF triples")
+        return documents
+
+class SPARQLOutputParser(BaseModel):
+    query: str = Field(description="The generated SPARQL query")
+    
+    @classmethod
+    def from_llm_output(cls, output: str):
+        # Extract SPARQL query from LLM output
+        query_parts = []
+        in_query = False
+        
+        for line in output.split("\n"):
+            if line.strip().lower() == "sparql query:" or line.strip() == "```sparql":
+                in_query = True
+                continue
+            elif line.strip() == "```" and in_query:
+                in_query = False
+                continue
+            
+            if in_query:
+                query_parts.append(line)
+        
+        query = "\n".join(query_parts).strip()
+        
+        # If no query was found, use the whole output
+        if not query:
+            query = output.strip()
+        
+        return cls(query=query)
+
+class GraphState(TypedDict):
+    query: str
+    schema: str
+    sparql_query: Optional[str]
+    sparql_results: Optional[List[Dict[str, Any]]]
+    answer: Optional[str]
+    error: Optional[str]
+    chat_history: List[Dict[str, str]]
+
+class AzureGraphRAGSystem:
     """
-    return PBTManager()
+    A GraphRAG system that uses TTL ontologies and Azure OpenAI 
+    to create a chat interface with SPARQL query generation.
+    """
+    
+    def __init__(
+        self,
+        ttl_file_path: str,
+        config_file: str = CONFIG_PATH,
+        creds_file: str = CREDS_PATH,
+        cert_file: str = CERT_PATH,
+        persistence_dir: str = "./graph_db",
+        embedding_model_name: str = "text-embedding-3-large",
+        llm_model_name: str = "gpt-4o-mini",
+        temperature: float = 0.7
+    ):
+        """
+        Initialize the GraphRAG system with Azure credentials.
+        
+        Args:
+            ttl_file_path: Path to the TTL ontology file
+            config_file: Path to config file for Azure
+            creds_file: Path to credentials file for Azure
+            cert_file: Path to certificate file for Azure
+            persistence_dir: Directory to persist ChromaDB
+            embedding_model_name: Name of the embedding model to use
+            llm_model_name: Name of the LLM model to use
+            temperature: Temperature for the LLM
+        """
+        self.ttl_file_path = ttl_file_path
+        self.config_file = config_file
+        self.creds_file = creds_file
+        self.cert_file = cert_file
+        self.persistence_dir = persistence_dir
+        self.embedding_model_name = embedding_model_name
+        self.llm_model_name = llm_model_name
+        self.temperature = temperature
+        
+        # Initialize components
+        self.env = OSEnv(config_file, creds_file, cert_file)
+        self.parser = None
+        self.rdf_graph = None
+        self.nx_graph = None
+        self.langchain_rdf_graph = None
+        self.vector_store = None
+        self.embeddings = None
+        self.llm = None
+        self.workflow = None
+        self.chat_history = []
+        
+        # Initialize the system
+        self._init_system()
+    
+    def _init_system(self):
+        """Initialize all components of the GraphRAG system"""
+        logger.info("Initializing GraphRAG system...")
+        
+        # Set up Azure embeddings
+        self.embeddings = self._setup_azure_embeddings()
+        
+        # Set up Azure LLM
+        self.llm = self._setup_azure_llm()
+        
+        # Parse TTL file
+        self._parse_ttl_file()
+        
+        # Create vector store
+        self._create_vector_store()
+        
+        # Create LangGraph workflow
+        self._create_workflow()
+        
+        logger.info("GraphRAG system initialized")
+    
+    def _setup_azure_embeddings(self):
+        """Set up Azure OpenAI embeddings"""
+        token_provider = get_bearer_token_provider(
+            self.env.credential,
+            "https://cognitiveservices.azure.com/.default"
+        )
+        
+        return AzureOpenAIEmbeddings(
+            azure_deployment=self.embedding_model_name,
+            api_version=self.env.get("API_VERSION", "2023-05-15"),
+            azure_endpoint=self.env.get("AZURE_ENDPOINT", ""),
+            azure_ad_token_provider=token_provider
+        )
+    
+    def _setup_azure_llm(self):
+        """Set up Azure OpenAI LLM"""
+        token_provider = get_bearer_token_provider(
+            self.env.credential,
+            "https://cognitiveservices.azure.com/.default"
+        )
+        
+        return AzureChatOpenAI(
+            azure_deployment=self.llm_model_name,
+            temperature=self.temperature,
+            max_tokens=800,
+            api_version=self.env.get("API_VERSION", "2023-05-15"),
+            azure_endpoint=self.env.get("AZURE_ENDPOINT", ""),
+            azure_ad_token_provider=token_provider
+        )
+    
+    def _parse_ttl_file(self):
+        """Parse the TTL file and create graphs"""
+        logger.info(f"Parsing TTL file: {self.ttl_file_path}")
+        
+        # Create TTL parser
+        self.parser = TTLParser(self.ttl_file_path)
+        
+        # Parse the file
+        self.rdf_graph, self.nx_graph = self.parser.parse()
+        
+        # Create RdfGraph for LangChain
+        self.langchain_rdf_graph = RdfGraph(
+            source_file=self.ttl_file_path,
+            serialization="ttl",
+            local_copy="local_graph.ttl"
+        )
+        
+        logger.info("TTL file parsed successfully")
+    
+    def _create_vector_store(self):
+        """Create a vector store from the graph documents"""
+        logger.info("Creating vector store...")
+        
+        # Get documents from the parser
+        documents = self.parser.to_documents()
+        
+        # Create vector store
+        self.vector_store = Chroma.from_documents(
+            documents=documents,
+            embedding=self.embeddings,
+            persist_directory=self.persistence_dir,
+            collection_name="ttl_graph"
+        )
+        
+        logger.info(f"Created vector store with {len(documents)} documents")
+    
+    def _create_workflow(self):
+        """Create LangGraph workflow for processing queries"""
+        logger.info("Creating LangGraph workflow...")
+        
+        # Step 1: Generate SPARQL from user query and schema
+        def generate_sparql(state: GraphState) -> GraphState:
+            try:
+                query = state["query"]
+                schema = state["schema"]
+                
+                # Create a prompt for SPARQL generation
+                sparql_prompt = ChatPromptTemplate.from_messages([
+                    SystemMessage(content=f"""You are an expert in RDF and SPARQL who can convert natural language questions into SPARQL queries.
+Based on the provided ontology schema, generate a valid SPARQL query to answer the user's question.
+Use proper prefixes based on the namespaces in the schema.
+Keep the query focused and relevant to the question.
+Include PREFIX declarations in your query.
+If you cannot create a SPARQL query for the question, explain why.
+
+Ontology Schema:
+{schema}"""),
+                    HumanMessage(content=f"Generate a SPARQL query to answer this question: {query}")
+                ])
+                
+                # Generate SPARQL query
+                response = self.llm.invoke(sparql_prompt)
+                
+                # Parse the response to extract SPARQL query
+                parser = SPARQLOutputParser.from_llm_output(response.content)
+                sparql_query = parser.query
+                
+                return {**state, "sparql_query": sparql_query}
+            except Exception as e:
+                logger.error(f"Error generating SPARQL: {e}")
+                return {**state, "error": f"Failed to generate SPARQL query: {str(e)}"}
+        
+        # Step 2: Execute SPARQL query
+        def execute_sparql(state: GraphState) -> GraphState:
+            try:
+                sparql_query = state["sparql_query"]
+                
+                if not sparql_query:
+                    return {**state, "error": "No SPARQL query to execute"}
+                
+                # Execute the query
+                results = list(self.langchain_rdf_graph.query(sparql_query))
+                
+                # Convert results to JSON-serializable format
+                formatted_results = []
+                if results:
+                    if hasattr(results, 'vars'):
+                        # SPARQL SELECT results
+                        for row in results:
+                            row_dict = {}
+                            for i, var in enumerate(results.vars):
+                                value = row[i] if i < len(row) else None
+                                row_dict[str(var)] = str(value) if value is not None else None
+                            formatted_results.append(row_dict)
+                    else:
+                        # Other query types
+                        formatted_results = [{"result": str(r)} for r in results]
+                
+                return {**state, "sparql_results": formatted_results}
+            except Exception as e:
+                logger.error(f"Error executing SPARQL: {e}")
+                return {**state, "error": f"Failed to execute SPARQL query: {str(e)}"}
+        
+        # Step 3: Generate answer using vector store for additional context
+        def generate_answer(state: GraphState) -> GraphState:
+            try:
+                query = state["query"]
+                sparql_results = state.get("sparql_results", [])
+                error = state.get("error")
+                
+                # Get additional context from vector store
+                retriever = self.vector_store.as_retriever(
+                    search_type="mmr",
+                    search_kwargs={"k": 5}
+                )
+                
+                retrieved_docs = retriever.invoke(query)
+                retrieved_context = "\n".join([doc.page_content for doc in retrieved_docs])
+                
+                # Format SPARQL results as text
+                sparql_results_text = ""
+                if sparql_results:
+                    sparql_results_text = json.dumps(sparql_results, indent=2)
+                
+                # Create a prompt for answer generation
+                answer_prompt = ChatPromptTemplate.from_messages([
+                    SystemMessage(content=f"""You are a helpful assistant that answers questions about a knowledge graph.
+You should use both the SPARQL query results and additional context to provide a complete answer.
+If there was an error with the SPARQL query, explain what might have happened and still try to answer based on the context.
+Always provide clear, concise answers based on the data."""),
+                    HumanMessage(content=f"""Question: {query}
+
+SPARQL Query Results:
+{sparql_results_text}
+
+Additional Context:
+{retrieved_context}
+
+Error (if any):
+{error or "None"}
+
+Please provide a comprehensive answer to the question.""")
+                ])
+                
+                # Generate answer
+                response = self.llm.invoke(answer_prompt)
+                
+                return {**state, "answer": response.content}
+            except Exception as e:
+                logger.error(f"Error generating answer: {e}")
+                return {**state, "error": f"Failed to generate answer: {str(e)}"}
+                
+        # Create the workflow
+        workflow = StateGraph(GraphState)
+        
+        # Add nodes
+        workflow.add_node("generate_sparql", generate_sparql)
+        workflow.add_node("execute_sparql", execute_sparql)
+        workflow.add_node("generate_answer", generate_answer)
+        
+        # Add edges
+        workflow.add_edge("generate_sparql", "execute_sparql")
+        workflow.add_edge("execute_sparql", "generate_answer")
+        workflow.add_edge("generate_answer", END)
+        
+        # Set entry point
+        workflow.set_entry_point("generate_sparql")
+        
+        # Compile the workflow
+        self.workflow = workflow.compile()
+        
+        logger.info("LangGraph workflow created")
+    
+    def query(self, user_query: str) -> str:
+        """
+        Process a user query and return an answer.
+        
+        Args:
+            user_query: The user's question
+            
+        Returns:
+            str: The answer to the question
+        """
+        # Record the question in chat history
+        self.chat_history.append({"role": "user", "content": user_query})
+        
+        try:
+            # Get the ontology schema as text
+            schema = self.parser.get_ontology_as_text()
+            
+            # Initialize the state
+            initial_state = {
+                "query": user_query,
+                "schema": schema,
+                "sparql_query": None,
+                "sparql_results": None,
+                "answer": None,
+                "error": None,
+                "chat_history": self.chat_history
+            }
+            
+            # Run the workflow
+            final_state = self.workflow.invoke(initial_state)
+            
+            # Get the answer
+            answer = final_state.get("answer", "Sorry, I couldn't process your query.")
+            
+            # Add the answer to chat history
+            self.chat_history.append({"role": "assistant", "content": answer})
+            
+            return answer
+        except Exception as e:
+            logger.error(f"Error processing query: {e}")
+            error_msg = f"Sorry, I encountered an error: {str(e)}"
+            
+            # Record the error in chat history
+            self.chat_history.append({"role": "assistant", "content": error_msg})
+            
+            return error_msg
+    
+    def get_debug_info(self, user_query: str) -> Dict[str, Any]:
+        """
+        Get debug information for a query.
+        
+        Args:
+            user_query: The user's question
+            
+        Returns:
+            Dict: Debug information
+        """
+        try:
+            # Get the ontology schema as text
+            schema = self.parser.get_ontology_as_text()
+            
+            # Initialize the state
+            initial_state = {
+                "query": user_query,
+                "schema": schema,
+                "sparql_query": None,
+                "sparql_results": None,
+                "answer": None,
+                "error": None,
+                "chat_history": self.chat_history
+            }
+            
+            # Run the workflow
+            final_state = self.workflow.invoke(initial_state)
+            
+            # Return the final state
+            return {
+                "query": user_query,
+                "sparql_query": final_state.get("sparql_query"),
+                "sparql_results": final_state.get("sparql_results"),
+                "answer": final_state.get("answer"),
+                "error": final_state.get("error")
+            }
+        except Exception as e:
+            logger.error(f"Error getting debug info: {e}")
+            return {
+                "query": user_query,
+                "error": f"Failed to get debug info: {str(e)}"
+            }
+    
+    def clear_chat_history(self):
+        """Clear the chat history"""
+        self.chat_history = []
+        return "Chat history cleared."
+
+# Example usage
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Azure GraphRAG Chat Interface")
+    parser.add_argument("--ttl-file", required=True, help="Path to the TTL ontology file")
+    parser.add_argument("--config", default=CONFIG_PATH, help="Path to config file")
+    parser.add_argument("--creds", default=CREDS_PATH, help="Path to credentials file")
+    parser.add_argument("--cert", default=CERT_PATH, help="Path to certificate file")
+    parser.add_argument("--db-dir", default="./graph_db", help="Directory to persist the vector store")
+    parser.add_argument("--temperature", type=float, default=0.7, help="Temperature for the LLM")
+    
+    args = parser.parse_args()
+    
+    # Create the GraphRAG system
+    graphrag = AzureGraphRAGSystem(
+        ttl_file_path=args.ttl_file,
+        config_file=args.config,
+        creds_file=args.creds,
+        cert_file=args.cert,
+        persistence_dir=args.db_dir,
+        temperature=args.temperature
+    )
+    
+    # Start a simple command-line chat interface
+    print("Azure GraphRAG Chat Interface")
+    print("Type 'exit' to quit")
+    print("Type 'clear' to clear chat history")
+    print("Type 'debug <query>' to see debug information")
+    
+    while True:
+        user_input = input("\nYou: ")
+        
+        if user_input.lower() == 'exit':
+            print("Goodbye!")
+            break
+        elif user_input.lower() == 'clear':
+            result = graphrag.clear_chat_history()
+            print(f"System: {result}")
+        elif user_input.lower().startswith('debug '):
+            query = user_input[6:]  # Remove 'debug ' prefix
+            debug_info = graphrag.get_debug_info(query)
+            print("\nDEBUG INFORMATION:")
+            print(f"Query: {debug_info['query']}")
+            print(f"\nSPARQL Query: {debug_info.get('sparql_query', 'None')}")
+            print(f"\nSPARQL Results: {json.dumps(debug_info.get('sparql_results', []), indent=2)}")
+            print(f"\nError: {debug_info.get('error', 'None')}")
+            print(f"\nAnswer: {debug_info.get('answer', 'None')}")
+        else:
+            response = graphrag.query(user_input)
+            print(f"\nAssistant: {response}")
