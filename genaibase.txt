@@ -1,315 +1,232 @@
-"""
-Confidence evaluation service for assessing match quality between business terms and PBTs.
-"""
-
-import logging
-import json
+import os
+import sys
 import uuid
-from typing import Dict, Any, Optional, Union
+import json
+import logging
+import chardet
+import pandas as pd
+import networkx as nx
+import numpy as np
+from typing import Optional, Any, Dict, List, Union
+from pathlib import Path
+from dotenv import dotenv_values
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider, ClientSecretCredential
+from openai import AzureOpenAI
 from pydantic import BaseModel
+from langchain.chat_models import AzureChatOpenAI
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationChain, LLMChain
+from langchain.docstore import Document as LC_DOCUMENT
+from langchain.embeddings.base import Embeddings
+from langchain.vectorstores import Chroma
+from langchain.prompts import PromptTemplate
+from chromadb.config import Settings
+from chromadb.utils import embedding_functions
+from collections import namedtuple
+import re
+from pydantic import BaseModel, ValidationError, field_validator
 
-from langchain_openai import AzureChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.messages import SystemMessage, HumanMessage
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.checkpoint.base import empty_checkpoint
-
-from app.config.settings import get_settings
-from app.config.environment import get_os_env
-from app.core.auth.auth_helper import get_azure_token_cached
-from app.core.models.pbt import ConfidenceScore, MatchedPBT
-
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-class ConfidenceService:
-    """Service for evaluating confidence of matches between business terms and PBTs."""
+ENV_DIR = "env"
+CONFIG_PATH = f"{ENV_DIR}/config.env"
+CREDS_PATH = f"{ENV_DIR}/credentials.env"
+CERT_PATH = f"{ENV_DIR}/cacert.pem"
+
+Triple = namedtuple("Triple", ["subject", "predicate", "object"])
+
+## utility functions
+def is_file_readable(filepath: str)->bool:
+    """Check if a file is readable."""
+    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
+        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
+    return True
+
+def str_to_bool(s: str)->bool:
+    """Convert a string to a boolean."""
+    if s== 'True':
+        return True
+    elif s== 'False':
+        return False
+    else:
+        raise ValueError(f"Invalid boolean value: {s}")
+
+## OSEnv class
+
+class OSEnv:
+    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
+        self.var_list = []
+        self.bulk_set(config_file, True)
+        self.bulk_set(creds_file, False)
+        self.set_certificate_path(certificate_path)
+        if str_to_bool(self.get("PROXY_ENABLED", "False")):
+            self.set_proxy()
+        
+        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
+            self.token = self.get_azure_token()
+        else:
+            self.token = None
+        
+    def _get_credential(self):
+        if str_to_bool(self.get("USE_MANAGED_IDENTITY", "False")):
+            return DefaultAzureCredential()
+        else:
+            return ClientSecretCredential(tenant_id=self.get("AZURE_TENANT_ID"), client_id=self.get("AZURE_CLIENT_ID"), client_secret=self.get("AZURE_CLIENT_SECRET"))
     
-    _instance = None
-    
-    def __new__(cls):
-        """Implement singleton pattern."""
-        if cls._instance is None:
-            cls._instance = super(ConfidenceService, cls).__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
-    
-    def __init__(self):
-        """Initialize the confidence service."""
-        if self._initialized:
-            return
-            
-        self._initialized = True
-        self.settings = get_settings()
-        self.env = get_os_env()
-        
-        # LLM for confidence evaluation
-        self.llm = self._init_llm()
-        
-        # Chain for confidence evaluation
-        self.chain = self._create_confidence_chain()
-        
-        # Memory for caching confidence evaluations
-        self.memory_saver = MemorySaver()
-        
-        # In-memory cache for fast lookups
-        self.cache = {}
-        
-        logger.info("Confidence service initialized")
-    
-    def _init_llm(self) -> AzureChatOpenAI:
-        """Initialize the LLM for confidence evaluation."""
+    def set_certificate_path(self, path: str):
         try:
-            # Get Azure token
-            token = get_azure_token_cached(
-                tenant_id=self.settings.azure.tenant_id,
-                client_id=self.settings.azure.client_id,
-                client_secret=self.settings.azure.client_secret,
-                scope="https://cognitiveservices.azure.com/.default"
-            )
+            if not os.path.isabs(path):
+                path = os.path.abspath(path)
+            if not is_file_readable(path):
+                raise FileNotFoundError(f"The file '{path}' does not exist or is not readable")
             
-            if not token:
-                logger.error("Failed to get Azure token for confidence service")
-                raise ValueError("Failed to get Azure token")
-            
-            # Create token provider function
-            token_provider = lambda: get_azure_token_cached(
-                tenant_id=self.settings.azure.tenant_id,
-                client_id=self.settings.azure.client_id,
-                client_secret=self.settings.azure.client_secret,
-                scope="https://cognitiveservices.azure.com/.default"
-            ) or token
-            
-            # Initialize Azure OpenAI client for LLM
-            llm = AzureChatOpenAI(
-                model_name=self.settings.azure.openai_model_name,  # Use the renamed field
-                temperature=0.2,  # Lower temperature for more consistent confidence scores
-                api_version=self.settings.azure.api_version,
-                azure_endpoint=self.settings.azure.azure_endpoint,
-                azure_ad_token_provider=token_provider
-            )
-            
-            return llm
-        
+            self.set("REQUESTS_CA_BUNDLE", path)
+            self.set("SSL_CERT_FILE", path)
+            self.set("CURL_CA_BUNDLE", path)
         except Exception as e:
-            logger.error(f"Error initializing LLM for confidence evaluation: {e}")
+            logger.error(f"Error setting certificate path: {e}")
             raise
     
-    def _create_confidence_chain(self):
-        """Create the confidence evaluation chain."""
-        # Define prompt for confidence evaluation
-        prompt = ChatPromptTemplate.from_messages([
-            SystemMessage(content="""
-            You are an expert system that evaluates the confidence of matches between user-provided terms and standard
-            Preferred Business Terms (PBT). Analyze the semantic similarity, contextual relevance, and overall 
-            appropriateness of the match.
-            
-            Provide a confidence score between 0 and 100, where:
-            - 0-20: Very low confidence. The match seems arbitrary or incorrect.
-            - 21-40: Low confidence. There's a vague relationship but likely not the best match.
-            - 41-60: Moderate confidence. There's a reasonable connection but potentially better alternatives.
-            - 61-80: High confidence. The match is strong and likely appropriate.
-            - 81-100: Very high confidence. The match is excellent and almost certainly correct.
-            
-            Return your evaluation as a JSON object with the following fields:
-            - score: (number between 0-100)
-            - explanation: (string explaining your reasoning)
-            """),
-            HumanMessage(content="""
-            User Input: {user_input}
-            
-            Matched PBT: 
-            ID: {pbt_id}
-            Name: {pbt_name}
-            Definition: {pbt_definition}
-            CDM: {pbt_cdm}
-            
-            Additional Information:
-            - Match Type: {match_type}
-            - Was matched via synonym: {synonym_match}
-            
-            Evaluate the confidence of this match.
-            """)
-        ])
-        
-        # Create the chain
-        return prompt | self.llm
-    
-    def _get_memory_key(self, user_input: str, pbt_id: str) -> str:
-        """Generate a consistent memory key for retrieving past evaluations."""
-        return f"confidence:{user_input.strip().lower()}:{pbt_id}"
-    
-    async def evaluate_confidence(self, user_input: str, 
-                                 pbt_match: Union[Dict[str, Any], MatchedPBT]) -> ConfidenceScore:
-        """
-        Evaluate the confidence of a match between user input and a PBT.
-        
-        Args:
-            user_input: User input (name and description)
-            pbt_match: Matched PBT (either a dict or MatchedPBT object)
-            
-        Returns:
-            ConfidenceScore with score and explanation
-        """
+    def bulk_set(self, dotenvfile: str, print_val: bool = False)->None:
         try:
-            # Use the original field names for PBT match
-            pbt_id = None
-            pbt_name = None
-            pbt_definition = None
-            
-            # Extract fields from input based on its type
-            if isinstance(pbt_match, MatchedPBT):
-                pbt_id = pbt_match.id
-                pbt_name = pbt_match.name  # Uses the property to get PBT_NAME
-                pbt_definition = pbt_match.definition  # Uses the property to get PBT_DEFINITION
-            elif isinstance(pbt_match, dict):
-                pbt_id = pbt_match.get("id")
-                # Try both field naming conventions
-                pbt_name = pbt_match.get("PBT_NAME", pbt_match.get("name"))
-                pbt_definition = pbt_match.get("PBT_DEFINITION", pbt_match.get("definition"))
-            else:
-                logger.error(f"Invalid PBT match type: {type(pbt_match)}")
-                return ConfidenceScore(
-                    score=50,
-                    explanation=f"Error: Invalid PBT match type: {type(pbt_match)}"
-                )
-            
-            # Validate required fields
-            if not pbt_id or not pbt_name or not pbt_definition:
-                logger.error(f"Missing required fields in PBT match: {pbt_match}")
-                return ConfidenceScore(
-                    score=50,
-                    explanation="Error: Missing required fields in PBT match"
-                )
-            
-            # Generate a memory key for this evaluation
-            memory_key = self._get_memory_key(user_input, str(pbt_id))
-            
-            # Check in-memory cache first
-            if memory_key in self.cache:
-                logger.info(f"Found cached confidence evaluation in memory: {memory_key}")
-                return self.cache[memory_key]
-            
-            # Create a session ID for memory storage
-            session_id = "confidence_evaluations"
-            
-            # Create a proper config object with thread_id and checkpoint_ns
-            config = {
-                "configurable": {
-                    "thread_id": session_id,
-                    "checkpoint_ns": ""
-                }
-            }
-            
-            # Try to get from persistent memory
-            try:
-                checkpoint = self.memory_saver.get(config)
-                
-                if checkpoint and memory_key in checkpoint.get("channel_values", {}):
-                    cached_result = checkpoint["channel_values"][memory_key]
-                    logger.info(f"Found cached confidence evaluation in persistent memory: {memory_key}")
-                    
-                    # Parse the cached result
-                    score = cached_result.get("score", 0)
-                    explanation = cached_result.get("explanation", "")
-                    
-                    # Create ConfidenceScore and cache it
-                    confidence_score = ConfidenceScore(score=score, explanation=explanation)
-                    self.cache[memory_key] = confidence_score
-                    
-                    return confidence_score
-            except Exception as mem_error:
-                logger.warning(f"Error retrieving from memory: {mem_error}")
-            
-            # Call the LLM chain for confidence evaluation
-            llm_response = await self.chain.ainvoke({
-                "user_input": user_input,
-                "pbt_id": pbt_id,
-                "pbt_name": pbt_name,
-                "pbt_definition": pbt_definition
-            })
-            
-            # Extract JSON data from the response
-            content = llm_response.content
-            
-            # Parse the JSON response
-            try:
-                # Try direct JSON parsing first
-                result = json.loads(content)
-            except json.JSONDecodeError:
-                # If that fails, try to extract JSON using regex
-                import re
-                json_pattern = r'\{.*\}'
-                match = re.search(json_pattern, content, re.DOTALL)
-                
-                if match:
-                    try:
-                        result = json.loads(match.group(0))
-                    except json.JSONDecodeError:
-                        # If regex extraction fails, create a default result
-                        result = {
-                            "score": 50,
-                            "explanation": "Could not parse confidence score from LLM output. Using default medium confidence."
-                        }
-                else:
-                    # If no JSON-like structure found, create a default result
-                    result = {
-                        "score": 50,
-                        "explanation": "Could not parse confidence score from LLM output. Using default medium confidence."
-                    }
-            
-            # Ensure the result has the expected fields
-            score = result.get("score", result.get("confidence_score", 50))
-            if isinstance(score, str):
-                try:
-                    score = int(score)
-                except ValueError:
-                    score = 50
-            
-            explanation = result.get("explanation", "No explanation provided")
-            
-            # Create a ConfidenceScore object
-            confidence_score = ConfidenceScore(score=score, explanation=explanation)
-            
-            # Save to memory
-            try:
-                # Create or update the checkpoint
-                checkpoint = self.memory_saver.get(config) or empty_checkpoint()
-                checkpoint["channel_values"][memory_key] = {
-                    "score": score,
-                    "explanation": explanation
-                }
-                
-                # Use the put method with the correct signature
-                self.memory_saver.put(
-                    config=config,
-                    checkpoint=checkpoint,
-                    metadata={"source": "input", "step": -1},
-                    new_versions={}
-                )
-                
-                logger.info(f"Saved confidence evaluation to memory: {memory_key}")
-            except Exception as mem_error:
-                logger.warning(f"Error saving to memory: {mem_error}")
-            
-            # Cache the result in memory
-            self.cache[memory_key] = confidence_score
-            
-            return confidence_score
-            
+            if not os.path.isabs(dotenvfile):
+                dotenvfile = os.path.abspath(dotenvfile)
+            if not is_file_readable(dotenvfile):
+                temp_dict = dotenv_values(dotenvfile)
+                for key, value in temp_dict.items():
+                    self.set(key, value, print_val)
+                del temp_dict
         except Exception as e:
-            logger.error(f"Error in confidence evaluation: {e}")
-            return ConfidenceScore(
-                score=50,
-                explanation=f"Error evaluating confidence: {str(e)}"
-            )
-
-
-# Get the confidence service instance
-def get_confidence_service() -> ConfidenceService:
-    """
-    Get the confidence service instance.
+            logger.error(f"Error loading environment variables from {dotenvfile}: {e}")
+            raise
     
-    Returns:
-        ConfidenceService: Confidence service instance
-    """
-    return ConfidenceService()
+    def set(self, key: str, value: str, print_val: bool = False)->None:
+        try:
+            os.environ[key] = value
+            if var_name not in self.var_list:
+                self.var_list.append(var_name)
+            if print_val:
+                logger.info(f"{key}: {value}")
+        except Exception as e:
+            logger.error(f"Error setting environment variable {key}: {e}")
+            raise
+    
+    def get(self, key: str, default: Optional[str] = None)->str:
+        try:
+            return os.environ.get(key, default)
+        except Exception as e:
+            logger.error(f"Error getting environment variable {key}: {e}")
+            raise
+    
+    def set_proxy(self) -> None:
+        try:
+            ad_username = self.get("AD_USERNAME")
+            ad_password = self.get("AD_USER_PW")
+            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
+            if not all([ad_username, ad_password, proxy_domain]):
+                raise ValueError("Proxy settings are incomplete")
+            proxy_url = f"https://{ad_username}:{ad_password}@{proxy_domain}"
+            self.set("HTTP_PROXY", proxy_url, print_val=False)
+            self.set("HTTPS_PROXY", proxy_url, print_val=False)
+            no_proxy_domains = [
+                'cognitiveservices.azure.com',
+                'search.windows.net',
+                'openai.azure.com',
+                'core.windows.net',
+                'azurewebsites.net'
+            ]
+            self.set("NO_PROXY", ",".join(no_proxy_domains), print_val=False)
+        except Exception as e:
+            logger.error(f"Error setting proxy: {e}")
+            raise
+    
+    def get_azure_token(self) -> str:
+        try:
+            credential = ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID"),
+                client_id=self.get("AZURE_CLIENT_ID"),
+                client_secret=self.get("AZURE_CLIENT_SECRET")
+            )
+            token = credential.get_token("https://cognitiveservices.azure.com/.default")
+            self.set("AZURE_TOKEN", token.token, print_val=False)
+            logger.info("Azure token set")
+            return token.token
+        except Exception as e:
+            logger.error(f"Error retrieving Azure token: {e}")
+            return None
+    
+    def list_env_vars(self)->None:
+        for var in self.var_list:
+            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET'}:
+                logger.info(f"{var}: [REDACTED]")
+            else:
+                logger.info(f"{var}: {os.getenv(var)}")
+
+
+## embedding class + Document class
+
+class MyDocument(BaseModel):
+    id: str = ""
+    text: str = ""
+    embedding: List[float] = []
+    metadata: Dict[str, Any] = {}
+
+class EmbeddingClient:
+    def __init__(self, azure_api_version: str = "2023-05-15", embeddings_model: str = "text-embedding-3-large"):
+        self.azure_api_version = azure_api_version
+        self.embeddings_model = embeddings_model
+        self.direct_azure_client = self._get_direct_azure_client()
+    
+    def _get_direct_azure_client(self):
+        token_provider = get_bearer_token_provider(
+            DefaultAzureCredential(),
+            "https://cognitiveservices.azure.com/.default"
+        )
+        return AzureOpenAI(token_provider, self.azure_api_version)
+    
+    def generate_embeddings(self, doc: MyDocument)->MyDocument:
+        try:
+            response = self.direct_azure_client.embeddings.create(
+                model=self.embeddings_model,
+                input=doc.text
+            ).data[0].embedding
+            doc.embedding = response
+            return doc
+        except Exception as e:
+            logger.error(f"Error generating embeddings: {e}")
+            return doc
+
+## LangChain components
+## AzureChatbot components
+
+class AzureChatbot:
+    def __init__(self, config_file=str, creds_file=str, cert_file=str):
+        self.env = OSEnv(config_file, creds_file, cert_file)
+        self._setup_chat_model()
+        self.memory = ConversationBufferMemory()
+        self.conversation = ConversationChain(llm=self.llm, memory=self.memory, verbose=True)
+    
+    def _setup_chat_model(self):
+        try:
+            token_provider = get_bearer_token_provider(
+                self.env.credential,
+                "https://cognitiveservices.azure.com/.default"
+            )
+            model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
+            temperature = float(self.env.get("TEMPERATURE", "0.7"))
+            max_tokens = int(self.env.get("MAX_TOKENS", "800"))
+            api_version = self.env.get("API_VERSION", "2023-05-15")
+            azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
+            azure_ad_token_provider = token_provider
+            self.llm = AzureChatOpenAI(
+                model_name=model_name,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                api_version=api_version,
+                azure_endpoint=azure_endpoint,
+                azure_ad_token_provider=azure_ad_token_provider
+            )
+        except Exception as e:
+            logger.error(f"Error setting up chatbot: {e}")
+            raise
