@@ -1,88 +1,60 @@
 """
-Classification service for mapping business terms to Preferred Business Terms (PBT).
+Embedding service for generating and managing embeddings for the AI Tagging Service.
 """
 
 import logging
 import uuid
-import json
-import asyncio
-from typing import List, Dict, Any, Optional, Tuple, Union
+from typing import List, Dict, Any, Optional, Tuple
 from pydantic import BaseModel, Field
-
-# LangChain imports
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-from langchain_core.tools import BaseTool
-from langchain_core.prompts import ChatPromptTemplate
+from azure.identity import get_bearer_token_provider
+from openai import AzureOpenAI
 from langchain_openai import AzureChatOpenAI
-
-# LangGraph imports
-from langgraph.graph import StateGraph, END
-from langgraph.graph.message import add_messages
-from langgraph.prebuilt import create_react_agent
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.checkpoint.base import empty_checkpoint
-
-# App imports
 from app.config.settings import get_settings
 from app.config.environment import get_os_env
-from app.core.services.embeddings import get_embedding_service
-from app.core.services.pbt_manager import get_pbt_manager
-from app.core.services.confidence import get_confidence_service
-from app.core.auth.auth_helper import get_azure_token_cached
-from app.core.models.pbt import (
-    PBT, MatchedPBT, MatchType, ConfidenceScore, 
-    PBTClassificationResponse
-)
+from app.core.auth.auth_helper import get_azure_token_cached, refresh_token_if_needed
 
 logger = logging.getLogger(__name__)
 
-# State type for the agent
-class AgentState(Dict[str, Any]):
-    """State dictionary for the LangGraph agent."""
-    pass
+class Document(BaseModel):
+    """Document model for embedding generation."""
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    text: str
+    embedding: List[float] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    synonyms: List[str] = Field(default_factory=list)
 
 
-class ClassificationService:
-    """Service for classifying business terms against Preferred Business Terms (PBT)."""
+class EmbeddingService:
+    """Service for generating embeddings using Azure OpenAI."""
     
     _instance = None
     
     def __new__(cls):
         """Implement singleton pattern."""
         if cls._instance is None:
-            cls._instance = super(ClassificationService, cls).__new__(cls)
+            cls._instance = super(EmbeddingService, cls).__new__(cls)
             cls._instance._initialized = False
         return cls._instance
     
     def __init__(self):
-        """Initialize the classification service."""
+        """Initialize the embedding service."""
         if self._initialized:
             return
             
         self._initialized = True
         self.settings = get_settings()
         self.env = get_os_env()
-        self.pbt_manager = get_pbt_manager()
-        self.embedding_service = get_embedding_service()
-        self.confidence_service = get_confidence_service()
         
-        # LLM for classification
+        # Initialize Azure OpenAI client for embeddings
+        self.client = self._init_client()
+        
+        # Initialize the LLM for generating synonyms
         self.llm = self._init_llm()
         
-        # Memory for caching classification results
-        self.memory_saver = MemorySaver()
-        
-        # Initialize the React agent with tools
-        self.tools = self._setup_tools()
-        self.agent = self._create_agent()
-        
-        # Request cache for avoiding duplicate classifications
-        self.request_cache = {}
-        
-        logger.info("Classification service initialized")
+        logger.info("Embedding service initialized")
     
-    def _init_llm(self) -> AzureChatOpenAI:
-        """Initialize the LLM for classification."""
+    def _init_client(self) -> AzureOpenAI:
+        """Initialize the Azure OpenAI client."""
         try:
             # Get Azure token
             token = get_azure_token_cached(
@@ -93,10 +65,46 @@ class ClassificationService:
             )
             
             if not token:
-                logger.error("Failed to get Azure token for classification service")
+                logger.error("Failed to get Azure token for embedding service")
                 raise ValueError("Failed to get Azure token")
             
-            # Create token provider function that refreshes on demand
+            # Create token provider function
+            token_provider = lambda: get_azure_token_cached(
+                tenant_id=self.settings.azure.tenant_id,
+                client_id=self.settings.azure.client_id,
+                client_secret=self.settings.azure.client_secret,
+                scope="https://cognitiveservices.azure.com/.default"
+            ) or token
+            
+            # Initialize Azure OpenAI client
+            client = AzureOpenAI(
+                azure_endpoint=self.settings.azure.azure_endpoint,
+                api_version=self.settings.azure.api_version,
+                azure_ad_token_provider=token_provider
+            )
+            
+            return client
+        
+        except Exception as e:
+            logger.error(f"Error initializing Azure OpenAI client: {e}")
+            raise
+    
+    def _init_llm(self) -> AzureChatOpenAI:
+        """Initialize the LLM for generating synonyms."""
+        try:
+            # Get Azure token
+            token = get_azure_token_cached(
+                tenant_id=self.settings.azure.tenant_id,
+                client_id=self.settings.azure.client_id,
+                client_secret=self.settings.azure.client_secret,
+                scope="https://cognitiveservices.azure.com/.default"
+            )
+            
+            if not token:
+                logger.error("Failed to get Azure token for LLM service")
+                raise ValueError("Failed to get Azure token")
+            
+            # Create token provider function that refreshes on each call
             token_provider = lambda: get_azure_token_cached(
                 tenant_id=self.settings.azure.tenant_id,
                 client_id=self.settings.azure.client_id,
@@ -107,7 +115,8 @@ class ClassificationService:
             # Initialize Azure OpenAI client for LLM
             llm = AzureChatOpenAI(
                 model_name=self.settings.azure.openai_model_name,  # Use the renamed field
-                temperature=0.3,  # Lower temperature for more consistent classifications
+                temperature=0.5,  # Good for creativity in synonyms
+                max_tokens=300,
                 api_version=self.settings.azure.api_version,
                 azure_endpoint=self.settings.azure.azure_endpoint,
                 azure_ad_token_provider=token_provider
@@ -117,819 +126,245 @@ class ClassificationService:
         
         except Exception as e:
             logger.error(f"Error initializing LLM: {e}")
-            raise
-    
-    def _setup_tools(self) -> List[BaseTool]:
-        """Set up tools for the React agent."""
-        return [PBTClassifierTool(pbt_manager=self.pbt_manager)]
-    
-    def _create_agent(self):
-        """Create the React agent with the LLM and tools."""
-        # Define custom system message
-        system_message = """
-        You are an expert business terminology standardization system. Your task is to map user-provided terms 
-        and descriptions to the organization's Preferred Business Terms (PBT).
-
-        When a user provides a name and description, use the pbt_classifier tool to find the most appropriate 
-        standard business terms from the database. 
-        
-        The tool will return both specific matches and broader category matches. Consider both types when making 
-        your recommendation. For example, "drawdown client account number" might match to both specific terms 
-        like "Account Number" and broader categories like "Account Identifier" or "Customer Account".
-        
-        Explain why the matches are appropriate, focusing on conceptual alignment rather than just keyword matching.
-        Always mention both specific and broader matches in your response when available.
-        
-        You will also see if matches are made through synonyms, which indicates that the term uses alternative
-        terminology for the same concept.
-        
-        If a term has a CDM (Conceptual Data Model) category, consider this in your matching. This is a higher-level
-        categorization of the business term.
-        
-        You also have access to memory of previous classifications. Reference past similar classifications if relevant.
-
-        If the pbt_classifier does not return any matches, explain that no matches were found and suggest that 
-        the user try different terminology or add the term to the PBT database.
-        """
-        
-        # Create the React agent with memory
-        try:
-            agent = create_react_agent(
-                self.llm,
-                self.tools,
-                prompt=system_message,
-                checkpointer=self.memory_saver
-            )
-            return agent
-        except Exception as agent_error:
-            logger.error(f"Error creating React agent: {agent_error}")
-            # Return a simpler agent with retries
-            try:
-                return create_react_agent(
-                    self.llm,
-                    self.tools,
-                    prompt=system_message
-                )
-            except Exception as fallback_error:
-                logger.error(f"Error creating fallback agent: {fallback_error}")
-                raise
-    
-    def _get_memory_key(self, name: str, description: str) -> str:
-        """Generate a consistent memory key for a classification request."""
-        name_desc = f"{name.lower().strip()}:{description.lower().strip()}"
-        return str(uuid.uuid5(uuid.NAMESPACE_DNS, name_desc))
-    
-    async def _save_to_memory(self, session_id: str, name: str, description: str, result: Dict[str, Any]):
-        """Save classification result to memory."""
-        try:
-            # Create a simplified memory entry
-            memory_entry = {
-                "input": {
-                    "name": name,
-                    "description": description,
-                },
-                "output": {
-                    "best_match": result.get("best_match", {}).get("name", ""),
-                    "best_match_id": result.get("best_match", {}).get("id", ""),
-                    "confidence": result.get("confidence", {}).get("score", 0)
-                },
-                "timestamp": str(uuid.uuid1())  # Use timestamp for ordering
-            }
-            
-            # Save to memory store
-            memory_key = self._get_memory_key(name, description)
-            namespace = f"classification:{memory_key}"
-            
-            # Create a proper config object with thread_id and checkpoint_ns
-            config = {
-                "configurable": {
-                    "thread_id": session_id,
-                    "checkpoint_ns": ""
-                }
-            }
-            
-            # Create an empty checkpoint and add our data to it
-            checkpoint = empty_checkpoint()
-            checkpoint["channel_values"][namespace] = memory_entry
-            
-            # Use the put method with the correct signature
-            self.memory_saver.put(
-                config=config,
-                checkpoint=checkpoint,
-                metadata={"source": "input", "step": -1},
-                new_versions={}
-            )
-            
-            logger.info(f"Saved classification result to memory with ID {session_id} in namespace {namespace}")
-        except Exception as e:
-            logger.error(f"Error saving to memory: {e}")
-    
-    async def _get_from_memory(self, session_id: str, name: str, description: str) -> Optional[Dict[str, Any]]:
-        """Retrieve classification from memory if it exists."""
-        try:
-            memory_key = self._get_memory_key(name, description)
-            namespace = f"classification:{memory_key}"
-            
-            # Create a proper config object with thread_id and checkpoint_ns
-            config = {
-                "configurable": {
-                    "thread_id": session_id,
-                    "checkpoint_ns": ""
-                }
-            }
-            
-            # Use the get method to retrieve the checkpoint
-            checkpoint = self.memory_saver.get(config)
-            
-            if checkpoint and namespace in checkpoint.get("channel_values", {}):
-                return checkpoint["channel_values"][namespace]
-            
-            return None
-        except Exception as e:
-            logger.error(f"Error retrieving from memory: {e}")
             return None
     
-    async def _process_agent_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        """Process the result from the agent."""
-        try:
-            # Extract the final message content
-            messages = result.get("messages", [])
-            final_message = messages[-1] if messages else None
-            
-            final_content = ""
-            if hasattr(final_message, 'content'):
-                final_content = final_message.content
-            elif isinstance(final_message, dict) and 'content' in final_message:
-                final_content = final_message['content']
-            elif final_message is not None:
-                final_content = str(final_message)
-            
-            # Extract tool results
-            best_match = None
-            specific_matches = []
-            broader_matches = []
-            
-            # Log the entire result for debugging
-            logger.debug(f"Processing agent result messages count: {len(messages)}")
-            
-            # Loop through messages to find tool results
-            for message in messages:
-                # Find the tool message with classification results
-                message_type = None
-                message_name = None
-                message_content = None
-                
-                # Extract message properties based on its structure
-                if hasattr(message, 'type'):
-                    message_type = message.type
-                elif isinstance(message, dict) and 'type' in message:
-                    message_type = message['type']
-                
-                if hasattr(message, 'name'):
-                    message_name = message.name
-                elif isinstance(message, dict) and 'name' in message:
-                    message_name = message['name']
-                elif hasattr(message, 'additional_kwargs') and message.additional_kwargs.get('name'):
-                    message_name = message.additional_kwargs.get('name')
-                
-                if hasattr(message, 'content'):
-                    message_content = message.content
-                elif isinstance(message, dict) and 'content' in message:
-                    message_content = message['content']
-                
-                # Check if this is a tool message from the pbt_classifier
-                is_tool_message = message_type == "tool"
-                is_pbt_classifier = message_name == "pbt_classifier"
-                
-                if is_tool_message and is_pbt_classifier and message_content:
-                    try:
-                        # Log the tool message content for debugging
-                        logger.debug(f"Found tool message type from PBT classifier")
-                        
-                        # Parse the JSON content
-                        if isinstance(message_content, str):
-                            try:
-                                tool_content = json.loads(message_content)
-                            except json.JSONDecodeError:
-                                # Try to extract JSON from the message
-                                import re
-                                json_pattern = r'\{.*\}'
-                                match = re.search(json_pattern, message_content, re.DOTALL)
-                                if match:
-                                    try:
-                                        tool_content = json.loads(match.group(0))
-                                    except:
-                                        logger.warning("Failed to extract JSON from tool message")
-                                        continue
-                                else:
-                                    logger.warning("No JSON-like content found in tool message")
-                                    continue
-                            
-                            if tool_content.get("status") == "success":
-                                # Use the original field names from tool content
-                                best_match = tool_content.get("best_match")
-                                specific_matches = tool_content.get("specific_matches", [])
-                                broader_matches = tool_content.get("broader_matches", [])
-                                break
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"Failed to parse tool content JSON: {e}")
-                    except Exception as e:
-                        logger.warning(f"Error processing tool message: {e}")
-            
-            # Return processed result with original field names preserved
-            return {
-                "agent_response": final_content,
-                "best_match": best_match,
-                "specific_matches": specific_matches,
-                "broader_matches": broader_matches
-            }
-            
-        except Exception as e:
-            logger.error(f"Error processing agent result: {e}")
-            return {}
-    
-    async def classify_with_llm(self, name: str, description: str, top_n: int = 5) -> Dict[str, Any]:
+    def generate_embedding(self, document: Document) -> Document:
         """
-        Classify using LLM to select the best match from embedding candidates.
+        Generate an embedding for a document.
         
         Args:
-            name: Name of the business term
-            description: Description of the business term
-            top_n: Number of results to return
+            document: Document to generate embedding for
             
         Returns:
-            Classification result
+            Document with embedding
         """
         try:
-            # First get similar items with embeddings
-            combined_input = f"{name} - {description}"
-            similar_items = await self.pbt_manager.find_similar_items(
-                combined_input, 
-                top_n=top_n * 2  # Get more candidates for the LLM to choose from
-            )
-            
-            if not similar_items:
-                logger.warning(f"No similar items found for '{name}'")
-                return {
-                    "status": "error", 
-                    "message": "No similar items found"
-                }
-            
-            # Create a prompt for the LLM
-            prompt = f"""
-            You are an expert in business terminology. You need to select the most appropriate 
-            Preferred Business Term (PBT) for the following input:
-            
-            Input Name: {name}
-            Input Description: {description}
-            
-            Here are the candidate terms:
-            
-            """
-            
-            for i, item in enumerate(similar_items):
-                prompt += f"""
-                Option {i+1}:
-                - ID: {item.id}
-                - Name: {item.PBT_NAME}
-                - Definition: {item.PBT_DEFINITION}
-                - CDM Category: {item.CDM or 'N/A'}
-                - Match Type: {item.match_type}
-                - Similarity Score: {item.similarity_score:.2f}
-                """
-                
-                if item.synonym_match:
-                    prompt += f"- Matched via synonym: {item.matched_synonym}\n"
-            
-            prompt += """
-            Select the BEST match based on conceptual alignment, not just keyword similarity.
-            Return your response in JSON format with these fields:
-            {
-              "best_match_id": "ID of the best matching PBT",
-              "explanation": "Brief explanation of why this is the best match"
-            }
-            """
-            
-            # Get the LLM's selection
-            response = self.llm.invoke(prompt)
-            response_content = response.content.strip()
-            
-            # Parse the JSON response
-            best_match_id = None
-            explanation = "The LLM did not provide a proper explanation."
-            
-            try:
-                # Try to extract JSON from the response
-                import re
-                json_pattern = r'\{.*\}'
-                match = re.search(json_pattern, response_content, re.DOTALL)
-                
-                if match:
-                    json_content = json.loads(match.group(0))
-                    best_match_id = json_content.get("best_match_id")
-                    explanation = json_content.get("explanation", explanation)
-                else:
-                    # If no JSON found, try to extract the ID directly
-                    id_pattern = r'ID: (\w+)'
-                    id_match = re.search(id_pattern, response_content)
-                    if id_match:
-                        best_match_id = id_match.group(1)
-            except Exception as e:
-                logger.warning(f"Error parsing LLM response: {e}")
-            
-            # Find the selected item
-            selected_item = next((item for item in similar_items if item.id == best_match_id), None)
-            
-            # If not found, take the first item (highest similarity)
-            if not selected_item:
-                logger.warning(f"LLM returned ID '{best_match_id}' that wasn't in candidates, using first match")
-                selected_item = similar_items[0]
-            
-            # Get confidence score for the selected item
-            confidence = await self.confidence_service.evaluate_confidence(
-                combined_input, 
-                selected_item
-            )
-            
-            # Return result
-            return {
-                "status": "success",
-                "best_match": selected_item,
-                "specific_matches": [item for item in similar_items if item.match_type == MatchType.SPECIFIC],
-                "broader_matches": [item for item in similar_items if item.match_type == MatchType.BROADER],
-                "confidence": confidence,
-                "llm_explanation": explanation
-            }
-            
-        except Exception as e:
-            logger.error(f"Error in LLM classification: {e}")
-            return {"status": "error", "message": str(e)}
-    
-    async def classify_with_embeddings(self, name: str, description: str, top_n: int = 5, 
-                                      include_broader_terms: bool = True) -> Dict[str, Any]:
-        """
-        Classify using embedding similarity only.
-        
-        Args:
-            name: Name of the business term
-            description: Description of the business term
-            top_n: Number of results to return
-            include_broader_terms: Whether to include broader terms
-            
-        Returns:
-            Classification result
-        """
-        try:
-            # Get similar items
-            combined_input = f"{name} - {description}"
-            similar_items = await self.pbt_manager.find_similar_items(
-                combined_input, 
-                top_n=top_n,
-                include_broader_terms=include_broader_terms,
-                similarity_threshold=0.2  # Lower threshold to ensure we get results
-            )
-            
-            if not similar_items:
-                logger.warning(f"No similar items found for '{name}'")
-                return {
-                    "status": "error", 
-                    "message": "No similar items found"
-                }
-            
-            # Best match is the first item (highest similarity)
-            best_match = similar_items[0]
-            
-            # Get confidence score for the best match
-            confidence = await self.confidence_service.evaluate_confidence(
-                combined_input, 
-                best_match
-            )
-            
-            # Return result
-            return {
-                "status": "success",
-                "best_match": best_match,
-                "specific_matches": [item for item in similar_items if item.match_type == MatchType.SPECIFIC],
-                "broader_matches": [item for item in similar_items if item.match_type == MatchType.BROADER],
-                "confidence": confidence
-            }
-            
-        except Exception as e:
-            logger.error(f"Error in embedding classification: {e}")
-            return {"status": "error", "message": str(e)}
-    
-    async def classify_with_agent(self, name: str, description: str) -> Dict[str, Any]:
-        """
-        Classify using the React agent with tools.
-        
-        Args:
-            name: Name of the business term
-            description: Description of the business term
-            
-        Returns:
-            Classification result
-        """
-        try:
-            # Generate a unique session ID for this classification
-            session_id = str(uuid.uuid4())
-            
-            # Check if we have a similar classification in memory
-            memory_entry = await self._get_from_memory(session_id, name, description)
-            
-            # Prepare input for the agent
-            input_message = f"""
-            Please map the following to standard Preferred Business Terms, including both specific and broader category matches:
-            
-            Name: {name}
-            Description: {description}
-            
-            Provide both specific matches and broader category matches when available.
-            """
-            
-            # If we have a memory entry, include it in the message
-            if memory_entry:
-                input_message += f"""
-                
-                I've previously classified similar input with the following result:
-                Previous Input: {memory_entry['input']['name']} - {memory_entry['input']['description']}
-                Previous Match: {memory_entry['output']['best_match']} (ID: {memory_entry['output']['best_match_id']})
-                Previous Confidence: {memory_entry['output']['confidence']}
-                """
-            
-            # Create a config for the agent
-            config = {
-                "configurable": {
-                    "thread_id": session_id,
-                    "checkpoint_ns": ""
-                }
-            }
-            
-            # Check if Azure token needs refreshing
-            token = get_azure_token_cached(
+            # Make sure we have a valid token
+            refresh_token_if_needed(
                 tenant_id=self.settings.azure.tenant_id,
                 client_id=self.settings.azure.client_id,
                 client_secret=self.settings.azure.client_secret,
-                scope="https://cognitiveservices.azure.com/.default"
+                scope="https://cognitiveservices.azure.com/.default",
+                min_validity_seconds=600  # 10 minutes
             )
             
-            if not token:
-                logger.error("Failed to get Azure token for agent classification")
-                raise ValueError("Failed to get Azure token for classification")
+            # Retry mechanism with backoff
+            max_retries = 3
+            retry_delay = 2  # seconds
             
-            # Ensure the LLM is properly initialized with the token
+            for attempt in range(max_retries):
+                try:
+                    response = self.client.embeddings.create(
+                        model=self.settings.azure.embedding_deployment_name,
+                        input=document.text,
+                        encoding_format="float"
+                    ).data[0].embedding
+                    
+                    document.embedding = response
+                    logger.debug(f"Generated embedding for document {document.id}")
+                    return document
+                except Exception as retry_error:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Embedding generation attempt {attempt+1} failed, retrying in {retry_delay} seconds: {retry_error}")
+                        import time
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                        
+                        # Re-initialize client on failure
+                        self.client = self._init_client()
+                    else:
+                        raise  # Re-raise on last attempt
+        
+        except Exception as e:
+            logger.error(f"Error generating embedding: {e}")
+            # Return document without embedding rather than failing completely
+            logger.warning(f"Returning document {document.id} without embedding")
+            return document
+    
+    def batch_generate_embeddings(self, documents: List[Document]) -> List[Document]:
+        """
+        Generate embeddings for a batch of documents.
+        
+        Args:
+            documents: Documents to generate embeddings for
+            
+        Returns:
+            Documents with embeddings
+        """
+        try:
+            # Make sure we have a valid token
+            refresh_token_if_needed(
+                tenant_id=self.settings.azure.tenant_id,
+                client_id=self.settings.azure.client_id,
+                client_secret=self.settings.azure.client_secret,
+                scope="https://cognitiveservices.azure.com/.default",
+                min_validity_seconds=600  # 10 minutes
+            )
+            
+            # Process in batches to avoid Azure API limits
+            batch_size = 16
+            processed_documents = []
+            
+            for i in range(0, len(documents), batch_size):
+                batch = documents[i:i+batch_size]
+                texts = [doc.text for doc in batch]
+                
+                max_retries = 3
+                retry_delay = 2  # seconds
+                
+                for attempt in range(max_retries):
+                    try:
+                        response = self.client.embeddings.create(
+                            model=self.settings.azure.embedding_deployment_name,
+                            input=texts,
+                            encoding_format="float"
+                        )
+                        
+                        # Update documents with embeddings
+                        for j, embedding_data in enumerate(response.data):
+                            batch[j].embedding = embedding_data.embedding
+                        
+                        break  # Success, exit retry loop
+                    except Exception as retry_error:
+                        if attempt < max_retries - 1:
+                            logger.warning(f"Batch embedding generation attempt {attempt+1} failed, retrying in {retry_delay} seconds: {retry_error}")
+                            import time
+                            time.sleep(retry_delay)
+                            retry_delay *= 2  # Exponential backoff
+                            
+                            # Re-initialize client on failure
+                            self.client = self._init_client()
+                        else:
+                            logger.error(f"Failed to generate embeddings for batch after {max_retries} attempts")
+                            # Leave embeddings empty rather than failing completely
+                
+                processed_documents.extend(batch)
+                logger.info(f"Generated embeddings for batch {i//batch_size + 1} of {(len(documents) - 1)//batch_size + 1}")
+            
+            return processed_documents
+        
+        except Exception as e:
+            logger.error(f"Error generating batch embeddings: {e}")
+            return documents  # Return documents without embeddings rather than failing
+    
+    def generate_synonyms(self, term_name: str, term_definition: str, max_synonyms: int = 10) -> List[str]:
+        """
+        Generate synonyms for a business term using the LLM.
+        
+        Args:
+            term_name: Business term name
+            term_definition: Business term definition
+            max_synonyms: Maximum number of synonyms to generate
+            
+        Returns:
+            List of synonyms
+        """
+        if not self.llm:
+            logger.warning("LLM not initialized, cannot generate synonyms")
+            return []
+        
+        try:
+            # Make sure we have a valid token
+            refresh_token_if_needed(
+                tenant_id=self.settings.azure.tenant_id,
+                client_id=self.settings.azure.client_id,
+                client_secret=self.settings.azure.client_secret,
+                scope="https://cognitiveservices.azure.com/.default",
+                min_validity_seconds=600  # 10 minutes
+            )
+            
+            # Re-initialize LLM if needed
             self.llm = self._init_llm()
             
-            # Re-initialize the agent with the refreshed LLM
-            try:
-                self.agent = self._create_agent()
-            except Exception as agent_error:
-                logger.error(f"Error re-initializing agent: {agent_error}")
-                # Continue with existing agent
+            prompt = f"""
+            Generate {max_synonyms} alternative terms, phrases or synonyms that business users might use when referring to this business term:
             
-            # Invoke the agent
-            try:
-                # Use a timeout to prevent hanging
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        self.agent.invoke,
-                        {"messages": [HumanMessage(content=input_message)]},
-                        config
-                    ),
-                    timeout=30.0  # 30 second timeout
-                )
-            except asyncio.TimeoutError:
-                logger.error("Agent classification timed out")
-                raise TimeoutError("Agent classification timed out")
-            except Exception as invoke_error:
-                logger.error(f"Error invoking agent: {invoke_error}")
-                # Fall back to embedding similarity
-                logger.warning("Falling back to embedding similarity due to agent invocation error")
-                return await self.classify_with_embeddings(name, description)
+            Term: {term_name}
+            Definition: {term_definition}
             
-            # Process the agent result
-            processed_result = await self._process_agent_result(result)
+            Provide ONLY a comma-separated list of alternative terms or phrases that a user might use when referring to this concept.
+            These should be different ways to express the same concept, including industry jargon, abbreviations, and common variations.
+            DO NOT provide explanations - ONLY the comma-separated list of terms.
+            """
             
-            if not processed_result.get("best_match"):
-                # If agent couldn't find a match, fall back to embedding similarity
-                logger.warning("Agent couldn't find a match, falling back to embedding similarity")
-                embedding_result = await self.classify_with_embeddings(name, description)
-                
-                if embedding_result.get("status") == "error":
-                    return embedding_result
-                
-                processed_result["best_match"] = embedding_result.get("best_match")
-                processed_result["specific_matches"] = embedding_result.get("specific_matches", [])
-                processed_result["broader_matches"] = embedding_result.get("broader_matches", [])
-                processed_result["agent_response"] = "The agent couldn't find a suitable match. This result is based on embedding similarity."
+            max_retries = 3
+            retry_delay = 2  # seconds
             
-            # Convert best_match to MatchedPBT if it's a dict
-            best_match = processed_result.get("best_match")
-            if best_match and isinstance(best_match, dict):
+            for attempt in range(max_retries):
                 try:
-                    # Keep original field names (PBT_NAME, PBT_DEFINITION) throughout
-                    if "PBT_NAME" in best_match and "PBT_DEFINITION" in best_match:
-                        logger.debug(f"Creating MatchedPBT with original field names: {best_match}")
-                        # Original format from the tool, use as is for confidence evaluation
-                        pass
+                    response = self.llm.invoke(prompt)
+                    
+                    # Parse the response to extract the list of synonyms
+                    synonyms_text = response.content.strip()
+                    
+                    # Split by comma and clean up each synonym
+                    synonyms = [syn.strip() for syn in synonyms_text.split(',')]
+                    
+                    # Remove duplicates and empty strings
+                    synonyms = list(set([syn for syn in synonyms if syn]))
+                    
+                    logger.info(f"Generated {len(synonyms)} synonyms for '{term_name}'")
+                    return synonyms
+                    
+                except Exception as retry_error:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Synonym generation attempt {attempt+1} failed, retrying in {retry_delay} seconds: {retry_error}")
+                        import time
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                        
+                        # Re-initialize LLM on failure
+                        self.llm = self._init_llm()
                     else:
-                        logger.warning(f"Best match missing required fields: {best_match}")
-                        # Fall back to embedding similarity
-                        combined_input = f"{name} - {description}"
-                        embedding_result = await self.classify_with_embeddings(name, description)
-                        
-                        if embedding_result.get("status") != "error":
-                            processed_result["best_match"] = embedding_result.get("best_match")
-                            processed_result["specific_matches"] = embedding_result.get("specific_matches", [])
-                            processed_result["broader_matches"] = embedding_result.get("broader_matches", [])
-                            if not processed_result.get("agent_response"):
-                                processed_result["agent_response"] = "Using embedding similarity due to missing fields in agent result."
-                        
-                except Exception as e:
-                    logger.error(f"Error processing best match: {e}")
-                    # Fall back to embedding similarity
-                    logger.warning("Falling back to embedding similarity due to error in agent result processing")
-                    
-                    combined_input = f"{name} - {description}"
-                    embedding_result = await self.classify_with_embeddings(name, description)
-                    
-                    if embedding_result.get("status") != "error":
-                        processed_result["best_match"] = embedding_result.get("best_match")
-                        processed_result["specific_matches"] = embedding_result.get("specific_matches", [])
-                        processed_result["broader_matches"] = embedding_result.get("broader_matches", [])
-                        if not processed_result.get("agent_response"):
-                            processed_result["agent_response"] = "Using embedding similarity due to error in agent result."
-            
-            # Get confidence score for the best match
-            combined_input = f"{name} - {description}"
-            confidence = await self.confidence_service.evaluate_confidence(
-                combined_input, 
-                best_match
-            )
-            
-            # Add confidence to the result
-            processed_result["confidence"] = confidence
-            
-            # Save to memory for future use
-            await self._save_to_memory(session_id, name, description, processed_result)
-            
-            # Return result with status
-            return {
-                "status": "success",
-                **processed_result
-            }
+                        logger.error(f"Failed to generate synonyms after {max_retries} attempts")
+                        return []  # Return empty list on failure
             
         except Exception as e:
-            logger.error(f"Error in agent classification: {e}")
-            # Try fallback to embedding classification
-            try:
-                logger.warning("Falling back to embedding classification after agent error")
-                return await self.classify_with_embeddings(name, description)
-            except Exception as fallback_error:
-                logger.error(f"Fallback classification also failed: {fallback_error}")
-                return {"status": "error", "message": str(e)}
+            logger.error(f"Error generating synonyms for '{term_name}': {e}")
+            return []
     
-    async def classify(self, name: str, description: str, method: str = "agent", 
-                       include_broader_terms: bool = True, top_n: int = 5) -> PBTClassificationResponse:
+    def get_langchain_compatible_embeddings(self):
         """
-        Classify a business term using the specified method.
+        Get a Langchain-compatible embeddings object for use with vector stores.
         
-        Args:
-            name: Name of the business term
-            description: Description of the business term
-            method: Classification method (embeddings, llm, agent)
-            include_broader_terms: Whether to include broader terms
-            top_n: Number of results to return
-            
         Returns:
-            Classification response
+            A Langchain-compatible embeddings object
         """
-        try:
-            # Generate a request ID
-            request_id = str(uuid.uuid4())
+        # Define a class that implements the Langchain embeddings interface
+        class AzureEmbeddings:
+            def __init__(self, service):
+                self.service = service
             
-            # Check cache if enabled
-            if self.settings.classification.cache_enabled:
-                cache_key = f"{name}:{description}:{method}"
-                if cache_key in self.request_cache:
-                    cached_result = self.request_cache[cache_key]
-                    cached_result.request_id = request_id
-                    logger.info(f"Cache hit for '{name}' (method={method})")
-                    return cached_result
+            def embed_documents(self, texts):
+                docs = [Document(id=str(i), text=text) for i, text in enumerate(texts)]
+                embedded_docs = self.service.batch_generate_embeddings(docs)
+                return [doc.embedding for doc in embedded_docs]
             
-            # Select the classification method
-            if method == "embeddings":
-                result = await self.classify_with_embeddings(
-                    name, description, top_n, include_broader_terms
-                )
-            elif method == "llm":
-                result = await self.classify_with_llm(name, description, top_n)
-            elif method == "agent":
-                result = await self.classify_with_agent(name, description)
-            else:
-                logger.error(f"Invalid classification method: {method}")
-                return PBTClassificationResponse(
-                    status="error",
-                    request_id=request_id,
-                    agent_response=f"Invalid classification method: {method}"
-                )
-            
-            # Create the response
-            response = PBTClassificationResponse(
-                status=result.get("status", "error"),
-                best_match=result.get("best_match"),
-                specific_matches=result.get("specific_matches", []),
-                broader_matches=result.get("broader_matches", []),
-                confidence=result.get("confidence"),
-                agent_response=result.get("agent_response"),
-                request_id=request_id
-            )
-            
-            # Cache the result if enabled
-            if self.settings.classification.cache_enabled:
-                cache_key = f"{name}:{description}:{method}"
-                self.request_cache[cache_key] = response
-                
-                # Prune cache if too large (simple LRU implementation)
-                if len(self.request_cache) > 1000:
-                    # Remove oldest 20% of entries
-                    remove_count = int(len(self.request_cache) * 0.2)
-                    for _ in range(remove_count):
-                        self.request_cache.pop(next(iter(self.request_cache)), None)
-            
-            return response
-            
-        except Exception as e:
-            logger.error(f"Error in classification: {e}")
-            return PBTClassificationResponse(
-                status="error",
-                request_id=str(uuid.uuid4()),
-                agent_response=f"Error: {str(e)}"
-            )
-    
-    async def batch_classify(self, items: List[Dict[str, Any]], method: str = "agent") -> List[PBTClassificationResponse]:
-        """
-        Classify multiple business terms in batch.
+            def embed_query(self, text):
+                doc = Document(id="query", text=text)
+                embedded_doc = self.service.generate_embedding(doc)
+                return embedded_doc.embedding
         
-        Args:
-            items: List of business terms (each with name and description)
-            method: Classification method (embeddings, llm, agent)
-            
-        Returns:
-            List of classification responses
-        """
-        results = []
-        
-        # Process items in parallel with a semaphore to limit concurrency
-        semaphore = asyncio.Semaphore(5)  # Limit to 5 concurrent classifications
-        
-        async def classify_with_semaphore(item):
-            async with semaphore:
-                return await self.classify(
-                    name=item.get("name", ""),
-                    description=item.get("description", ""),
-                    method=method,
-                    include_broader_terms=item.get("include_broader_terms", True),
-                    top_n=item.get("top_n", 5)
-                )
-        
-        # Create tasks
-        tasks = [classify_with_semaphore(item) for item in items]
-        
-        # Wait for all tasks to complete
-        results = await asyncio.gather(*tasks)
-        
-        return results
+        return AzureEmbeddings(self)
 
 
-class PBTClassifierTool(BaseTool):
-    """Tool for classifying business terms against PBT database."""
-    
-    name: str = "pbt_classifier"
-    description: str = "Classifies user input against PBT (Preferred Business Terms) database entries"
-    pbt_manager: Any = None
-    
-    def __init__(self, pbt_manager):
-        """Initialize the tool."""
-        super().__init__(
-            name="pbt_classifier", 
-            description="Classifies user input against PBT (Preferred Business Terms) database entries. Include parameter 'return_broader_terms=True' to get both specific and broader business terms.",
-            pbt_manager=pbt_manager
-        )
-        self.pbt_manager = pbt_manager
-    
-    async def _arun(self, name: str, description: str, return_broader_terms: bool = True) -> str:
-        """Run the tool asynchronously."""
-        try:
-            combined_input = f"{name} - {description}"
-            
-            logger.debug(f"PBTClassifierTool: Running with input: {combined_input}")
-            
-            # Try multiple similarity thresholds if needed
-            thresholds = [0.4, 0.3, 0.2, 0.1]  # Try progressively lower thresholds
-            similar_items = []
-            
-            for threshold in thresholds:
-                similar_items = await self.pbt_manager.find_similar_items(
-                    combined_input, 
-                    top_n=5, 
-                    include_broader_terms=return_broader_terms,
-                    similarity_threshold=threshold
-                )
-                
-                if similar_items:
-                    logger.info(f"Found {len(similar_items)} similar items with threshold {threshold}")
-                    break
-            
-            if not similar_items:
-                logger.warning(f"PBTClassifierTool: No similar items found for '{name}' even with lowest threshold")
-                return json.dumps({
-                    "status": "error", 
-                    "message": "No similar items found in the PBT database. Consider trying different terminology or adding this term to the database."
-                })
-            
-            # Group results by match type but keep original field names (PBT_NAME, PBT_DEFINITION)
-            specific_matches = []
-            broader_matches = []
-            
-            for item in similar_items:
-                item_dict = item.dict()  # This will keep PBT_NAME and PBT_DEFINITION
-                if item.match_type == MatchType.SPECIFIC:
-                    specific_matches.append(item_dict)
-                elif item.match_type == MatchType.BROADER:
-                    broader_matches.append(item_dict)
-            
-            # Identify items matched via synonyms
-            synonym_matches = []
-            for item in similar_items:
-                if item.synonym_match:
-                    item_dict = item.dict()
-                    synonym_matches.append(item_dict)
-            
-            # If no specific grouping, treat all as specific
-            if not specific_matches and not broader_matches:
-                specific_matches = [item.dict() for item in similar_items]
-            
-            # Format result with original field names preserved
-            result = {
-                "status": "success",
-                "best_match": similar_items[0].dict() if similar_items else None,
-                "specific_matches": specific_matches,
-                "broader_matches": broader_matches,
-                "similar_items": [item.dict() for item in similar_items]
-            }
-            
-            # Add synonym match information if available
-            if synonym_matches:
-                result["synonym_matches"] = [
-                    {
-                        "id": item.get("id", ""),
-                        "name": item.get("PBT_NAME", ""),
-                        "score": item.get("similarity_score", 0),
-                        "matched_synonym": item.get("matched_synonym", "")
-                    } for item in synonym_matches
-                ]
-            
-            # Debug log the result
-            logger.debug(f"PBTClassifierTool result structure: {list(result.keys())}")
-            
-            # Convert to JSON with error handling
-            try:
-                json_result = json.dumps(result)
-                return json_result
-            except Exception as json_error:
-                logger.error(f"Error serializing to JSON: {json_error}")
-                # Return a simplified result
-                return json.dumps({
-                    "status": "error",
-                    "message": "Error serializing result to JSON"
-                })
-                
-        except Exception as e:
-            logger.error(f"Error in PBTClassifierTool: {e}")
-            return json.dumps({
-                "status": "error",
-                "message": f"Tool error: {str(e)}"
-            })
-    
-    def _run(self, name: str, description: str, return_broader_terms: bool = True) -> str:
-        """Run the tool synchronously by wrapping the async method."""
-        import asyncio
-        
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        
-        return loop.run_until_complete(self._arun(name, description, return_broader_terms))
-
-
-# Get the classification service instance
-def get_classification_service() -> ClassificationService:
+# Get the embedding service instance
+def get_embedding_service(force_refresh: bool = False) -> EmbeddingService:
     """
-    Get the classification service instance.
+    Get the embedding service instance.
+    
+    Args:
+        force_refresh: Force refresh of tokens and service initialization
     
     Returns:
-        ClassificationService: Classification service instance
+        EmbeddingService: Embedding service instance
     """
-    return ClassificationService()
+    instance = EmbeddingService()
+    
+    if force_refresh:
+        # Reinitialize the clients with fresh tokens
+        instance._initialized = False
+        instance.__init__()
+        logger.info("Embedding service reinitialized with fresh tokens")
+    
+    return instance
