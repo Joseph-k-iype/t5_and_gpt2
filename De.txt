@@ -1,481 +1,412 @@
 """
-API endpoints for business term classification.
+Confidence evaluation service for assessing match quality between business terms and PBTs.
 """
 
 import logging
-from typing import List, Dict, Any, Optional, Set
+import json
+import uuid
+import asyncio
+import time
+from typing import Dict, Any, Optional, Union
+from pydantic import BaseModel
 
-from fastapi import APIRouter, Depends, HTTPException, status, Query, Body
-from starlette.concurrency import run_in_threadpool
+from langchain_openai import AzureChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import SystemMessage, HumanMessage
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.base import empty_checkpoint
 
 from app.config.settings import get_settings
-from app.api.deps import (
-    get_api_key, 
-    get_request_id, 
-    get_classification_service_dep,
-    get_pbt_manager_dep,
-    check_rate_limit
-)
-from app.core.services.classification import ClassificationService
-from app.core.services.pbt_manager import PBTManager
-from app.core.models.pbt import (
-    PBT, PBTClassificationRequest, PBTClassificationResponse,
-    BatchPBTClassificationRequest, BatchPBTClassificationResponse,
-    PBTLoadRequest, PBTLoadResponse, PBTStatistics
-)
+from app.config.environment import get_os_env
+from app.core.auth.auth_helper import get_azure_token_cached, refresh_token_if_needed
+from app.core.models.pbt import ConfidenceScore, MatchedPBT
 
 logger = logging.getLogger(__name__)
-settings = get_settings()
 
-router = APIRouter(
-    prefix="/classification",
-    tags=["classification"]
-    # No API key dependency required
-)
-
-@router.post(
-    "/classify",
-    response_model=PBTClassificationResponse,
-    summary="Classify a business term",
-    description="Classify a business term against the Preferred Business Terms (PBT) database."
-)
-async def classify_term(
-    request: PBTClassificationRequest,
-    request_id: str = Depends(get_request_id),
-    classification_service: ClassificationService = Depends(get_classification_service_dep)
-):
-    """
-    Classify a business term against the PBT database.
+class ConfidenceService:
+    """Service for evaluating confidence of matches between business terms and PBTs."""
     
-    Args:
-        request: Classification request with name and description
-        request_id: Request ID
-        classification_service: Classification service
-        
-    Returns:
-        Classification response with best match and confidence
-    """
-    logger.info(f"Classification request: {request.name} (method={request.method}, request_id={request_id})")
+    _instance = None
     
-    try:
-        # Validate method
-        if request.method not in settings.classification.available_methods:
-            logger.warning(f"Invalid classification method: {request.method}")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid classification method. Available methods: {settings.classification.available_methods}"
+    def __new__(cls):
+        """Implement singleton pattern."""
+        if cls._instance is None:
+            cls._instance = super(ConfidenceService, cls).__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self):
+        """Initialize the confidence service."""
+        if self._initialized:
+            return
+            
+        self._initialized = True
+        self.settings = get_settings()
+        self.env = get_os_env()
+        
+        # LLM for confidence evaluation
+        self.llm = self._init_llm()
+        
+        # Chain for confidence evaluation
+        self.chain = self._create_confidence_chain()
+        
+        # Memory for caching confidence evaluations
+        self.memory_saver = MemorySaver()
+        
+        # In-memory cache for fast lookups
+        self.cache = {}
+        
+        logger.info("Confidence service initialized")
+    
+    def _init_llm(self) -> AzureChatOpenAI:
+        """Initialize the LLM for confidence evaluation."""
+        try:
+            # Get Azure token
+            token = get_azure_token_cached(
+                tenant_id=self.settings.azure.tenant_id,
+                client_id=self.settings.azure.client_id,
+                client_secret=self.settings.azure.client_secret,
+                scope="https://cognitiveservices.azure.com/.default"
             )
-        
-        # Validate input
-        if not request.name or not request.name.strip():
-            logger.warning(f"Empty name provided in request")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Name cannot be empty"
+            
+            if not token:
+                logger.error("Failed to get Azure token for confidence service")
+                raise ValueError("Failed to get Azure token")
+            
+            # Create token provider function
+            token_provider = lambda: get_azure_token_cached(
+                tenant_id=self.settings.azure.tenant_id,
+                client_id=self.settings.azure.client_id,
+                client_secret=self.settings.azure.client_secret,
+                scope="https://cognitiveservices.azure.com/.default"
+            ) or token
+            
+            # Initialize Azure OpenAI client for LLM
+            llm = AzureChatOpenAI(
+                model_name=self.settings.azure.openai_model_name,  # Use the renamed field
+                temperature=0.2,  # Lower temperature for more consistent confidence scores
+                api_version=self.settings.azure.api_version,
+                azure_endpoint=self.settings.azure.azure_endpoint,
+                azure_ad_token_provider=token_provider
             )
+            
+            return llm
         
-        if not request.description or not request.description.strip():
-            logger.warning(f"Empty description provided in request")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Description cannot be empty"
-            )
+        except Exception as e:
+            logger.error(f"Error initializing LLM for confidence evaluation: {e}")
+            raise
+    
+    def _create_confidence_chain(self):
+        """Create the confidence evaluation chain."""
+        # Define prompt for confidence evaluation
+        prompt = ChatPromptTemplate.from_messages([
+            SystemMessage(content="""
+            You are an expert system that evaluates the confidence of matches between user-provided terms and standard
+            Preferred Business Terms (PBT). Analyze the semantic similarity, contextual relevance, and overall 
+            appropriateness of the match.
+            
+            Provide a confidence score between 0 and 100, where:
+            - 0-20: Very low confidence. The match seems arbitrary or incorrect.
+            - 21-40: Low confidence. There's a vague relationship but likely not the best match.
+            - 41-60: Moderate confidence. There's a reasonable connection but potentially better alternatives.
+            - 61-80: High confidence. The match is strong and likely appropriate.
+            - 81-100: Very high confidence. The match is excellent and almost certainly correct.
+            
+            Return your evaluation as a JSON object with the following fields:
+            - score: (number between 0-100)
+            - explanation: (string explaining your reasoning)
+            """),
+            HumanMessage(content="""
+            User Input: {user_input}
+            
+            Matched PBT: 
+            ID: {pbt_id}
+            Name: {pbt_name}
+            Definition: {pbt_definition}
+            CDM: {pbt_cdm}
+            
+            Additional Information:
+            - Match Type: {match_type}
+            - Was matched via synonym: {synonym_match}
+            - Matched synonym (if any): {matched_synonym}
+            - Similarity Score: {similarity_score}
+            
+            Evaluate the confidence of this match.
+            """)
+        ])
         
-        # Classify
-        result = await classification_service.classify(
-            name=request.name,
-            description=request.description,
-            method=request.method,
-            include_broader_terms=request.include_broader_terms,
-            top_n=request.top_n
-        )
+        # Create the chain
+        return prompt | self.llm
+    
+    def _get_memory_key(self, user_input: str, pbt_id: str) -> str:
+        """Generate a consistent memory key for retrieving past evaluations."""
+        # Normalize input to ensure consistent keys
+        normalized_input = user_input.strip().lower()
+        normalized_id = str(pbt_id).strip()
+        return f"confidence:{normalized_input}:{normalized_id}"
+    
+    async def evaluate_confidence(self, user_input: str, 
+                                 pbt_match: Union[Dict[str, Any], MatchedPBT]) -> ConfidenceScore:
+        """
+        Evaluate the confidence of a match between user input and a PBT.
         
-        # Add request ID
-        result.request_id = request_id
-        
-        # Check for empty results
-        if result.status == "error":
-            logger.warning(f"Classification failed for {request.name}: {result.agent_response}")
-            if "No similar items found" in result.agent_response:
-                return PBTClassificationResponse(
-                    status="no_match",
-                    request_id=request_id,
-                    agent_response="No matching terms found in the PBT database. Consider trying different terminology or adding this term to the database."
-                )
+        Args:
+            user_input: User input (name and description)
+            pbt_match: Matched PBT (either a dict or MatchedPBT object)
+            
+        Returns:
+            ConfidenceScore with score and explanation
+        """
+        try:
+            # Extract fields based on the match object type
+            pbt_id = None
+            pbt_name = None
+            pbt_definition = None
+            pbt_cdm = None
+            match_type = None
+            similarity_score = None
+            synonym_match = False
+            matched_synonym = None
+            
+            # Extract fields from input based on its type
+            if isinstance(pbt_match, MatchedPBT):
+                pbt_id = pbt_match.id
+                pbt_name = pbt_match.name  # Uses the property to get PBT_NAME
+                pbt_definition = pbt_match.definition  # Uses the property to get PBT_DEFINITION
+                pbt_cdm = pbt_match.CDM
+                match_type = pbt_match.match_type
+                similarity_score = pbt_match.similarity_score
+                synonym_match = pbt_match.synonym_match
+                matched_synonym = pbt_match.matched_synonym
+            elif isinstance(pbt_match, dict):
+                pbt_id = pbt_match.get("id")
+                # Try both field naming conventions
+                pbt_name = pbt_match.get("PBT_NAME", pbt_match.get("name"))
+                pbt_definition = pbt_match.get("PBT_DEFINITION", pbt_match.get("definition"))
+                pbt_cdm = pbt_match.get("CDM", pbt_match.get("cdm"))
+                match_type = pbt_match.get("match_type", "specific")
+                similarity_score = pbt_match.get("similarity_score", 0.5)
+                synonym_match = pbt_match.get("synonym_match", False)
+                matched_synonym = pbt_match.get("matched_synonym")
             else:
-                # Return the error but with 200 status code to allow client handling
-                return result
-        
-        return result
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error in classify_term: {e}", exc_info=True)
-        return PBTClassificationResponse(
-            status="error",
-            request_id=request_id,
-            agent_response=f"An unexpected error occurred: {str(e)}"
-        )
-
-@router.post(
-    "/batch",
-    response_model=BatchPBTClassificationResponse,
-    summary="Classify multiple business terms",
-    description="Classify multiple business terms in a single request."
-)
-async def batch_classify(
-    request: BatchPBTClassificationRequest,
-    request_id: str = Depends(get_request_id),
-    classification_service: ClassificationService = Depends(get_classification_service_dep)
-):
-    """
-    Batch classify multiple business terms.
-    
-    Args:
-        request: Batch classification request with multiple items
-        request_id: Request ID
-        classification_service: Classification service
-        
-    Returns:
-        Batch classification response with results for each item
-    """
-    try:
-        # Check batch size limit
-        if len(request.items) > settings.rate_limit.batch_size_limit:
-            logger.warning(f"Batch size {len(request.items)} exceeds limit of {settings.rate_limit.batch_size_limit}")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Batch size exceeds limit of {settings.rate_limit.batch_size_limit} items"
-            )
-        
-        # Check for empty batch
-        if not request.items:
-            logger.warning("Empty batch request received")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Batch request cannot be empty"
-            )
-        
-        logger.info(f"Batch classification request with {len(request.items)} items (method={request.method}, request_id={request_id})")
-        
-        # Validate method
-        if request.method not in settings.classification.available_methods:
-            logger.warning(f"Invalid classification method: {request.method}")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid classification method. Available methods: {settings.classification.available_methods}"
-            )
-        
-        # Validate all items have required fields
-        for i, item in enumerate(request.items):
-            if not item.name or not item.name.strip():
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Item at index {i} has empty name"
+                logger.error(f"Invalid PBT match type: {type(pbt_match)}")
+                return ConfidenceScore(
+                    score=50,
+                    explanation=f"Error: Invalid PBT match type: {type(pbt_match)}"
                 )
             
-            if not item.description or not item.description.strip():
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Item at index {i} has empty description"
-                )
-        
-        # Batch classify with error handling
-        try:
-            results = await classification_service.batch_classify(
-                items=[item.dict() for item in request.items],
-                method=request.method
+            # Validate required fields
+            if not pbt_id or not pbt_name or not pbt_definition:
+                logger.error(f"Missing required fields in PBT match: {pbt_match}")
+                
+                # Use default values for missing fields rather than failing
+                if not pbt_id:
+                    pbt_id = "unknown_id"
+                if not pbt_name:
+                    pbt_name = "Unknown Term"
+                if not pbt_definition:
+                    pbt_definition = "No definition available"
+            
+            # Generate a memory key for this evaluation
+            memory_key = self._get_memory_key(user_input, str(pbt_id))
+            
+            # Check in-memory cache first
+            if memory_key in self.cache:
+                logger.info(f"Found cached confidence evaluation in memory: {memory_key}")
+                return self.cache[memory_key]
+            
+            # Create a session ID for memory storage
+            session_id = "confidence_evaluations"
+            
+            # Create a proper config object with thread_id and checkpoint_ns
+            config = {
+                "configurable": {
+                    "thread_id": session_id,
+                    "checkpoint_ns": ""
+                }
+            }
+            
+            # Try to get from persistent memory
+            try:
+                checkpoint = self.memory_saver.get(config)
+                
+                if checkpoint and memory_key in checkpoint.get("channel_values", {}):
+                    cached_result = checkpoint["channel_values"][memory_key]
+                    logger.info(f"Found cached confidence evaluation in persistent memory: {memory_key}")
+                    
+                    # Parse the cached result
+                    score = cached_result.get("score", 0)
+                    explanation = cached_result.get("explanation", "")
+                    
+                    # Create ConfidenceScore and cache it
+                    confidence_score = ConfidenceScore(score=score, explanation=explanation)
+                    self.cache[memory_key] = confidence_score
+                    
+                    return confidence_score
+            except Exception as mem_error:
+                logger.warning(f"Error retrieving from memory: {mem_error}")
+            
+            # Ensure we have valid token before calling LLM
+            refresh_token_if_needed(
+                tenant_id=self.settings.azure.tenant_id,
+                client_id=self.settings.azure.client_id,
+                client_secret=self.settings.azure.client_secret,
+                scope="https://cognitiveservices.azure.com/.default",
+                min_validity_seconds=600  # 10 minutes
             )
-        except Exception as batch_error:
-            logger.error(f"Error in batch classification: {batch_error}", exc_info=True)
-            # Create error response for each item
-            results = [
-                PBTClassificationResponse(
-                    status="error",
-                    agent_response=f"Batch processing error: {str(batch_error)}"
-                ) for _ in request.items
-            ]
-        
-        # Count successes and failures
-        success_count = sum(1 for result in results if result.status == "success")
-        no_match_count = sum(1 for result in results if result.status == "no_match")
-        error_count = len(results) - success_count - no_match_count
-        
-        # Create response
-        response = BatchPBTClassificationResponse(
-            status="success" if success_count > 0 else "error",
-            items=results,
-            request_id=request_id,
-            total_processed=len(results),
-            total_success=success_count,
-            total_failure=error_count
-        )
-        
-        return response
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error in batch_classify: {e}", exc_info=True)
-        # Return error response with empty results
-        return BatchPBTClassificationResponse(
-            status="error",
-            items=[],
-            request_id=request_id,
-            total_processed=0,
-            total_success=0,
-            total_failure=len(request.items) if request.items else 0
-        )
-
-@router.post(
-    "/load-pbt",
-    response_model=PBTLoadResponse,
-    summary="Load PBT data",
-    description="Load Preferred Business Terms (PBT) data from a CSV file."
-)
-async def load_pbt_data(
-    request: PBTLoadRequest,
-    request_id: str = Depends(get_request_id),
-    pbt_manager: PBTManager = Depends(get_pbt_manager_dep)
-):
-    """
-    Load PBT data from a CSV file.
-    
-    Args:
-        request: Load request with CSV path
-        request_id: Request ID
-        pbt_manager: PBT manager
-        
-    Returns:
-        Load response with status and count
-    """
-    try:
-        logger.info(f"Loading PBT data from {request.csv_path} (reload={request.reload}, request_id={request_id})")
-        
-        # Validate CSV path
-        if not request.csv_path or not request.csv_path.strip():
-            logger.warning("Empty CSV path provided")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="CSV path cannot be empty"
-            )
-        
-        # Load the data
-        result = await pbt_manager.load_csv(request.csv_path, request.reload)
-        
-        # Check for load errors
-        if result["status"] == "error":
-            logger.error(f"Error loading PBT data: {result['message']}")
-            # Return error but with 200 status code to allow client handling
-            response = PBTLoadResponse(
-                status=result["status"],
-                message=result["message"],
-                total_loaded=result["total_loaded"],
-                request_id=request_id
-            )
-            return response
-        
-        # Add request ID
-        response = PBTLoadResponse(
-            status=result["status"],
-            message=result["message"],
-            total_loaded=result["total_loaded"],
-            request_id=request_id
-        )
-        
-        return response
-    except Exception as e:
-        logger.error(f"Unexpected error in load_pbt_data: {e}", exc_info=True)
-        return PBTLoadResponse(
-            status="error",
-            message=f"An unexpected error occurred: {str(e)}",
-            total_loaded=0,
-            request_id=request_id
-        )
-
-@router.get(
-    "/pbt/{pbt_id}",
-    response_model=PBT,
-    summary="Get PBT by ID",
-    description="Get a Preferred Business Term (PBT) by its ID."
-)
-async def get_pbt_by_id(
-    pbt_id: str,
-    request_id: str = Depends(get_request_id),
-    pbt_manager: PBTManager = Depends(get_pbt_manager_dep)
-):
-    """
-    Get a PBT by its ID.
-    
-    Args:
-        pbt_id: PBT ID
-        request_id: Request ID
-        pbt_manager: PBT manager
-        
-    Returns:
-        PBT object
-    """
-    try:
-        logger.info(f"Getting PBT by ID: {pbt_id} (request_id={request_id})")
-        
-        # Validate PBT ID
-        if not pbt_id or not pbt_id.strip():
-            logger.warning("Empty PBT ID provided")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="PBT ID cannot be empty"
-            )
-        
-        # Get the PBT
-        pbt = await pbt_manager.get_pbt_by_id(pbt_id)
-        
-        if not pbt:
-            logger.warning(f"PBT with ID {pbt_id} not found")
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"PBT with ID {pbt_id} not found"
-            )
-        
-        return pbt
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error in get_pbt_by_id: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An unexpected error occurred: {str(e)}"
-        )
-
-@router.get(
-    "/statistics",
-    response_model=PBTStatistics,
-    summary="Get PBT statistics",
-    description="Get statistics about the loaded PBT data."
-)
-async def get_pbt_statistics(
-    request_id: str = Depends(get_request_id),
-    pbt_manager: PBTManager = Depends(get_pbt_manager_dep)
-):
-    """
-    Get statistics about the loaded PBT data.
-    
-    Args:
-        request_id: Request ID
-        pbt_manager: PBT manager
-        
-    Returns:
-        PBT statistics
-    """
-    try:
-        logger.info(f"Getting PBT statistics (request_id={request_id})")
-        
-        # Get statistics with error handling
-        try:
-            stats = await pbt_manager.get_statistics()
-        except Exception as stats_error:
-            logger.error(f"Error getting PBT statistics: {stats_error}", exc_info=True)
-            # Return default statistics on error
-            stats = PBTStatistics(
-                total_pbt_count=0,
-                indexed_count=0,
-                cdm_categories={},
-                has_synonyms_count=0,
-                average_synonyms_per_pbt=0,
-                top_cdm_categories=[]
-            )
-        
-        return stats
-    except Exception as e:
-        logger.error(f"Unexpected error in get_pbt_statistics: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An unexpected error occurred: {str(e)}"
-        )
-
-# New endpoint for testing the system
-@router.post(
-    "/test-classification",
-    response_model=PBTClassificationResponse,
-    summary="Test classification system",
-    description="Test the classification system with a simple example."
-)
-async def test_classification(
-    request_id: str = Depends(get_request_id),
-    classification_service: ClassificationService = Depends(get_classification_service_dep)
-):
-    """
-    Test the classification system with a simple example.
-    
-    Args:
-        request_id: Request ID
-        classification_service: Classification service
-        
-    Returns:
-        Classification response
-    """
-    try:
-        logger.info(f"Test classification request (request_id={request_id})")
-        
-        # Define a test term
-        test_name = "Customer Account"
-        test_description = "A unique identifier for a customer in the system"
-        
-        # Try all classification methods
-        methods = list(settings.classification.available_methods)
-        
-        # Start with embeddings (simplest method)
-        method = "embeddings"
-        if "embeddings" in methods:
-            method = "embeddings"
-        
-        # Classify using the chosen method
-        result = await classification_service.classify(
-            name=test_name,
-            description=test_description,
-            method=method,
-            include_broader_terms=True,
-            top_n=5
-        )
-        
-        # Add request ID and test info
-        result.request_id = request_id
-        
-        if result.status == "success":
-            # Add test info to agent response
-            if result.agent_response:
-                result.agent_response = f"TEST CLASSIFICATION SUCCEEDED USING METHOD: {method}\n\n" + result.agent_response
-            else:
-                result.agent_response = f"TEST CLASSIFICATION SUCCEEDED USING METHOD: {method}"
-        else:
-            # Try other methods if first one failed
-            for backup_method in methods:
-                if backup_method != method:
-                    logger.info(f"First method failed, trying method: {backup_method}")
-                    backup_result = await classification_service.classify(
-                        name=test_name,
-                        description=test_description,
-                        method=backup_method,
-                        include_broader_terms=True,
-                        top_n=5
+            
+            # Make sure token is valid and LLM is properly initialized
+            self.llm = self._init_llm()
+            self.chain = self._create_confidence_chain()
+            
+            # Call the LLM chain for confidence evaluation with retry mechanism
+            max_retries = 3
+            retry_delay = 2  # seconds
+            
+            for attempt in range(max_retries):
+                try:
+                    # Call LLM with timeout
+                    llm_response = await asyncio.wait_for(
+                        self.chain.ainvoke({
+                            "user_input": user_input,
+                            "pbt_id": pbt_id,
+                            "pbt_name": pbt_name,
+                            "pbt_definition": pbt_definition,
+                            "pbt_cdm": pbt_cdm or "N/A",
+                            "match_type": match_type,
+                            "synonym_match": "Yes" if synonym_match else "No",
+                            "matched_synonym": matched_synonym or "N/A",
+                            "similarity_score": f"{similarity_score:.2f}" if similarity_score is not None else "N/A"
+                        }),
+                        timeout=30.0  # 30 second timeout
                     )
                     
-                    if backup_result.status == "success":
-                        logger.info(f"Backup method {backup_method} succeeded")
-                        backup_result.request_id = request_id
-                        backup_result.agent_response = f"TEST CLASSIFICATION SUCCEEDED USING BACKUP METHOD: {backup_method}\n\n" + (backup_result.agent_response or "")
-                        return backup_result
+                    # Extract content from response
+                    content = llm_response.content
+                    break  # Success, exit retry loop
+                except asyncio.TimeoutError:
+                    logger.warning(f"LLM call timed out on attempt {attempt+1}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                    else:
+                        # Fallback on timeout
+                        logger.error("LLM confidence evaluation timed out after all retries")
+                        return ConfidenceScore(
+                            score=50,
+                            explanation="Confidence evaluation timed out. Using default medium confidence."
+                        )
+                except Exception as llm_error:
+                    logger.warning(f"LLM call failed on attempt {attempt+1}: {llm_error}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                        # Reinitialize LLM
+                        self.llm = self._init_llm()
+                        self.chain = self._create_confidence_chain()
+                    else:
+                        # Fallback on error
+                        logger.error(f"LLM confidence evaluation failed after all retries: {llm_error}")
+                        return ConfidenceScore(
+                            score=50,
+                            explanation=f"Error evaluating confidence: {str(llm_error)}. Using default medium confidence."
+                        )
             
-            # All methods failed
-            logger.warning("All classification methods failed in test")
-            result.agent_response = f"TEST CLASSIFICATION FAILED FOR ALL METHODS\n\n" + (result.agent_response or "")
-        
-        return result
-    except Exception as e:
-        logger.error(f"Unexpected error in test_classification: {e}", exc_info=True)
-        return PBTClassificationResponse(
-            status="error",
-            request_id=request_id,
-            agent_response=f"Test failed with error: {str(e)}"
-        )
+            # Parse the JSON response
+            try:
+                # Try direct JSON parsing first
+                result = json.loads(content)
+            except json.JSONDecodeError:
+                # If that fails, try to extract JSON using regex
+                import re
+                json_pattern = r'\{.*\}'
+                match = re.search(json_pattern, content, re.DOTALL)
+                
+                if match:
+                    try:
+                        result = json.loads(match.group(0))
+                    except json.JSONDecodeError:
+                        # If regex extraction fails, create a default result
+                        result = {
+                            "score": 50,
+                            "explanation": "Could not parse confidence score from LLM output. Using default medium confidence."
+                        }
+                else:
+                    # If no JSON-like structure found, create a default result
+                    result = {
+                        "score": 50,
+                        "explanation": "Could not parse confidence score from LLM output. Using default medium confidence."
+                    }
+            
+            # Ensure the result has the expected fields
+            score = result.get("score", result.get("confidence_score", 50))
+            if isinstance(score, str):
+                try:
+                    score = int(score)
+                except ValueError:
+                    score = 50
+            
+            # Clamp the score to valid range
+            score = max(0, min(100, score))
+            
+            explanation = result.get("explanation", "No explanation provided")
+            
+            # Create a ConfidenceScore object
+            confidence_score = ConfidenceScore(score=score, explanation=explanation)
+            
+            # Save to memory
+            try:
+                # Create or update the checkpoint
+                checkpoint = self.memory_saver.get(config) or empty_checkpoint()
+                checkpoint["channel_values"][memory_key] = {
+                    "score": score,
+                    "explanation": explanation
+                }
+                
+                # Use the put method with the correct signature
+                self.memory_saver.put(
+                    config=config,
+                    checkpoint=checkpoint,
+                    metadata={"source": "input", "step": -1},
+                    new_versions={}
+                )
+                
+                logger.info(f"Saved confidence evaluation to memory: {memory_key}")
+            except Exception as mem_error:
+                logger.warning(f"Error saving to memory: {mem_error}")
+            
+            # Cache the result in memory
+            self.cache[memory_key] = confidence_score
+            
+            # Prune cache if too large
+            if len(self.cache) > 1000:
+                # Remove 20% of entries (oldest first)
+                items_to_remove = sorted(self.cache.keys())[:int(len(self.cache) * 0.2)]
+                for key in items_to_remove:
+                    del self.cache[key]
+            
+            return confidence_score
+            
+        except Exception as e:
+            logger.error(f"Error in confidence evaluation: {e}")
+            # Return a default confidence score rather than failing completely
+            return ConfidenceScore(
+                score=50,
+                explanation=f"Error evaluating confidence: {str(e)}. Using default medium confidence."
+            )
+    
+    def clear_cache(self):
+        """Clear the in-memory cache."""
+        self.cache = {}
+        logger.info("Cleared confidence evaluation cache")
+
+
+# Get the confidence service instance
+def get_confidence_service() -> ConfidenceService:
+    """
+    Get the confidence service instance.
+    
+    Returns:
+        ConfidenceService: Confidence service instance
+    """
+    return ConfidenceService()
