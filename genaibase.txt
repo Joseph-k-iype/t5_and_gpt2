@@ -1,296 +1,233 @@
-"""
-Azure OpenAI service using the official SDK instead of direct HTTP requests.
-"""
 
 import os
-import logging
+import sys
+import uuid
 import json
-import time
-from typing import List, Dict, Any, Optional, Union
+import logging
+import chardet
+import pandas as pd
+import networkx as nx
+import numpy as np
+from typing import Optional, Any, Dict, List, Union
+from pathlib import Path
 from dotenv import dotenv_values
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider, ClientSecretCredential
 from openai import AzureOpenAI
-from azure.identity import DefaultAzureCredential, ClientSecretCredential, get_bearer_token_provider
+from pydantic import BaseModel
+from langchain.chat_models import AzureChatOpenAI
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationChain, LLMChain
+from langchain.docstore import Document as LC_DOCUMENT
+from langchain.embeddings.base import Embeddings
+from langchain.vectorstores import Chroma
+from langchain.prompts import PromptTemplate
+from chromadb.config import Settings
+from chromadb.utils import embedding_functions
+from collections import namedtuple
+import re
+from pydantic import BaseModel, ValidationError, field_validator
 
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-# Load credentials directly from file
-credentials_path = os.path.join("env", "credentials.env")
-config_path = os.path.join("env", "config.env")
-credentials_values = {}
-config_values = {}
+ENV_DIR = "env"
+CONFIG_PATH = f"{ENV_DIR}/config.env"
+CREDS_PATH = f"{ENV_DIR}/credentials.env"
+CERT_PATH = f"{ENV_DIR}/cacert.pem"
 
-try:
-    if os.path.isfile(credentials_path):
-        logger.info(f"AzureOpenAIService loading credentials from {credentials_path}")
-        credentials_values = dotenv_values(credentials_path)
-        logger.info(f"Loaded {len(credentials_values)} values from {credentials_path}")
+Triple = namedtuple("Triple", ["subject", "predicate", "object"])
+
+## utility functions
+def is_file_readable(filepath: str)->bool:
+    """Check if a file is readable."""
+    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
+        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
+    return True
+
+def str_to_bool(s: str)->bool:
+    """Convert a string to a boolean."""
+    if s== 'True':
+        return True
+    elif s== 'False':
+        return False
     else:
-        logger.warning(f"Credentials file not found: {credentials_path}")
+        raise ValueError(f"Invalid boolean value: {s}")
+
+## OSEnv class
+
+class OSEnv:
+    def __init__(self, config_file: str, creds_file: str, certificate_path: str):
+        self.var_list = []
+        self.bulk_set(config_file, True)
+        self.bulk_set(creds_file, False)
+        self.set_certificate_path(certificate_path)
+        if str_to_bool(self.get("PROXY_ENABLED", "False")):
+            self.set_proxy()
         
-    if os.path.isfile(config_path):
-        logger.info(f"AzureOpenAIService loading config from {config_path}")
-        config_values = dotenv_values(config_path)
-        logger.info(f"Loaded {len(config_values)} values from {config_path}")
-    else:
-        logger.warning(f"Config file not found: {config_path}")
-except Exception as e:
-    logger.error(f"Error loading env files: {e}")
-
-# Combine values, with credentials taking precedence
-all_values = {**config_values, **credentials_values}
-
-# Extract values directly
-AZURE_TENANT_ID = all_values.get("AZURE_TENANT_ID", "")
-AZURE_CLIENT_ID = all_values.get("AZURE_CLIENT_ID", "")
-AZURE_CLIENT_SECRET = all_values.get("AZURE_CLIENT_SECRET", "")
-AZURE_OPENAI_ENDPOINT = all_values.get("AZURE_OPENAI_ENDPOINT", "")
-AZURE_EMBEDDING_MODEL = all_values.get("AZURE_EMBEDDING_MODEL", "text-embedding-3-large")
-AZURE_EMBEDDING_DEPLOYMENT = all_values.get("AZURE_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
-AZURE_LLM_MODEL = all_values.get("AZURE_LLM_MODEL", "gpt-4o-mini")
-AZURE_LLM_DEPLOYMENT = all_values.get("AZURE_LLM_DEPLOYMENT", "gpt-4o-mini")
-
-# Log values (masked for security)
-if AZURE_TENANT_ID:
-    masked_tenant = f"{AZURE_TENANT_ID[:4]}...{AZURE_TENANT_ID[-4:]}" if len(AZURE_TENANT_ID) > 8 else "***"
-    logger.info(f"Using Azure tenant ID: {masked_tenant}")
-else:
-    logger.warning("AZURE_TENANT_ID is missing")
-
-if AZURE_CLIENT_ID:
-    masked_client = f"{AZURE_CLIENT_ID[:4]}...{AZURE_CLIENT_ID[-4:]}" if len(AZURE_CLIENT_ID) > 8 else "***"
-    logger.info(f"Using Azure client ID: {masked_client}")
-else:
-    logger.warning("AZURE_CLIENT_ID is missing")
-
-if AZURE_CLIENT_SECRET:
-    logger.info(f"Azure client secret is set (length: {len(AZURE_CLIENT_SECRET)} characters)")
-else:
-    logger.warning("AZURE_CLIENT_SECRET is missing")
-
-logger.info(f"Using Azure OpenAI endpoint: {AZURE_OPENAI_ENDPOINT}")
-logger.info(f"Using embedding model: {AZURE_EMBEDDING_MODEL}, deployment: {AZURE_EMBEDDING_DEPLOYMENT}")
-logger.info(f"Using LLM model: {AZURE_LLM_MODEL}, deployment: {AZURE_LLM_DEPLOYMENT}")
-
-class AzureOpenAIService:
-    """Service for interacting with Azure OpenAI models using the official SDK."""
+        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
+            self.token = self.get_azure_token()
+        else:
+            self.token = None
+        
+    def _get_credential(self):
+        if str_to_bool(self.get("USE_MANAGED_IDENTITY", "False")):
+            return DefaultAzureCredential()
+        else:
+            return ClientSecretCredential(tenant_id=self.get("AZURE_TENANT_ID"), client_id=self.get("AZURE_CLIENT_ID"), client_secret=self.get("AZURE_CLIENT_SECRET"))
     
-    def __init__(self):
-        """Initialize the Azure OpenAI service."""
-        self.tenant_id = AZURE_TENANT_ID
-        self.client_id = AZURE_CLIENT_ID
-        self.client_secret = AZURE_CLIENT_SECRET
-        self.endpoint = AZURE_OPENAI_ENDPOINT
-        self.embedding_model = AZURE_EMBEDDING_MODEL
-        self.embedding_deployment = AZURE_EMBEDDING_DEPLOYMENT
-        self.llm_model = AZURE_LLM_MODEL
-        self.llm_deployment = AZURE_LLM_DEPLOYMENT
-        self.api_version = "2023-05-15"
-        
-        # Show the actual values being used (partially masked for security)
-        masked_tenant = f"{self.tenant_id[:4]}...{self.tenant_id[-4:]}" if len(self.tenant_id) > 8 else "***"
-        masked_client = f"{self.client_id[:4]}...{self.client_id[-4:]}" if len(self.client_id) > 8 else "***"
-        logger.info(f"AzureOpenAIService initialized with:")
-        logger.info(f"  - Tenant ID: {masked_tenant}")
-        logger.info(f"  - Client ID: {masked_client}") 
-        logger.info(f"  - Client secret length: {len(self.client_secret)} characters")
-        logger.info(f"  - OpenAI endpoint: {self.endpoint}")
-        
-        # Initialize the Azure OpenAI client
-        self._initialize_client()
-        logger.info(f"AzureOpenAIService initialized successfully")
-    
-    def _initialize_client(self):
-        """Initialize the Azure OpenAI client using Azure AD credentials."""
+    def set_certificate_path(self, path: str):
         try:
-            # Create credentials
-            credential = ClientSecretCredential(
-                tenant_id=self.tenant_id,
-                client_id=self.client_id,
-                client_secret=self.client_secret
-            )
+            if not os.path.isabs(path):
+                path = os.path.abspath(path)
+            if not is_file_readable(path):
+                raise FileNotFoundError(f"The file '{path}' does not exist or is not readable")
             
-            # Get token provider
-            token_provider = get_bearer_token_provider(
-                credential,
-                "https://cognitiveservices.azure.com/.default"
-            )
-            
-            # Initialize the client with token provider
-            self.client = AzureOpenAI(
-                azure_endpoint=self.endpoint,
-                api_version=self.api_version,
-                azure_ad_token_provider=token_provider
-            )
-            
-            logger.info("Azure OpenAI client initialized successfully")
+            self.set("REQUESTS_CA_BUNDLE", path)
+            self.set("SSL_CERT_FILE", path)
+            self.set("CURL_CA_BUNDLE", path)
         except Exception as e:
-            logger.error(f"Failed to initialize Azure OpenAI client: {e}")
+            logger.error(f"Error setting certificate path: {e}")
             raise
     
-    def refresh_tokens(self):
-        """Refresh the Azure tokens by reinitializing the client."""
+    def bulk_set(self, dotenvfile: str, print_val: bool = False)->None:
         try:
-            logger.info("Refreshing Azure AD token by reinitializing the client...")
-            self._initialize_client()
-            logger.info("Azure OpenAI client reinitialized with fresh token")
-            return True
+            if not os.path.isabs(dotenvfile):
+                dotenvfile = os.path.abspath(dotenvfile)
+            if not is_file_readable(dotenvfile):
+                temp_dict = dotenv_values(dotenvfile)
+                for key, value in temp_dict.items():
+                    self.set(key, value, print_val)
+                del temp_dict
         except Exception as e:
-            logger.error(f"Failed to refresh Azure OpenAI token: {e}")
-            return False
+            logger.error(f"Error loading environment variables from {dotenvfile}: {e}")
+            raise
     
-    async def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """
-        Generate embeddings for a list of texts using Azure OpenAI SDK.
-        
-        Args:
-            texts: List of texts to embed
-            
-        Returns:
-            List of embedding vectors
-        """
+    def set(self, key: str, value: str, print_val: bool = False)->None:
         try:
-            # Return empty list if no texts provided
-            if not texts:
-                return []
-                
-            # Batch the requests to avoid overloading the API
-            # Process in chunks of 20 texts at a time
-            batch_size = 20
-            all_embeddings = []
-            
-            for i in range(0, len(texts), batch_size):
-                batch_texts = texts[i:i+batch_size]
-                
-                try:
-                    # Generate embeddings for the batch
-                    response = self.client.embeddings.create(
-                        input=batch_texts,
-                        model=self.embedding_deployment,
-                        dimensions=3072  # Maximum dimensions for text-embedding-3-large
-                    )
-                    
-                    # Extract embeddings from response
-                    batch_embeddings = [item.embedding for item in response.data]
-                    all_embeddings.extend(batch_embeddings)
-                    logger.debug(f"Generated embeddings for batch of {len(batch_texts)} texts")
-                    
-                except Exception as e:
-                    logger.error(f"Error generating embeddings for batch: {e}")
-                    # Try to refresh token and retry once
-                    if "authentication" in str(e).lower() or "unauthorized" in str(e).lower():
-                        logger.info("Authentication error, attempting to refresh token...")
-                        if self.refresh_tokens():
-                            # Retry the request
-                            response = self.client.embeddings.create(
-                                input=batch_texts,
-                                model=self.embedding_deployment,
-                                dimensions=3072
-                            )
-                            batch_embeddings = [item.embedding for item in response.data]
-                            all_embeddings.extend(batch_embeddings)
-                            logger.debug(f"Generated embeddings for batch of {len(batch_texts)} texts after token refresh")
-                        else:
-                            raise Exception("Failed to refresh token after authentication error")
-                    else:
-                        raise
-                
-                # Add a small delay between batches to avoid rate limiting
-                if i + batch_size < len(texts):
-                    time.sleep(0.5)
-            
-            return all_embeddings
-            
+            os.environ[key] = value
+            if var_name not in self.var_list:
+                self.var_list.append(var_name)
+            if print_val:
+                logger.info(f"{key}: {value}")
+        except Exception as e:
+            logger.error(f"Error setting environment variable {key}: {e}")
+            raise
+    
+    def get(self, key: str, default: Optional[str] = None)->str:
+        try:
+            return os.environ.get(key, default)
+        except Exception as e:
+            logger.error(f"Error getting environment variable {key}: {e}")
+            raise
+    
+    def set_proxy(self) -> None:
+        try:
+            ad_username = self.get("AD_USERNAME")
+            ad_password = self.get("AD_USER_PW")
+            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
+            if not all([ad_username, ad_password, proxy_domain]):
+                raise ValueError("Proxy settings are incomplete")
+            proxy_url = f"https://{ad_username}:{ad_password}@{proxy_domain}"
+            self.set("HTTP_PROXY", proxy_url, print_val=False)
+            self.set("HTTPS_PROXY", proxy_url, print_val=False)
+            no_proxy_domains = [
+                'cognitiveservices.azure.com',
+                'search.windows.net',
+                'openai.azure.com',
+                'core.windows.net',
+                'azurewebsites.net'
+            ]
+            self.set("NO_PROXY", ",".join(no_proxy_domains), print_val=False)
+        except Exception as e:
+            logger.error(f"Error setting proxy: {e}")
+            raise
+    
+    def get_azure_token(self) -> str:
+        try:
+            credential = ClientSecretCredential(
+                tenant_id=self.get("AZURE_TENANT_ID"),
+                client_id=self.get("AZURE_CLIENT_ID"),
+                client_secret=self.get("AZURE_CLIENT_SECRET")
+            )
+            token = credential.get_token("https://cognitiveservices.azure.com/.default")
+            self.set("AZURE_TOKEN", token.token, print_val=False)
+            logger.info("Azure token set")
+            return token.token
+        except Exception as e:
+            logger.error(f"Error retrieving Azure token: {e}")
+            return None
+    
+    def list_env_vars(self)->None:
+        for var in self.var_list:
+            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET'}:
+                logger.info(f"{var}: [REDACTED]")
+            else:
+                logger.info(f"{var}: {os.getenv(var)}")
+
+
+## embedding class + Document class
+
+class MyDocument(BaseModel):
+    id: str = ""
+    text: str = ""
+    embedding: List[float] = []
+    metadata: Dict[str, Any] = {}
+
+class EmbeddingClient:
+    def __init__(self, azure_api_version: str = "2023-05-15", embeddings_model: str = "text-embedding-3-large"):
+        self.azure_api_version = azure_api_version
+        self.embeddings_model = embeddings_model
+        self.direct_azure_client = self._get_direct_azure_client()
+    
+    def _get_direct_azure_client(self):
+        token_provider = get_bearer_token_provider(
+            DefaultAzureCredential(),
+            "https://cognitiveservices.azure.com/.default"
+        )
+        return AzureOpenAI(token_provider, self.azure_api_version)
+    
+    def generate_embeddings(self, doc: MyDocument)->MyDocument:
+        try:
+            response = self.direct_azure_client.embeddings.create(
+                model=self.embeddings_model,
+                input=doc.text
+            ).data[0].embedding
+            doc.embedding = response
+            return doc
         except Exception as e:
             logger.error(f"Error generating embeddings: {e}")
-            raise
+            return doc
+
+## LangChain components
+## AzureChatbot components
+
+class AzureChatbot:
+    def __init__(self, config_file=str, creds_file=str, cert_file=str):
+        self.env = OSEnv(config_file, creds_file, cert_file)
+        self._setup_chat_model()
+        self.memory = ConversationBufferMemory()
+        self.conversation = ConversationChain(llm=self.llm, memory=self.memory, verbose=True)
     
-    async def generate_single_embedding(self, text: str) -> List[float]:
-        """
-        Generate embeddings for a single text using Azure OpenAI SDK.
-        
-        Args:
-            text: Text to embed
-            
-        Returns:
-            Embedding vector
-        """
+    def _setup_chat_model(self):
         try:
-            # Generate embedding
-            response = self.client.embeddings.create(
-                input=text,
-                model=self.embedding_deployment,
-                dimensions=3072  # Maximum dimensions for text-embedding-3-large
+            token_provider = get_bearer_token_provider(
+                self.env.credential,
+                "https://cognitiveservices.azure.com/.default"
             )
-            
-            # Extract embedding from response
-            embedding = response.data[0].embedding
-            return embedding
-            
-        except Exception as e:
-            logger.error(f"Error generating single embedding: {e}")
-            
-            # Try to refresh token and retry once
-            if "authentication" in str(e).lower() or "unauthorized" in str(e).lower():
-                logger.info("Authentication error, attempting to refresh token...")
-                if self.refresh_tokens():
-                    # Retry the request
-                    response = self.client.embeddings.create(
-                        input=text,
-                        model=self.embedding_deployment,
-                        dimensions=3072
-                    )
-                    embedding = response.data[0].embedding
-                    return embedding
-                else:
-                    raise Exception("Failed to refresh token after authentication error")
-            else:
-                raise
-    
-    async def generate_completion(self, 
-                                messages: List[Dict[str, str]], 
-                                temperature: float = 0.0,
-                                max_tokens: int = 2000) -> str:
-        """
-        Generate a completion using Azure OpenAI SDK.
-        
-        Args:
-            messages: List of messages (system, user, assistant)
-            temperature: Temperature for generation
-            max_tokens: Maximum tokens to generate
-            
-        Returns:
-            Generated text
-        """
-        try:
-            # Generate completion
-            response = self.client.chat.completions.create(
-                model=self.llm_deployment,
-                messages=messages,
+            model_name = self.env.get("MODEL_NAME", "gpt-4o-mini")
+            temperature = float(self.env.get("TEMPERATURE", "0.7"))
+            max_tokens = int(self.env.get("MAX_TOKENS", "800"))
+            api_version = self.env.get("API_VERSION", "2023-05-15")
+            azure_endpoint = self.env.get("AZURE_ENDPOINT", "")
+            azure_ad_token_provider = token_provider
+            self.llm = AzureChatOpenAI(
+                model_name=model_name,
                 temperature=temperature,
-                max_tokens=max_tokens
+                max_tokens=max_tokens,
+                api_version=api_version,
+                azure_endpoint=azure_endpoint,
+                azure_ad_token_provider=azure_ad_token_provider
             )
-            
-            # Extract content from response
-            content = response.choices[0].message.content
-            return content
-            
         except Exception as e:
-            logger.error(f"Error generating completion: {e}")
-            
-            # Try to refresh token and retry once
-            if "authentication" in str(e).lower() or "unauthorized" in str(e).lower():
-                logger.info("Authentication error, attempting to refresh token...")
-                if self.refresh_tokens():
-                    # Retry the request
-                    response = self.client.chat.completions.create(
-                        model=self.llm_deployment,
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens
-                    )
-                    content = response.choices[0].message.content
-                    return content
-                else:
-                    raise Exception("Failed to refresh token after authentication error")
-            else:
-                raise
+            logger.error(f"Error setting up chatbot: {e}")
+            raise
