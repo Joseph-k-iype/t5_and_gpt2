@@ -1,430 +1,344 @@
 """
-Environment Configuration - Utilities for managing environment variables and configuration.
-Loads environment variables from both config.env and credentials.env.
+Authentication helper functions for working with Azure AD tokens.
+Improved error handling and logging for token acquisition.
 """
 
-import os
-import sys
 import logging
-import chardet
-from typing import Optional, Any, Dict, List, Union
-from pathlib import Path
-from dotenv import dotenv_values
-from azure.identity import DefaultAzureCredential, get_bearer_token_provider, ClientSecretCredential
+import time
+import threading
+import requests
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
+from fastapi import Depends, HTTPException, status
+from jose import JWTError, jwt
+from pydantic import BaseModel
+from app.config.settings import get_settings
 
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-# Default environment file locations
-ENV_DIR = "env"
-CONFIG_PATH = f"{ENV_DIR}/config.env"
-CREDS_PATH = f"{ENV_DIR}/credentials.env"
-CERT_PATH = f"{ENV_DIR}/cacert.pem"
+# Models for token handling
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    expires_at: datetime
 
-def is_file_readable(filepath: str) -> bool:
-    """
-    Check if a file is readable.
-    
-    Args:
-        filepath: Path to the file
-        
-    Returns:
-        bool: True if readable, raises FileNotFoundError otherwise
-    
-    Raises:
-        FileNotFoundError: If file doesn't exist or isn't readable
-    """
-    if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
-        raise FileNotFoundError(f"The file '{filepath}' does not exist or is not readable")
-    return True
 
-def str_to_bool(s: str) -> bool:
-    """
-    Convert a string to a boolean value.
+class TokenCache:
+    """Thread-safe token cache for storing and retrieving Azure tokens."""
     
-    Args:
-        s: String to convert
-        
-    Returns:
-        bool: Converted boolean value
-        
-    Raises:
-        ValueError: If string can't be converted to boolean
-    """
-    if s.lower() in ('true', 't', 'yes', 'y', '1'):
-        return True
-    elif s.lower() in ('false', 'f', 'no', 'n', '0'):
-        return False
-    else:
-        raise ValueError(f"Invalid boolean value: {s}")
-
-class OSEnv:
-    """
-    Environment variable manager for application configuration.
+    _instance = None
+    _lock = threading.RLock()
     
-    This class provides methods for loading, accessing, and managing environment
-    variables from multiple sources, including .env files and the OS environment.
-    """
+    def __new__(cls):
+        """Implement singleton pattern."""
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super(TokenCache, cls).__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
     
-    def __init__(self, config_file: str, creds_file: str, certificate_path: str, proxy_enabled: Optional[bool] = None):
+    def __init__(self):
+        """Initialize the token cache."""
+        if self._initialized:
+            return
+            
+        with self._lock:
+            if not self._initialized:
+                self._tokens = {}  # Format: {cache_key: (token, expiry_time)}
+                self._initialized = True
+                logger.info("Token cache initialized")
+    
+    def get(self, tenant_id: str, client_id: str, scope: str) -> Optional[str]:
         """
-        Initialize environment configuration.
+        Get a token from the cache if it exists and is not expired.
         
         Args:
-            config_file: Path to configuration .env file
-            creds_file: Path to credentials .env file
-            certificate_path: Path to SSL certificate
-            proxy_enabled: Override the PROXY_ENABLED setting
-        """
-        self.var_list = []
-        
-        # Check if files exist first to provide better error messages
-        config_exists = os.path.isfile(config_file) and os.access(config_file, os.R_OK)
-        creds_exists = os.path.isfile(creds_file) and os.access(creds_file, os.R_OK)
-        
-        if not config_exists:
-            logger.warning(f"Warning: Configuration file '{config_file}' not found or not readable")
-        
-        if not creds_exists:
-            logger.warning(f"Warning: Credentials file '{creds_file}' not found or not readable")
+            tenant_id: Azure tenant ID
+            client_id: Azure client ID
+            scope: OAuth scope
             
-        # Load configuration (even if files don't exist, we'll just log warnings)
-        self.bulk_set(config_file, True)
+        Returns:
+            Token if found and valid, None otherwise
+        """
+        cache_key = self._get_cache_key(tenant_id, client_id, scope)
         
-        # Explicitly log that we're loading the credentials file
-        logger.info(f"Loading credentials from {creds_file}")
-        self.bulk_set(creds_file, False)
+        with self._lock:
+            if cache_key in self._tokens:
+                token, expiry_time = self._tokens[cache_key]
+                # Allow 5 minute buffer before expiration
+                if time.time() < expiry_time - 300:
+                    logger.debug(f"Token cache hit for {client_id[:8]}...")
+                    return token
+                else:
+                    logger.debug(f"Token expired for {client_id[:8]}...")
+                    # Remove expired token
+                    del self._tokens[cache_key]
         
-        # Check for Azure credentials after loading both files
-        self._check_azure_credentials()
-        
-        self.set_certificate_path(certificate_path)
-        
-        # Handle proxy_enabled override
-        if proxy_enabled is not None:
-            self.set("PROXY_ENABLED", str(proxy_enabled))
-            logger.info(f"Proxy enabled setting overridden to: {proxy_enabled}")
-        
-        # Set proxy if enabled
-        proxy_enabled_env = str_to_bool(self.get("PROXY_ENABLED", "False"))
-        if proxy_enabled_env:
-            self.set_proxy()
-            logger.info("Proxy settings applied")
-        else:
-            logger.info("Running without proxy")
-        
-        # Handle secured endpoints
-        if str_to_bool(self.get("SECURED_ENDPOINTS", "False")):
-            self.token = self.get_azure_token()
-        else:
-            self.token = None
-        
-        self.credential = self._get_credential()
-        
-        # Set PostgreSQL environment variables if not already set
-        self._set_postgres_defaults()
+        return None
     
-    def _check_azure_credentials(self):
+    def set(self, tenant_id: str, client_id: str, scope: str, token: str, expires_in: int = 3600) -> None:
         """
-        Check if required Azure credentials are set and log warnings if not.
+        Store a token in the cache.
+        
+        Args:
+            tenant_id: Azure tenant ID
+            client_id: Azure client ID
+            scope: OAuth scope
+            token: The token to store
+            expires_in: Token expiration time in seconds
         """
-        required_vars = [
-            "AZURE_TENANT_ID", 
-            "AZURE_CLIENT_ID", 
-            "AZURE_CLIENT_SECRET",
-            "AZURE_OPENAI_ENDPOINT"
-        ]
+        cache_key = self._get_cache_key(tenant_id, client_id, scope)
+        expiry_time = time.time() + expires_in
         
-        for var in required_vars:
-            value = self.get(var)
-            if not value:
-                logger.warning(f"Required Azure variable {var} is not set in environment or config files")
-            elif var == "AZURE_TENANT_ID" and value == "default-tenant-id":
-                logger.warning(f"{var} is set to default value. Check if credentials.env was properly loaded.")
-            elif var == "AZURE_CLIENT_ID" and value == "default-client-id":
-                logger.warning(f"{var} is set to default value. Check if credentials.env was properly loaded.")
-            elif var == "AZURE_CLIENT_SECRET" and value == "default-client-secret":
-                logger.warning(f"{var} is set to default value. Check if credentials.env was properly loaded.")
+        with self._lock:
+            self._tokens[cache_key] = (token, expiry_time)
+            
+        logger.debug(f"Token cached for {client_id[:8]}... (expires in {expires_in}s)")
+    
+    def _get_cache_key(self, tenant_id: str, client_id: str, scope: str) -> str:
+        """Generate a cache key."""
+        return f"{tenant_id}:{client_id}:{scope}"
+    
+    def clear(self) -> None:
+        """Clear all tokens from the cache."""
+        with self._lock:
+            self._tokens.clear()
+        logger.info("Token cache cleared")
+    
+    def remove(self, tenant_id: str, client_id: str, scope: str) -> None:
+        """Remove a specific token from the cache."""
+        cache_key = self._get_cache_key(tenant_id, client_id, scope)
         
-    def _set_postgres_defaults(self):
-        """Set default PostgreSQL environment variables if not already set."""
-        # Default PostgreSQL configuration
-        postgres_defaults = {
-            "PG_HOST": self.get("PG_HOST", "localhost"),
-            "PG_PORT": self.get("PG_PORT", "5432"),
-            "PG_USER": self.get("PG_USER", "postgres"),
-            "PG_PASSWORD": self.get("PG_PASSWORD", "postgres"),
-            "PG_DB": self.get("PG_DB", "metadata_db")
+        with self._lock:
+            if cache_key in self._tokens:
+                del self._tokens[cache_key]
+                logger.debug(f"Token removed from cache for {client_id[:8]}...")
+
+
+# Initialize global token cache
+token_cache = TokenCache()
+
+def get_azure_token_cached(tenant_id: str, client_id: str, client_secret: str, 
+                          scope: str = "https://cognitiveservices.azure.com/.default") -> Optional[str]:
+    """
+    Get an Azure AD token with caching support.
+    This function first checks the cache before making a new token request.
+    
+    Args:
+        tenant_id: Azure tenant ID
+        client_id: Azure client ID
+        client_secret: Azure client secret
+        scope: OAuth scope to request
+        
+    Returns:
+        Access token if successful, None otherwise
+    """
+    # Validate input parameters
+    if not tenant_id or tenant_id == "default-tenant-id":
+        logger.error("Invalid tenant_id: empty or using default value")
+        return None
+        
+    if not client_id or client_id == "default-client-id":
+        logger.error("Invalid client_id: empty or using default value")
+        return None
+        
+    if not client_secret or client_secret == "default-client-secret":
+        logger.error("Invalid client_secret: empty or using default value")
+        return None
+    
+    # Check cache first
+    token = token_cache.get(tenant_id, client_id, scope)
+    if token:
+        return token
+    
+    # Cache miss - get new token
+    try:
+        # Mask credentials for logging
+        masked_tenant = f"{tenant_id[:4]}...{tenant_id[-4:]}" if len(tenant_id) > 8 else "***"
+        masked_client = f"{client_id[:4]}...{client_id[-4:]}" if len(client_id) > 8 else "***"
+        logger.info(f"Token cache miss for {masked_client} - fetching new token from Azure AD")
+        
+        # OAuth2 token endpoint
+        token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+        
+        # Request body
+        data = {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "scope": scope,
+            "grant_type": "client_credentials"
         }
         
-        # Set defaults if not already set
-        for key, value in postgres_defaults.items():
-            if not self.get(key):
-                self.set(key, value)
-                
-        # Log PostgreSQL configuration (without password)
-        logger.info(f"PostgreSQL configuration: host={self.get('PG_HOST')}, port={self.get('PG_PORT')}, db={self.get('PG_DB')}, user={self.get('PG_USER')}")
-    
-    def _get_credential(self):
-        """
-        Get the appropriate Azure credential.
+        # Make the request
+        logger.debug(f"Requesting token from {token_url}")
+        response = requests.post(
+            token_url, 
+            data=data,
+            timeout=30
+        )
         
-        Returns:
-            Azure credential instance
-        """
-        if str_to_bool(self.get("USE_MANAGED_IDENTITY", "False")):
-            logger.info("Using DefaultAzureCredential (managed identity)")
-            return DefaultAzureCredential()
-        else:
-            # Get Azure credentials from environment
-            tenant_id = self.get("AZURE_TENANT_ID")
-            client_id = self.get("AZURE_CLIENT_ID")
-            client_secret = self.get("AZURE_CLIENT_SECRET")
-            
-            # Log credentials (masking secrets)
-            if tenant_id and client_id and client_secret:
-                masked_tenant = f"{tenant_id[:4]}...{tenant_id[-4:]}" if len(tenant_id) > 8 else "***"
-                masked_client = f"{client_id[:4]}...{client_id[-4:]}" if len(client_id) > 8 else "***"
-                logger.info(f"Using ClientSecretCredential with tenant_id: {masked_tenant}, client_id: {masked_client}")
+        # Handle response
+        if response.status_code == 200:
+            token_data = response.json()
+            if "access_token" in token_data:
+                token = token_data["access_token"]
+                expires_in = token_data.get("expires_in", 3600)  # Default to 1 hour
                 
-                return ClientSecretCredential(
-                    tenant_id=tenant_id, 
-                    client_id=client_id, 
-                    client_secret=client_secret
-                )
+                # Cache the token
+                token_cache.set(tenant_id, client_id, scope, token, expires_in)
+                
+                logger.info(f"New token acquired and cached (expires in {expires_in}s)")
+                return token
             else:
-                logger.warning("Missing Azure AD credentials, cannot create ClientSecretCredential")
-                logger.warning("Make sure AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET are set in credentials.env")
+                logger.error("Token response did not contain access_token")
+                logger.debug(f"Response body: {token_data}")
                 return None
-    
-    def set_certificate_path(self, path: str):
-        """
-        Set the certificate path for SSL verification.
-        
-        Args:
-            path: Path to SSL certificate
-        """
-        try:
-            if not os.path.isabs(path):
-                path = os.path.abspath(path)
+        else:
+            logger.error(f"Token request failed with status {response.status_code}: {response.text}")
             
-            if os.path.exists(path):
-                if is_file_readable(path):
-                    self.set("REQUESTS_CA_BUNDLE", path)
-                    self.set("SSL_CERT_FILE", path)
-                    self.set("CURL_CA_BUNDLE", path)
-                    logger.info(f"Certificate path set to {path}")
-                else:
-                    logger.warning(f"Certificate file {path} exists but is not readable")
-            else:
-                logger.warning(f"Certificate file {path} not found, using system certificates")
-        except Exception as e:
-            logger.error(f"Error setting certificate path: {e}")
-            raise
-    
-    def bulk_set(self, dotenvfile: str, print_val: bool = False) -> None:
-        """
-        Load environment variables from a dotenv file.
-        
-        Args:
-            dotenvfile: Path to .env file
-            print_val: Whether to print values to logs
-        """
-        try:
-            if not os.path.isabs(dotenvfile):
-                dotenvfile = os.path.abspath(dotenvfile)
-            
-            if os.path.exists(dotenvfile) and is_file_readable(dotenvfile):
-                temp_dict = dotenv_values(dotenvfile)
+            # Log more detailed error information
+            if response.status_code == 400:
+                error = response.json().get("error", "unknown")
+                error_description = response.json().get("error_description", "No description provided")
+                logger.error(f"Token error: {error}")
+                logger.error(f"Error description: {error_description}")
                 
-                # Log how many variables were loaded
-                logger.info(f"Loading {len(temp_dict)} environment variables from {dotenvfile}")
+                if "invalid_request" in error:
+                    logger.error("Invalid request - check your Azure AD credentials")
+                elif "invalid_client" in error:
+                    logger.error("Invalid client - check your client ID and client secret")
+                elif "invalid_grant" in error:
+                    logger.error("Invalid grant - check your tenant ID and scope")
+            
+            return None
+            
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"Connection error when getting Azure token: {e}")
+        logger.error("Check network connectivity and proxy settings")
+        return None
+    except requests.exceptions.Timeout as e:
+        logger.error(f"Timeout when getting Azure token: {e}")
+        logger.error("The request to Azure AD timed out")
+        return None
+    except Exception as e:
+        logger.error(f"Error getting Azure token: {e}")
+        return None
+
+
+def refresh_token_if_needed(tenant_id: str, client_id: str, client_secret: str, 
+                           scope: str = "https://cognitiveservices.azure.com/.default",
+                           min_validity_seconds: int = 600) -> bool:
+    """
+    Check if a token is about to expire and refresh it if needed.
+    
+    Args:
+        tenant_id: Azure tenant ID
+        client_id: Azure client ID
+        client_secret: Azure client secret
+        scope: OAuth scope
+        min_validity_seconds: Minimum seconds of validity required
+        
+    Returns:
+        True if token was refreshed or is valid, False on error
+    """
+    # Get token from cache to check expiry
+    cache_key = token_cache._get_cache_key(tenant_id, client_id, scope)
+    should_refresh = False
+    
+    with token_cache._lock:
+        if cache_key in token_cache._tokens:
+            _, expiry_time = token_cache._tokens[cache_key]
+            time_left = expiry_time - time.time()
+            
+            # If token expires soon, refresh it
+            if time_left < min_validity_seconds:
+                logger.info(f"Token for {client_id[:8]}... expires in {time_left:.0f}s, refreshing")
                 
-                for key, value in temp_dict.items():
-                    self.set(key, value, print_val)
-                del temp_dict
-                logger.info(f"Loaded environment from {dotenvfile}")
-            else:
-                logger.warning(f"Environment file {dotenvfile} not found or not readable, skipping")
-        except Exception as e:
-            logger.error(f"Error loading environment variables from {dotenvfile}: {e}")
-            raise
+                # Remove old token
+                del token_cache._tokens[cache_key]
+                should_refresh = True
+        else:
+            # No token in cache, need to refresh
+            should_refresh = True
     
-    def set(self, key: str, value: str, print_val: bool = False) -> None:
-        """
-        Set an environment variable.
+    if should_refresh:
+        # Get a fresh token (will update cache)
+        token = get_azure_token_cached(tenant_id, client_id, client_secret, scope)
+        if token:
+            logger.info(f"Successfully refreshed token for {client_id[:8]}...")
+            return True
+        else:
+            logger.error(f"Failed to refresh token for {client_id[:8]}...")
+            return False
+    
+    # Token is still valid
+    return True
+
+
+# Global refresh thread reference
+_token_refresh_thread = None
+
+def start_token_refresh_service(refresh_interval: int = 300) -> threading.Thread:
+    """
+    Start a background thread that refreshes tokens periodically.
+    
+    Args:
+        refresh_interval: Interval between refresh checks in seconds
         
-        Args:
-            key: Environment variable name
-            value: Environment variable value
-            print_val: Whether to print value to logs
-        """
-        try:
-            os.environ[key] = value
-            if key not in self.var_list:
-                self.var_list.append(key)
-            if print_val:
-                if key in {'AZURE_CLIENT_SECRET', 'AD_USER_PW', 'PG_PASSWORD'}:
-                    logger.info(f"{key}: [REDACTED]")
-                else:
-                    logger.info(f"{key}: {value}")
-        except Exception as e:
-            logger.error(f"Error setting environment variable {key}: {e}")
-            raise
-    
-    def get(self, key: str, default: Optional[str] = None) -> str:
-        """
-        Get an environment variable.
+    Returns:
+        The background thread
+    """
+    def _token_refresh_worker():
+        settings = get_settings()
         
-        Args:
-            key: Environment variable name
-            default: Default value if not found
-            
-        Returns:
-            str: Environment variable value or default
-        """
-        try:
-            return os.environ.get(key, default)
-        except Exception as e:
-            logger.error(f"Error getting environment variable {key}: {e}")
-            raise
-    
-    def set_proxy(self) -> None:
-        """
-        Set up proxy configuration for HTTP requests.
-        """
-        try:
-            ad_username = self.get("AD_USERNAME")
-            ad_password = self.get("AD_USER_PW")
-            proxy_domain = self.get("HTTPS_PROXY_DOMAIN")
-            
-            if not all([ad_username, ad_password, proxy_domain]):
-                logger.error("Proxy settings are incomplete, cannot configure proxy")
-                raise ValueError("Proxy settings are incomplete. Check AD_USERNAME, AD_USER_PW, and HTTPS_PROXY_DOMAIN")
-            
-            # Use http:// instead of https:// as the proxy only supports HTTP
-            proxy_url = f"http://{ad_username}:{ad_password}@{proxy_domain}"
-            self.set("HTTP_PROXY", proxy_url, print_val=False)
-            self.set("HTTPS_PROXY", proxy_url, print_val=False)
-            
-            # Set no_proxy domains
-            no_proxy_domains = [
-                'cognitiveservices.azure.com',
-                'search.windows.net',
-                'openai.azure.com',
-                'core.windows.net',
-                'azurewebsites.net'
-            ]
-            
-            # Add any custom NO_PROXY entries from environment
-            custom_no_proxy = self.get("CUSTOM_NO_PROXY", "")
-            if custom_no_proxy:
-                no_proxy_domains.extend(custom_no_proxy.split(","))
-            
-            # Add PostgreSQL host to NO_PROXY if it's not localhost
-            pg_host = self.get("PG_HOST")
-            if pg_host and pg_host not in ["localhost", "127.0.0.1"]:
-                no_proxy_domains.append(pg_host)
-            
-            self.set("NO_PROXY", ",".join(no_proxy_domains), print_val=False)
-            logger.info("Proxy settings configured with HTTP protocol")
-            logger.info(f"NO_PROXY domains: {', '.join(no_proxy_domains)}")
-        except Exception as e:
-            logger.error(f"Error setting proxy: {e}")
-            raise
-    
-    def get_azure_token(self) -> str:
-        """
-        Get an Azure AD token for authenticated API calls.
+        tenant_id = settings.azure.tenant_id
+        client_id = settings.azure.client_id
+        client_secret = settings.azure.client_secret
         
-        Returns:
-            str: Azure AD token
-        """
-        try:
-            # Get Azure credentials from environment
-            tenant_id = self.get("AZURE_TENANT_ID")
-            client_id = self.get("AZURE_CLIENT_ID")
-            client_secret = self.get("AZURE_CLIENT_SECRET")
-            
-            # Log which credentials are being used (masked for security)
-            if tenant_id and client_id and client_secret:
-                masked_tenant = f"{tenant_id[:4]}...{tenant_id[-4:]}" if len(tenant_id) > 8 else "***"
-                masked_client = f"{client_id[:4]}...{client_id[-4:]}" if len(client_id) > 8 else "***"
-                logger.info(f"Acquiring Azure token with tenant_id: {masked_tenant}, client_id: {masked_client}")
-            
-                # Create credential
-                credential = ClientSecretCredential(
+        # Initial delay to let the application start up
+        time.sleep(10)
+        
+        while True:
+            try:
+                # Refresh the token if it's going to expire soon
+                refresh_token_if_needed(
                     tenant_id=tenant_id,
                     client_id=client_id,
                     client_secret=client_secret
                 )
-                
-                # Get token
-                token = credential.get_token("https://cognitiveservices.azure.com/.default")
-                
-                if token and token.token:
-                    self.set("AZURE_TOKEN", token.token, print_val=False)
-                    logger.info("Azure token acquired successfully")
-                    return token.token
-                else:
-                    logger.error("Failed to get Azure token (token is None)")
-            else:
-                logger.error("Missing Azure credentials, cannot get token")
-                if not tenant_id:
-                    logger.error("AZURE_TENANT_ID is not set")
-                if not client_id:
-                    logger.error("AZURE_CLIENT_ID is not set")
-                if not client_secret:
-                    logger.error("AZURE_CLIENT_SECRET is not set")
+            except Exception as e:
+                logger.error(f"Error in token refresh worker: {e}")
             
-            return None
-        except Exception as e:
-            logger.error(f"Error retrieving Azure token: {e}")
-            return None
+            # Sleep for the specified interval
+            time.sleep(refresh_interval)
     
-    def list_env_vars(self) -> None:
-        """
-        List all environment variables (with sensitive values redacted).
-        """
-        logger.info("Environment variables currently set:")
-        for var in sorted(self.var_list):
-            if var in {'AZURE_TOKEN', 'AD_USER_PW', 'AZURE_CLIENT_SECRET', 'PG_PASSWORD'}:
-                logger.info(f"{var}: [REDACTED]")
-            else:
-                value = os.getenv(var)
-                # Truncate very long values
-                if value and len(value) > 100:
-                    value = value[:97] + "..."
-                logger.info(f"{var}: {value}")
+    # Create and start the thread
+    refresh_thread = threading.Thread(
+        target=_token_refresh_worker,
+        daemon=True,
+        name="TokenRefreshThread"
+    )
+    refresh_thread.start()
+    logger.info(f"Token refresh service started (interval: {refresh_interval}s)")
+    
+    return refresh_thread
 
-# Singleton instance for application-wide access
-_os_env_instance = None
 
-def get_os_env(
-    config_file: str = CONFIG_PATH, 
-    creds_file: str = CREDS_PATH, 
-    certificate_path: str = CERT_PATH,
-    proxy_enabled: Optional[bool] = None
-) -> OSEnv:
+# Simplified auth functions - No API key verification
+async def verify_api_key(api_key: str = None):
     """
-    Get the OSEnv instance.
-    
-    Args:
-        config_file: Path to configuration file
-        creds_file: Path to credentials file
-        certificate_path: Path to SSL certificate
-        proxy_enabled: Override the PROXY_ENABLED setting in the config file
-        
-    Returns:
-        OSEnv: Environment variable manager instance
+    No API key verification required.
+    This function always returns True.
     """
-    global _os_env_instance
-    if _os_env_instance is None:
-        logger.info(f"Initializing environment from {config_file} and {creds_file}")
-        _os_env_instance = OSEnv(config_file, creds_file, certificate_path, proxy_enabled)
-    elif proxy_enabled is not None and proxy_enabled != str_to_bool(_os_env_instance.get("PROXY_ENABLED", "False")):
-        # If proxy_enabled changes, recreate the instance
-        logger.info("Re-initializing environment with new proxy settings")
-        _os_env_instance = OSEnv(config_file, creds_file, certificate_path, proxy_enabled)
-    
-    return _os_env_instance
+    return True
+
+
+async def get_current_user(token: str = None):
+    """
+    Simplified user authentication.
+    For direct connection without auth, this just returns a default user.
+    """
+    # Create a simple user object
+    user = {"username": "default_user"}
+    return user
