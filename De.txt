@@ -1,27 +1,29 @@
 """
-Unified Azure Token Provider for FastAPI and background workers.
-This module ensures consistent token handling across synchronous and asynchronous contexts.
+Azure AD token management aligned with existing codebase patterns.
+This module ensures consistent token handling across synchronous and asynchronous contexts
+using the get_bearer_token_provider pattern from your existing code.
 """
 
 import logging
 import time
 import threading
-import traceback
 import os
-import random
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, Callable
-from fastapi import Depends, HTTPException, status
-from pydantic import BaseModel
+import traceback
+from typing import Optional, Dict, Any
 from dotenv import dotenv_values
-import requests
-from azure.identity import ClientSecretCredential
+from azure.identity import (
+    DefaultAzureCredential, 
+    ClientSecretCredential,
+    get_bearer_token_provider
+)
 
 logger = logging.getLogger(__name__)
 
 # Load credentials directly from file
 credentials_path = os.path.join("env", "credentials.env")
+config_path = os.path.join("env", "config.env")
 credentials_values = {}
+config_values = {}
 
 try:
     if os.path.isfile(credentials_path):
@@ -30,23 +32,36 @@ try:
         logger.info(f"Loaded {len(credentials_values)} values from {credentials_path}")
     else:
         logger.warning(f"Credentials file not found: {credentials_path}")
+        
+    if os.path.isfile(config_path):
+        logger.info(f"Auth helper loading config from {config_path}")
+        config_values = dotenv_values(config_path)
+        logger.info(f"Loaded {len(config_values)} values from {config_path}")
+    else:
+        logger.warning(f"Config file not found: {config_path}")
 except Exception as e:
-    logger.error(f"Error loading credentials file: {e}")
+    logger.error(f"Error loading env files: {e}")
+
+# Combine both sets of values, with credentials taking precedence
+all_values = {**config_values, **credentials_values}
 
 # Extract Azure AD credentials directly
-AZURE_TENANT_ID = credentials_values.get("AZURE_TENANT_ID", "")
-AZURE_CLIENT_ID = credentials_values.get("AZURE_CLIENT_ID", "")
-AZURE_CLIENT_SECRET = credentials_values.get("AZURE_CLIENT_SECRET", "")
+AZURE_TENANT_ID = all_values.get("AZURE_TENANT_ID", "")
+AZURE_CLIENT_ID = all_values.get("AZURE_CLIENT_ID", "")
+AZURE_CLIENT_SECRET = all_values.get("AZURE_CLIENT_SECRET", "")
+AZURE_OPENAI_ENDPOINT = all_values.get("AZURE_OPENAI_ENDPOINT", "")
+USE_MANAGED_IDENTITY = all_values.get("USE_MANAGED_IDENTITY", "False").lower() in ("true", "1", "yes", "y")
 
-# Models for token handling
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-    expires_at: datetime
+# Log credential status (masked for security)
+if AZURE_TENANT_ID and AZURE_CLIENT_ID and AZURE_CLIENT_SECRET:
+    masked_tenant = f"{AZURE_TENANT_ID[:4]}...{AZURE_TENANT_ID[-4:]}" if len(AZURE_TENANT_ID) > 8 else "***"
+    masked_client = f"{AZURE_CLIENT_ID[:4]}...{AZURE_CLIENT_ID[-4:]}" if len(AZURE_CLIENT_ID) > 8 else "***"
+    logger.info(f"Using Azure credentials - tenant_id: {masked_tenant}, client_id: {masked_client}")
+else:
+    logger.warning("One or more Azure credentials are missing or invalid")
 
-
-class TokenCache:
-    """Thread-safe token cache for storing and retrieving Azure tokens."""
+class AzureCredentialManager:
+    """Singleton manager for Azure credentials and token providers."""
     
     _instance = None
     _lock = threading.RLock()
@@ -56,311 +71,174 @@ class TokenCache:
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
-                    cls._instance = super(TokenCache, cls).__new__(cls)
+                    cls._instance = super(AzureCredentialManager, cls).__new__(cls)
                     cls._instance._initialized = False
         return cls._instance
     
     def __init__(self):
-        """Initialize the token cache."""
+        """Initialize the credential manager."""
         if self._initialized:
             return
             
         with self._lock:
             if not self._initialized:
-                self._tokens = {}  # Format: {cache_key: (token, expiry_time)}
+                self._credential = None
+                self._token_provider = None
+                self._last_init_time = 0
+                self._refresh_interval = 55 * 60  # 55 minutes (tokens typically last 60 min)
+                self._initialize_credential()
                 self._initialized = True
-                self._last_log_time = 0  # For limiting log frequency
-                logger.info("Token cache initialized")
+                logger.info("Azure credential manager initialized")
     
-    def get(self, tenant_id: str, client_id: str, scope: str) -> Optional[str]:
+    def _initialize_credential(self):
+        """Initialize Azure credential."""
+        try:
+            if USE_MANAGED_IDENTITY:
+                logger.info("Using DefaultAzureCredential (managed identity)")
+                self._credential = DefaultAzureCredential()
+            else:
+                # Validate credentials
+                if not AZURE_TENANT_ID or AZURE_TENANT_ID == "your-tenant-id-here":
+                    logger.error("Invalid tenant_id: empty or using default value")
+                    raise ValueError("Invalid AZURE_TENANT_ID")
+                    
+                if not AZURE_CLIENT_ID or AZURE_CLIENT_ID == "your-client-id-here":
+                    logger.error("Invalid client_id: empty or using default value")
+                    raise ValueError("Invalid AZURE_CLIENT_ID")
+                    
+                if not AZURE_CLIENT_SECRET or AZURE_CLIENT_SECRET == "your-client-secret-here":
+                    logger.error("Invalid client_secret: empty or using default value")
+                    raise ValueError("Invalid AZURE_CLIENT_SECRET")
+                
+                logger.info("Using ClientSecretCredential")
+                self._credential = ClientSecretCredential(
+                    tenant_id=AZURE_TENANT_ID,
+                    client_id=AZURE_CLIENT_ID,
+                    client_secret=AZURE_CLIENT_SECRET
+                )
+            
+            # Create token provider
+            self._token_provider = get_bearer_token_provider(
+                self._credential,
+                "https://cognitiveservices.azure.com/.default"
+            )
+            
+            self._last_init_time = time.time()
+            logger.info("Azure credential and token provider initialized successfully")
+        except Exception as e:
+            logger.error(f"Error initializing Azure credential: {e}")
+            logger.error(traceback.format_exc())
+            raise
+    
+    def get_credential(self, force_refresh: bool = False):
         """
-        Get a token from the cache if it exists and is not expired.
+        Get the Azure credential, refreshing if needed.
         
         Args:
-            tenant_id: Azure tenant ID
-            client_id: Azure client ID
-            scope: OAuth scope
+            force_refresh: Force refresh the credential
             
         Returns:
-            Token if found and valid, None otherwise
+            Azure credential
         """
-        cache_key = self._get_cache_key(tenant_id, client_id, scope)
-        
         with self._lock:
-            if cache_key in self._tokens:
-                token, expiry_time = self._tokens[cache_key]
-                # Allow 5 minute buffer before expiration
-                if time.time() < expiry_time - 300:
-                    current_time = time.time()
-                    # Limit log frequency to avoid spamming logs
-                    if current_time - self._last_log_time > 60:  # Log no more than once per minute
-                        logger.debug(f"Token cache hit for {client_id[:8]}...")
-                        self._last_log_time = current_time
-                    return token
-                else:
-                    logger.debug(f"Token expired for {client_id[:8]}...")
-                    # Remove expired token
-                    del self._tokens[cache_key]
-        
-        return None
+            current_time = time.time()
+            # Refresh credential if it's time or forced
+            if force_refresh or (current_time - self._last_init_time) > self._refresh_interval:
+                logger.info("Refreshing Azure credential")
+                self._initialize_credential()
+            
+            return self._credential
     
-    def set(self, tenant_id: str, client_id: str, scope: str, token: str, expires_in: int = 3600) -> None:
+    def get_token_provider(self, force_refresh: bool = False):
         """
-        Store a token in the cache.
+        Get the Azure token provider, refreshing if needed.
         
         Args:
-            tenant_id: Azure tenant ID
-            client_id: Azure client ID
-            scope: OAuth scope
-            token: The token to store
-            expires_in: Token expiration time in seconds
-        """
-        cache_key = self._get_cache_key(tenant_id, client_id, scope)
-        expiry_time = time.time() + expires_in
-        
-        with self._lock:
-            self._tokens[cache_key] = (token, expiry_time)
+            force_refresh: Force refresh the token provider
             
-        logger.debug(f"Token cached for {client_id[:8]}... (expires in {expires_in}s)")
-    
-    def _get_cache_key(self, tenant_id: str, client_id: str, scope: str) -> str:
-        """Generate a cache key."""
-        return f"{tenant_id}:{client_id}:{scope}"
-    
-    def clear(self) -> None:
-        """Clear all tokens from the cache."""
+        Returns:
+            Azure token provider
+        """
         with self._lock:
-            self._tokens.clear()
-        logger.info("Token cache cleared")
+            # Refresh credential and token provider if needed
+            self.get_credential(force_refresh)
+            return self._token_provider
     
-    def remove(self, tenant_id: str, client_id: str, scope: str) -> None:
-        """Remove a specific token from the cache."""
-        cache_key = self._get_cache_key(tenant_id, client_id, scope)
+    def get_token(self, scope: str = "https://cognitiveservices.azure.com/.default", force_refresh: bool = False):
+        """
+        Get an Azure AD token directly.
         
-        with self._lock:
-            if cache_key in self._tokens:
-                del self._tokens[cache_key]
-                logger.debug(f"Token removed from cache for {client_id[:8]}...")
+        Args:
+            scope: OAuth scope to request
+            force_refresh: Force refresh the credential
+            
+        Returns:
+            Access token if successful, None otherwise
+        """
+        try:
+            credential = self.get_credential(force_refresh)
+            token = credential.get_token(scope)
+            
+            if token and token.token:
+                # Log the token (partially masked)
+                token_prefix = token.token[:10] if len(token.token) > 20 else token.token[:5]
+                token_suffix = token.token[-10:] if len(token.token) > 20 else token.token[-5:]
+                logger.info(f"Received token: {token_prefix}...{token_suffix}")
+                
+                return token.token
+            else:
+                logger.error("No token received from Azure AD")
+                return None
+        except Exception as e:
+            logger.error(f"Error getting Azure token: {e}")
+            logger.error(traceback.format_exc())
+            return None
 
 
-# Initialize global token cache
-token_cache = TokenCache()
+# Global credential manager instance
+credential_manager = AzureCredentialManager()
 
-def get_azure_token_cached(tenant_id: str = None, client_id: str = None, client_secret: str = None, 
-                          scope: str = "https://cognitiveservices.azure.com/.default",
-                          max_retries: int = 3,
-                          retry_delay: int = 2) -> Optional[str]:
+def get_azure_credential(force_refresh: bool = False):
     """
-    Get an Azure AD token with caching support and retry logic.
-    This function first checks the cache before making a new token request.
+    Get the Azure credential, refreshing if needed.
     
     Args:
-        tenant_id: Azure tenant ID (uses value from credentials.env if None)
-        client_id: Azure client ID (uses value from credentials.env if None)
-        client_secret: Azure client secret (uses value from credentials.env if None)
+        force_refresh: Force refresh the credential
+        
+    Returns:
+        Azure credential
+    """
+    return credential_manager.get_credential(force_refresh)
+
+def get_azure_token_provider(force_refresh: bool = False):
+    """
+    Get the Azure token provider, refreshing if needed.
+    
+    Args:
+        force_refresh: Force refresh the token provider
+        
+    Returns:
+        Azure token provider
+    """
+    return credential_manager.get_token_provider(force_refresh)
+
+def get_azure_token(scope: str = "https://cognitiveservices.azure.com/.default", force_refresh: bool = False):
+    """
+    Get an Azure AD token directly.
+    
+    Args:
         scope: OAuth scope to request
-        max_retries: Maximum number of retry attempts
-        retry_delay: Base delay between retries in seconds
+        force_refresh: Force refresh the credential
         
     Returns:
         Access token if successful, None otherwise
     """
-    # Use provided values or fall back to values loaded from credentials.env
-    tenant_id = tenant_id or AZURE_TENANT_ID
-    client_id = client_id or AZURE_CLIENT_ID
-    client_secret = client_secret or AZURE_CLIENT_SECRET
-    
-    # Validate input parameters
-    if not tenant_id or tenant_id == "your-tenant-id-here":
-        logger.error("Invalid tenant_id: empty or using default value")
-        return None
-        
-    if not client_id or client_id == "your-client-id-here":
-        logger.error("Invalid client_id: empty or using default value")
-        return None
-        
-    if not client_secret or client_secret == "your-client-secret-here":
-        logger.error("Invalid client_secret: empty or using default value")
-        return None
-    
-    # Check cache first
-    token = token_cache.get(tenant_id, client_id, scope)
-    if token:
-        return token
-    
-    # Cache miss - get new token with retries
-    for retry in range(max_retries):
-        try:
-            # Mask credentials for logging
-            masked_tenant = f"{tenant_id[:4]}...{tenant_id[-4:]}" if len(tenant_id) > 8 else "***"
-            masked_client = f"{client_id[:4]}...{client_id[-4:]}" if len(client_id) > 8 else "***"
-            
-            if retry == 0:
-                logger.info(f"Token cache miss for {masked_client} - fetching new token from Azure AD")
-            else:
-                logger.info(f"Retrying token acquisition (attempt {retry+1}/{max_retries})")
-            
-            # Try using Azure Identity SDK first (preferred method)
-            try:
-                logger.debug("Attempting token acquisition with Azure Identity SDK...")
-                credential = ClientSecretCredential(
-                    tenant_id=tenant_id,
-                    client_id=client_id,
-                    client_secret=client_secret
-                )
-                token_response = credential.get_token(scope)
-                if token_response and token_response.token:
-                    token = token_response.token
-                    expires_in = 3600  # Default to 1 hour if not provided
-                    
-                    # Log the token (partially masked)
-                    token_prefix = token[:10] if len(token) > 20 else token[:5]
-                    token_suffix = token[-10:] if len(token) > 20 else token[-5:]
-                    logger.info(f"Received token using Azure Identity SDK: {token_prefix}...{token_suffix}")
-                    
-                    # Cache the token
-                    token_cache.set(tenant_id, client_id, scope, token, expires_in)
-                    
-                    logger.info(f"New token acquired and cached (expires in {expires_in}s)")
-                    return token
-                else:
-                    logger.warning("Azure Identity SDK did not return a valid token, falling back to REST API")
-            except Exception as sdk_error:
-                logger.warning(f"Error using Azure Identity SDK: {sdk_error}, falling back to REST API")
-            
-            # Fallback to OAuth2 token endpoint
-            token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
-            
-            # Request body
-            data = {
-                "client_id": client_id,
-                "client_secret": client_secret,
-                "scope": scope,
-                "grant_type": "client_credentials"
-            }
-            
-            # Make the request
-            logger.debug(f"Requesting token from {token_url}")
-            response = requests.post(
-                token_url, 
-                data=data,
-                timeout=30
-            )
-            
-            # Handle response
-            if response.status_code == 200:
-                token_data = response.json()
-                if "access_token" in token_data:
-                    token = token_data["access_token"]
-                    expires_in = token_data.get("expires_in", 3600)  # Default to 1 hour
-                    
-                    # Log the token (partially masked)
-                    token_prefix = token[:10] if len(token) > 20 else token[:5]
-                    token_suffix = token[-10:] if len(token) > 20 else token[-5:]
-                    logger.info(f"Received token: {token_prefix}...{token_suffix}")
-                    
-                    # Cache the token
-                    token_cache.set(tenant_id, client_id, scope, token, expires_in)
-                    
-                    logger.info(f"New token acquired and cached (expires in {expires_in}s)")
-                    return token
-                else:
-                    logger.error("Token response did not contain access_token")
-                    logger.debug(f"Response body: {token_data}")
-            else:
-                logger.error(f"Token request failed with status {response.status_code}: {response.text}")
-                
-                # Log more detailed error information for troubleshooting
-                if response.status_code == 400:
-                    try:
-                        error_data = response.json()
-                        error = error_data.get("error", "unknown")
-                        error_description = error_data.get("error_description", "No description provided")
-                        logger.error(f"Token error: {error}")
-                        logger.error(f"Error description: {error_description}")
-                    except:
-                        logger.error(f"Could not parse error response: {response.text}")
-        
-        except requests.exceptions.ConnectionError as e:
-            logger.error(f"Connection error when getting Azure token: {e}")
-            logger.error("Check network connectivity and proxy settings")
-        except requests.exceptions.Timeout as e:
-            logger.error(f"Timeout when getting Azure token: {e}")
-            logger.error("The request to Azure AD timed out")
-        except Exception as e:
-            logger.error(f"Error getting Azure token: {e}")
-            logger.error(traceback.format_exc())
-        
-        # If we get here, the attempt failed - add delay before retry
-        if retry < max_retries - 1:  # Only sleep if we're going to retry
-            sleep_time = (retry_delay * (2 ** retry)) + random.uniform(0, 1)  # Exponential backoff with jitter
-            logger.info(f"Retrying token acquisition in {sleep_time:.2f} seconds...")
-            time.sleep(sleep_time)
-    
-    # If we get here, all retries failed
-    logger.error(f"Failed to get Azure token after {max_retries} attempts")
-    return None
+    return credential_manager.get_token(scope, force_refresh)
 
 
-# Function to check and refresh token if needed (used by both async and sync code)
-def refresh_token_if_needed(tenant_id: str = None, client_id: str = None, client_secret: str = None, 
-                           scope: str = "https://cognitiveservices.azure.com/.default",
-                           min_validity_seconds: int = 600) -> bool:
-    """
-    Check if a token is about to expire and refresh it if needed.
-    
-    Args:
-        tenant_id: Azure tenant ID (uses value from credentials.env if None)
-        client_id: Azure client ID (uses value from credentials.env if None) 
-        client_secret: Azure client secret (uses value from credentials.env if None)
-        scope: OAuth scope
-        min_validity_seconds: Minimum seconds of validity required
-        
-    Returns:
-        True if token was refreshed or is valid, False on error
-    """
-    # Use provided values or fall back to values loaded from credentials.env
-    tenant_id = tenant_id or AZURE_TENANT_ID
-    client_id = client_id or AZURE_CLIENT_ID
-    client_secret = client_secret or AZURE_CLIENT_SECRET
-    
-    # Get token from cache to check expiry
-    cache_key = token_cache._get_cache_key(tenant_id, client_id, scope)
-    should_refresh = False
-    
-    with token_cache._lock:
-        if cache_key in token_cache._tokens:
-            _, expiry_time = token_cache._tokens[cache_key]
-            time_left = expiry_time - time.time()
-            
-            # If token expires soon, refresh it
-            if time_left < min_validity_seconds:
-                logger.info(f"Token for {client_id[:8]}... expires in {time_left:.0f}s, refreshing")
-                
-                # Remove old token
-                del token_cache._tokens[cache_key]
-                should_refresh = True
-        else:
-            # No token in cache, need to refresh
-            should_refresh = True
-    
-    if should_refresh:
-        # Get a fresh token (will update cache)
-        token = get_azure_token_cached(tenant_id, client_id, client_secret, scope)
-        if token:
-            logger.info(f"Successfully refreshed token for {client_id[:8]}...")
-            return True
-        else:
-            logger.error(f"Failed to refresh token for {client_id[:8]}...")
-            return False
-    
-    # Token is still valid
-    return True
-
-
-# Background refresh worker that handles both synchronous and asynchronous contexts
+# Token refresh background service
 class TokenRefreshService:
-    """Service for refreshing Azure AD tokens periodically in background."""
+    """Service for refreshing Azure credentials periodically."""
     
     _instance = None
     _lock = threading.RLock()
@@ -386,7 +264,7 @@ class TokenRefreshService:
                 self._initialized = True
                 logger.info("Token refresh service initialized")
     
-    def start(self, refresh_interval: int = 300):
+    def start(self, refresh_interval: int = 1800):  # Default 30 minutes
         """
         Start the token refresh service.
         
@@ -418,7 +296,7 @@ class TokenRefreshService:
     
     def _refresh_worker(self, refresh_interval: int):
         """
-        Worker function for refreshing tokens periodically.
+        Worker function for refreshing credentials periodically.
         
         Args:
             refresh_interval: Interval between refresh checks in seconds
@@ -430,28 +308,24 @@ class TokenRefreshService:
         
         while self._running:
             try:
-                # Refresh the token if it's going to expire soon
-                refresh_token_if_needed(
-                    tenant_id=AZURE_TENANT_ID,
-                    client_id=AZURE_CLIENT_ID,
-                    client_secret=AZURE_CLIENT_SECRET,
-                    min_validity_seconds=refresh_interval * 2  # Refresh if less than 2 intervals remaining
-                )
+                # Force refresh the credential which will recreate the token provider
+                credential_manager.get_credential(force_refresh=True)
+                logger.info("Azure credentials refreshed successfully")
             except Exception as e:
                 logger.error(f"Error in token refresh worker: {e}")
                 logger.error(traceback.format_exc())
             
             # Sleep for the specified interval
-            for _ in range(refresh_interval):
-                if not self._running:
-                    break
+            sleep_counter = 0
+            while sleep_counter < refresh_interval and self._running:
                 time.sleep(1)  # Sleep in 1-second increments for faster stopping
+                sleep_counter += 1
 
 
 # Global refresh service instance
 token_refresh_service = TokenRefreshService()
 
-def start_token_refresh_service(refresh_interval: int = 300) -> threading.Thread:
+def start_token_refresh_service(refresh_interval: int = 1800) -> threading.Thread:
     """
     Start the token refresh service.
     
