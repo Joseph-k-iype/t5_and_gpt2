@@ -1,92 +1,388 @@
 """
-Models for mapping job tracking with mandatory ID fields.
+Service for tracking mapping jobs in Elasticsearch with required ID fields.
 """
 
-from pydantic import BaseModel, Field, validator
-from typing import Optional, List, Dict, Any, Union
+import logging
+import asyncio
+import time
+from typing import List, Dict, Any, Optional, Union
 from datetime import datetime
-from enum import Enum
-from app.models.base import BaseResponse
+from app.models.job import MappingJob, JobStatus, MappingJobRequest
 from app.models.mapping import MappingRequest, MappingResult
+from elasticsearch import AsyncElasticsearch, NotFoundError
+from app.core.environment import get_os_env
 
+logger = logging.getLogger(__name__)
 
-class JobStatus(str, Enum):
-    """Enum for job status."""
-    PENDING = "pending"
-    IN_PROGRESS = "in_progress"
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-
-class MappingJob(BaseModel):
-    """
-    Model for tracking mapping jobs.
-    """
-    id: str  # Now required - no default factory
-    process_id: str  # Now required - no default factory
-    status: JobStatus = Field(default=JobStatus.PENDING)
-    created_at: datetime = Field(default_factory=datetime.now)
-    updated_at: datetime = Field(default_factory=datetime.now)
-    completed_at: Optional[datetime] = None
-    request: MappingRequest
-    results: Optional[List[MappingResult]] = None
-    error: Optional[str] = None
+class JobTrackingService:
+    """Service for tracking mapping jobs in Elasticsearch."""
     
-    def update_status(self, status: JobStatus):
-        """Update job status and updated_at timestamp."""
-        self.status = status
-        self.updated_at = datetime.now()
-        if status == JobStatus.COMPLETED:
-            self.completed_at = datetime.now()
-
-
-class MappingJobResponse(BaseResponse):
-    """
-    Response model for mapping job endpoints.
-    """
-    job: Optional[MappingJob] = None
-
-
-class MappingJobsResponse(BaseResponse):
-    """
-    Response model for listing mapping jobs.
-    """
-    jobs: List[MappingJob] = []
-    total: int = 0
-    page: int = 1
-    page_size: int = 10
-
-
-class JobStatusUpdateRequest(BaseModel):
-    """
-    Request model for updating job status.
-    """
-    status: JobStatus
-    results: Optional[List[MappingResult]] = None
-    error: Optional[str] = None
-
-
-class MappingJobRequest(BaseModel):
-    """
-    Request model for creating a new mapping job,
-    combining the mapping request with job identifiers.
-    """
-    id: str
-    process_id: str
-    name: str
-    description: str
-    example: Optional[str] = None
-    cdm: Optional[str] = None
-    process_name: Optional[str] = None
-    process_description: Optional[str] = None
+    def __init__(self, client: Optional[AsyncElasticsearch] = None):
+        """
+        Initialize the job tracking service.
+        
+        Args:
+            client: Elasticsearch client (optional)
+        """
+        self.client = client
+        self.index_name = "mapping_jobs"
+        self._connected = False
     
-    def to_mapping_request(self) -> MappingRequest:
-        """Convert to a MappingRequest object."""
-        return MappingRequest(
-            name=self.name,
-            description=self.description,
-            example=self.example,
-            cdm=self.cdm,
-            process_name=self.process_name,
-            process_description=self.process_description
+    async def connect(self, client: Optional[AsyncElasticsearch] = None):
+        """
+        Connect to Elasticsearch if not already connected.
+        
+        Args:
+            client: Elasticsearch client to use (optional)
+        """
+        if client:
+            self.client = client
+            self._connected = True
+            return
+            
+        if self._connected and self.client:
+            return
+        
+        # Get environment
+        env = get_os_env()
+        
+        # Get Elasticsearch configuration
+        hosts = env.get("ELASTICSEARCH_HOSTS", '["http://localhost:9200"]')
+        if hosts.startswith('[') and hosts.endswith(']'):
+            import json
+            hosts = json.loads(hosts)
+        else:
+            hosts = [hosts]
+            
+        # Clean up hosts
+        clean_hosts = []
+        for host in hosts:
+            if isinstance(host, str):
+                host = host.strip('\'"')
+                if not host.startswith(('http://', 'https://')):
+                    host = f"https://{host}"
+                clean_hosts.append(host)
+        
+        # Get authentication details
+        username = env.get("ELASTICSEARCH_USERNAME", None)
+        password = env.get("ELASTICSEARCH_PASSWORD", None)
+        
+        # Create connection parameters
+        conn_params = {
+            "timeout": 30,
+            "max_retries": 3,
+            "retry_on_timeout": True,
+            "verify_certs": False,
+            "ssl_show_warn": False
+        }
+        
+        # Add authentication if provided
+        if username and password:
+            conn_params["basic_auth"] = (username, password)
+        
+        # Create client
+        self.client = AsyncElasticsearch(
+            clean_hosts,
+            **conn_params
         )
+        
+        # Test connection
+        try:
+            info = await self.client.info()
+            logger.info(f"Connected to Elasticsearch version {info['version']['number']}")
+            self._connected = True
+        except Exception as e:
+            logger.error(f"Failed to connect to Elasticsearch: {e}")
+            raise
+    
+    async def create_index(self):
+        """Create the mapping jobs index if it doesn't exist."""
+        if not self._connected:
+            await self.connect()
+        
+        # Check if index exists
+        exists = await self.client.indices.exists(index=self.index_name)
+        if exists:
+            logger.info(f"Index '{self.index_name}' already exists")
+            return
+        
+        # Define index settings
+        settings = {
+            "settings": {
+                "number_of_shards": 1,
+                "number_of_replicas": 1,
+                "analysis": {
+                    "analyzer": {
+                        "default": {
+                            "type": "standard"
+                        }
+                    }
+                }
+            },
+            "mappings": {
+                "properties": {
+                    "id": {"type": "keyword"},
+                    "process_id": {"type": "keyword"},
+                    "status": {"type": "keyword"},
+                    "created_at": {"type": "date"},
+                    "updated_at": {"type": "date"},
+                    "completed_at": {"type": "date"},
+                    "request": {"type": "object"},
+                    "results": {"type": "object"},
+                    "error": {"type": "text"}
+                }
+            }
+        }
+        
+        # Create index
+        try:
+            await self.client.indices.create(index=self.index_name, body=settings)
+            logger.info(f"Created index '{self.index_name}'")
+        except Exception as e:
+            logger.error(f"Error creating index '{self.index_name}': {e}")
+            raise
+    
+    async def create_job(self, job_id: str, process_id: str, request: MappingRequest) -> MappingJob:
+        """
+        Create a new mapping job with the specified ID and process ID.
+        
+        Args:
+            job_id: Job ID (required)
+            process_id: Process ID (required)
+            request: Mapping request
+            
+        Returns:
+            Created job
+        """
+        if not self._connected:
+            await self.connect()
+        
+        # Ensure index exists
+        await self.create_index()
+        
+        # Check if job with this ID already exists
+        try:
+            existing_job = await self.client.get(
+                index=self.index_name,
+                id=job_id
+            )
+            logger.warning(f"Job with ID {job_id} already exists")
+            # Return the existing job
+            return MappingJob(**existing_job["_source"])
+        except NotFoundError:
+            # Job doesn't exist, proceed with creation
+            pass
+        
+        # Create job with specified IDs
+        job = MappingJob(
+            id=job_id,
+            process_id=process_id,
+            request=request
+        )
+        
+        # Save to Elasticsearch
+        try:
+            await self.client.index(
+                index=self.index_name,
+                id=job.id,
+                document=job.model_dump(),
+                refresh=True
+            )
+            logger.info(f"Created mapping job with ID: {job.id}, process ID: {job.process_id}")
+            return job
+        except Exception as e:
+            logger.error(f"Error creating mapping job: {e}")
+            raise
+    
+    async def update_job_status(self, job_id: str, status: JobStatus, 
+                             results: Optional[List[MappingResult]] = None,
+                             error: Optional[str] = None) -> Optional[MappingJob]:
+        """
+        Update a job's status.
+        
+        Args:
+            job_id: ID of the job to update
+            status: New status
+            results: Mapping results (if completed)
+            error: Error message (if failed)
+            
+        Returns:
+            Updated job or None if not found
+        """
+        if not self._connected:
+            await self.connect()
+        
+        # Get current job
+        try:
+            response = await self.client.get(
+                index=self.index_name,
+                id=job_id
+            )
+            job_data = response["_source"]
+            
+            # Convert to MappingJob
+            job = MappingJob(**job_data)
+            
+            # Update status
+            job.update_status(status)
+            
+            # Add results or error if provided
+            if results is not None:
+                job.results = results
+            if error is not None:
+                job.error = error
+            
+            # Save to Elasticsearch
+            await self.client.index(
+                index=self.index_name,
+                id=job.id,
+                document=job.model_dump(),
+                refresh=True
+            )
+            
+            logger.info(f"Updated job {job_id} status to {status}")
+            return job
+        except NotFoundError:
+            logger.error(f"Job {job_id} not found")
+            return None
+        except Exception as e:
+            logger.error(f"Error updating job {job_id}: {e}")
+            raise
+    
+    async def get_job(self, job_id: str) -> Optional[MappingJob]:
+        """
+        Get a job by ID.
+        
+        Args:
+            job_id: ID of the job to get
+            
+        Returns:
+            Job or None if not found
+        """
+        if not self._connected:
+            await self.connect()
+        
+        try:
+            response = await self.client.get(
+                index=self.index_name,
+                id=job_id
+            )
+            job_data = response["_source"]
+            
+            # Convert to MappingJob
+            job = MappingJob(**job_data)
+            return job
+        except NotFoundError:
+            logger.error(f"Job {job_id} not found")
+            return None
+        except Exception as e:
+            logger.error(f"Error getting job {job_id}: {e}")
+            raise
+    
+    async def get_job_by_process_id(self, process_id: str) -> Optional[MappingJob]:
+        """
+        Get a job by process ID.
+        
+        Args:
+            process_id: Process ID to search for
+            
+        Returns:
+            Job or None if not found
+        """
+        if not self._connected:
+            await self.connect()
+        
+        try:
+            # Search for a job with the given process ID
+            response = await self.client.search(
+                index=self.index_name,
+                query={"term": {"process_id": process_id}},
+                size=1
+            )
+            
+            # Check if a job was found
+            if response["hits"]["total"]["value"] > 0:
+                job_data = response["hits"]["hits"][0]["_source"]
+                job = MappingJob(**job_data)
+                return job
+            else:
+                logger.info(f"No job found with process ID: {process_id}")
+                return None
+        except Exception as e:
+            logger.error(f"Error getting job by process ID {process_id}: {e}")
+            raise
+    
+    async def get_jobs(self, status: Optional[JobStatus] = None, 
+                     page: int = 1, page_size: int = 10) -> tuple[List[MappingJob], int]:
+        """
+        Get jobs with optional filtering by status.
+        
+        Args:
+            status: Filter by status (optional)
+            page: Page number (1-based)
+            page_size: Number of results per page
+            
+        Returns:
+            Tuple of (list of jobs, total count)
+        """
+        if not self._connected:
+            await self.connect()
+        
+        # Calculate from index
+        from_idx = (page - 1) * page_size
+        
+        # Build query
+        query = {"match_all": {}}
+        if status:
+            query = {"term": {"status": status}}
+        
+        # Execute search
+        try:
+            response = await self.client.search(
+                index=self.index_name,
+                query=query,
+                sort=[{"created_at": {"order": "desc"}}],
+                from_=from_idx,
+                size=page_size
+            )
+            
+            # Extract jobs and total
+            jobs = []
+            for hit in response["hits"]["hits"]:
+                job_data = hit["_source"]
+                jobs.append(MappingJob(**job_data))
+            
+            total = response["hits"]["total"]["value"]
+            
+            return jobs, total
+        except Exception as e:
+            logger.error(f"Error getting jobs: {e}")
+            raise
+    
+    async def delete_job(self, job_id: str) -> bool:
+        """
+        Delete a job.
+        
+        Args:
+            job_id: ID of the job to delete
+            
+        Returns:
+            True if deleted, False if not found
+        """
+        if not self._connected:
+            await self.connect()
+        
+        try:
+            response = await self.client.delete(
+                index=self.index_name,
+                id=job_id,
+                refresh=True
+            )
+            logger.info(f"Deleted job {job_id}")
+            return True
+        except NotFoundError:
+            logger.error(f"Job {job_id} not found")
+            return False
+        except Exception as e:
+            logger.error(f"Error deleting job {job_id}: {e}")
+            raise
