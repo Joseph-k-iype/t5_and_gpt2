@@ -1,332 +1,918 @@
 """
-Fixed mapping service with correct method signature for create_mapping_job.
+Enhanced Elasticsearch service with production-grade connection handling, resilient queries,
+and advanced vector search capabilities.
 """
 
 import logging
+import time
 import asyncio
-from typing import List, Dict, Any, Optional, Union
-from datetime import datetime
-from app.models.mapping import MappingRequest, MappingResponse, MappingResult
-from app.models.job import MappingJob, JobStatus
-from app.services.azure_openai import AzureOpenAIService
-from app.services.elasticsearch_service import ElasticsearchService
-from app.services.vector_service import VectorService
-from app.services.job_tracking_service import JobTrackingService
+import json
+from typing import List, Dict, Any, Optional, Union, Tuple
+from elasticsearch import AsyncElasticsearch, ConnectionError, NotFoundError, RequestError, TransportError
+from elasticsearch.exceptions import ConnectionTimeout, AuthorizationException, AuthenticationException
+from app.core.environment import get_os_env
 
 logger = logging.getLogger(__name__)
 
-class MappingService:
-    """Enhanced service for mapping business terms with asynchronous processing and job tracking."""
+class ElasticsearchService:
+    """
+    Production-grade service for interacting with Elasticsearch with enhanced connection pooling,
+    automatic retry mechanisms, and advanced vector search capabilities.
+    """
     
-    def __init__(self, 
-                azure_service: AzureOpenAIService,
-                es_service: ElasticsearchService,
-                vector_service: VectorService):
+    def __init__(self):
+        """Initialize the Elasticsearch service with environment-based configuration."""
+        # Get environment
+        env = get_os_env()
+        
+        # Get Elasticsearch configuration
+        self.hosts = self._parse_hosts(env.get("ELASTICSEARCH_HOSTS", '["http://localhost:9200"]'))
+        self.index_name = env.get("ELASTICSEARCH_INDEX_NAME", "business_terms")
+        self.username = env.get("ELASTICSEARCH_USERNAME", None)
+        self.password = env.get("ELASTICSEARCH_PASSWORD", None)
+        
+        # Connection settings
+        self.request_timeout = int(env.get("ELASTICSEARCH_REQUEST_TIMEOUT", "30"))
+        self.connect_timeout = int(env.get("ELASTICSEARCH_CONNECT_TIMEOUT", "10"))
+        self.max_retries = int(env.get("ELASTICSEARCH_MAX_RETRIES", "5"))
+        self.retry_on_timeout = env.get("ELASTICSEARCH_RETRY_ON_TIMEOUT", "True").lower() in ('true', 't', 'yes', 'y', '1')
+        self.retry_on_status = [429, 500, 502, 503, 504]  # Retry on these status codes
+        
+        # Connection pool settings
+        self.maxsize = int(env.get("ELASTICSEARCH_CONN_MAXSIZE", "25"))  # Max connections per node
+        self.max_keepalive_time = int(env.get("ELASTICSEARCH_MAX_KEEPALIVE", "600"))  # In seconds
+        
+        # Circuit breaker settings
+        self.circuit_breaker_enabled = env.get("ELASTICSEARCH_CIRCUIT_BREAKER", "True").lower() in ('true', 't', 'yes', 'y', '1')
+        self.circuit_breaker_threshold = int(env.get("ELASTICSEARCH_CB_THRESHOLD", "5"))
+        self.circuit_breaker_timeout = int(env.get("ELASTICSEARCH_CB_TIMEOUT", "60"))
+        
+        # Advanced vector search configuration
+        self.vector_dimensions = int(env.get("ELASTICSEARCH_VECTOR_DIMENSIONS", "3072"))
+        self.vector_similarity = env.get("ELASTICSEARCH_VECTOR_SIMILARITY", "cosine")
+        self.hnsw_m = int(env.get("ELASTICSEARCH_HNSW_M", "16"))  # Graph connections per node
+        self.hnsw_ef_construction = int(env.get("ELASTICSEARCH_HNSW_EF_CONSTRUCTION", "100"))  # Higher = better quality, slower indexing
+        self.hnsw_ef_search = int(env.get("ELASTICSEARCH_HNSW_EF_SEARCH", "100"))  # Higher = better search quality, slower search
+        
+        # Log configuration
+        logger.info(f"Elasticsearch configuration:")
+        logger.info(f"  - Hosts: {self.hosts}")
+        logger.info(f"  - Index: {self.index_name}")
+        logger.info(f"  - Username: {'set' if self.username else 'not set'}")
+        logger.info(f"  - Request timeout: {self.request_timeout}s")
+        logger.info(f"  - Connect timeout: {self.connect_timeout}s")
+        logger.info(f"  - Max Retries: {self.max_retries}")
+        logger.info(f"  - Retry on status: {self.retry_on_status}")
+        logger.info(f"  - Connection pool size: {self.maxsize}")
+        logger.info(f"  - Circuit breaker: {'enabled' if self.circuit_breaker_enabled else 'disabled'}")
+        
+        # Circuit breaker state
+        self._circuit_open = False
+        self._failure_count = 0
+        self._last_failure_time = 0
+        
+        # Create client with None to ensure connect() is called before use
+        self.client = None
+        self._connected = False
+    
+    def _parse_hosts(self, hosts_str: str) -> List[str]:
         """
-        Initialize the Mapping Service.
+        Parse hosts string into list of hosts with error handling.
         
         Args:
-            azure_service: Azure OpenAI service
-            es_service: Elasticsearch service
-            vector_service: Vector service
-        """
-        self.azure_service = azure_service
-        self.es_service = es_service
-        self.vector_service = vector_service
-        self.job_tracking_service = JobTrackingService()
-        self.background_tasks = {}  # Track async tasks
-    
-    async def map_business_term(self, request: MappingRequest) -> MappingResponse:
-        """
-        Map a business term to existing terms using enhanced AI agent evaluation.
-        
-        Args:
-            request: Mapping request
+            hosts_str: String representation of hosts (JSON array or single string)
             
         Returns:
-            Mapping response with results
+            List of host URLs
         """
         try:
-            logger.info(f"Processing mapping request for '{request.name}'")
-            
-            # Use the enhanced LangGraph workflow with AI agent evaluation
-            results = await self.vector_service.create_langgraph_workflow(request)
-            
-            # Add detailed reasoning for each result using the AI agent
-            enriched_results = await self._enrich_results_with_explanation(request, results)
-            
-            # Create response
-            response = MappingResponse(
-                success=True,
-                message="Mapping completed successfully with AI agent evaluation",
-                results=enriched_results,
-                query=request,
-                timestamp=datetime.now()
-            )
-            
-            logger.info(f"Mapping completed with {len(results)} results using AI agent evaluation")
-            return response
-        except Exception as e:
-            logger.error(f"Error mapping business term: {e}")
-            
-            # Return error response
-            return MappingResponse(
-                success=False,
-                message=f"Error mapping business term: {str(e)}",
-                results=[],
-                query=request,
-                timestamp=datetime.now()
-            )
-    
-    async def create_mapping_job(self, job_id: str, process_id: str, request: MappingRequest) -> MappingJob:
-        """
-        Create a new asynchronous mapping job with the specified ID and process ID.
-        
-        Args:
-            job_id: Job ID (required)
-            process_id: Process ID (required)
-            request: Mapping request
-            
-        Returns:
-            Created job
-        """
-        # Connect to job tracking service
-        await self.job_tracking_service.connect(self.es_service.client)
-        
-        # Create job record with the provided IDs
-        job = await self.job_tracking_service.create_job(job_id, process_id, request)
-        
-        # Start background task to process the mapping
-        task = asyncio.create_task(self._process_mapping_job(job))
-        
-        # Store task reference to prevent it from being garbage collected
-        self.background_tasks[job.id] = task
-        
-        return job
-    
-    async def _process_mapping_job(self, job: MappingJob):
-        """
-        Process a mapping job in the background.
-        
-        Args:
-            job: Mapping job to process
-        """
-        try:
-            # Update status to in progress
-            await self.job_tracking_service.update_job_status(job.id, JobStatus.IN_PROGRESS)
-            
-            logger.info(f"Started processing mapping job {job.id} (process ID: {job.process_id}) for '{job.request.name}'")
-            
-            # Process the mapping request
-            results = await self.vector_service.create_langgraph_workflow(job.request)
-            
-            # Add detailed reasoning
-            enriched_results = await self._enrich_results_with_explanation(job.request, results)
-            
-            # Update job with completed status and results
-            await self.job_tracking_service.update_job_status(
-                job.id, 
-                JobStatus.COMPLETED,
-                results=enriched_results
-            )
-            
-            logger.info(f"Completed mapping job {job.id} (process ID: {job.process_id}) with {len(results)} results")
-        except Exception as e:
-            logger.error(f"Error processing mapping job {job.id} (process ID: {job.process_id}): {e}")
-            
-            # Update job with failed status and error message
-            await self.job_tracking_service.update_job_status(
-                job.id,
-                JobStatus.FAILED,
-                error=str(e)
-            )
-        finally:
-            # Remove task reference
-            if job.id in self.background_tasks:
-                del self.background_tasks[job.id]
-    
-    async def get_mapping_job(self, job_id: str) -> Optional[MappingJob]:
-        """
-        Get a mapping job by ID.
-        
-        Args:
-            job_id: ID of the job to get
-            
-        Returns:
-            Job or None if not found
-        """
-        await self.job_tracking_service.connect(self.es_service.client)
-        return await self.job_tracking_service.get_job(job_id)
-    
-    async def get_mapping_job_by_process_id(self, process_id: str) -> Optional[MappingJob]:
-        """
-        Get a mapping job by process ID.
-        
-        Args:
-            process_id: Process ID to search for
-            
-        Returns:
-            Job or None if not found
-        """
-        await self.job_tracking_service.connect(self.es_service.client)
-        return await self.job_tracking_service.get_job_by_process_id(process_id)
-    
-    async def get_mapping_jobs(self, status: Optional[JobStatus] = None, 
-                            page: int = 1, page_size: int = 10) -> tuple[List[MappingJob], int]:
-        """
-        Get mapping jobs with optional filtering by status.
-        
-        Args:
-            status: Filter by status (optional)
-            page: Page number (1-based)
-            page_size: Number of results per page
-            
-        Returns:
-            Tuple of (list of jobs, total count)
-        """
-        await self.job_tracking_service.connect(self.es_service.client)
-        return await self.job_tracking_service.get_jobs(status, page, page_size)
-    
-    async def _enrich_results_with_explanation(self, request: MappingRequest, results: List[MappingResult]) -> List[MappingResult]:
-        """
-        Enrich mapping results with detailed explanations using the AI agent.
-        
-        Args:
-            request: Original mapping request
-            results: List of mapping results to enrich
-            
-        Returns:
-            Enriched mapping results with detailed explanations
-        """
-        if not results:
-            return results
-            
-        # Create system prompt for explanation
-        system_prompt = """
-        You are an expert in data governance, metadata management, and business terminology.
-        Your task is to provide a clear, detailed explanation for why each matched business term
-        is relevant to the user's request.
-        
-        For each term, explain:
-        1. The semantic relationship between the request and the term
-        2. How the definitions align 
-        3. Any contextual or domain-specific relationships
-        4. The confidence level and why it's appropriate
-        
-        Keep each explanation concise (2-3 sentences) but informative, focusing on why this
-        is a good match from a business perspective.
-        """
-        
-        # Create user prompt with all details
-        user_prompt = f"""
-        Original Request:
-        - Name: {request.name}
-        - Description: {request.description}
-        """
-        
-        if request.example:
-            user_prompt += f"- Example: {request.example}\n"
-        if request.cdm:
-            user_prompt += f"- CDM: {request.cdm}\n"
-        if request.process_name:
-            user_prompt += f"- Process: {request.process_name}\n"
-        if request.process_description:
-            user_prompt += f"- Process Description: {request.process_description}\n"
-        
-        user_prompt += "\nTop Matches:\n"
-        
-        # Add each result to the prompt
-        for i, result in enumerate(results):
-            user_prompt += f"""
-            Match {i+1}: {result.term_name}
-            - ID: {result.term_id}
-            - Confidence: {result.confidence}
-            - Match Type: {result.mapping_type}
-            """
-        
-        user_prompt += "\nPlease provide a concise explanation for each match."
-        
-        # Create messages for the LLM
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ]
-        
-        try:
-            # Get explanations from LLM
-            explanation_text = await self.azure_service.generate_completion(
-                messages,
-                temperature=0.2,  # Low temperature for consistent, precise explanations
-                max_tokens=2000
-            )
-            
-            # Parse explanations and add to results
-            explanations = self._parse_explanations(explanation_text, len(results))
-            
-            # Update results with explanations
-            for i, result in enumerate(results):
-                if i < len(explanations):
-                    # Clone the result to avoid modifying the original
-                    updated_result = MappingResult(
-                        term_id=result.term_id,
-                        term_name=result.term_name,
-                        similarity_score=result.similarity_score,
-                        confidence=result.confidence,
-                        mapping_type=result.mapping_type,
-                        matched_attributes=result.matched_attributes
-                    )
-                    
-                    # Add explanation
-                    setattr(updated_result, "explanation", explanations[i])
-                    
-                    results[i] = updated_result
-            
-            return results
-        except Exception as e:
-            logger.error(f"Error enriching results with explanations: {e}")
-            # Return original results if enrichment fails
-            return results
-    
-    def _parse_explanations(self, explanation_text: str, num_results: int) -> List[str]:
-        """
-        Parse explanations from LLM response.
-        
-        Args:
-            explanation_text: Text containing explanations
-            num_results: Number of results to expect explanations for
-            
-        Returns:
-            List of explanations
-        """
-        explanations = []
-        
-        # Simple parsing based on "Match X:" pattern
-        import re
-        
-        for i in range(1, num_results + 1):
-            pattern = rf"Match {i}:?(.*?)(?:Match {i+1}:|$)"
-            match = re.search(pattern, explanation_text, re.DOTALL)
-            
-            if match:
-                explanation = match.group(1).strip()
-                explanations.append(explanation)
+            # Try to parse as JSON array
+            if isinstance(hosts_str, str) and hosts_str.startswith('[') and hosts_str.endswith(']'):
+                hosts = json.loads(hosts_str.replace("'", '"'))
+            elif isinstance(hosts_str, list):
+                hosts = hosts_str
             else:
-                explanations.append("No detailed explanation available.")
-        
-        return explanations
+                # Single host string
+                hosts = [hosts_str]
+            
+            # Clean up hosts (remove quotes, ensure protocol)
+            clean_hosts = []
+            for host in hosts:
+                if isinstance(host, str):
+                    # Remove quotes if they exist
+                    host = host.strip('\'"')
+                    
+                    # Ensure protocol
+                    if not host.startswith(('http://', 'https://')):
+                        host = f"https://{host}"
+                    
+                    clean_hosts.append(host)
+            
+            return clean_hosts
+        except Exception as e:
+            logger.warning(f"Error parsing hosts: {e}, falling back to default")
+            return ["http://localhost:9200"]
     
-    async def get_all_business_terms(self) -> List[Dict[str, Any]]:
+    async def connect(self, max_retries: int = 3) -> Optional[AsyncElasticsearch]:
         """
-        Get all indexed business terms.
+        Connect to Elasticsearch with retries and robust error handling.
         
+        Args:
+            max_retries: Maximum number of connection attempts
+            
         Returns:
-            List of business terms
+            AsyncElasticsearch client if successful, None otherwise
+        """
+        if self._connected and self.client:
+            logger.debug("Already connected to Elasticsearch")
+            return self.client
+        
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Connecting to Elasticsearch (attempt {attempt+1}/{max_retries})...")
+                
+                # Prepare connection parameters with optimized settings
+                conn_params = {
+                    "timeout": self.request_timeout,
+                    "retry_on_timeout": self.retry_on_timeout,
+                    "max_retries": self.max_retries,
+                    "retry_on_status": self.retry_on_status,
+                    "connection_class": None,  # Use default (AsyncHttpConnection)
+                    "connections_per_node": self.maxsize,  # Control connection pooling
+                    "verify_certs": False,  # For development ease
+                    "ssl_show_warn": False,  # Suppress SSL warnings
+                    "request_timeout": self.request_timeout,
+                    "connection_timeout": self.connect_timeout
+                }
+                
+                # Add authentication if provided
+                if self.username and self.password:
+                    conn_params["basic_auth"] = (self.username, self.password)
+                    logger.info(f"Using basic authentication with username: {self.username}")
+                
+                # Create client with transport_options
+                self.client = AsyncElasticsearch(
+                    self.hosts,
+                    transport_options=transport_options,
+                    **conn_params
+                )
+                
+                # Test connection
+                info = await self.client.info(request_timeout=self.connect_timeout)
+                es_version = info["version"]["number"]
+                cluster_name = info["cluster_name"]
+                logger.info(f"Connected to Elasticsearch version {es_version} on cluster '{cluster_name}'")
+                
+                # Reset circuit breaker state
+                self._circuit_open = False
+                self._failure_count = 0
+                self._connected = True
+                
+                return self.client
+                
+            except ConnectionError as e:
+                logger.error(f"Failed to connect to Elasticsearch (attempt {attempt+1}): {e}")
+                if attempt + 1 < max_retries:
+                    # Wait before retrying (exponential backoff with jitter)
+                    sleep_time = (2 ** attempt) + (0.1 * random.random())
+                    logger.info(f"Retrying in {sleep_time:.2f} seconds...")
+                    await asyncio.sleep(sleep_time)
+            except (AuthenticationException, AuthorizationException) as e:
+                logger.error(f"Authentication error connecting to Elasticsearch: {e}")
+                # Authentication errors won't be resolved by retrying
+                break
+            except Exception as e:
+                logger.error(f"Unexpected error connecting to Elasticsearch: {e}")
+                if attempt + 1 < max_retries:
+                    sleep_time = (2 ** attempt) + (0.1 * random.random())
+                    await asyncio.sleep(sleep_time)
+                else:
+                    raise
+        
+        logger.error(f"Failed to connect to Elasticsearch after {max_retries} attempts")
+        return None
+    
+    async def close(self):
+        """Close the Elasticsearch connection safely."""
+        if self.client:
+            try:
+                await self.client.close()
+                logger.info("Elasticsearch connection closed")
+                self._connected = False
+                self.client = None
+            except Exception as e:
+                logger.error(f"Error closing Elasticsearch connection: {e}")
+    
+    def _update_circuit_breaker(self, success: bool):
+        """
+        Update circuit breaker state based on success/failure of operation.
+        
+        Args:
+            success: Whether the operation was successful
+        """
+        if not self.circuit_breaker_enabled:
+            return
+        
+        current_time = time.time()
+        
+        if success:
+            # Reset failure count on success
+            self._failure_count = 0
+            
+            # Check if circuit was open and needs to be closed
+            if self._circuit_open:
+                # Check if timeout elapsed
+                if current_time - self._last_failure_time > self.circuit_breaker_timeout:
+                    logger.info("Circuit breaker closed - successful operation")
+                    self._circuit_open = False
+        else:
+            # Increment failure count
+            self._failure_count += 1
+            self._last_failure_time = current_time
+            
+            # Check if circuit should be opened
+            if self._failure_count >= self.circuit_breaker_threshold:
+                if not self._circuit_open:
+                    logger.warning(f"Circuit breaker opened - {self._failure_count} consecutive failures")
+                    self._circuit_open = True
+    
+    async def _execute_with_retry(self, operation_func, *args, max_retries=None, **kwargs):
+        """
+        Execute an Elasticsearch operation with retry logic and circuit breaker.
+        
+        Args:
+            operation_func: Function to execute
+            *args: Arguments for the function
+            max_retries: Maximum number of retries (defaults to self.max_retries)
+            **kwargs: Keyword arguments for the function
+            
+        Returns:
+            Result of the operation
+            
+        Raises:
+            Exception: If all retries fail
+        """
+        if max_retries is None:
+            max_retries = self.max_retries
+        
+        # Check circuit breaker
+        if self.circuit_breaker_enabled and self._circuit_open:
+            current_time = time.time()
+            if current_time - self._last_failure_time <= self.circuit_breaker_timeout:
+                logger.warning("Circuit breaker open - skipping operation")
+                raise ConnectionError("Circuit breaker open")
+            else:
+                # Try one request to see if things have recovered
+                logger.info("Circuit breaker timeout elapsed - attempting operation")
+                self._circuit_open = False
+        
+        # Ensure client is connected
+        if not self.client:
+            await self.connect()
+        
+        last_exception = None
+        total_delay = 0
+        
+        for attempt in range(max_retries + 1):  # +1 for initial attempt
+            try:
+                # Execute operation
+                result = await operation_func(*args, **kwargs)
+                
+                # Update circuit breaker on success
+                self._update_circuit_breaker(True)
+                
+                return result
+                
+            except ConnectionTimeout as e:
+                logger.warning(f"Connection timeout (attempt {attempt+1}/{max_retries+1}): {e}")
+                last_exception = e
+                self._update_circuit_breaker(False)
+            except TransportError as e:
+                if hasattr(e, 'status_code') and e.status_code in self.retry_on_status:
+                    logger.warning(f"Transport error with status {e.status_code} (attempt {attempt+1}/{max_retries+1}): {e}")
+                    last_exception = e
+                    self._update_circuit_breaker(False)
+                    
+                    # Check for Retry-After header (standard rate limiting response)
+                    retry_after = None
+                    if hasattr(e, 'info') and isinstance(e.info, dict) and 'retry-after' in e.info:
+                        try:
+                            retry_after = int(e.info['retry-after'])
+                        except (ValueError, TypeError):
+                            pass
+                    
+                    if retry_after is not None:
+                        # Use server-specified retry delay
+                        delay = retry_after
+                    else:
+                        # Exponential backoff with jitter
+                        delay = min(30, (2 ** attempt) + (random.random() * 0.5))
+                else:
+                    # Don't retry other transport errors
+                    logger.error(f"Non-retriable transport error: {e}")
+                    raise
+            except Exception as e:
+                logger.error(f"Unexpected error in Elasticsearch operation: {e}")
+                last_exception = e
+                self._update_circuit_breaker(False)
+                
+                # Only retry certain types of errors
+                if isinstance(e, (ConnectionError, RequestError)):
+                    delay = min(30, (2 ** attempt) + (random.random() * 0.5))
+                else:
+                    # Don't retry other errors
+                    raise
+            
+            # Only attempt retry if not on final attempt
+            if attempt < max_retries:
+                logger.info(f"Retrying in {delay:.2f} seconds (attempt {attempt+1}/{max_retries})...")
+                await asyncio.sleep(delay)
+                total_delay += delay
+                
+                # If total delay exceeds request timeout, break early
+                if total_delay > self.request_timeout:
+                    logger.warning(f"Breaking retry loop after {total_delay:.2f}s cumulative delay")
+                    break
+                
+                # Check if we need to reconnect
+                if attempt > 0 and attempt % 2 == 0:
+                    try:
+                        logger.info("Reconnecting to Elasticsearch...")
+                        await self.connect(max_retries=1)
+                    except Exception as e:
+                        logger.error(f"Error reconnecting to Elasticsearch: {e}")
+        
+        # If we got here, all retries failed
+        logger.error(f"All {max_retries+1} attempts failed for Elasticsearch operation")
+        if last_exception:
+            raise last_exception
+        else:
+            raise ConnectionError("Maximum retries exceeded")
+    
+    async def create_index(self, force: bool = False):
+        """
+        Create the Elasticsearch index with robust error handling.
+        
+        Args:
+            force: Whether to force create the index (delete if exists)
         """
         try:
-            logger.info("Retrieving all business terms")
-            terms = await self.es_service.get_all_documents()
-            logger.info(f"Retrieved {len(terms)} business terms")
-            return terms
+            # Ensure client is connected
+            if not self.client:
+                await self.connect()
+            
+            if force:
+                try:
+                    logger.info(f"Forcibly deleting index '{self.index_name}' if it exists")
+                    await self._execute_with_retry(self.client.indices.delete, index=self.index_name)
+                    logger.info(f"Existing index '{self.index_name}' deleted")
+                except NotFoundError:
+                    logger.info(f"Index '{self.index_name}' does not exist, nothing to delete")
+                except Exception as e:
+                    logger.warning(f"Error deleting index: {e}")
+            
+            # Check if index exists
+            exists = await self._execute_with_retry(self.client.indices.exists, index=self.index_name)
+            if exists:
+                logger.info(f"Index '{self.index_name}' already exists")
+                return
+            
+            # Index settings with enhanced vector search capabilities
+            settings = {
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0,
+                    "index.knn": True,  # Enable KNN capabilities
+                    "analysis": {
+                        "analyzer": {
+                            "default": {
+                                "type": "standard"
+                            },
+                            "ngram_analyzer": {
+                                "tokenizer": "standard",
+                                "filter": ["lowercase", "ngram_filter"]
+                            }
+                        },
+                        "filter": {
+                            "ngram_filter": {
+                                "type": "ngram",
+                                "min_gram": 3,
+                                "max_gram": 4
+                            }
+                        }
+                    }
+                },
+                "mappings": {
+                    "properties": {
+                        "id": {"type": "keyword"},
+                        "pbt_name": {
+                            "type": "text", 
+                            "analyzer": "standard",
+                            "fields": {
+                                "keyword": {"type": "keyword"},
+                                "ngram": {"type": "text", "analyzer": "ngram_analyzer"}
+                            }
+                        },
+                        "pbt_definition": {
+                            "type": "text", 
+                            "analyzer": "standard"
+                        },
+                        "cdm": {
+                            "type": "text", 
+                            "analyzer": "standard",
+                            "fields": {
+                                "keyword": {"type": "keyword"}
+                            }
+                        },
+                        "embedding": {
+                            "type": "dense_vector",
+                            "dims": self.vector_dimensions,
+                            "index": True,
+                            "similarity": self.vector_similarity,
+                            "index_options": {
+                                "type": "hnsw",
+                                "m": self.hnsw_m,
+                                "ef_construction": self.hnsw_ef_construction
+                            }
+                        }
+                    }
+                }
+            }
+            
+            logger.info(f"Creating index '{self.index_name}' with {self.vector_dimensions} dimensions and HNSW algorithm")
+            await self._execute_with_retry(self.client.indices.create, index=self.index_name, body=settings)
+            logger.info(f"Index '{self.index_name}' created successfully with advanced vector search settings")
+            
         except Exception as e:
-            logger.error(f"Error retrieving business terms: {e}")
+            logger.error(f"Error creating index: {e}")
             raise
+    
+    async def index_document(self, term: Dict[str, Any]) -> bool:
+        """
+        Index a document in Elasticsearch with retries.
+        
+        Args:
+            term: Business term to index
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Ensure client is connected
+            if not self.client:
+                await self.connect()
+            
+            await self._execute_with_retry(
+                self.client.index,
+                index=self.index_name,
+                document=term,
+                id=term["id"],
+                refresh=True
+            )
+            logger.debug(f"Document indexed with ID: {term['id']}")
+            return True
+        except Exception as e:
+            logger.error(f"Error indexing document: {e}")
+            return False
+    
+    async def bulk_index_documents(self, terms: List[Dict[str, Any]], batch_size: int = 25) -> int:
+        """
+        Bulk index documents in Elasticsearch with retries, batching, and rate limiting.
+        
+        Args:
+            terms: List of business terms to index
+            batch_size: Size of batches for bulk operations
+            
+        Returns:
+            Number of successfully indexed documents
+        """
+        if not terms:
+            return 0
+        
+        # Ensure client is connected
+        if not self.client:
+            await self.connect()
+        
+        success_count = 0
+        failure_count = 0
+        
+        # Process in batches
+        for i in range(0, len(terms), batch_size):
+            batch = terms[i:i+batch_size]
+            batch_num = (i // batch_size) + 1
+            total_batches = (len(terms) + batch_size - 1) // batch_size
+            
+            logger.info(f"Processing bulk index batch {batch_num}/{total_batches} ({len(batch)} documents)")
+            
+            # Prepare bulk operations
+            operations = []
+            for term in batch:
+                operations.append({"index": {"_index": self.index_name, "_id": term["id"]}})
+                operations.append(term)
+            
+            try:
+                # Execute bulk operation with retry logic
+                result = await self._execute_with_retry(
+                    self.client.bulk,
+                    operations=operations,
+                    refresh=True
+                )
+                
+                # Check for errors
+                if not result.get("errors", False):
+                    success_count += len(batch)
+                    logger.info(f"Successfully indexed batch {batch_num}/{total_batches}")
+                else:
+                    # Count successful operations
+                    success_items = sum(1 for item in result.get("items", []) 
+                                     if item.get("index", {}).get("status", 500) < 400)
+                    success_count += success_items
+                    failure_count += len(batch) - success_items
+                    
+                    # Log errors
+                    error_items = [item for item in result.get("items", []) 
+                                  if item.get("index", {}).get("error")]
+                    if error_items:
+                        errors = [f"{item['index']['_id']}: {item['index']['error']['type']}" 
+                                 for item in error_items[:3]]
+                        logger.error(f"Batch {batch_num} had {len(error_items)} errors: {errors}")
+            except Exception as e:
+                logger.error(f"Error processing batch {batch_num}: {e}")
+                failure_count += len(batch)
+            
+            # Add delay between batches to avoid overwhelming ES
+            if i + batch_size < len(terms):
+                await asyncio.sleep(0.5)  # 500ms delay between batches
+        
+        logger.info(f"Bulk indexing completed: {success_count} successful, {failure_count} failed")
+        return success_count
+    
+    async def search_by_vector_ann(self, 
+                               vector: List[float], 
+                               filter_query: Optional[Dict] = None,
+                               size: int = 10,
+                               ef_search: Optional[int] = None) -> List[Dict]:
+        """
+        Search documents by vector similarity using ANN with HNSW.
+        This is the most efficient approach for large datasets.
+        
+        Args:
+            vector: Embedding vector to search
+            filter_query: Optional filter query
+            size: Number of results to return
+            ef_search: Runtime search parameter (higher = better quality but slower)
+            
+        Returns:
+            List of matching documents
+        """
+        try:
+            # Ensure client is connected
+            if not self.client:
+                await self.connect()
+            
+            # Build kNN query
+            knn_query = {
+                "field": "embedding",
+                "query_vector": vector,
+                "k": size,
+                "num_candidates": size * 4  # Increase for better quality
+            }
+            
+            # Add runtime parameters if provided
+            if ef_search:
+                knn_query["ef_search"] = ef_search
+                
+            # Add filter if provided
+            if filter_query:
+                knn_query["filter"] = filter_query
+            
+            # Execute kNN search with retry
+            response = await self._execute_with_retry(
+                self.client.search,
+                index=self.index_name,
+                knn=knn_query,
+                size=size
+            )
+            
+            # Process results
+            results = []
+            for hit in response["hits"]["hits"]:
+                doc = hit["_source"]
+                doc["score"] = hit["_score"]
+                results.append(doc)
+            
+            logger.info(f"ANN vector search returned {len(results)} results")
+            return results
+                
+        except Exception as e:
+            logger.error(f"Error in ANN search: {e}")
+            return []
+    
+    async def search_by_vector_exact(self, 
+                                  vector: List[float], 
+                                  filter_query: Optional[Dict] = None,
+                                  size: int = 10) -> List[Dict]:
+        """
+        Search documents by vector similarity using exact KNN (slower but accurate).
+        
+        Args:
+            vector: Embedding vector to search
+            filter_query: Optional filter query
+            size: Number of results to return
+            
+        Returns:
+            List of matching documents
+        """
+        try:
+            # Ensure client is connected
+            if not self.client:
+                await self.connect()
+            
+            # Create script score query based on similarity function
+            if self.vector_similarity == "cosine":
+                script = {
+                    "source": "cosineSimilarity(params.query_vector, 'embedding') + 1.0",
+                    "params": {
+                        "query_vector": vector
+                    }
+                }
+            elif self.vector_similarity == "dot_product":
+                script = {
+                    "source": "dotProduct(params.query_vector, 'embedding')",
+                    "params": {
+                        "query_vector": vector
+                    }
+                }
+            else:  # l2_norm (euclidean)
+                script = {
+                    "source": "1 / (1 + l2norm(params.query_vector, 'embedding'))",
+                    "params": {
+                        "query_vector": vector
+                    }
+                }
+            
+            # Create query
+            query = {
+                "script_score": {
+                    "query": filter_query if filter_query else {"match_all": {}},
+                    "script": script
+                }
+            }
+            
+            # Execute search with retry
+            response = await self._execute_with_retry(
+                self.client.search,
+                index=self.index_name,
+                query=query,
+                size=size
+            )
+            
+            # Process results
+            results = []
+            for hit in response["hits"]["hits"]:
+                doc = hit["_source"]
+                doc["score"] = hit["_score"]
+                results.append(doc)
+            
+            logger.info(f"Exact vector search returned {len(results)} results")
+            return results
+                
+        except Exception as e:
+            logger.error(f"Error in exact vector search: {e}")
+            return []
+    
+    async def search_by_text(self, 
+                           text: str, 
+                           fields: List[str] = ["pbt_name", "pbt_definition"],
+                           size: int = 10) -> List[Dict]:
+        """
+        Search documents by text using BM25.
+        
+        Args:
+            text: Text to search
+            fields: Fields to search in
+            size: Number of results to return
+            
+        Returns:
+            List of matching documents
+        """
+        try:
+            # Ensure client is connected
+            if not self.client:
+                await self.connect()
+            
+            query = {
+                "multi_match": {
+                    "query": text,
+                    "fields": fields,
+                    "type": "best_fields",
+                    "operator": "or"
+                }
+            }
+            
+            # Execute search with retry
+            response = await self._execute_with_retry(
+                self.client.search,
+                index=self.index_name,
+                query=query,
+                size=size
+            )
+            
+            # Process results
+            results = []
+            for hit in response["hits"]["hits"]:
+                doc = hit["_source"]
+                doc["score"] = hit["_score"]
+                results.append(doc)
+            
+            logger.info(f"Text search returned {len(results)} results")
+            return results
+                
+        except Exception as e:
+            logger.error(f"Error in text search: {e}")
+            return []
+    
+    async def search_by_keywords(self, 
+                              keywords: List[str], 
+                              fields: List[str] = ["pbt_name", "pbt_definition"],
+                              size: int = 10) -> List[Dict]:
+        """
+        Search documents by keywords.
+        
+        Args:
+            keywords: Keywords to search
+            fields: Fields to search in
+            size: Number of results to return
+            
+        Returns:
+            List of matching documents
+        """
+        try:
+            # Ensure client is connected
+            if not self.client:
+                await self.connect()
+            
+            should_clauses = []
+            
+            for field in fields:
+                should_clauses.append({
+                    "match": {
+                        field: {
+                            "query": " ".join(keywords),
+                            "operator": "or"
+                        }
+                    }
+                })
+            
+            query = {
+                "bool": {
+                    "should": should_clauses,
+                    "minimum_should_match": 1
+                }
+            }
+            
+            # Execute search with retry
+            response = await self._execute_with_retry(
+                self.client.search,
+                index=self.index_name,
+                query=query,
+                size=size
+            )
+            
+            # Process results
+            results = []
+            for hit in response["hits"]["hits"]:
+                doc = hit["_source"]
+                doc["score"] = hit["_score"]
+                results.append(doc)
+            
+            logger.info(f"Keyword search returned {len(results)} results")
+            return results
+                
+        except Exception as e:
+            logger.error(f"Error in keyword search: {e}")
+            return []
+    
+    async def hybrid_search(self,
+                         text: str,
+                         vector: List[float],
+                         fields: List[str] = ["pbt_name", "pbt_definition"],
+                         vector_weight: float = 0.7,
+                         size: int = 10) -> List[Dict]:
+        """
+        Hybrid search combining vector and text search.
+        
+        Args:
+            text: Text to search
+            vector: Embedding vector
+            fields: Fields to search in
+            vector_weight: Weight for vector search (0-1)
+            size: Number of results to return
+            
+        Returns:
+            List of matching documents
+        """
+        try:
+            # Ensure client is connected
+            if not self.client:
+                await self.connect()
+            
+            # Define the script based on similarity function
+            if self.vector_similarity == "cosine":
+                score_script = "cosineSimilarity(params.vector, 'embedding') + 1.0"
+            elif self.vector_similarity == "dot_product":
+                score_script = "dotProduct(params.vector, 'embedding')"
+            else:  # l2_norm
+                score_script = "1 / (1 + l2norm(params.vector, 'embedding'))"
+            
+            # Create combined query with function score
+            query = {
+                "function_score": {
+                    "query": {
+                        "multi_match": {
+                            "query": text,
+                            "fields": fields,
+                            "type": "best_fields",
+                            "operator": "or"
+                        }
+                    },
+                    "functions": [
+                        {
+                            "script_score": {
+                                "script": {
+                                    "source": score_script,
+                                    "params": {
+                                        "vector": vector
+                                    }
+                                }
+                            },
+                            "weight": vector_weight
+                        }
+                    ],
+                    "boost_mode": "multiply",
+                    "score_mode": "sum"
+                }
+            }
+            
+            # Execute search with retry
+            response = await self._execute_with_retry(
+                self.client.search,
+                index=self.index_name,
+                query=query,
+                size=size
+            )
+            
+            # Process results
+            results = []
+            for hit in response["hits"]["hits"]:
+                doc = hit["_source"]
+                doc["score"] = hit["_score"]
+                results.append(doc)
+            
+            logger.info(f"Hybrid search returned {len(results)} results")
+            return results
+                
+        except Exception as e:
+            logger.error(f"Error in hybrid search: {e}")
+            
+            # Fall back to ANN search if hybrid fails
+            logger.warning("Falling back to ANN search due to hybrid search error")
+            return await self.search_by_vector_ann(vector, size=size)
+    
+    async def get_all_documents(self, size: int = 1000) -> List[Dict]:
+        """
+        Get all documents from the index.
+        
+        Args:
+            size: Maximum number of documents to retrieve
+            
+        Returns:
+            List of documents
+        """
+        try:
+            # Ensure client is connected
+            if not self.client:
+                await self.connect()
+            
+            # Execute search with retry
+            response = await self._execute_with_retry(
+                self.client.search,
+                index=self.index_name,
+                query={"match_all": {}},
+                size=size
+            )
+            
+            # Process results
+            results = []
+            for hit in response["hits"]["hits"]:
+                results.append(hit["_source"])
+            
+            logger.info(f"Retrieved {len(results)} documents from index")
+            return results
+                
+        except Exception as e:
+            logger.error(f"Error getting all documents: {e}")
+            return []
+
+# Import for randomization in backoff strategy
+import random
