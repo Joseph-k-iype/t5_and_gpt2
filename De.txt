@@ -1,379 +1,680 @@
 """
-Enhanced Vector Service with parallel processing, error handling,
-and improved LLM agent evaluation.
+Enhanced mapping service with production-grade error handling, optimized I/O,
+and robust job management for high-reliability operations.
 """
 
 import logging
-import json
-import re
 import asyncio
-import random
 import time
-from typing import List, Dict, Any, Optional, Union, TypedDict
-import pandas as pd
-import numpy as np
-from functools import partial
-from datetime import datetime
-
-# Enhanced workflow libraries
-from langgraph.graph import StateGraph, END
-
-# JSON repair utility
-from app.utils.json_repair import repair_json
-
-# Import services
+import uuid
+import random
+from typing import List, Dict, Any, Optional, Union, Tuple
+from datetime import datetime, timedelta
+from app.models.mapping import MappingRequest, MappingResponse, MappingResult
+from app.models.job import MappingJob, JobStatus
 from app.services.azure_openai import AzureOpenAIService
 from app.services.elasticsearch_service import ElasticsearchService
-from app.models.mapping import BusinessTerm, MappingRequest, MappingResult
+from app.services.vector_service import VectorService
+from app.services.job_tracking_service import JobTrackingService
+from app.utils.json_repair import repair_json
 
 logger = logging.getLogger(__name__)
 
-class VectorService:
-    """Enhanced service for vector operations and LLM-based mapping with robust error recovery."""
+class MappingService:
+    """
+    Enhanced mapping service with robust error handling and optimized operations.
+    """
     
-    def __init__(self, azure_service: AzureOpenAIService, es_service: ElasticsearchService):
+    def __init__(self, 
+                azure_service: AzureOpenAIService,
+                es_service: ElasticsearchService,
+                vector_service: VectorService):
         """
-        Initialize the Vector Service.
+        Initialize the Mapping Service with proper dependency management.
         
         Args:
             azure_service: Azure OpenAI service
             es_service: Elasticsearch service
+            vector_service: Vector service
         """
         self.azure_service = azure_service
         self.es_service = es_service
+        self.vector_service = vector_service
+        self.job_tracking_service = JobTrackingService()
         
-        # Configure concurrent operations
-        self.max_concurrent_searches = 3  # Max concurrent search operations
-        self.max_concurrent_embeddings = 5  # Max concurrent embedding operations
+        # Task management
+        self.background_tasks = {}  # Track async tasks
+        self.completed_tasks = {}   # Store completed task results
+        self.task_cleanup_interval = 3600  # Clean up completed tasks every hour
+        self.last_cleanup_time = time.time()
         
-        # Configure LLM settings
-        self.explanation_format_prompt = """
-        Please format your response as valid JSON in the following format:
-        {
-            "evaluation": "Your brief explanation",
-            "matches": [
-                {
-                    "term_id": "ID from the candidate",
-                    "term_name": "Name from the candidate",
-                    "confidence": 0.0 to 1.0 (float),
-                    "reasoning": "Detailed explanation for this match",
-                    "matched_attributes": ["list", "of", "matched", "attributes"],
-                    "match_type": "semantic/exact/partial/contextual"
-                },
-                ...
-            ]
+        # Rate limiting
+        self.semaphore = asyncio.Semaphore(8)  # Limit concurrent mappings
+        
+        # Performance tracking
+        self.timing_stats = {
+            "map_business_term": [],
+            "create_mapping_job": [],
+            "process_mapping_job": []
         }
         
-        Ensure your JSON is valid with:
-        - No trailing commas
-        - Properly quoted strings
-        - Properly nested brackets
-        - Confidence as a numeric value between 0 and 1
-        """
+        # Start background cleanup task
+        self._start_cleanup_task()
+        
+        logger.info("MappingService initialized")
     
-    async def index_data_from_csv(self, csv_path: str):
+    def _start_cleanup_task(self):
+        """Start a background task to clean up completed tasks."""
+        async def cleanup_worker():
+            while True:
+                try:
+                    await self._cleanup_tasks()
+                    await asyncio.sleep(self.task_cleanup_interval)
+                except Exception as e:
+                    logger.error(f"Error in cleanup worker: {e}")
+                    await asyncio.sleep(300)  # Sleep 5 minutes before retrying
+        
+        # Start the worker
+        asyncio.create_task(cleanup_worker())
+    
+    async def _cleanup_tasks(self):
+        """Clean up completed tasks and perform maintenance."""
+        current_time = time.time()
+        
+        # Only clean up every task_cleanup_interval seconds
+        if current_time - self.last_cleanup_time < self.task_cleanup_interval:
+            return
+        
+        try:
+            # Clean up completed tasks older than 1 hour
+            tasks_to_remove = []
+            for job_id, data in self.completed_tasks.items():
+                if current_time - data.get("completion_time", 0) > 3600:  # 1 hour
+                    tasks_to_remove.append(job_id)
+            
+            # Remove old tasks
+            for job_id in tasks_to_remove:
+                if job_id in self.completed_tasks:
+                    del self.completed_tasks[job_id]
+            
+            if tasks_to_remove:
+                logger.info(f"Cleaned up {len(tasks_to_remove)} completed tasks")
+            
+            # Clean up any cancelled or done tasks from background_tasks
+            tasks_to_remove = []
+            for job_id, task in self.background_tasks.items():
+                if task.done() or task.cancelled():
+                    tasks_to_remove.append(job_id)
+            
+            for job_id in tasks_to_remove:
+                if job_id in self.background_tasks:
+                    del self.background_tasks[job_id]
+            
+            if tasks_to_remove:
+                logger.info(f"Cleaned up {len(tasks_to_remove)} background tasks")
+            
+            # Clean up stale jobs in database
+            try:
+                await self.job_tracking_service.connect(self.es_service.client)
+                cleaned_jobs = await self.job_tracking_service.cleanup_stale_jobs(max_age_hours=24)
+                if cleaned_jobs > 0:
+                    logger.info(f"Cleaned up {cleaned_jobs} stale jobs from database")
+            except Exception as e:
+                logger.error(f"Error cleaning up stale jobs: {e}")
+            
+            # Update last cleanup time
+            self.last_cleanup_time = current_time
+            
+        except Exception as e:
+            logger.error(f"Error in _cleanup_tasks: {e}")
+    
+    def _record_timing(self, operation: str, duration: float):
         """
-        Index data from a CSV file with parallel processing.
+        Record timing information for performance tracking.
         
         Args:
-            csv_path: Path to the CSV file
+            operation: Name of the operation
+            duration: Duration in seconds
         """
+        if operation in self.timing_stats:
+            # Keep only the last 100 timings
+            if len(self.timing_stats[operation]) >= 100:
+                self.timing_stats[operation].pop(0)
+            
+            self.timing_stats[operation].append(duration)
+            
+            # Log average timing every 10 records
+            if len(self.timing_stats[operation]) % 10 == 0:
+                avg_time = sum(self.timing_stats[operation]) / len(self.timing_stats[operation])
+                logger.info(f"Average {operation} time over last {len(self.timing_stats[operation])} operations: {avg_time:.2f}s")
+    
+    async def map_business_term(self, request: MappingRequest) -> MappingResponse:
+        """
+        Map a business term to existing terms with robust error handling.
+        
+        Args:
+            request: Mapping request
+            
+        Returns:
+            Mapping response with results
+        """
+        start_time = time.time()
+        
         try:
-            # Read CSV
-            df = pd.read_csv(csv_path)
-            
-            # Check if columns exist and rename if needed
-            column_mapping = {
-                'PBT_NAME': 'pbt_name',
-                'PBT_DEFINITION': 'pbt_definition',
-                'CDM': 'cdm'
-            }
-            
-            for old_col, new_col in column_mapping.items():
-                if old_col in df.columns and new_col not in df.columns:
-                    df = df.rename(columns={old_col: new_col})
-            
-            # Ensure id column exists
-            if 'id' not in df.columns:
-                df['id'] = df.index.astype(str)
-            
-            # Generate embeddings with parallel processing
-            logger.info(f"Generating embeddings for {len(df)} business terms...")
-            
-            # Create combined texts for embedding
-            texts = [f"{row.pbt_name} {row.pbt_definition}" for _, row in df.iterrows()]
-            
-            # Generate embeddings in batches for reliability
-            embeddings = await self.azure_service.generate_embeddings(texts)
-            
-            # Prepare documents for indexing
-            documents = []
-            for i, (_, row) in enumerate(df.iterrows()):
-                if i < len(embeddings):
-                    doc = {
-                        "id": str(row.id),
-                        "pbt_name": row.pbt_name,
-                        "pbt_definition": row.pbt_definition,
-                        "cdm": row.cdm if 'cdm' in row and not pd.isna(row.cdm) else None,
-                        "embedding": embeddings[i]
-                    }
-                    documents.append(doc)
-            
-            # Bulk index documents
-            logger.info(f"Indexing {len(documents)} documents to Elasticsearch...")
-            await self.es_service.bulk_index_documents(documents)
-            
-            logger.info("CSV data indexed successfully")
+            async with self.semaphore:  # Limit concurrent executions
+                logger.info(f"Processing mapping request for '{request.name}'")
+                
+                # Use the LangGraph workflow with AI agent evaluation
+                try:
+                    results = await self.vector_service.create_langgraph_workflow(request)
+                    logger.info(f"LangGraph workflow completed with {len(results)} results")
+                except Exception as e:
+                    logger.error(f"Error in LangGraph workflow: {e}")
+                    # Fallback to direct semantic search
+                    logger.info("Falling back to direct semantic search")
+                    results = await self.vector_service.semantic_search(request)
+                
+                # Add detailed reasoning for each result
+                try:
+                    enriched_results = await self._enrich_results_with_explanation(request, results)
+                except Exception as e:
+                    logger.error(f"Error enriching results: {e}")
+                    # Continue with original results
+                    enriched_results = results
+                
+                # Create response
+                response = MappingResponse(
+                    success=True,
+                    message="Mapping completed successfully",
+                    results=enriched_results,
+                    query=request,
+                    timestamp=datetime.now()
+                )
+                
+                logger.info(f"Mapping completed with {len(results)} results")
+                
+                # Record timing
+                self._record_timing("map_business_term", time.time() - start_time)
+                
+                return response
         except Exception as e:
-            logger.error(f"Error indexing data from CSV: {e}")
+            logger.error(f"Error mapping business term: {e}")
+            duration = time.time() - start_time
+            logger.warning(f"Failed mapping operation took {duration:.2f}s")
+            
+            # Return error response
+            return MappingResponse(
+                success=False,
+                message=f"Error mapping business term: {str(e)}",
+                results=[],
+                query=request,
+                timestamp=datetime.now()
+            )
+    
+    async def create_mapping_job(self, job_id: str, process_id: str, request: MappingRequest) -> MappingJob:
+        """
+        Create a new asynchronous mapping job with reliable ID handling.
+        
+        Args:
+            job_id: Job ID (required)
+            process_id: Process ID (required)
+            request: Mapping request
+            
+        Returns:
+            Created job
+        """
+        start_time = time.time()
+        
+        try:
+            # Connect to job tracking service
+            await self.job_tracking_service.connect(self.es_service.client)
+            
+            # Validate IDs
+            if not job_id:
+                job_id = str(uuid.uuid4())
+                logger.warning(f"No job ID provided, generated: {job_id}")
+            
+            if not process_id:
+                process_id = str(uuid.uuid4())
+                logger.warning(f"No process ID provided, generated: {process_id}")
+            
+            # Create job record with the provided IDs
+            job = await self.job_tracking_service.create_job(job_id, process_id, request)
+            
+            # Start background task to process the mapping
+            task = asyncio.create_task(self._process_mapping_job(job))
+            
+            # Store task reference to prevent it from being garbage collected
+            self.background_tasks[job.id] = task
+            
+            logger.info(f"Created mapping job {job.id} for process {job.process_id}")
+            
+            # Record timing
+            self._record_timing("create_mapping_job", time.time() - start_time)
+            
+            return job
+        except Exception as e:
+            logger.error(f"Error creating mapping job: {e}")
+            
+            # Record timing for failed operation
+            self._record_timing("create_mapping_job", time.time() - start_time)
+            
+            # Re-raise for controller to handle
             raise
     
-    async def semantic_search(self, query: MappingRequest, top_k: int = 5) -> List[MappingResult]:
+    async def _process_mapping_job(self, job: MappingJob):
         """
-        Perform semantic search using embeddings and ANN with error handling.
+        Process a mapping job in the background with robust error handling.
         
         Args:
-            query: Mapping request
-            top_k: Number of results to return
-            
-        Returns:
-            List of mapping results
+            job: Mapping job to process
         """
+        start_time = time.time()
+        
         try:
-            # Create a combined query text
-            query_text = f"{query.name} {query.description}"
-            if query.example:
-                query_text += f" {query.example}"
-            if query.process_name:
-                query_text += f" {query.process_name}"
-            if query.process_description:
-                query_text += f" {query.process_description}"
+            # Update status to in progress
+            await self.job_tracking_service.connect(self.es_service.client)
+            await self.job_tracking_service.update_job_status(job.id, JobStatus.IN_PROGRESS)
             
-            # Generate embedding for the query
-            query_embedding = await self.azure_service.generate_single_embedding(query_text)
+            logger.info(f"Started processing mapping job {job.id} (process ID: {job.process_id}) for '{job.request.name}'")
             
-            # Search by vector using optimized ANN
-            results = await self.es_service.search_by_vector_ann(
-                vector=query_embedding, 
-                size=top_k,
-                ef_search=100  # Use higher ef_search for better quality
-            )
+            # Process with retry and timeout
+            max_retries = 3
+            timeout_seconds = 120  # 2 minutes timeout
             
-            # Convert to MappingResult objects
-            mapping_results = []
-            for result in results:
-                # Apply score normalization for more consistent confidence values
-                normalized_score = min(max(result.get("score", 0.5) * 0.8, 0.0), 1.0)
+            for attempt in range(max_retries):
+                try:
+                    # Process the mapping request with timeout
+                    results = await asyncio.wait_for(
+                        self.vector_service.create_langgraph_workflow(job.request),
+                        timeout=timeout_seconds
+                    )
+                    
+                    logger.info(f"Mapping workflow completed for job {job.id} with {len(results)} results")
+                    
+                    # Add detailed reasoning with timeout
+                    try:
+                        enriched_results = await asyncio.wait_for(
+                            self._enrich_results_with_explanation(job.request, results),
+                            timeout=60  # 1 minute timeout for enrichment
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Explanation enrichment timed out for job {job.id}, using original results")
+                        enriched_results = results
+                    except Exception as enrichment_error:
+                        logger.error(f"Error enriching results for job {job.id}: {enrichment_error}")
+                        enriched_results = results
+                    
+                    # Update job with completed status and results
+                    await self.job_tracking_service.update_job_status(
+                        job.id, 
+                        JobStatus.COMPLETED,
+                        results=enriched_results
+                    )
+                    
+                    # Record job completion
+                    self.completed_tasks[job.id] = {
+                        "status": "completed",
+                        "completion_time": time.time(),
+                        "result_count": len(enriched_results)
+                    }
+                    
+                    logger.info(f"Completed mapping job {job.id} with {len(enriched_results)} results")
+                    
+                    # Record timing
+                    self._record_timing("process_mapping_job", time.time() - start_time)
+                    
+                    # Return successfully
+                    return
+                    
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout processing job {job.id} (attempt {attempt+1}/{max_retries})")
+                    
+                    # If this is the last attempt, mark as failed
+                    if attempt == max_retries - 1:
+                        logger.error(f"Job {job.id} failed after {max_retries} timeout attempts")
+                        await self.job_tracking_service.update_job_status(
+                            job.id,
+                            JobStatus.FAILED,
+                            error=f"Operation timed out after {timeout_seconds}s ({max_retries} attempts)"
+                        )
+                    else:
+                        # Wait before retrying
+                        await asyncio.sleep(1 * (attempt + 1))  # Progressive delay
                 
-                mapping_result = MappingResult(
-                    term_id=result.get("id", "unknown"),
-                    term_name=result.get("pbt_name", "Unknown Term"),
-                    similarity_score=normalized_score,
-                    confidence=normalized_score,
-                    mapping_type="semantic",
-                    matched_attributes=["pbt_name", "pbt_definition"]
-                )
-                mapping_results.append(mapping_result)
+                except Exception as processing_error:
+                    logger.error(f"Error processing job {job.id} (attempt {attempt+1}/{max_retries}): {processing_error}")
+                    
+                    # If this is the last attempt, mark as failed
+                    if attempt == max_retries - 1:
+                        logger.error(f"Job {job.id} failed after {max_retries} attempts")
+                        await self.job_tracking_service.update_job_status(
+                            job.id,
+                            JobStatus.FAILED,
+                            error=str(processing_error)
+                        )
+                    else:
+                        # Wait before retrying
+                        await asyncio.sleep(1 * (attempt + 1))  # Progressive delay
             
-            return mapping_results
         except Exception as e:
-            logger.error(f"Error performing semantic search: {e}")
-            # Return empty results as fallback
-            return []
-    
-    async def bm25_search(self, query: MappingRequest, top_k: int = 5) -> List[MappingResult]:
-        """
-        Perform BM25 text search with error handling.
-        
-        Args:
-            query: Mapping request
-            top_k: Number of results to return
+            logger.error(f"Unhandled error processing mapping job {job.id}: {e}")
             
-        Returns:
-            List of mapping results
-        """
-        try:
-            # Create a combined query text
-            query_text = f"{query.name} {query.description}"
-            if query.example:
-                query_text += f" {query.example}"
-            if query.process_name:
-                query_text += f" {query.process_name}"
-            if query.process_description:
-                query_text += f" {query.process_description}"
-            
-            # Search by text using BM25
-            results = await self.es_service.search_by_text(
-                text=query_text, 
-                fields=["pbt_name", "pbt_definition"],
-                size=top_k
-            )
-            
-            # Convert to MappingResult objects
-            mapping_results = []
-            for result in results:
-                # Normalize BM25 scores - they can be >1
-                normalized_score = min(result.get("score", 5.0) / 10.0, 1.0)
-                
-                mapping_result = MappingResult(
-                    term_id=result.get("id", "unknown"),
-                    term_name=result.get("pbt_name", "Unknown Term"),
-                    similarity_score=normalized_score,
-                    confidence=normalized_score,
-                    mapping_type="BM25",
-                    matched_attributes=["pbt_name", "pbt_definition"]
-                )
-                mapping_results.append(mapping_result)
-            
-            return mapping_results
-        except Exception as e:
-            logger.error(f"Error performing BM25 search: {e}")
-            # Return empty results as fallback
-            return []
-    
-    async def keyword_search(self, query: MappingRequest, top_k: int = 5) -> List[MappingResult]:
-        """
-        Perform keyword-based search with error handling.
-        
-        Args:
-            query: Mapping request
-            top_k: Number of results to return
-            
-        Returns:
-            List of mapping results
-        """
-        try:
-            # Extract keywords from query using LLM
-            system_prompt = """
-            Your task is to extract the most important keywords from the following text.
-            Return ONLY a list of 5-10 individual keywords or short phrases separated by spaces.
-            Focus on business terms, technical terms, entities, and domain-specific vocabulary.
-            DO NOT include any explanations, headers, formatting, or extra information.
-            """
-            
-            user_prompt = f"""
-            Text to extract keywords from:
-            
-            Name: {query.name}
-            Description: {query.description}
-            """
-            
-            if query.example:
-                user_prompt += f"\nExample: {query.example}"
-            if query.process_name:
-                user_prompt += f"\nProcess Name: {query.process_name}"
-            if query.process_description:
-                user_prompt += f"\nProcess Description: {query.process_description}"
-            
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ]
-            
-            # Get keywords using LLM with specialized model for extraction
+            # Ensure job is marked as failed
             try:
-                keywords_text = await self.azure_service.generate_completion(
-                    messages,
-                    temperature=0.0,  # Use zero temperature for deterministic output
-                    max_tokens=100
+                await self.job_tracking_service.update_job_status(
+                    job.id,
+                    JobStatus.FAILED,
+                    error=f"Unhandled error: {str(e)}"
                 )
-                keywords = keywords_text.strip().split()
-                logger.info(f"Extracted keywords: {keywords}")
-            except Exception as e:
-                logger.warning(f"Error extracting keywords: {e}. Using fallback method.")
-                # Fallback method: simple keyword extraction
-                all_text = f"{query.name} {query.description}"
-                if query.example:
-                    all_text += f" {query.example}"
-                
-                # Extract potential keywords using basic NLP
-                words = re.findall(r'\b[a-zA-Z][a-zA-Z-]+\b', all_text)
-                # Remove common stopwords
-                stopwords = {'and', 'or', 'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'with', 'by', 'about', 
-                            'from', 'as', 'of', 'that', 'this', 'these', 'those', 'is', 'are', 'was', 'were'}
-                keywords = [word for word in words if word.lower() not in stopwords][:10]
-                logger.info(f"Used fallback keyword extraction: {keywords}")
+            except Exception as update_error:
+                logger.error(f"Error updating failed job status: {update_error}")
+        
+        finally:
+            # Clean up task reference
+            if job.id in self.background_tasks:
+                del self.background_tasks[job.id]
             
-            # Search by keywords
-            results = await self.es_service.search_by_keywords(
-                keywords=keywords,
-                fields=["pbt_name", "pbt_definition"],
-                size=top_k
-            )
-            
-            # Convert to MappingResult objects
-            mapping_results = []
-            for result in results:
-                normalized_score = min(result.get("score", 5.0) / 10.0, 1.0)
-                
-                mapping_result = MappingResult(
-                    term_id=result.get("id", "unknown"),
-                    term_name=result.get("pbt_name", "Unknown Term"),
-                    similarity_score=normalized_score,
-                    confidence=normalized_score,
-                    mapping_type="keyword",
-                    matched_attributes=["pbt_name", "pbt_definition"]
-                )
-                mapping_results.append(mapping_result)
-            
-            return mapping_results
-        except Exception as e:
-            logger.error(f"Error performing keyword search: {e}")
-            # Return empty results as fallback
-            return []
+            # Record failed timing if not already recorded
+            if start_time > 0 and "process_mapping_job" not in self.timing_stats:
+                self._record_timing("process_mapping_job", time.time() - start_time)
     
-    async def hybrid_search(self, query: MappingRequest, top_k: int = 5) -> List[MappingResult]:
+    async def get_mapping_job(self, job_id: str) -> Optional[MappingJob]:
         """
-        Perform hybrid search combining vector and keyword search.
+        Get a mapping job by ID with robust error handling.
         
         Args:
-            query: Mapping request
-            top_k: Number of results to return
+            job_id: ID of the job to get
             
         Returns:
-            List of mapping results
+            Job or None if not found
         """
         try:
-            # Create a combined query text
-            query_text = f"{query.name} {query.description}"
-            if query.example:
-                query_text += f" {query.example}"
-            if query.process_name:
-                query_text += f" {query.process_name}"
-            if query.process_description:
-                query_text += f" {query.process_description}"
-            
-            # Generate embedding for the query
-            query_embedding = await self.azure_service.generate_single_embedding(query_text)
-            
-            # Perform hybrid search
-            results = await self.es_service.hybrid_search(
-                text=query_text,
-                vector=query_embedding,
-                fields=["pbt_name", "pbt_definition"],
-                vector_weight=0.7,  # Give vector search higher weight
-                size=top_k
-            )
-            
-            # Convert to MappingResult objects
-            mapping_results = []
-            for result in results:
-                mapping_result = MappingResult(
-                    term_id=result.get("id", "unknown"),
-                    term_name=result.get("pbt_name", "Unknown Term"),
-                    similarity_score=result.get("score", 0.5),
-                    confidence=min(result.get("score", 0.5), 1.0),
-                    mapping_type="hybrid",
-                    matched_attributes=["pbt_name", "pbt_definition"]
-                )
-                mapping_results.append(mapping_result)
-            
-            return mapping_results
+            await self.job_tracking_service.connect(self.es_service.client)
+            return await self.job_tracking_service.get_job(job_id)
         except Exception as e:
-            logger.error(f"Error performing hybrid search: {e}")
-            # Return empty results as fallback
-            return []
+            logger.error(f"Error retrieving mapping job {job_id}: {e}")
+            return None
     
+    async def get_mapping_job_by_process_id(self, process_id: str) -> Optional[MappingJob]:
+        """
+        Get a mapping job by process ID with robust error handling.
+        
+        Args:
+            process_id: Process ID to search for
+            
+        Returns:
+            Job or None if not found
+        """
+        try:
+            await self.job_tracking_service.connect(self.es_service.client)
+            return await self.job_tracking_service.get_job_by_process_id(process_id)
+        except Exception as e:
+            logger.error(f"Error retrieving mapping job by process ID {process_id}: {e}")
+            return None
+    
+    async def get_mapping_jobs(self, status: Optional[JobStatus] = None, 
+                            page: int = 1, page_size: int = 10) -> Tuple[List[MappingJob], int]:
+        """
+        Get mapping jobs with robust error handling and pagination.
+        
+        Args:
+            status: Filter by status (optional)
+            page: Page number (1-based)
+            page_size: Number of results per page
+            
+        Returns:
+            Tuple of (list of jobs, total count)
+        """
+        try:
+            await self.job_tracking_service.connect(self.es_service.client)
+            return await self.job_tracking_service.get_jobs(status, page, page_size)
+        except Exception as e:
+            logger.error(f"Error retrieving mapping jobs: {e}")
+            return [], 0
+    
+    async def _enrich_results_with_explanation(self, request: MappingRequest, results: List[MappingResult]) -> List[MappingResult]:
+        """
+        Enrich mapping results with detailed explanations using the LLM.
+        Compatible with both Pydantic v1 and v2.
+        
+        Args:
+            request: Original mapping request
+            results: List of mapping results to enrich
+            
+        Returns:
+            Enriched mapping results with detailed explanations
+        """
+        if not results:
+            return results
+            
+        # Create system prompt for explanation
+        system_prompt = """
+        You are an expert in data governance, metadata management, and business terminology.
+        Your task is to provide a clear, detailed explanation for why each matched business term
+        is relevant to the user's request.
+        
+        For each term, explain:
+        1. The semantic relationship between the request and the term
+        2. How the definitions align 
+        3. Any contextual or domain-specific relationships
+        4. The confidence level and why it's appropriate
+        
+        Keep each explanation concise (2-3 sentences) but informative, focusing on why this
+        is a good match from a business perspective.
+        
+        Format your response as follows:
+        Match 1: [Detailed explanation for first match]
+        Match 2: [Detailed explanation for second match]
+        Match 3: [Detailed explanation for third match]
+        ... and so on for all matches.
+        
+        Do not include any other text, headers, or formatting beyond these match explanations.
+        """
+        
+        # Create user prompt with all details
+        user_prompt = f"""
+        Original Request:
+        - Name: {request.name}
+        - Description: {request.description}
+        """
+        
+        if request.example:
+            user_prompt += f"- Example: {request.example}\n"
+        if request.cdm:
+            user_prompt += f"- CDM: {request.cdm}\n"
+        if request.process_name:
+            user_prompt += f"- Process: {request.process_name}\n"
+        if request.process_description:
+            user_prompt += f"- Process Description: {request.process_description}\n"
+        
+        user_prompt += "\nTop Matches:\n"
+        
+        # Add each result to the prompt
+        for i, result in enumerate(results):
+            user_prompt += f"""
+            Match {i+1}: {result.term_name}
+            - ID: {result.term_id}
+            - Confidence: {result.confidence}
+            - Match Type: {result.mapping_type}
+            """
+        
+        user_prompt += "\nPlease provide a concise explanation for each match as specified in the instructions."
+        
+        # Create messages for the LLM
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+        
+        # Try to get explanations with retry logic
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                # Get explanations from LLM - use a simpler model for faster processing
+                explanation_text = await self.azure_service.generate_completion(
+                    messages,
+                    temperature=0.1,  # Lower temperature for consistent, precise explanations
+                    max_tokens=1500
+                )
+                
+                # Parse explanations and add to results
+                explanations = self._parse_explanations(explanation_text, len(results))
+                
+                # Make a copy of the results list with updated explanations
+                # Use a Pydantic v1/v2 compatible approach
+                enriched_results = []
+                
+                # Update results with explanations
+                for i, result in enumerate(results):
+                    if i < len(explanations):
+                        # Create a dictionary from the original result
+                        result_dict = result.model_dump() if hasattr(result, 'model_dump') else result.dict()
+                        
+                        # Update with explanation
+                        result_dict['explanation'] = explanations[i]
+                        
+                        # Create a new result from the dictionary
+                        enriched_result = MappingResult(**result_dict)
+                        enriched_results.append(enriched_result)
+                    else:
+                        # Add the original result if we don't have an explanation for it
+                        # Create a dictionary from the original result
+                        result_dict = result.model_dump() if hasattr(result, 'model_dump') else result.dict()
+                        
+                        # Update with default explanation
+                        result_dict['explanation'] = "No explanation available"
+                        
+                        # Create a new result from the dictionary
+                        enriched_result = MappingResult(**result_dict)
+                        enriched_results.append(enriched_result)
+                
+                return enriched_results
+                
+            except Exception as e:
+                logger.error(f"Error enriching results with explanations (attempt {attempt+1}/{max_retries+1}): {e}")
+                
+                if attempt < max_retries:
+                    # Wait before retrying
+                    backoff = (2 ** attempt) + (random.random() * 0.5)
+                    logger.info(f"Retrying explanation in {backoff:.2f}s...")
+                    await asyncio.sleep(backoff)
+                else:
+                    # Return original results with default explanations if all retries fail
+                    logger.warning("All explanation attempts failed, returning results with default explanations")
+                    enriched_results = []
+                    for result in results:
+                        # Create a dictionary from the original result
+                        result_dict = result.model_dump() if hasattr(result, 'model_dump') else result.dict()
+                        
+                        # Update with default explanation
+                        result_dict['explanation'] = "No explanation available due to processing error"
+                        
+                        # Create a new result from the dictionary
+                        enriched_result = MappingResult(**result_dict)
+                        enriched_results.append(enriched_result)
+                    
+                    return enriched_results
+
+    def _parse_explanations(self, explanation_text: str, num_results: int) -> List[str]:
+        """
+        Parse explanations from LLM response with robust error handling.
+        
+        Args:
+            explanation_text: Text containing explanations
+            num_results: Number of results to expect explanations for
+            
+        Returns:
+            List of explanations
+        """
+        explanations = []
+        
+        # Try parsing with regex pattern
+        try:
+            # Find all "Match X:" sections
+            pattern = r"Match (\d+):?\s*(.*?)(?=Match \d+:|$)"
+            matches = list(re.finditer(pattern, explanation_text, re.DOTALL))
+            
+            # Process each match
+            for match in matches:
+                match_num = int(match.group(1))
+                explanation = match.group(2).strip()
+                
+                # Store at the correct index
+                while len(explanations) < match_num:
+                    explanations.append("No detailed explanation available.")
+                    
+                if match_num <= len(explanations):
+                    explanations[match_num-1] = explanation
+                else:
+                    explanations.append(explanation)
+        except Exception as e:
+            logger.error(f"Error parsing explanations with regex: {e}")
+            
+            # Fallback: try line-by-line parsing
+            try:
+                lines = explanation_text.split('\n')
+                current_explanation = []
+                current_match = 0
+                
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                        
+                    # Check if this is a new match header
+                    match_header = re.match(r"Match (\d+):?", line)
+                    if match_header:
+                        # Save previous explanation if any
+                        if current_explanation and current_match > 0:
+                            while len(explanations) < current_match:
+                                explanations.append("No detailed explanation available.")
+                            explanations.append(" ".join(current_explanation))
+                            
+                        # Start new explanation
+                        current_match = int(match_header.group(1))
+                        current_explanation = []
+                        
+                        # Add the rest of this line to the explanation
+                        rest_of_line = line[match_header.end():].strip()
+                        if rest_of_line:
+                            current_explanation.append(rest_of_line)
+                    else:
+                        # Add to current explanation
+                        if current_match > 0:
+                            current_explanation.append(line)
+                
+                # Add the last explanation if any
+                if current_explanation and current_match > 0:
+                    while len(explanations) < current_match:
+                        explanations.append("No detailed explanation available.")
+                    explanations.append(" ".join(current_explanation))
+                
+            except Exception as e2:
+                logger.error(f"Error in fallback explanation parsing: {e2}")
+        
+        # Ensure we have the right number of explanations
+        while len(explanations) < num_results:
+            explanations.append("No detailed explanation available.")
+        
+        # Trim to the number of results
+        return explanations[:num_results]
+    
+    async def get_all_business_terms(self) -> List[Dict[str, Any]]:
+        """
+        Get all indexed business terms with robust error handling.
+        
+        Returns:
+            List of business terms
+        """
+        try:
+            logger.info("Retrieving all business terms")
+            terms = await self.es_service.get_all_documents(size=1000)
+            logger.info(f"Retrieved {len(terms)} business terms")
+            return terms
+        except Exception as e:
+            logger.error(f"Error retrieving business terms: {e}")
+            return []
     async def advanced_agent_evaluation(self, query: MappingRequest, candidates: List[Dict], top_k: int = 3) -> List[MappingResult]:
         """
         Robust AI agent evaluation of search results with error recovery and retries.
@@ -622,237 +923,3 @@ class VectorService:
                 emergency_results.append(mapping_result)
             
             return emergency_results
-
-    
-    async def create_langgraph_workflow(self, query: MappingRequest) -> List[MappingResult]:
-        """
-        Create and execute an enhanced LangGraph workflow with reliable error handling.
-        
-        Args:
-            query: Mapping request
-            
-        Returns:
-            List of mapping results
-        """
-        try:
-            # Define the state as a TypedDict
-            class GraphState(TypedDict):
-                query: Dict
-                semantic_results: List
-                bm25_results: List
-                keyword_results: List
-                hybrid_results: List
-                all_candidates: List
-                agent_results: List
-                final_results: List
-            
-            # Define the nodes with error handling
-            async def semantic_search_node(state: GraphState) -> GraphState:
-                """Perform semantic search using ANN."""
-                try:
-                    semantic_results = await self.semantic_search(query, top_k=8)
-                    return {"semantic_results": semantic_results}
-                except Exception as e:
-                    logger.error(f"Error in semantic search node: {e}")
-                    return {"semantic_results": []}
-            
-            async def bm25_search_node(state: GraphState) -> GraphState:
-                """Perform BM25 search."""
-                try:
-                    bm25_results = await self.bm25_search(query, top_k=8)
-                    return {"bm25_results": bm25_results}
-                except Exception as e:
-                    logger.error(f"Error in BM25 search node: {e}")
-                    return {"bm25_results": []}
-            
-            async def keyword_search_node(state: GraphState) -> GraphState:
-                """Perform keyword search."""
-                try:
-                    keyword_results = await self.keyword_search(query, top_k=5)
-                    return {"keyword_results": keyword_results}
-                except Exception as e:
-                    logger.error(f"Error in keyword search node: {e}")
-                    return {"keyword_results": []}
-            
-            async def hybrid_search_node(state: GraphState) -> GraphState:
-                """Perform hybrid search."""
-                try:
-                    hybrid_results = await self.hybrid_search(query, top_k=8)
-                    return {"hybrid_results": hybrid_results}
-                except Exception as e:
-                    logger.error(f"Error in hybrid search node: {e}")
-                    return {"hybrid_results": []}
-            
-            async def collect_candidates_node(state: GraphState) -> GraphState:
-                """Collect unique candidates from all search methods."""
-                try:
-                    # Collect all results
-                    all_results = {}
-                    
-                    # Process all search results
-                    for result_list in [
-                        state["semantic_results"], 
-                        state["bm25_results"], 
-                        state["keyword_results"],
-                        state["hybrid_results"]
-                    ]:
-                        for result in result_list:
-                            term_id = result.term_id
-                            if term_id not in all_results:
-                                # Get the full document data
-                                try:
-                                    # Use fetch by ID for reliability
-                                    response = await self.es_service._execute_with_retry(
-                                        self.es_service.client.get,
-                                        index=self.es_service.index_name,
-                                        id=term_id
-                                    )
-                                    doc = response["_source"]
-                                    
-                                    # Add score information
-                                    doc["score"] = result.similarity_score
-                                    doc["search_method"] = result.mapping_type
-                                    
-                                    all_results[term_id] = doc
-                                except Exception as e:
-                                    logger.error(f"Error retrieving document {term_id}: {e}")
-                    
-                    # Convert to list
-                    all_candidates = list(all_results.values())
-                    
-                    # Sort by score
-                    all_candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
-                    
-                    # Limit to top candidates for agent evaluation
-                    top_candidates = all_candidates[:15]  # Limited to 15 for faster processing
-                    
-                    return {"all_candidates": top_candidates}
-                except Exception as e:
-                    logger.error(f"Error in collect candidates node: {e}")
-                    # Return empty list as fallback
-                    return {"all_candidates": []}
-            
-            async def agent_evaluation_node(state: GraphState) -> GraphState:
-                """Perform advanced agent-based evaluation."""
-                try:
-                    agent_results = await self.advanced_agent_evaluation(
-                        query, 
-                        state["all_candidates"], 
-                        top_k=3  # Get top 3 results from the agent
-                    )
-                    return {"agent_results": agent_results}
-                except Exception as e:
-                    logger.error(f"Error in agent evaluation node: {e}")
-                    # If agent evaluation fails completely, use a simple score-based ranking
-                    top_candidates = sorted(
-                        state["all_candidates"],
-                        key=lambda x: x.get("score", 0),
-                        reverse=True
-                    )[:3]
-                    
-                    # Convert to MappingResult
-                    fallback_results = []
-                    for candidate in top_candidates:
-                        result = MappingResult(
-                            term_id=candidate.get("id", "unknown"),
-                            term_name=candidate.get("pbt_name", "Unknown Term"),
-                            similarity_score=min(candidate.get("score", 0.8), 1.0),
-                            confidence=min(candidate.get("score", 0.8), 1.0),
-                            mapping_type="fallback",
-                            matched_attributes=["pbt_name", "pbt_definition"]
-                        )
-                        fallback_results.append(result)
-                    
-                    logger.warning("Used fallback score-based ranking due to agent failure")
-                    return {"agent_results": fallback_results}
-            
-            async def finalize_results_node(state: GraphState) -> GraphState:
-                """Finalize results based on agent evaluation."""
-                # The agent results are our final results
-                final_results = state.get("agent_results", [])
-                
-                # If no results, use a fallback
-                if not final_results and state.get("all_candidates"):
-                    logger.warning("No results from agent, using fallback")
-                    # Sort candidates by score
-                    sorted_candidates = sorted(
-                        state["all_candidates"],
-                        key=lambda x: x.get("score", 0),
-                        reverse=True
-                    )[:3]
-                    
-                    # Convert to MappingResult
-                    final_results = []
-                    for candidate in sorted_candidates:
-                        result = MappingResult(
-                            term_id=candidate.get("id", "unknown"),
-                            term_name=candidate.get("pbt_name", "Unknown Term"),
-                            similarity_score=min(candidate.get("score", 0.8), 1.0),
-                            confidence=min(candidate.get("score", 0.8), 1.0),
-                            mapping_type="final_fallback",
-                            matched_attributes=["pbt_name", "pbt_definition"]
-                        )
-                        final_results.append(result)
-                
-                return {"final_results": final_results}
-            
-            # Create the workflow
-            workflow = StateGraph(GraphState)
-            
-            # Add nodes
-            workflow.add_node("semantic_search", semantic_search_node)
-            workflow.add_node("bm25_search", bm25_search_node)
-            workflow.add_node("keyword_search", keyword_search_node)
-            workflow.add_node("hybrid_search", hybrid_search_node)
-            workflow.add_node("collect_candidates", collect_candidates_node)
-            workflow.add_node("agent_evaluation", agent_evaluation_node)
-            workflow.add_node("finalize_results", finalize_results_node)
-            
-            # Define the workflow with parallel execution of search methods
-            workflow.set_entry_point("semantic_search")
-            
-            # Run search methods in parallel branches for performance
-            workflow.add_edge("semantic_search", "bm25_search")
-            workflow.add_edge("bm25_search", "keyword_search")
-            workflow.add_edge("keyword_search", "hybrid_search")
-            workflow.add_edge("hybrid_search", "collect_candidates")
-            
-            # Collect all results and evaluate
-            workflow.add_edge("collect_candidates", "agent_evaluation")
-            workflow.add_edge("agent_evaluation", "finalize_results")
-            workflow.add_edge("finalize_results", END)
-            
-            # Compile the workflow
-            app = workflow.compile()
-            
-            # Set timeout for workflow execution
-            execution_timeout = 60  # seconds
-            
-            try:
-                # Run the workflow with timeout
-                result = await asyncio.wait_for(
-                    app.ainvoke({
-                        "query": query.model_dump(),
-                        "semantic_results": [],
-                        "bm25_results": [],
-                        "keyword_results": [],
-                        "hybrid_results": [],
-                        "all_candidates": [],
-                        "agent_results": [],
-                        "final_results": []
-                    }),
-                    timeout=execution_timeout
-                )
-                
-                return result["final_results"]
-            except asyncio.TimeoutError:
-                logger.error(f"Workflow execution timed out after {execution_timeout}s")
-                # Fallback to simple semantic search
-                logger.info("Falling back to semantic search due to workflow timeout")
-                return await self.semantic_search(query, top_k=3)
-            
-        except Exception as e:
-            logger.error(f"Error executing LangGraph workflow: {e}")
-            # Fallback to simple semantic search if workflow fails
-            logger.info("Falling back to semantic search due to workflow error")
-            return await self.semantic_search(query, top_k=3)
