@@ -1,340 +1,475 @@
+"""
+Enhancement API - Routes for data element enhancement.
+
+This module provides API endpoints for enhancing data elements to meet ISO/IEC 11179
+standards, with support for asynchronous processing and job tracking.
+"""
+
 import logging
-from typing import Dict, Any, List, Optional, Tuple, TypedDict, Annotated
+from typing import Dict, Any, List, Optional
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends, Query
 from langchain_openai import AzureChatOpenAI
-from langgraph.graph import StateGraph, END
-from pydantic import BaseModel, Field
 from app.core.models import (
     DataElement, 
     EnhancedDataElement, 
-    ValidationResult, 
-    EnhancementResult, 
+    EnhancementRequest, 
+    EnhancementResponse, 
+    EnhancementStatus,
+    ValidationResult,
     DataQualityStatus,
     Process
 )
-from app.agents.validator_agent import ValidatorAgent
-from app.agents.enhancer_agent import EnhancerAgent
-from app.agents.confidence_evaluator import ConfidenceEvaluator
+from app.core.db_manager import DBManager
+from app.agents.workflow import DataEnhancementWorkflow
+from app.config.settings import get_llm
+
+router = APIRouter(prefix="/api/v1", tags=["data-enhancement"])
+
+# In-memory cache for current jobs for fast access
+# The persistent storage is in PostgreSQL
+enhancement_jobs: Dict[str, Dict[str, Any]] = {}
 
 logger = logging.getLogger(__name__)
 
-# Define workflow state
-class WorkflowState(TypedDict):
-    """State for the data enhancement workflow."""
-    data_element: Dict[str, Any]
-    enhanced_data: Optional[Dict[str, Any]]
-    validation_result: Optional[Dict[str, Any]]
-    enhancement_result: Optional[Dict[str, Any]]
-    iterations: int
-    max_iterations: int
-    is_complete: bool
-    error: Optional[str]
+def get_workflow() -> DataEnhancementWorkflow:
+    """
+    Get the data enhancement workflow.
+    
+    Returns:
+        DataEnhancementWorkflow: The enhancement workflow
+    """
+    llm = get_llm()
+    return DataEnhancementWorkflow(llm)
 
-class DataEnhancementWorkflow:
-    """LangGraph workflow for enhancing data elements with quality feedback loop."""
+def get_db():
+    """
+    Get the database manager.
     
-    def __init__(self, llm: AzureChatOpenAI):
-        self.llm = llm
-        self.validator = ValidatorAgent(llm)
-        self.enhancer = EnhancerAgent(llm)
-        self.confidence_evaluator = ConfidenceEvaluator(llm)
-        self.graph = self._build_graph()
+    Returns:
+        DBManager: The database manager
+    """
+    return DBManager()
+
+@router.post("/validate", response_model=Dict[str, Any])
+async def validate_data_element(data_element: DataElement):
+    """
+    Validate a data element against ISO/IEC 11179 standards.
     
-    def _convert_processes_to_model(self, processes_data):
-        """Safely convert process data to Process objects if needed."""
-        if not processes_data:
-            return None
-            
-        processes_list = []
-        for proc in processes_data:
-            # If already a Process object, use directly
-            if isinstance(proc, Process):
-                processes_list.append(proc)
-            # If a dict, convert to Process object
-            elif isinstance(proc, dict):
-                processes_list.append(Process(**proc))
-            else:
-                logger.warning(f"Unknown process data type: {type(proc)}")
-        
-        return processes_list
+    This endpoint performs initial validation without enhancement.
     
-    async def _validate_data(self, state: WorkflowState) -> WorkflowState:
-        """Validate the data element."""
-        try:
-            # If there's enhanced data, validate that
-            if state.get("enhanced_data"):
-                # Handle processes correctly
-                processes = None
-                if state["data_element"].get("processes"):
-                    processes = self._convert_processes_to_model(state["data_element"].get("processes", []))
-                
-                data_to_validate = DataElement(
-                    id=state["data_element"]["id"],
-                    existing_name=state["enhanced_data"]["enhanced_name"],
-                    existing_description=state["enhanced_data"]["enhanced_description"],
-                    example=state["data_element"].get("example"),
-                    processes=processes,
-                    cdm=state["data_element"].get("cdm")
-                )
-            else:
-                # Otherwise validate the original data
-                # Handle processes correctly
-                data_element_dict = state["data_element"].copy()
-                
-                # Convert processes if present
-                if data_element_dict.get("processes"):
-                    data_element_dict["processes"] = self._convert_processes_to_model(data_element_dict.get("processes", []))
-                
-                data_to_validate = DataElement(**data_element_dict)
+    Args:
+        data_element: The data element to validate
+        
+    Returns:
+        Dict with validation results in JSON format
+    """
+    logger.info(f"Validating data element: {data_element.id}")
+    workflow = get_workflow()
+    try:
+        # Run just the validation step
+        result = await workflow.validator.validate(data_element)
+        
+        # Extract name and description feedback
+        name_feedback = ""
+        desc_feedback = ""
+        if result.feedback:
+            feedback_parts = result.feedback.split("\n\n")
+            if len(feedback_parts) >= 1:
+                name_feedback = feedback_parts[0].replace("Name feedback:", "").strip()
+            if len(feedback_parts) >= 2:
+                desc_feedback = feedback_parts[1].replace("Description feedback:", "").strip()
+        
+        # Extract separate name and description validity from feedback
+        # By default, both follow the overall is_valid flag
+        name_valid = result.is_valid
+        desc_valid = result.is_valid
+        
+        # Check for specific invalid indicators in the feedback
+        if "name validation failed" in result.feedback.lower() or "invalid name" in result.feedback.lower():
+            name_valid = False
+        if "description validation failed" in result.feedback.lower() or "invalid description" in result.feedback.lower():
+            desc_valid = False
             
-            # Validate the data
-            validation_result = await self.validator.validate(data_to_validate)
-            
-            # Update state with validation result
-            state["validation_result"] = validation_result.dict()
-            
-            # If this is a subsequent iteration, update the enhanced data with validation feedback
-            if state.get("enhanced_data") and state["iterations"] > 0:
-                if "validation_feedback" not in state["enhanced_data"]:
-                    state["enhanced_data"]["validation_feedback"] = []
-                state["enhanced_data"]["validation_feedback"].append(validation_result.feedback)
-                state["enhanced_data"]["quality_status"] = validation_result.quality_status
-            
-            return state
-        except Exception as e:
-            logger.error(f"Validation error: {str(e)}")
-            state["error"] = f"Validation error: {str(e)}"
-            state["is_complete"] = True
-            return state
+        # Format as JSON with all 6 evaluation points, ensuring both name and description have feedback
+        return {
+            "id": data_element.id,
+            "name_valid": name_valid,
+            "name_feedback": name_feedback or "No specific feedback provided for name",
+            "description_valid": desc_valid, 
+            "description_feedback": desc_feedback or "No specific feedback provided for description",
+            "quality_status": result.quality_status.value,
+            "suggested_improvements": result.suggested_improvements,
+            "processes_info": f"Found {len(data_element.processes or [])} processes" if data_element.processes else "No processes found"
+        }
+    except Exception as e:
+        logger.error(f"Validation error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Validation error: {str(e)}")
+
+@router.post("/enhance", response_model=EnhancementResponse)
+async def enhance_data_element(
+    request: EnhancementRequest,
+    background_tasks: BackgroundTasks,
+    db: DBManager = Depends(get_db)
+):
+    """
+    Enhance a data element to meet ISO/IEC 11179 standards.
+    This is an asynchronous operation that will run in the background.
     
-    async def _enhance_data(self, state: WorkflowState) -> WorkflowState:
-        """Enhance the data element using the quality feedback loop."""
-        try:
-            # Get validation feedback
-            validation_feedback = state["validation_result"]["feedback"]
-            if state["validation_result"].get("suggested_improvements"):
-                validation_feedback += "\n\nSuggested improvements:\n" + "\n".join(
-                    state["validation_result"]["suggested_improvements"]
-                )
-            
-            # Handle processes correctly
-            data_element_dict = state["data_element"].copy()
-            
-            # Convert processes if present
-            if data_element_dict.get("processes"):
-                data_element_dict["processes"] = self._convert_processes_to_model(data_element_dict.get("processes", []))
-            
-            # Create the DataElement object
-            original_element = DataElement(**data_element_dict)
-            
-            # Determine max iterations based on remaining allowed iterations
-            remaining_iterations = state["max_iterations"] - state["iterations"]
-            quality_iterations = min(3, remaining_iterations)  # Use at most 3 iterations for quality improvement
-            
-            if quality_iterations > 1:
-                # Use the enhance_until_quality method for better results
-                enhancement_result, validation_result = await self.enhancer.enhance_until_quality(
-                    data_element=original_element,
-                    validation_feedback=validation_feedback,
-                    max_iterations=quality_iterations
-                )
-                # Add the used iterations to the state's iteration count (subtract 1 as we'll increment later)
-                state["iterations"] += quality_iterations - 1
-            else:
-                # Just do a single enhancement if we're on the last iteration
-                enhancement_result = await self.enhancer.enhance(
-                    original_element, 
-                    validation_feedback
-                )
-                # Validate the result to get quality status
-                test_element = DataElement(
-                    id=original_element.id,
-                    existing_name=enhancement_result.enhanced_name,
-                    existing_description=enhancement_result.enhanced_description,
-                    example=original_element.example,
-                    processes=original_element.processes,
-                    cdm=original_element.cdm
-                )
-                validation_result = await self.validator.validate(test_element)
-            
-            state["enhancement_result"] = enhancement_result.dict()
-            
-            # Create or update enhanced data
-            if not state.get("enhanced_data"):
-                confidence_score = enhancement_result.confidence
-                
-                if state["iterations"] == 0:
-                    # Confidence based on quality status for first iteration
-                    if validation_result.quality_status == DataQualityStatus.GOOD:
-                        confidence_score = 1.0
-                    elif validation_result.quality_status == DataQualityStatus.NEEDS_IMPROVEMENT:
-                        confidence_score = 0.8
-                    else:
-                        confidence_score = 0.5
-                
-                # Convert processes to dicts for serialization
-                processes_dicts = None
-                if original_element.processes:
-                    processes_dicts = [proc.dict() for proc in original_element.processes]
-                
-                enhanced_data = {
-                    **state["data_element"],
-                    "enhanced_name": enhancement_result.enhanced_name,
-                    "enhanced_description": enhancement_result.enhanced_description,
-                    "processes": processes_dicts,  # Use serialized processes
-                    "quality_status": validation_result.quality_status,
-                    "enhancement_iterations": 1,
-                    "enhancement_feedback": [enhancement_result.feedback],
-                    "validation_feedback": [validation_result.feedback],
-                    "confidence_score": confidence_score
-                }
-                state["enhanced_data"] = enhanced_data
-            else:
-                # Update the confidence score based on new quality status
-                if validation_result.quality_status == DataQualityStatus.GOOD:
-                    new_confidence = 1.0
-                elif validation_result.quality_status == DataQualityStatus.NEEDS_IMPROVEMENT:
-                    new_confidence = 0.8
-                else:
-                    new_confidence = 0.5
-                
-                state["enhanced_data"]["enhanced_name"] = enhancement_result.enhanced_name
-                state["enhanced_data"]["enhanced_description"] = enhancement_result.enhanced_description
-                state["enhanced_data"]["enhancement_iterations"] = state["enhanced_data"].get("enhancement_iterations", 0) + 1
-                state["enhanced_data"]["confidence_score"] = new_confidence
-                state["enhanced_data"]["quality_status"] = validation_result.quality_status
-                
-                if "enhancement_feedback" not in state["enhanced_data"]:
-                    state["enhanced_data"]["enhancement_feedback"] = []
-                state["enhanced_data"]["enhancement_feedback"].append(enhancement_result.feedback)
-                
-                if "validation_feedback" not in state["enhanced_data"]:
-                    state["enhanced_data"]["validation_feedback"] = []
-                state["enhanced_data"]["validation_feedback"].append(validation_result.feedback)
-            
-            # Increment iteration counter
-            state["iterations"] = state["iterations"] + 1
-            
-            return state
-        except Exception as e:
-            logger.error(f"Enhancement error: {e}")
-            state["error"] = f"Enhancement error: {str(e)}"
-            state["is_complete"] = True
-            return state
+    Args:
+        request: Enhancement request with data element
+        background_tasks: FastAPI background tasks
+        db: Database manager
+        
+    Returns:
+        EnhancementResponse with request ID and status
+    """
+    # Use the provided ID as the request ID for tracking
+    request_id = request.data_element.id
+    logger.info(f"Enhancement request received for data element: {request_id}")
     
-    def _should_enhance(self, state: WorkflowState) -> str:
-        """Determine if the data needs further enhancement."""
-        # Check if we've hit the maximum number of iterations
-        if state["iterations"] >= state["max_iterations"]:
-            logger.info(f"Reached maximum iterations ({state['max_iterations']})")
-            return "complete"
+    # Check if this ID is already being processed in memory
+    if request_id in enhancement_jobs:
+        logger.info(f"Enhancement job already exists in memory for ID: {request_id}")
+        job = enhancement_jobs[request_id]
         
-        # Check validation result
-        if state["validation_result"]["quality_status"] == DataQualityStatus.GOOD:
-            logger.info("Quality status is GOOD, completing workflow")
-            return "complete"
+        # If already completed or failed, return the result
+        if job["status"] in [EnhancementStatus.COMPLETED, EnhancementStatus.FAILED]:
+            return EnhancementResponse(
+                request_id=request_id,
+                status=job["status"],
+                enhanced_data=job.get("result"),  # Use get() to avoid KeyError
+                error_message=job.get("error")
+            )
         
-        # If we have enhanced data, check its quality status
-        if state.get("enhanced_data") and state["enhanced_data"].get("quality_status") == DataQualityStatus.GOOD:
-            logger.info("Enhanced data quality status is GOOD, completing workflow")
-            return "complete"
-        
-        # Otherwise, continue enhancing
-        logger.info(f"Quality status is {state['validation_result']['quality_status']}, continuing enhancement")
-        return "enhance"
-    
-    async def _complete_workflow(self, state: WorkflowState) -> WorkflowState:
-        """Mark the workflow as complete."""
-        state["is_complete"] = True
-        logger.info("Workflow completed")
-        
-        # Add a final confidence evaluation if needed
-        if state.get("enhanced_data") and state["enhanced_data"]["quality_status"] == DataQualityStatus.GOOD:
-            logger.info("Enhancement achieved GOOD quality - setting high confidence")
-            state["enhanced_data"]["confidence_score"] = 1.0
-        
-        return state
-    
-    def _build_graph(self) -> StateGraph:
-        """Build the LangGraph workflow."""
-        workflow = StateGraph(WorkflowState)
-        
-        # Add nodes
-        workflow.add_node("validate", self._validate_data)
-        workflow.add_node("enhance", self._enhance_data)
-        workflow.add_node("complete", self._complete_workflow)
-        
-        # Add conditional edges
-        workflow.add_conditional_edges(
-            "validate",
-            self._should_enhance,
-            {
-                "enhance": "enhance",
-                "complete": "complete"
-            }
+        # Otherwise, return the current status
+        return EnhancementResponse(
+            request_id=request_id,
+            status=job["status"],
+            enhanced_data=None,
+            error_message=None
         )
-        
-        # Add remaining edges
-        workflow.add_edge("enhance", "validate")
-        workflow.add_edge("complete", END)  # End of workflow
-        
-        # Set entrypoint
-        workflow.set_entry_point("validate")
-        
-        return workflow.compile()
     
-    async def run(self, data_element: DataElement, max_iterations: int = 5) -> EnhancedDataElement:
-        """
-        Run the data enhancement workflow on a data element.
+    # Check if job exists in the database
+    db_job = db.get_job(request_id)
+    if db_job is not None:
+        # Job exists in database
+        status = EnhancementStatus(db_job["status"])
         
-        Args:
-            data_element: The data element to enhance
-            max_iterations: Maximum number of enhancement iterations to perform
+        # Load job data from database to memory for faster access
+        enhancement_jobs[request_id] = {
+            "status": status,
+            "request": db_job["data"].get("request", {}),
+            "result": db_job["data"].get("result"),
+            "error": db_job["data"].get("error")
+        }
         
-        Returns:
-            Enhanced data element
-        """
-        logger.info(f"Starting enhancement workflow for element: {data_element.id}")
+        # If already completed or failed, return the result
+        if status in [EnhancementStatus.COMPLETED, EnhancementStatus.FAILED]:
+            return EnhancementResponse(
+                request_id=request_id,
+                status=status,
+                enhanced_data=enhancement_jobs[request_id].get("result"),
+                error_message=enhancement_jobs[request_id].get("error")
+            )
         
-        # Convert processes to dict for serializing in the state
-        element_dict = data_element.dict()
-        if data_element.processes:
-            element_dict["processes"] = [proc.dict() for proc in data_element.processes]
+        # Otherwise, return the current status
+        return EnhancementResponse(
+            request_id=request_id,
+            status=status,
+            enhanced_data=None,
+            error_message=None
+        )
+    
+    # Initialize job status in memory - important to set all fields
+    enhancement_jobs[request_id] = {
+        "status": EnhancementStatus.PENDING,
+        "request": request.dict(),
+        "result": None,
+        "error": None
+    }
+    
+    # Store job in database
+    db.store_job(
+        job_id=request_id,
+        job_type="enhancement",
+        status=EnhancementStatus.PENDING.value,
+        data={
+            "request": request.dict(),
+            "result": None,
+            "error": None
+        }
+    )
+    
+    # Add the enhancement task to the background tasks
+    background_tasks.add_task(
+        run_enhancement_job,
+        request_id=request_id,
+        data_element=request.data_element,
+        max_iterations=request.max_iterations
+    )
+    
+    return EnhancementResponse(
+        request_id=request_id,
+        status=EnhancementStatus.PENDING,
+        enhanced_data=None,
+        error_message=None
+    )
+
+@router.get("/enhance/{request_id}", response_model=EnhancementResponse)
+async def get_enhancement_status(request_id: str, db: DBManager = Depends(get_db)):
+    """
+    Get the status of an enhancement job.
+    
+    Args:
+        request_id: ID of the enhancement job
+        db: Database manager
         
-        initial_state: WorkflowState = {
-            "data_element": element_dict,
-            "enhanced_data": None,
-            "validation_result": None,
-            "enhancement_result": None,
-            "iterations": 0,
-            "max_iterations": max_iterations,
-            "is_complete": False,
+    Returns:
+        EnhancementResponse with current status and results if available
+    """
+    # First check in-memory cache for faster access
+    if request_id in enhancement_jobs:
+        job = enhancement_jobs[request_id]
+        
+        logger.debug(f"Enhancement job found in memory: {request_id}, status: {job['status']}")
+        logger.debug(f"Job data: {job}")
+        
+        return EnhancementResponse(
+            request_id=request_id,
+            status=job["status"],
+            enhanced_data=job.get("result"),
+            error_message=job.get("error")
+        )
+    
+    # If not in memory, check the database
+    db_job = db.get_job(request_id)
+    if db_job is None:
+        raise HTTPException(status_code=404, detail=f"Enhancement job {request_id} not found")
+    
+    # Convert status string to enum
+    status = EnhancementStatus(db_job["status"])
+    
+    # Load into memory cache for future requests
+    enhancement_jobs[request_id] = {
+        "status": status,
+        "request": db_job["data"].get("request", {}),
+        "result": db_job["data"].get("result"),
+        "error": db_job["data"].get("error")
+    }
+    
+    logger.debug(f"Enhancement job loaded from database: {request_id}, status: {status}")
+    
+    return EnhancementResponse(
+        request_id=request_id,
+        status=status,
+        enhanced_data=enhancement_jobs[request_id].get("result"),
+        error_message=enhancement_jobs[request_id].get("error")
+    )
+
+@router.post("/enhance/batch", response_model=List[str])
+async def batch_enhance_data_elements(
+    requests: List[EnhancementRequest],
+    background_tasks: BackgroundTasks,
+    db: DBManager = Depends(get_db)
+):
+    """
+    Enhance multiple data elements in batch mode.
+    Returns a list of request IDs that can be used to check status.
+    
+    Args:
+        requests: List of enhancement requests
+        background_tasks: FastAPI background tasks
+        db: Database manager
+        
+    Returns:
+        List of request IDs
+    """
+    request_ids = []
+    
+    for request in requests:
+        request_id = request.data_element.id
+        request_ids.append(request_id)
+        
+        # Skip if already processing in memory
+        if request_id in enhancement_jobs:
+            if enhancement_jobs[request_id]["status"] not in [EnhancementStatus.COMPLETED, EnhancementStatus.FAILED]:
+                continue
+        
+        # Check if job exists in database
+        db_job = db.get_job(request_id)
+        if db_job is not None:
+            status = EnhancementStatus(db_job["status"])
+            
+            # Skip if already completed or failed
+            if status in [EnhancementStatus.COMPLETED, EnhancementStatus.FAILED]:
+                # Load into memory cache
+                enhancement_jobs[request_id] = {
+                    "status": status,
+                    "request": db_job["data"].get("request", {}),
+                    "result": db_job["data"].get("result"),
+                    "error": db_job["data"].get("error")
+                }
+                continue
+        
+        # Initialize job status with all required fields
+        enhancement_jobs[request_id] = {
+            "status": EnhancementStatus.PENDING,
+            "request": request.dict(),
+            "result": None,
             "error": None
         }
         
+        # Store job in database
+        db.store_job(
+            job_id=request_id,
+            job_type="enhancement",
+            status=EnhancementStatus.PENDING.value,
+            data={
+                "request": request.dict(),
+                "result": None,
+                "error": None
+            }
+        )
+        
+        # Add the enhancement task to the background tasks
+        background_tasks.add_task(
+            run_enhancement_job,
+            request_id=request_id,
+            data_element=request.data_element,
+            max_iterations=request.max_iterations
+        )
+    
+    return request_ids
+
+@router.delete("/enhance/{request_id}", response_model=Dict[str, Any])
+async def delete_enhancement_job(request_id: str, db: DBManager = Depends(get_db)):
+    """
+    Delete an enhancement job from the system.
+    
+    Args:
+        request_id: ID of the job to delete
+        db: Database manager
+        
+    Returns:
+        Dict with deletion message
+    """
+    # Check if job exists
+    if request_id not in enhancement_jobs and db.get_job(request_id) is None:
+        raise HTTPException(status_code=404, detail=f"Enhancement job {request_id} not found")
+    
+    # Get status from memory or database
+    status = None
+    if request_id in enhancement_jobs:
+        status = enhancement_jobs[request_id]["status"]
+    else:
+        db_job = db.get_job(request_id)
+        if db_job:
+            status = EnhancementStatus(db_job["status"])
+    
+    # Don't allow deleting running jobs
+    if status == EnhancementStatus.IN_PROGRESS:
+        raise HTTPException(status_code=400, detail=f"Cannot delete a job that is currently in progress")
+    
+    # Delete from memory
+    if request_id in enhancement_jobs:
+        del enhancement_jobs[request_id]
+    
+    # Delete from database
+    db.delete_job(request_id)
+    
+    return {"message": f"Enhancement job {request_id} deleted successfully"}
+
+def convert_processes(data_element_dict):
+    """
+    Convert any processes data from dictionaries to Process objects.
+    
+    Args:
+        data_element_dict: Dictionary representation of a DataElement
+        
+    Returns:
+        DataElement with properly converted processes
+    """
+    # Convert processes if they exist
+    if "processes" in data_element_dict and data_element_dict["processes"]:
+        processes = []
+        for proc in data_element_dict["processes"]:
+            if isinstance(proc, dict):
+                processes.append(Process(**proc))
+            elif isinstance(proc, Process):
+                processes.append(proc)
+        data_element_dict["processes"] = processes
+    
+    # Create and return the DataElement
+    return DataElement(**data_element_dict)
+
+async def run_enhancement_job(request_id: str, data_element: DataElement, max_iterations: int = 5):
+    """
+    Run the enhancement job in the background.
+    
+    Args:
+        request_id: ID of the enhancement job
+        data_element: The data element to enhance
+        max_iterations: Maximum number of enhancement iterations
+    """
+    logger.info(f"Starting enhancement job for {request_id}")
+    workflow = get_workflow()
+    db = DBManager()
+    
+    try:
+        # Update job status to in progress
+        enhancement_jobs[request_id]["status"] = EnhancementStatus.IN_PROGRESS
+        
+        # Update database status
+        db.store_job(
+            job_id=request_id,
+            job_type="enhancement",
+            status=EnhancementStatus.IN_PROGRESS.value,
+            data=enhancement_jobs[request_id]
+        )
+        
         # Run the workflow
-        result = await self.graph.ainvoke(initial_state)
+        result = await workflow.run(data_element, max_iterations)
         
-        if result.get("error"):
-            logger.error(f"Workflow error: {result['error']}")
-            raise ValueError(result["error"])
+        # Update job status to completed in memory
+        enhancement_jobs[request_id]["status"] = EnhancementStatus.COMPLETED
+        enhancement_jobs[request_id]["result"] = result
+        enhancement_jobs[request_id]["error"] = None
         
-        if not result.get("enhanced_data"):
-            logger.info("No enhancement was performed, using original data")
-            # If no enhancement was performed, create an enhanced data element from the original
-            return EnhancedDataElement(
-                **data_element.dict(),
-                enhanced_name=data_element.existing_name,
-                enhanced_description=data_element.existing_description,
-                quality_status=result["validation_result"]["quality_status"] if result.get("validation_result") else DataQualityStatus.GOOD,
-                enhancement_iterations=0,
-                validation_feedback=[result["validation_result"]["feedback"]] if result.get("validation_result") else [],
-                confidence_score=0.5  # Default confidence
+        logger.info(f"Job result: {result}")
+        
+        # Update database with result - important to convert result to dict
+        db.store_job(
+            job_id=request_id,
+            job_type="enhancement",
+            status=EnhancementStatus.COMPLETED.value,
+            data={
+                "request": enhancement_jobs[request_id]["request"],
+                "result": result.dict(),
+                "error": None
+            }
+        )
+        
+        logger.info(f"Enhancement job completed for {request_id}")
+        
+    except Exception as e:
+        # Update job status to failed in memory
+        logger.error(f"Enhancement job failed for {request_id}: {str(e)}")
+        
+        if request_id in enhancement_jobs:
+            enhancement_jobs[request_id]["status"] = EnhancementStatus.FAILED
+            enhancement_jobs[request_id]["error"] = str(e)
+            enhancement_jobs[request_id]["result"] = None
+        
+            # Update database with error
+            db.store_job(
+                job_id=request_id,
+                job_type="enhancement",
+                status=EnhancementStatus.FAILED.value,
+                data={
+                    "request": enhancement_jobs[request_id]["request"],
+                    "result": None,
+                    "error": str(e)
+                }
             )
-        
-        # Handle the processes correctly, converting dict to Process objects if needed
-        if result["enhanced_data"].get("processes"):
-            result["enhanced_data"]["processes"] = self._convert_processes_to_model(result["enhanced_data"]["processes"])
-        
-        # Convert the enhanced data dict back to an EnhancedDataElement
-        logger.info(f"Workflow completed with {result['enhanced_data'].get('enhancement_iterations', 0)} iterations")
-        return EnhancedDataElement(**result["enhanced_data"])
+        else:
+            logger.error(f"Job {request_id} not found in memory after failure")
