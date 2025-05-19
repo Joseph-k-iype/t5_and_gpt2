@@ -1,115 +1,349 @@
-import uuid
-from typing import Dict, Any, Optional, List
-from app.core.models import Process
+import logging
+from typing import Dict, Any, Optional
+from langchain_openai import AzureChatOpenAI
+from langgraph.graph import StateGraph, END
+from pydantic import BaseModel
+from app.core.models import (
+    DataElement, 
+    EnhancedDataElement, 
+    ValidationResult, 
+    EnhancementResult, 
+    DataQualityStatus
+)
+from app.agents.validator_agent import ValidatorAgent
+from app.agents.enhancer_agent import EnhancerAgent
+from app.agents.confidence_evaluator import ConfidenceEvaluator
+from app.utils.compatibility_utils import create_process_from_legacy
 
-def convert_legacy_data_element(data_element: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Convert a legacy DataElement with process_name/process_description to the new format with processes array.
+logger = logging.getLogger(__name__)
+
+# Define workflow state
+class WorkflowState(Dict[str, Any]):
+    """State for the data enhancement workflow."""
+    pass
+
+class DataEnhancementWorkflow:
+    """LangGraph workflow for enhancing data elements with quality feedback loop."""
     
-    Args:
-        data_element: Dictionary representation of a legacy DataElement
-        
-    Returns:
-        Updated dictionary with processes array
-    """
-    # Make a shallow copy to avoid modifying the input
-    result = data_element.copy()
+    def __init__(self, llm: AzureChatOpenAI):
+        self.llm = llm
+        self.validator = ValidatorAgent(llm)
+        self.enhancer = EnhancerAgent(llm)
+        self.confidence_evaluator = ConfidenceEvaluator(llm)
+        self.graph = self._build_graph()
     
-    # Check if this is a legacy data element with process_name or process_description
-    if "process_name" in result or "process_description" in result:
-        process_name = result.pop("process_name", None)
-        process_description = result.pop("process_description", None)
+    async def _validate_data(self, state: WorkflowState) -> WorkflowState:
+        """Validate the data element."""
+        try:
+            # If there's enhanced data, validate that
+            if state.get("enhanced_data"):
+                # Create a new DataElement with processes array from enhanced data
+                processes = state["enhanced_data"].get("processes", [])
+                
+                # Handle legacy elements that might not have processes
+                if not processes and (
+                    state["enhanced_data"].get("process_name") or 
+                    state["enhanced_data"].get("process_description")
+                ):
+                    process = create_process_from_legacy(
+                        state["enhanced_data"].get("process_name"),
+                        state["enhanced_data"].get("process_description")
+                    )
+                    if process:
+                        processes = [process]
+                
+                data_to_validate = DataElement(
+                    id=state["data_element"]["id"],
+                    existing_name=state["enhanced_data"]["enhanced_name"],
+                    existing_description=state["enhanced_data"]["enhanced_description"],
+                    example=state["data_element"].get("example"),
+                    processes=processes,
+                    cdm=state["data_element"].get("cdm")
+                )
+            else:
+                # Otherwise validate the original data
+                # Take care to handle the processes list
+                original_element = state["data_element"]
+                processes = original_element.get("processes", [])
+                
+                # Handle legacy elements that might not have processes
+                if not processes and (
+                    original_element.get("process_name") or 
+                    original_element.get("process_description")
+                ):
+                    process = create_process_from_legacy(
+                        original_element.get("process_name"),
+                        original_element.get("process_description")
+                    )
+                    if process:
+                        processes = [process]
+                
+                data_to_validate = DataElement(
+                    id=original_element["id"],
+                    existing_name=original_element["existing_name"],
+                    existing_description=original_element["existing_description"],
+                    example=original_element.get("example"),
+                    processes=processes,
+                    cdm=original_element.get("cdm")
+                )
+            
+            # Validate the data
+            validation_result = await self.validator.validate(data_to_validate)
+            
+            # Update state with validation result
+            state["validation_result"] = validation_result.dict()
+            
+            # If this is a subsequent iteration, update the enhanced data with validation feedback
+            if state.get("enhanced_data") and state["iterations"] > 0:
+                if "validation_feedback" not in state["enhanced_data"]:
+                    state["enhanced_data"]["validation_feedback"] = []
+                state["enhanced_data"]["validation_feedback"].append(validation_result.feedback)
+                state["enhanced_data"]["quality_status"] = validation_result.quality_status
+            
+            return state
+        except Exception as e:
+            logger.error(f"Validation error: {str(e)}")
+            state["error"] = f"Validation error: {str(e)}"
+            state["is_complete"] = True
+            return state
+    
+    async def _enhance_data(self, state: WorkflowState) -> WorkflowState:
+        """Enhance the data element using the quality feedback loop."""
+        try:
+            # Get validation feedback
+            validation_feedback = state["validation_result"]["feedback"]
+            if state["validation_result"].get("suggested_improvements"):
+                validation_feedback += "\n\nSuggested improvements:\n" + "\n".join(
+                    state["validation_result"]["suggested_improvements"]
+                )
+            
+            # Get original data element with processes array
+            original_element_dict = state["data_element"]
+            processes = original_element_dict.get("processes", [])
+            
+            # Handle legacy elements that might not have processes
+            if not processes and (
+                original_element_dict.get("process_name") or 
+                original_element_dict.get("process_description")
+            ):
+                process = create_process_from_legacy(
+                    original_element_dict.get("process_name"),
+                    original_element_dict.get("process_description")
+                )
+                if process:
+                    processes = [process]
+            
+            # Create a proper DataElement object
+            original_element = DataElement(
+                id=original_element_dict["id"],
+                existing_name=original_element_dict["existing_name"],
+                existing_description=original_element_dict["existing_description"],
+                example=original_element_dict.get("example"),
+                processes=processes,
+                cdm=original_element_dict.get("cdm")
+            )
+            
+            # Determine max iterations based on remaining allowed iterations
+            remaining_iterations = state["max_iterations"] - state["iterations"]
+            quality_iterations = min(3, remaining_iterations)  # Use at most 3 iterations for quality improvement
+            
+            if quality_iterations > 1:
+                # Use the enhance_until_quality method for better results
+                enhancement_result, validation_result = await self.enhancer.enhance_until_quality(
+                    data_element=original_element,
+                    validation_feedback=validation_feedback,
+                    max_iterations=quality_iterations
+                )
+                # Add the used iterations to the state's iteration count (subtract 1 as we'll increment later)
+                state["iterations"] += quality_iterations - 1
+            else:
+                # Just do a single enhancement if we're on the last iteration
+                enhancement_result = await self.enhancer.enhance(
+                    original_element, 
+                    validation_feedback
+                )
+                # Validate the result to get quality status
+                test_element = DataElement(
+                    id=original_element.id,
+                    existing_name=enhancement_result.enhanced_name,
+                    existing_description=enhancement_result.enhanced_description,
+                    example=original_element.example,
+                    processes=original_element.processes,
+                    cdm=original_element.cdm
+                )
+                validation_result = await self.validator.validate(test_element)
+            
+            state["enhancement_result"] = enhancement_result.dict()
+            
+            # Create or update enhanced data
+            if not state.get("enhanced_data"):
+                confidence_score = enhancement_result.confidence
+                
+                if state["iterations"] == 0:
+                    # Confidence based on quality status for first iteration
+                    if validation_result.quality_status == DataQualityStatus.GOOD:
+                        confidence_score = 1.0
+                    elif validation_result.quality_status == DataQualityStatus.NEEDS_IMPROVEMENT:
+                        confidence_score = 0.8
+                    else:
+                        confidence_score = 0.5
+                
+                # Create enhanced data with processes array
+                enhanced_data = {
+                    "id": original_element.id,
+                    "existing_name": original_element.existing_name,
+                    "existing_description": original_element.existing_description,
+                    "example": original_element.example,
+                    "processes": [p.dict() for p in original_element.processes],
+                    "cdm": original_element.cdm,
+                    "enhanced_name": enhancement_result.enhanced_name,
+                    "enhanced_description": enhancement_result.enhanced_description,
+                    "quality_status": validation_result.quality_status,
+                    "enhancement_iterations": 1,
+                    "enhancement_feedback": [enhancement_result.feedback],
+                    "validation_feedback": [validation_result.feedback],
+                    "confidence_score": confidence_score
+                }
+                state["enhanced_data"] = enhanced_data
+            else:
+                # Update the confidence score based on new quality status
+                if validation_result.quality_status == DataQualityStatus.GOOD:
+                    new_confidence = 1.0
+                elif validation_result.quality_status == DataQualityStatus.NEEDS_IMPROVEMENT:
+                    new_confidence = 0.8
+                else:
+                    new_confidence = 0.5
+                
+                state["enhanced_data"]["enhanced_name"] = enhancement_result.enhanced_name
+                state["enhanced_data"]["enhanced_description"] = enhancement_result.enhanced_description
+                state["enhanced_data"]["enhancement_iterations"] = state["enhanced_data"].get("enhancement_iterations", 0) + 1
+                state["enhanced_data"]["confidence_score"] = new_confidence
+                state["enhanced_data"]["quality_status"] = validation_result.quality_status
+                
+                if "enhancement_feedback" not in state["enhanced_data"]:
+                    state["enhanced_data"]["enhancement_feedback"] = []
+                state["enhanced_data"]["enhancement_feedback"].append(enhancement_result.feedback)
+                
+                if "validation_feedback" not in state["enhanced_data"]:
+                    state["enhanced_data"]["validation_feedback"] = []
+                state["enhanced_data"]["validation_feedback"].append(validation_result.feedback)
+            
+            # Increment iteration counter
+            state["iterations"] = state["iterations"] + 1
+            
+            return state
+        except Exception as e:
+            logger.error(f"Enhancement error: {e}")
+            state["error"] = f"Enhancement error: {str(e)}"
+            state["is_complete"] = True
+            return state
+    
+    def _should_enhance(self, state: WorkflowState) -> str:
+        """Determine if the data needs further enhancement."""
+        # Check if we've hit the maximum number of iterations
+        if state["iterations"] >= state["max_iterations"]:
+            logger.info(f"Reached maximum iterations ({state['max_iterations']})")
+            return "complete"
         
-        if process_name or process_description:
-            # Create a process entry with a generated ID
-            process = {
-                "process_id": f"LEGACY-{uuid.uuid4().hex[:8]}",
-                "process_name": process_name or "Unnamed Process",
-                "process_description": process_description or ""
+        # Check validation result
+        if state["validation_result"]["quality_status"] == DataQualityStatus.GOOD:
+            logger.info("Quality status is GOOD, completing workflow")
+            return "complete"
+        
+        # If we have enhanced data, check its quality status
+        if state.get("enhanced_data") and state["enhanced_data"].get("quality_status") == DataQualityStatus.GOOD:
+            logger.info("Enhanced data quality status is GOOD, completing workflow")
+            return "complete"
+        
+        # Otherwise, continue enhancing
+        logger.info(f"Quality status is {state['validation_result']['quality_status']}, continuing enhancement")
+        return "enhance"
+    
+    async def _complete_workflow(self, state: WorkflowState) -> WorkflowState:
+        """Mark the workflow as complete."""
+        state["is_complete"] = True
+        logger.info("Workflow completed")
+        
+        # Add a final confidence evaluation if needed
+        if state.get("enhanced_data") and state["enhanced_data"]["quality_status"] == DataQualityStatus.GOOD:
+            logger.info("Enhancement achieved GOOD quality - setting high confidence")
+            state["enhanced_data"]["confidence_score"] = 1.0
+        
+        return state
+    
+    def _build_graph(self) -> StateGraph:
+        """Build the LangGraph workflow."""
+        workflow = StateGraph(WorkflowState)
+        
+        # Add nodes
+        workflow.add_node("validate", self._validate_data)
+        workflow.add_node("enhance", self._enhance_data)
+        workflow.add_node("complete", self._complete_workflow)
+        
+        # Add conditional edges
+        workflow.add_conditional_edges(
+            "validate",
+            self._should_enhance,
+            {
+                "enhance": "enhance",
+                "complete": "complete"
             }
-            
-            # Add to processes array
-            if "processes" not in result:
-                result["processes"] = []
-            
-            result["processes"].append(process)
-    
-    return result
-
-def convert_legacy_data_element_to_new(data_element_dict: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Convert a legacy DataElement to the new format and return a dictionary.
-    This function handles nested dictionaries and ensures all paths are updated.
-    
-    Args:
-        data_element_dict: Dictionary representation of a legacy DataElement
+        )
         
-    Returns:
-        Updated dictionary with processes array
-    """
-    result = convert_legacy_data_element(data_element_dict)
-    
-    # Also check and convert any nested data elements
-    for key, value in result.items():
-        if isinstance(value, dict) and ("process_name" in value or "process_description" in value):
-            result[key] = convert_legacy_data_element(value)
-        elif isinstance(value, list):
-            # Convert any dictionaries in the list that have process_name/process_description
-            for i, item in enumerate(value):
-                if isinstance(item, dict) and ("process_name" in item or "process_description" in item):
-                    result[key][i] = convert_legacy_data_element(item)
-    
-    return result
-
-def create_process_from_legacy(process_name: Optional[str], process_description: Optional[str]) -> Optional[Process]:
-    """
-    Create a Process model from legacy process_name and process_description fields.
-    
-    Args:
-        process_name: Legacy process name
-        process_description: Legacy process description
+        # Add remaining edges
+        workflow.add_edge("enhance", "validate")
+        workflow.add_edge("complete", END)  # End of workflow
         
-    Returns:
-        Process model or None if both inputs are None
-    """
-    if not process_name and not process_description:
-        return None
+        # Set entrypoint
+        workflow.set_entry_point("validate")
         
-    return Process(
-        process_id=f"LEGACY-{uuid.uuid4().hex[:8]}",
-        process_name=process_name or "Unnamed Process",
-        process_description=process_description or ""
-    )
-
-def convert_legacy_processes_in_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Specially formatted function to handle enhancement requests or tagging requests.
+        return workflow.compile()
     
-    Args:
-        request_data: Request data that may contain a data_element
+    async def run(self, data_element: DataElement, max_iterations: int = 5) -> EnhancedDataElement:
+        """
+        Run the data enhancement workflow on a data element.
         
-    Returns:
-        Updated request data with processes array
-    """
-    # Handle the case where the request has a data_element
-    if "data_element" in request_data and isinstance(request_data["data_element"], dict):
-        request_data["data_element"] = convert_legacy_data_element_to_new(request_data["data_element"])
-    
-    # Special handling for tagging requests that may have process_name/process_description directly
-    if "process_name" in request_data or "process_description" in request_data:
-        process_name = request_data.pop("process_name", None)
-        process_description = request_data.pop("process_description", None)
+        Args:
+            data_element: The data element to enhance
+            max_iterations: Maximum number of enhancement iterations to perform
         
-        if process_name or process_description:
-            process = {
-                "process_id": f"LEGACY-{uuid.uuid4().hex[:8]}",
-                "process_name": process_name or "Unnamed Process",
-                "process_description": process_description or ""
-            }
-            
-            if "processes" not in request_data:
-                request_data["processes"] = []
-            
-            request_data["processes"].append(process)
-    
-    return request_data
+        Returns:
+            Enhanced data element
+        """
+        logger.info(f"Starting enhancement workflow for element: {data_element.id}")
+        
+        # Start with a clean state
+        initial_state: WorkflowState = {
+            "data_element": data_element.dict(),
+            "enhanced_data": None,
+            "validation_result": None,
+            "enhancement_result": None,
+            "iterations": 0,
+            "max_iterations": max_iterations,
+            "is_complete": False,
+            "error": None
+        }
+        
+        # Run the workflow
+        result = await self.graph.ainvoke(initial_state)
+        
+        if result.get("error"):
+            logger.error(f"Workflow error: {result['error']}")
+            raise ValueError(result["error"])
+        
+        if not result.get("enhanced_data"):
+            logger.info("No enhancement was performed, using original data")
+            # If no enhancement was performed, create an enhanced data element from the original
+            return EnhancedDataElement(
+                **data_element.dict(),
+                enhanced_name=data_element.existing_name,
+                enhanced_description=data_element.existing_description,
+                quality_status=result["validation_result"]["quality_status"] if result.get("validation_result") else DataQualityStatus.GOOD,
+                enhancement_iterations=0,
+                validation_feedback=[result["validation_result"]["feedback"]] if result.get("validation_result") else [],
+                confidence_score=0.5  # Default confidence
+            )
+        
+        # Convert the enhanced data dict back to an EnhancedDataElement
+        logger.info(f"Workflow completed with {result['enhanced_data'].get('enhancement_iterations', 0)} iterations")
+        return EnhancedDataElement(**result["enhanced_data"])
