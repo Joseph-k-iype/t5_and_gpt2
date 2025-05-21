@@ -1,592 +1,603 @@
 """
-Updated cache.py with fixed async methods for the CacheManager class.
+Improved workflow that combines validation and enhancement in fewer LLM calls.
+Replace app/agents/workflow.py with this optimized version.
 """
 
-import functools
-import hashlib
-import json
 import logging
-import time
-import pickle
-import threading
 import asyncio
-from typing import Any, Callable, Dict, Optional, TypeVar, cast, List, Set, Tuple
-from datetime import datetime, timedelta
+import re
+import json
+from typing import Dict, Any, List, Optional, Tuple, TypedDict, Annotated, AsyncGenerator
+from langchain_openai import AzureChatOpenAI
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langgraph.graph import StateGraph, END
+from pydantic import BaseModel, Field
+from app.core.models import (
+    DataElement, 
+    EnhancedDataElement, 
+    ValidationResult, 
+    EnhancementResult, 
+    DataQualityStatus,
+    Process
+)
+from app.utils.cache import cache_manager
+from app.agents.validator_agent import ValidatorAgent  # Add this import
 
 logger = logging.getLogger(__name__)
 
-# Define a type variable for the function return type
-T = TypeVar('T')
+# Define workflow state
+class WorkflowState(TypedDict):
+    """State for the data enhancement workflow."""
+    data_element: Dict[str, Any]
+    enhanced_data: Optional[Dict[str, Any]]
+    validation_result: Optional[Dict[str, Any]]
+    enhancement_result: Optional[Dict[str, Any]]
+    iterations: int
+    max_iterations: int
+    is_complete: bool
+    error: Optional[str]
 
-class CacheManager:
-    """
-    Enhanced cache manager for expensive operations.
-    Features:
-    - Result serialization for any type of object
-    - TTL management with background cleanup
-    - Thread-safe operations
-    - Detailed statistics and monitoring
-    - Async support
-    """
+class OptimizedDataEnhancementWorkflow:
+    """Optimized LangGraph workflow for enhancing data elements with reduced LLM calls."""
     
-    _instance = None
+    def __init__(self, llm: AzureChatOpenAI):
+        self.llm = llm
+        self.graph = self._build_graph()
+        
+        # Add ValidatorAgent instance for direct validation
+        self.validator = ValidatorAgent(llm)
+        
+        # Set up the single-call prompt for both validation and enhancement
+        self.combined_prompt = PromptTemplate(
+            input_variables=["id", "name", "description", "example", "processes_info"],
+            template="""
+            You are an expert in data governance and ISO/IEC 11179 metadata standards. Your task is to:
+            1. VALIDATE the given data element name and description against ISO standards
+            2. ENHANCE the data element to meet these standards
+            
+            ISO/IEC 11179 standards for data element names (adapted for business-friendly format):
+            - Names MUST be in lowercase with spaces between words.
+            - Names MUST NOT use technical formatting like camelCase, snake_case or PascalCase
+            - Names MUST NOT contain underscores, hyphens, or special characters
+            - Names should be clear, unambiguous and self-describing
+            - Names should not use acronyms or abbreviations unless they are universally understood
+            - Names should be concise yet descriptive
+            - Names should use standard terminology in the domain
+            - Names should use business language that non-technical users can understand
+            
+            ISO/IEC 11179 standards for data element descriptions:
+            - Descriptions should clearly define what the data element represents
+            - Descriptions should be complete, covering the concept fully
+            - Descriptions should be precise, specific enough to distinguish from other concepts
+            - Descriptions should be objective and factual, not opinion-based
+            - Descriptions should use complete sentences with proper grammar and punctuation
+            - Descriptions should be written in business language, not technical jargon
+            
+            Data Element to Evaluate and Enhance:
+            - ID: {id}
+            - Current Name: {name}
+            - Current Description: {description}
+            - Example (if provided): {example}
+            {processes_info}
+            
+            First, provide a VALIDATION of the current data element with:
+            1. Name valid: [yes/no]
+            2. Name feedback: [details]
+            3. Description valid: [yes/no]
+            4. Description feedback: [details]
+            5. Overall quality (GOOD, NEEDS_IMPROVEMENT, or POOR): [quality]
+            6. Improvements needed: [list]
+            
+            Then, provide an ENHANCEMENT of the data element with:
+            1. Enhanced Name: [improved name]
+            2. Enhanced Description: [improved description]
+            3. Enhancement Notes: [explanation]
+            4. Confidence Score (0.0-1.0): [score]
+            
+            Your response MUST include both sections (VALIDATION and ENHANCEMENT).
+            """
+        )
+        self.combined_chain = self.combined_prompt | self.llm | StrOutputParser()
     
-    def __new__(cls, *args, **kwargs):
-        """Singleton pattern to ensure only one instance of the cache manager."""
-        if cls._instance is None:
-            cls._instance = super(CacheManager, cls).__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
+    def _convert_processes_to_model(self, processes_data):
+        """Safely convert process data to Process objects if needed."""
+        if not processes_data:
+            return None
+            
+        processes_list = []
+        for proc in processes_data:
+            # If already a Process object, use directly
+            if isinstance(proc, Process):
+                processes_list.append(proc)
+            # If a dict, convert to Process object
+            elif isinstance(proc, dict):
+                processes_list.append(Process(**proc))
+            else:
+                logger.warning(f"Unknown process type: {type(proc)}")
+        
+        return processes_list
     
-    def __init__(self, max_size: int = 1000, ttl: int = 3600):
+    def _format_processes_info(self, data_element: DataElement) -> str:
+        """Format the processes information for the prompt."""
+        if not data_element.processes:
+            return "Related Processes: None"
+        
+        processes = data_element.processes
+        # Ensure processes are Process objects
+        if not all(isinstance(p, Process) for p in processes):
+            # Convert dictionaries to Process objects
+            processes = self._convert_processes_to_model(data_element.processes)
+        
+        processes_info = "Related Processes:\n"
+        
+        for i, process in enumerate(processes, 1):
+            processes_info += f"Process {i} ID: {process.process_id}\n"
+            processes_info += f"Process {i} Name: {process.process_name}\n"
+            if process.process_description:
+                processes_info += f"Process {i} Description: {process.process_description}\n"
+            processes_info += "\n"
+        
+        return processes_info
+    
+    @cache_manager.async_cached(ttl=3600)  # Cache for 1 hour
+    async def _single_call_enhancement(self, state: WorkflowState) -> WorkflowState:
+        """Perform validation and enhancement in a single LLM call to reduce latency."""
+        try:
+            # Handle processes correctly
+            data_element_dict = state["data_element"].copy()
+            
+            # Convert processes if present
+            if data_element_dict.get("processes"):
+                data_element_dict["processes"] = self._convert_processes_to_model(data_element_dict.get("processes", []))
+            
+            original_element = DataElement(**data_element_dict)
+            
+            # Format processes information
+            processes_info = self._format_processes_info(original_element)
+            
+            # Perform the combined validation and enhancement in a single call
+            start_time = asyncio.get_event_loop().time()
+            combined_result = await self.combined_chain.ainvoke({
+                "id": original_element.id,
+                "name": original_element.existing_name,
+                "description": original_element.existing_description,
+                "example": original_element.example or "Not provided",
+                "processes_info": processes_info
+            })
+            elapsed = asyncio.get_event_loop().time() - start_time
+            logger.info(f"Combined validation and enhancement completed in {elapsed:.2f}s")
+            
+            # Parse the validation and enhancement results
+            validation_result = self._parse_validation_section(combined_result)
+            enhancement_result = self._parse_enhancement_section(combined_result)
+            
+            # Update state with results
+            state["validation_result"] = validation_result.dict()
+            state["enhancement_result"] = enhancement_result.dict()
+            
+            # Set enhanced data
+            processes_dicts = None
+            if original_element.processes:
+                processes_dicts = [proc.dict() for proc in original_element.processes]
+            
+            # Calculate confidence score based on quality status
+            confidence_score = enhancement_result.confidence
+            if validation_result.quality_status == DataQualityStatus.GOOD:
+                confidence_score = max(confidence_score, 0.9)  # Boost confidence for good quality
+            
+            enhanced_data = {
+                **state["data_element"],
+                "enhanced_name": enhancement_result.enhanced_name,
+                "enhanced_description": enhancement_result.enhanced_description,
+                "processes": processes_dicts,
+                "quality_status": validation_result.quality_status,
+                "enhancement_iterations": 1,
+                "enhancement_feedback": [enhancement_result.feedback],
+                "validation_feedback": [validation_result.feedback],
+                "confidence_score": confidence_score
+            }
+            state["enhanced_data"] = enhanced_data
+            
+            # Increment iteration counter
+            state["iterations"] = state["iterations"] + 1
+            
+            # Check if we've achieved good quality
+            if validation_result.quality_status == DataQualityStatus.GOOD:
+                logger.info(f"Achieved GOOD quality on first attempt for element: {original_element.id}")
+                state["is_complete"] = True
+            
+            return state
+        except Exception as e:
+            logger.error(f"Error in combined validation/enhancement: {e}")
+            state["error"] = f"Error in validation/enhancement: {str(e)}"
+            state["is_complete"] = True
+            return state
+    
+    def _parse_validation_section(self, result: str) -> ValidationResult:
+        """Parse the validation section of the combined result."""
+        # Split by lines
+        lines = result.split("\n")
+        
+        # Find the validation section
+        validation_start = None
+        validation_end = None
+        
+        for i, line in enumerate(lines):
+            if "VALIDATION" in line.upper():
+                validation_start = i
+            elif validation_start and "ENHANCEMENT" in line.upper():
+                validation_end = i
+                break
+        
+        if validation_start is None:
+            return ValidationResult(
+                is_valid=False,
+                quality_status=DataQualityStatus.POOR,
+                feedback="Failed to parse validation results",
+                suggested_improvements=[]
+            )
+        
+        if validation_end is None:
+            validation_end = len(lines)
+        
+        validation_text = "\n".join(lines[validation_start:validation_end])
+        
+        # Extract validation details
+        name_valid = False
+        for line in validation_text.split("\n"):
+            if "name valid" in line.lower() and ("yes" in line.lower() or "valid" in line.lower()):
+                name_valid = True
+                break
+                
+        desc_valid = False
+        for line in validation_text.split("\n"):
+            if "description valid" in line.lower() and ("yes" in line.lower() or "valid" in line.lower()):
+                desc_valid = True
+                break
+        
+        # Extract quality status
+        quality_status = DataQualityStatus.NEEDS_IMPROVEMENT
+        if "GOOD" in validation_text.upper():
+            quality_status = DataQualityStatus.GOOD
+        elif "POOR" in validation_text.upper():
+            quality_status = DataQualityStatus.POOR
+        
+        # Extract feedback
+        feedback = "Name feedback: "
+        name_feedback_match = re.search(r"Name feedback:(.+?)(?:\n\d+\.|\n\n|$)", validation_text, re.DOTALL)
+        if name_feedback_match:
+            feedback += name_feedback_match.group(1).strip()
+        
+        feedback += "\n\nDescription feedback: "
+        desc_feedback_match = re.search(r"Description feedback:(.+?)(?:\n\d+\.|\n\n|$)", validation_text, re.DOTALL)
+        if desc_feedback_match:
+            feedback += desc_feedback_match.group(1).strip()
+        
+        # Extract improvements
+        improvements = []
+        improvements_section = re.search(r"Improvements needed:(.+?)(?:\n\n|ENHANCEMENT|$)", validation_text, re.DOTALL)
+        if improvements_section:
+            improvements_text = improvements_section.group(1).strip()
+            for line in improvements_text.split("\n"):
+                line = line.strip()
+                if line and (line.startswith("-") or line.startswith("*") or re.match(r"^\d+\.", line)):
+                    # Remove the list marker
+                    clean_line = re.sub(r"^[-*]\s*|\d+\.\s*", "", line).strip()
+                    improvements.append(clean_line)
+                elif line and improvements:
+                    improvements[-1] += " " + line
+        
+        return ValidationResult(
+            is_valid=name_valid and desc_valid,
+            quality_status=quality_status,
+            feedback=feedback,
+            suggested_improvements=improvements
+        )
+    
+    def _parse_enhancement_section(self, result: str) -> EnhancementResult:
+        """Parse the enhancement section of the combined result."""
+        # Split by lines
+        lines = result.split("\n")
+        
+        # Find the enhancement section
+        enhancement_start = None
+        
+        for i, line in enumerate(lines):
+            if "ENHANCEMENT" in line.upper():
+                enhancement_start = i
+                break
+        
+        if enhancement_start is None:
+            return EnhancementResult(
+                enhanced_name="",
+                enhanced_description="",
+                feedback="Failed to parse enhancement results",
+                confidence=0.0
+            )
+        
+        enhancement_text = "\n".join(lines[enhancement_start:])
+        
+        # Extract enhanced name
+        enhanced_name = ""
+        name_match = re.search(r"Enhanced Name:(.+?)(?:\n\d+\.|\n\n|$)", enhancement_text, re.DOTALL)
+        if name_match:
+            enhanced_name = name_match.group(1).strip()
+            # Remove any enclosing brackets or quotes
+            enhanced_name = re.sub(r"^\[|\]$|^\"|\"\$", "", enhanced_name).strip()
+        
+        # Extract enhanced description
+        enhanced_description = ""
+        desc_match = re.search(r"Enhanced Description:(.+?)(?:\n\d+\.|\n\n|Enhancement Notes:|$)", enhancement_text, re.DOTALL)
+        if desc_match:
+            enhanced_description = desc_match.group(1).strip()
+            # Remove any enclosing brackets or quotes
+            enhanced_description = re.sub(r"^\[|\]$|^\"|\"\$", "", enhanced_description).strip()
+        
+        # Extract feedback
+        feedback = ""
+        feedback_match = re.search(r"Enhancement Notes:(.+?)(?:\n\d+\.|\n\n|Confidence Score|$)", enhancement_text, re.DOTALL)
+        if feedback_match:
+            feedback = feedback_match.group(1).strip()
+            # Remove any enclosing brackets or quotes
+            feedback = re.sub(r"^\[|\]$|^\"|\"\$", "", feedback).strip()
+        
+        # Extract confidence
+        confidence = 0.7  # Default
+        confidence_match = re.search(r"Confidence Score.+?(\d+\.\d+)", enhancement_text)
+        if confidence_match:
+            try:
+                confidence = float(confidence_match.group(1))
+                confidence = max(0.0, min(1.0, confidence))  # Ensure within bounds
+            except ValueError:
+                pass
+        
+        return EnhancementResult(
+            enhanced_name=enhanced_name,
+            enhanced_description=enhanced_description,
+            feedback=feedback,
+            confidence=confidence
+        )
+    
+    def _should_continue(self, state: WorkflowState) -> str:
+        """Determine if the process should continue or complete."""
+        # Check if we've hit the maximum number of iterations
+        if state["iterations"] >= state["max_iterations"]:
+            logger.info(f"Reached maximum iterations ({state['max_iterations']})")
+            return "complete"
+        
+        # Check if we've achieved good quality
+        quality_status = state.get("validation_result", {}).get("quality_status")
+        if quality_status == DataQualityStatus.GOOD:
+            logger.info("Quality status is GOOD, completing workflow")
+            return "complete"
+        
+        # If we have enhanced data, check its quality status
+        if state.get("enhanced_data") and state["enhanced_data"].get("quality_status") == DataQualityStatus.GOOD:
+            logger.info("Enhanced data quality status is GOOD, completing workflow")
+            return "complete"
+        
+        # Continue the process only if quality is not good and we haven't reached max iterations
+        logger.info(f"Quality status is {quality_status}, continuing enhancement")
+        return "continue"
+    
+    async def _complete_workflow(self, state: WorkflowState) -> WorkflowState:
+        """Mark the workflow as complete."""
+        state["is_complete"] = True
+        logger.info("Workflow completed")
+        
+        # Add a final confidence evaluation if needed
+        if state.get("enhanced_data") and state["enhanced_data"]["quality_status"] == DataQualityStatus.GOOD:
+            logger.info("Enhancement achieved GOOD quality - setting high confidence")
+            state["enhanced_data"]["confidence_score"] = 1.0
+        
+        return state
+    
+    def _build_graph(self) -> StateGraph:
+        """Build the optimized LangGraph workflow."""
+        workflow = StateGraph(WorkflowState)
+        
+        # Add nodes
+        workflow.add_node("single_call_enhancement", self._single_call_enhancement)
+        workflow.add_node("complete", self._complete_workflow)
+        
+        # Add conditional edges
+        workflow.add_conditional_edges(
+            "single_call_enhancement",
+            self._should_continue,
+            {
+                "continue": "single_call_enhancement",
+                "complete": "complete"
+            }
+        )
+        
+        # Add edge to end
+        workflow.add_edge("complete", END)
+        
+        # Set entrypoint
+        workflow.set_entry_point("single_call_enhancement")
+        
+        return workflow.compile()
+    
+    @cache_manager.async_cached(ttl=3600)  # Cache for 1 hour
+    async def run(self, data_element: DataElement, max_iterations: int = 2) -> EnhancedDataElement:
         """
-        Initialize the cache manager with performance optimizations.
+        Run the data enhancement workflow on a data element.
         
         Args:
-            max_size: Maximum number of items in the cache
-            ttl: Default time to live in seconds
-        """
-        if self._initialized:
-            return
-            
-        self._cache: Dict[str, Dict[str, Any]] = {}
-        self._max_size = max_size
-        self._default_ttl = ttl
-        self._lock = threading.RLock()  # Reentrant lock for better performance
+            data_element: The data element to enhance
+            max_iterations: Maximum number of enhancement iterations to perform (default reduced to 2)
         
-        # Add performance metrics
-        self._stats = {
-            "hits": 0,
-            "misses": 0,
-            "evictions": 0,
-            "additions": 0,
-            "expired": 0,
-            "size": 0
+        Returns:
+            Enhanced data element
+        """
+        logger.info(f"Starting enhancement workflow for element: {data_element.id}")
+        
+        # Convert processes to dict for serializing in the state
+        element_dict = data_element.dict()
+        if data_element.processes:
+            element_dict["processes"] = [proc.dict() for proc in data_element.processes]
+        
+        initial_state: WorkflowState = {
+            "data_element": element_dict,
+            "enhanced_data": None,
+            "validation_result": None,
+            "enhancement_result": None,
+            "iterations": 0,
+            "max_iterations": max_iterations,
+            "is_complete": False,
+            "error": None
         }
         
-        # Jobs cache for storing job-like objects
-        self._jobs_cache: Dict[str, Dict[str, Any]] = {}
+        # Run the workflow
+        result = await self.graph.ainvoke(initial_state)
         
-        # Last access timestamps for LRU eviction
-        self._last_access = {}
+        if result.get("error"):
+            logger.error(f"Workflow error: {result['error']}")
+            raise ValueError(result["error"])
         
-        # Setup background cleanup thread
-        self._stop_cleanup = threading.Event()
-        self._cleanup_thread = threading.Thread(target=self._cleanup_worker, daemon=True)
-        self._cleanup_thread.start()
+        if not result.get("enhanced_data"):
+            logger.info("No enhancement was performed, using original data")
+            # If no enhancement was performed, create an enhanced data element from the original
+            return EnhancedDataElement(
+                **data_element.dict(),
+                enhanced_name=data_element.existing_name,
+                enhanced_description=data_element.existing_description,
+                quality_status=result["validation_result"]["quality_status"] if result.get("validation_result") else DataQualityStatus.GOOD,
+                enhancement_iterations=0,
+                validation_feedback=[result["validation_result"]["feedback"]] if result.get("validation_result") else [],
+                confidence_score=0.5  # Default confidence
+            )
         
-        self._initialized = True
-        logger.info(f"Enhanced cache manager initialized with max_size={max_size}, ttl={ttl}")
+        # Handle the processes correctly, converting dict to Process objects if needed
+        if result["enhanced_data"].get("processes"):
+            result["enhanced_data"]["processes"] = self._convert_processes_to_model(result["enhanced_data"]["processes"])
+        
+        # Convert the enhanced data dict back to an EnhancedDataElement
+        logger.info(f"Workflow completed with {result['enhanced_data'].get('enhancement_iterations', 0)} iterations")
+        return EnhancedDataElement(**result["enhanced_data"])
     
-    def _cleanup_worker(self):
-        """Background worker to clean up expired cache entries."""
-        logger.info("Cache cleanup worker started")
-        cleanup_interval = 60  # Check every minute
-        
-        while not self._stop_cleanup.wait(cleanup_interval):
-            try:
-                self._cleanup_expired()
-            except Exception as e:
-                logger.error(f"Error in cache cleanup: {e}")
-        
-        logger.info("Cache cleanup worker stopped")
-    
-    def _cleanup_expired(self):
-        """Remove expired entries from cache."""
-        now = time.time()
-        expired_keys = []
-        
-        with self._lock:
-            # Find expired keys in main cache
-            for key, entry in self._cache.items():
-                if now > entry.get("expires_at", 0):
-                    expired_keys.append(key)
-            
-            # Remove expired entries
-            for key in expired_keys:
-                del self._cache[key]
-                if key in self._last_access:
-                    del self._last_access[key]
-            
-            # Update stats
-            self._stats["expired"] += len(expired_keys)
-            self._stats["size"] = len(self._cache)
-            
-            # Also clean up jobs cache
-            expired_jobs = []
-            for key, job in self._jobs_cache.items():
-                if "expires_at" in job and now > job["expires_at"]:
-                    expired_jobs.append(key)
-                    
-            for key in expired_jobs:
-                del self._jobs_cache[key]
-        
-        if expired_keys:
-            logger.debug(f"Removed {len(expired_keys)} expired cache entries")
-    
-    def _generate_key(self, prefix: str, *args, **kwargs) -> str:
+    async def stream_run(self, data_element: DataElement, max_iterations: int = 2) -> AsyncGenerator[Dict[str, Any], None]:
         """
-        Generate a cache key from function arguments with improved serialization.
-        
-        Args:
-            prefix: Prefix for the key (usually function name)
-            args: Positional arguments
-            kwargs: Keyword arguments
-            
-        Returns:
-            str: MD5 hash of the arguments
+        Run the workflow and stream results after each iteration.
+        Max iterations reduced to 2 for better performance.
         """
-        # Create a consistent representation of the arguments
-        key_parts = [prefix]
+        # Convert processes to dict for serializing in the state
+        element_dict = data_element.dict()
+        if data_element.processes:
+            element_dict["processes"] = [proc.dict() for proc in data_element.processes]
         
-        # Handle args
-        for arg in args:
-            try:
-                # Try to use the object's __repr__ for better uniqueness
-                if hasattr(arg, '__dict__'):
-                    # For objects, use their attributes
-                    key_parts.append(str(sorted(arg.__dict__.items())))
-                else:
-                    key_parts.append(repr(arg))
-            except:
-                # Fallback for non-serializable objects
-                key_parts.append(str(id(arg)))
+        initial_state: WorkflowState = {
+            "data_element": element_dict,
+            "enhanced_data": None,
+            "validation_result": None,
+            "enhancement_result": None,
+            "iterations": 0,
+            "max_iterations": max_iterations,
+            "is_complete": False,
+            "error": None
+        }
         
-        # Handle kwargs
-        sorted_kwargs = sorted(kwargs.items())
-        for k, v in sorted_kwargs:
-            try:
-                if hasattr(v, '__dict__'):
-                    key_parts.append(f"{k}:{sorted(v.__dict__.items())}")
-                else:
-                    key_parts.append(f"{k}:{repr(v)}")
-            except:
-                key_parts.append(f"{k}:{str(id(v))}")
+        # Manually control the workflow for streaming
+        state = initial_state
         
-        # Create a string and hash it
-        key_str = "||".join(key_parts)
-        return hashlib.md5(key_str.encode()).hexdigest()
-    
-    def get(self, key: str) -> Optional[Any]:
-        """
-        Get a value from the cache with TTL checking.
+        # Initial progress update
+        yield {
+            "status": "in_progress",
+            "message": "Starting enhancement workflow",
+            "iteration": 0,
+            "progress": 0.0
+        }
         
-        Args:
-            key: Cache key
+        try:
+            # Run first iteration
+            state = await self._single_call_enhancement(state)
             
-        Returns:
-            Any: Cached value or None if not found or expired
-        """
-        with self._lock:
-            if key not in self._cache:
-                self._stats["misses"] += 1
-                return None
+            if state.get("error"):
+                yield {
+                    "status": "error",
+                    "message": state["error"],
+                    "iteration": state["iterations"],
+                    "progress": 0.0
+                }
+                return
             
-            cache_entry = self._cache[key]
-            
-            # Check if entry is expired
-            if time.time() > cache_entry["expires_at"]:
-                del self._cache[key]
-                if key in self._last_access:
-                    del self._last_access[key]
-                self._stats["misses"] += 1
-                self._stats["expired"] += 1
-                self._stats["size"] = len(self._cache)
-                return None
-            
-            # Update last access time for LRU
-            self._last_access[key] = time.time()
-            
-            # Update hits counter
-            self._stats["hits"] += 1
-            
-            # Return deserialized value
-            try:
-                value = cache_entry["value"]
-                if cache_entry.get("serialized", False):
-                    value = pickle.loads(value)
-                return value
-            except Exception as e:
-                logger.error(f"Error deserializing cached value: {e}")
-                # Count as miss on deserialization error
-                self._stats["misses"] += 1
-                return None
-    
-    def set(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
-        """
-        Set a value in the cache with optimized serialization.
-        
-        Args:
-            key: Cache key
-            value: Value to cache
-            ttl: Custom time to live in seconds
-        """
-        # Make room if cache is full
-        with self._lock:
-            if len(self._cache) >= self._max_size:
-                self._evict_entries(1)
-            
-            # Calculate expiration time
-            expires_at = time.time() + (ttl or self._default_ttl)
-            
-            # Serialize complex objects to ensure cache integrity
-            serialized = False
-            try:
-                # Try JSON serialization first as it's faster
-                json.dumps(value)
-                # Value is JSON serializable, store as is
-                serialized_value = value
-            except (TypeError, ValueError):
-                # For complex objects, use pickle
-                try:
-                    serialized_value = pickle.dumps(value)
-                    serialized = True
-                except Exception as e:
-                    logger.error(f"Error serializing value for cache: {e}")
-                    # Fall back to storing the original value
-                    serialized_value = value
-                    serialized = False
-            
-            # Add entry to cache
-            self._cache[key] = {
-                "value": serialized_value,
-                "serialized": serialized,
-                "expires_at": expires_at,
-                "created_at": time.time()
+            # Send first iteration results
+            progress = min(1.0, state["iterations"] / max_iterations)
+            yield {
+                "status": "in_progress",
+                "message": f"Completed iteration {state['iterations']}",
+                "iteration": state["iterations"],
+                "progress": progress,
+                "current_result": {
+                    "enhanced_name": state["enhanced_data"]["enhanced_name"],
+                    "enhanced_description": state["enhanced_data"]["enhanced_description"],
+                    "quality_status": state["enhanced_data"]["quality_status"],
+                    "confidence_score": state["enhanced_data"]["confidence_score"]
+                }
             }
             
-            # Update last access time for LRU
-            self._last_access[key] = time.time()
+            # Continue iterations until complete or hit limit
+            while not state["is_complete"] and state["iterations"] < max_iterations:
+                if self._should_continue(state) == "complete":
+                    state = await self._complete_workflow(state)
+                    break
+                
+                # Run next iteration
+                state = await self._single_call_enhancement(state)
+                
+                if state.get("error"):
+                    yield {
+                        "status": "error",
+                        "message": state["error"],
+                        "iteration": state["iterations"],
+                        "progress": progress
+                    }
+                    return
+                
+                # Send iteration results
+                progress = min(1.0, state["iterations"] / max_iterations)
+                yield {
+                    "status": "in_progress",
+                    "message": f"Completed iteration {state['iterations']}",
+                    "iteration": state["iterations"],
+                    "progress": progress,
+                    "current_result": {
+                        "enhanced_name": state["enhanced_data"]["enhanced_name"],
+                        "enhanced_description": state["enhanced_data"]["enhanced_description"],
+                        "quality_status": state["enhanced_data"]["quality_status"],
+                        "confidence_score": state["enhanced_data"]["confidence_score"]
+                    }
+                }
             
-            # Update stats
-            self._stats["additions"] += 1
-            self._stats["size"] = len(self._cache)
-    
-    def _evict_entries(self, count: int = 1) -> None:
-        """
-        Evict entries using LRU strategy.
-        
-        Args:
-            count: Number of entries to evict
-        """
-        if not self._last_access:
-            return
-        
-        # Sort keys by last access time (oldest first)
-        sorted_keys = sorted(self._last_access.items(), key=lambda x: x[1])
-        
-        # Evict the specified number of entries
-        for i in range(min(count, len(sorted_keys))):
-            key = sorted_keys[i][0]
-            if key in self._cache:
-                del self._cache[key]
-            if key in self._last_access:
-                del self._last_access[key]
-            self._stats["evictions"] += 1
-        
-        self._stats["size"] = len(self._cache)
-    
-    def clear(self) -> None:
-        """Clear the cache."""
-        with self._lock:
-            self._cache.clear()
-            self._last_access.clear()
-            self._jobs_cache.clear()
-            self._stats["size"] = 0
-        logger.info("Cache cleared")
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """
-        Get detailed cache statistics.
-        
-        Returns:
-            Dict with cache statistics
-        """
-        with self._lock:
-            hit_rate = 0.0
-            total_requests = self._stats["hits"] + self._stats["misses"]
-            if total_requests > 0:
-                hit_rate = self._stats["hits"] / total_requests
+            # Complete the workflow if not already
+            if not state["is_complete"]:
+                state = await self._complete_workflow(state)
             
-            return {
-                "size": self._stats["size"],
-                "max_size": self._max_size,
-                "ttl": self._default_ttl,
-                "hits": self._stats["hits"],
-                "misses": self._stats["misses"],
-                "hit_rate": hit_rate,
-                "evictions": self._stats["evictions"],
-                "additions": self._stats["additions"],
-                "expired": self._stats["expired"],
-                "memory_usage_estimate": self._estimate_memory_usage(),
-                "jobs_cache_size": len(self._jobs_cache)
+            # Handle the processes correctly
+            if state["enhanced_data"].get("processes"):
+                state["enhanced_data"]["processes"] = self._convert_processes_to_model(state["enhanced_data"]["processes"])
+            
+            # Convert to EnhancedDataElement
+            enhanced_element = EnhancedDataElement(**state["enhanced_data"])
+            
+            # Send final result
+            yield {
+                "status": "completed",
+                "message": "Enhancement workflow completed",
+                "iteration": state["iterations"],
+                "progress": 1.0,
+                "result": enhanced_element.dict()
             }
-    
-    def _estimate_memory_usage(self) -> int:
-        """
-        Estimate memory usage of the cache in bytes.
-        
-        Returns:
-            int: Estimated memory usage in bytes
-        """
-        total_size = 0
-        sample_size = min(10, len(self._cache))
-        
-        if sample_size == 0:
-            return 0
-        
-        # Sample a few entries to estimate average size
-        sampled_keys = list(self._cache.keys())[:sample_size]
-        for key in sampled_keys:
-            entry = self._cache[key]
-            try:
-                if entry.get("serialized", False):
-                    entry_size = len(entry["value"])
-                else:
-                    # For non-serialized values, use pickle to estimate size
-                    entry_size = len(pickle.dumps(entry["value"]))
-                total_size += entry_size
-            except:
-                # Fallback estimation
-                total_size += 1024  # Assume 1KB per entry
-        
-        # Extrapolate to full cache
-        avg_entry_size = total_size / sample_size
-        return int(avg_entry_size * len(self._cache))
-    
-    def cached(self, ttl: Optional[int] = None) -> Callable[[Callable[..., T]], Callable[..., T]]:
-        """
-        Optimized decorator for caching function results.
-        
-        Args:
-            ttl: Custom time to live in seconds
             
-        Returns:
-            Decorated function
-        """
-        def decorator(func: Callable[..., T]) -> Callable[..., T]:
-            @functools.wraps(func)
-            def wrapper(*args, **kwargs) -> T:
-                # Generate cache key
-                key = self._generate_key(func.__name__, *args, **kwargs)
-                
-                # Check if result is in cache
-                cached_result = self.get(key)
-                if cached_result is not None:
-                    logger.debug(f"Cache hit for {func.__name__}")
-                    return cached_result
-                
-                # Call original function
-                start_time = time.time()
-                result = func(*args, **kwargs)
-                execution_time = time.time() - start_time
-                
-                # Only cache results for functions that take significant time
-                # This avoids caching overhead for very fast functions
-                if execution_time > 0.001:  # Only cache if execution took more than 1ms
-                    self.set(key, result, ttl)
-                    logger.debug(f"Cache miss for {func.__name__} (execution time: {execution_time:.3f}s)")
-                
-                return result
-            return cast(Callable[..., T], wrapper)
-        return decorator
-    
-    def async_cached(self, ttl: Optional[int] = None) -> Callable[[Callable[..., T]], Callable[..., T]]:
-        """
-        Optimized decorator for caching async function results.
-        
-        Args:
-            ttl: Custom time to live in seconds
-            
-        Returns:
-            Decorated function
-        """
-        def decorator(func: Callable[..., T]) -> Callable[..., T]:
-            @functools.wraps(func)
-            async def wrapper(*args, **kwargs) -> T:
-                # Generate cache key
-                key = self._generate_key(func.__name__, *args, **kwargs)
-                
-                # Check if result is in cache
-                cached_result = self.get(key)
-                if cached_result is not None:
-                    logger.debug(f"Cache hit for async {func.__name__}")
-                    return cached_result
-                
-                # Call original function
-                import asyncio
-                start_time = asyncio.get_event_loop().time()
-                result = await func(*args, **kwargs)
-                execution_time = asyncio.get_event_loop().time() - start_time
-                
-                # Only cache results for functions that take significant time
-                if execution_time > 0.005:  # Only cache if execution took more than 5ms
-                    self.set(key, result, ttl)
-                    logger.debug(f"Cache miss for async {func.__name__} (execution time: {execution_time:.3f}s)")
-                
-                return result
-            return cast(Callable[..., T], wrapper)
-        return decorator
-    
-    # New methods for job-like caching
-    def store_job(self, job_id: str, job_type: str, status: str, data: Dict[str, Any], ttl: Optional[int] = None) -> bool:
-        """
-        Store a job in the cache.
-        
-        Args:
-            job_id: Unique identifier for the job
-            job_type: Type of job
-            status: Status of the job
-            data: Job data
-            ttl: Optional TTL override
-            
-        Returns:
-            bool: True if successful
-        """
-        with self._lock:
-            expires_at = time.time() + (ttl or self._default_ttl)
-            self._jobs_cache[job_id] = {
-                "id": job_id,
-                "job_type": job_type,
-                "status": status,
-                "data": data,
-                "created_at": time.time(),
-                "updated_at": time.time(),
-                "expires_at": expires_at
+        except Exception as e:
+            logger.error(f"Error in streaming workflow: {e}")
+            yield {
+                "status": "error",
+                "message": f"Error: {str(e)}",
+                "iteration": state.get("iterations", 0),
+                "progress": min(1.0, state.get("iterations", 0) / max_iterations)
             }
-            return True
-    
-    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Get a job from the cache.
-        
-        Args:
-            job_id: Job ID
-            
-        Returns:
-            Dict: Job data or None if not found
-        """
-        with self._lock:
-            job = self._jobs_cache.get(job_id)
-            if job:
-                # Check if job is expired
-                if time.time() > job.get("expires_at", float('inf')):
-                    del self._jobs_cache[job_id]
-                    return None
-                return job.copy()
-            return None
-    
-    def delete_job(self, job_id: str) -> bool:
-        """
-        Delete a job from the cache.
-        
-        Args:
-            job_id: Job ID
-            
-        Returns:
-            bool: True if found and deleted, False otherwise
-        """
-        with self._lock:
-            if job_id in self._jobs_cache:
-                del self._jobs_cache[job_id]
-                return True
-            return False
-    
-    # Async versions
-    async def async_get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Asynchronously get a job from the cache.
-        
-        Args:
-            job_id: Job ID
-            
-        Returns:
-            Dict: Job data or None if not found
-        """
-        return self.get_job(job_id)
-    
-    async def async_store_job(self, job_id: str, job_type: str, status: str, data: Dict[str, Any], ttl: Optional[int] = None) -> bool:
-        """
-        Asynchronously store a job in the cache.
-        
-        Args:
-            job_id: Unique identifier for the job
-            job_type: Type of job
-            status: Status of the job
-            data: Job data
-            ttl: Optional TTL override
-            
-        Returns:
-            bool: True if successful
-        """
-        return self.store_job(job_id, job_type, status, data, ttl)
-    
-    async def async_delete_job(self, job_id: str) -> bool:
-        """
-        Asynchronously delete a job from the cache.
-        
-        Args:
-            job_id: Job ID
-            
-        Returns:
-            bool: True if found and deleted, False otherwise
-        """
-        return self.delete_job(job_id)
-    
-    def stop(self):
-        """Stop the cache manager and cleanup thread."""
-        self._stop_cleanup.set()
-        if self._cleanup_thread.is_alive():
-            self._cleanup_thread.join(timeout=5)
-        logger.info("Cache manager stopped")
 
-# Create a global instance for application-wide use
-cache_manager = CacheManager()
-
-def setup_caching(max_size: int = 5000, ttl: int = 7200) -> None:
-    """
-    Initialize the cache manager with improved defaults.
-    
-    Args:
-        max_size: Maximum number of items in the cache (increased from 1000 to 5000)
-        ttl: Time to live in seconds (increased from 3600 to 7200)
-    """
-    global cache_manager
-    # Stop existing cache manager if initialized
-    if hasattr(cache_manager, 'stop') and callable(cache_manager.stop):
-        cache_manager.stop()
-    
-    cache_manager = CacheManager(max_size=max_size, ttl=ttl)
-    logger.info(f"Enhanced cache initialized with max_size={max_size}, ttl={ttl}")
-
-def get_cache_stats() -> Dict[str, Any]:
-    """
-    Get detailed cache statistics.
-    
-    Returns:
-        Dict with cache statistics
-    """
-    return cache_manager.get_stats()
-
-def invalidate_key(key_prefix: str) -> int:
-    """
-    Invalidate cache entries by key prefix.
-    
-    Args:
-        key_prefix: Prefix to match for cache keys
-        
-    Returns:
-        int: Number of invalidated entries
-    """
-    count = 0
-    with cache_manager._lock:
-        keys_to_remove = [k for k in cache_manager._cache.keys() if k.startswith(key_prefix)]
-        for k in keys_to_remove:
-            del cache_manager._cache[k]
-            if k in cache_manager._last_access:
-                del cache_manager._last_access[k]
-            count += 1
-        cache_manager._stats["size"] = len(cache_manager._cache)
-    
-    logger.info(f"Invalidated {count} cache entries with prefix '{key_prefix}'")
-    return count
+# For backwards compatibility
+DataEnhancementWorkflow = OptimizedDataEnhancementWorkflow
