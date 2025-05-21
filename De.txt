@@ -1,668 +1,312 @@
 """
-Fixed workflow implementation with error handling and proper method access.
-Replace app/agents/workflow.py with this implementation.
+OptimizedDataEnhancementWorkflow: Manages the overall process of enhancing a data element.
+It now primarily uses the EnhancerAgent's iterative `enhance_until_quality` method.
 """
 
 import logging
 import asyncio
-import re
-import json
-from typing import Dict, Any, List, Optional, Tuple, TypedDict, Annotated, AsyncGenerator
+from typing import Dict, Any, List, Optional, Tuple, TypedDict, AsyncGenerator
 from langchain_openai import AzureChatOpenAI
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langgraph.graph import StateGraph, END
-from pydantic import BaseModel, Field
+
 from app.core.models import (
     DataElement,
     EnhancedDataElement,
-    ValidationResult,
-    EnhancementResult,
+    ValidationResult, # For typing
+    EnhancementResult, # For typing
     DataQualityStatus,
-    Process
+    Process # For typing
 )
 from app.utils.cache import cache_manager
-from app.agents.validator_agent import ValidatorAgent # Import ValidatorAgent
+from app.agents.validator_agent import ValidatorAgent
+from app.agents.enhancer_agent import EnhancerAgent
 
 logger = logging.getLogger(__name__)
 
-# Define workflow state
 class WorkflowState(TypedDict):
-    """State for the data enhancement workflow."""
-    data_element: Dict[str, Any] # Store as dict for LangGraph state
-    original_data_element_model: DataElement # Keep original model for context
-    enhanced_data_model: Optional[EnhancedDataElement] # Store the Pydantic model of enhanced data
-    validation_result_model: Optional[ValidationResult] # Store Pydantic model
-    enhancement_result_model: Optional[EnhancementResult] # Store Pydantic model
-    iterations: int
-    max_iterations: int
-    current_validation_feedback_str: str # String feedback for the LLM
+    """
+    State for the data enhancement workflow.
+    """
+    original_data_element: DataElement # The initial DataElement model passed to the workflow
+    
+    # The final result of the enhancement process
+    final_enhanced_data_model: Optional[EnhancedDataElement] 
+    
+    # For tracking and control (though less critical now as EnhancerAgent handles iterations)
+    workflow_iterations_done: int # How many times the main workflow step ran (typically 1)
+    max_workflow_iterations: int  # Max times the main workflow step can run (typically 1)
+    
+    # Status and error tracking
     is_complete: bool
-    error: Optional[str]
+    error_message: Optional[str]
 
 
 class OptimizedDataEnhancementWorkflow:
-    """Optimized LangGraph workflow for enhancing data elements with reduced LLM calls."""
+    """
+    Manages the data enhancement process. It now primarily orchestrates a call 
+    to the EnhancerAgent's `enhance_until_quality` method, which handles its own
+    internal iterative refinement.
+    """
 
     def __init__(self, llm: AzureChatOpenAI):
         self.llm = llm
-        # Re-instate the ValidatorAgent instance for direct validation capabilities
+        # ValidatorAgent is still needed for the dedicated /validate endpoint
         self.validator = ValidatorAgent(llm)
-
-        self.combined_prompt = PromptTemplate(
-            input_variables=["id", "name", "description", "example", "processes_info", "current_validation_feedback_str", "iteration_info"],
-            template="""
-            You are an expert in data governance and ISO/IEC 11179 metadata standards.
-            This is iteration {iteration_info}.
-            Your task is to first VALIDATE then ENHANCE the given data element based on the standards and any previous feedback.
-
-            **ISO/IEC 11179 Standards for Data Element Names (Business-Friendly Adaptation):**
-            1.  **Format:** Names MUST be in lowercase with single spaces between words.
-            2.  **No Technical Casing:** Names MUST NOT use technical formatting like camelCase, snake_case, or PascalCase.
-            3.  **No Special Characters:** Names MUST NOT contain underscores, hyphens, or any special characters (e.g., %, &, *, #, /). Only alphanumeric characters and spaces are allowed.
-            4.  **Clarity & Unambiguity:** Names should be clear, unambiguous, and self-describing. Avoid vague terms.
-            5.  **Acronyms/Abbreviations:** Avoid acronyms or abbreviations unless they are universally understood within the business context (e.g., ID, URL, SKU). If used, ensure they are common knowledge.
-            6.  **Conciseness & Descriptiveness:** Names should be concise yet descriptive enough to convey meaning.
-            7.  **Standard Terminology:** Use standard terminology relevant to the data element's domain.
-            8.  **Business Language:** Use business language that non-technical users can easily understand.
-
-            **ISO/IEC 11179 Standards for Data Element Descriptions:**
-            1.  **Clarity of Definition:** Descriptions MUST clearly and precisely define what the data element represents.
-            2.  **Completeness:** Descriptions should be complete, fully covering the concept of the data element.
-            3.  **Precision:** Descriptions should be specific enough to distinguish the data element from other related concepts.
-            4.  **Objectivity:** Descriptions must be objective and factual, not based on opinion.
-            5.  **Grammar & Punctuation:** Descriptions MUST use complete sentences with proper grammar and punctuation. Each description should start with a capital letter and end with a period.
-            6.  **Business Language:** Descriptions should be written in clear business language, avoiding technical jargon.
-            7.  **Avoid Vague Language:** Do not use imprecise phrases like "etc.", "and so on", or "various".
-
-            **Data Element to Evaluate and Enhance:**
-            - ID: {id}
-            - Current Name: {name}
-            - Current Description: {description}
-            - Example (if provided): {example}
-            {processes_info}
-
-            **Feedback from Previous Validation (if any, "{current_validation_feedback_str}" means no feedback yet or feedback was positive):**
-            {current_validation_feedback_str}
-
-            **High-Quality Examples (Target Quality: GOOD):**
-            * Original Name: cust_id, Enhanced Name: customer identifier
-                Original Description: Customer ID in the system
-                Enhanced Description: A unique alphanumeric code assigned to identify an individual customer within the organization's systems.
-            * Original Name: LN, Enhanced Name: last name
-                Original Description: Last name
-                Enhanced Description: The legal surname of an individual as it appears on official identification documents.
-
-            **Task:**
-            1.  **VALIDATE** the "Current Name" and "Current Description" against all listed ISO/IEC 11179 standards.
-            2.  If validation is not GOOD, or if this is the first attempt, **ENHANCE** the "Current Name" and "Current Description" to fully meet all standards.
-            3.  Aim for a "GOOD" quality assessment.
-
-            **Output Format:**
-            Provide your response *strictly* in the following format, with each item on a new line. Do not include any extra formatting, numbering, or markdown like asterisks:
-
-            SECTION: VALIDATION
-            Is name valid: [yes/no, based on strict adherence to all name standards]
-            Name feedback: [Detailed feedback on current name quality. Explain all reasons if not valid.]
-            Is description valid: [yes/no, based on strict adherence to all description standards]
-            Description feedback: [Detailed feedback on current description quality. Explain all reasons if not valid.]
-            Overall quality: [GOOD, NEEDS_IMPROVEMENT, or POOR. GOOD only if both name and description are fully valid according to all standards.]
-            Suggested improvements for current element: [List specific improvements if not GOOD. If GOOD, state "No improvements needed for current element." Each on new line, start with "- ". ]
-
-            SECTION: ENHANCEMENT
-            Enhanced Name: [Provide the improved name as plain text here, adhering to all name standards]
-            Enhanced Description: [Provide the improved description as plain text here, adhering to all description standards. Start with capital, end with period.]
-            Enhancement Notes: [Explain changes made and why they improve quality and standard compliance. Be specific.]
-            Confidence Score (0.0-1.0): [Provide a numerical confidence score for your enhancement, e.g., 0.9]
-
-            Ensure both VALIDATION and ENHANCEMENT sections are present.
-            If the current element is already GOOD, the Enhanced Name and Description should be identical to the Current Name and Description.
-            """
-        )
-        self.combined_chain = self.combined_prompt | self.llm | StrOutputParser()
+        # EnhancerAgent will perform the core iterative enhancement logic
+        self.enhancer = EnhancerAgent(llm)
         self.graph = self._build_graph()
 
-    def _convert_processes_to_model(self, processes_data: Optional[List[Any]]) -> Optional[List[Process]]:
-        if not processes_data:
-            return None
-        processes_list = []
-        for proc_item in processes_data:
-            if isinstance(proc_item, Process):
-                processes_list.append(proc_item)
-            elif isinstance(proc_item, dict):
-                try:
-                    processes_list.append(Process(**proc_item))
-                except Exception as e:
-                    logger.warning(f"Workflow: Could not convert dict to Process: {proc_item}. Error: {e}")
-            else:
-                logger.warning(f"Workflow: Unknown process type: {type(proc_item)}")
-        return processes_list if processes_list else None
+    async def _initialize_workflow_state_node(self, state: WorkflowState) -> WorkflowState:
+        """
+        Initializes the workflow state.
+        """
+        # `original_data_element` is passed in when invoking the graph.
+        # `max_workflow_iterations` is also passed in.
+        state["workflow_iterations_done"] = 0
+        state["final_enhanced_data_model"] = None
+        state["is_complete"] = False
+        state["error_message"] = None
+        logger.info(f"Workflow initialized for element: {state['original_data_element'].id}. Max workflow iterations: {state['max_workflow_iterations']}")
+        return state
 
-    def _format_processes_info(self, data_element_model: DataElement) -> str:
-        if not data_element_model.processes:
-            return "Related Processes: None"
-        
-        processes_info = "Related Processes:\n"
-        for i, process in enumerate(data_element_model.processes, 1):
-            processes_info += f"  Process {i} ID: {process.process_id}\n"
-            processes_info += f"  Process {i} Name: {process.process_name}\n"
-            if process.process_description:
-                processes_info += f"  Process {i} Description: {process.process_description}\n"
-            processes_info += "\n"
-        return processes_info.strip()
-
-
-    async def _call_llm_for_enhancement(self, state: WorkflowState) -> WorkflowState:
+    async def _execute_enhancement_process_node(self, state: WorkflowState) -> WorkflowState:
+        """
+        This node executes the core enhancement logic by calling the EnhancerAgent's
+        iterative `enhance_until_quality` method.
+        """
         try:
-            iteration_num = state["iterations"] + 1
-            logger.info(f"Workflow: Starting LLM call for iteration {iteration_num}, element ID: {state['data_element']['id']}")
-            
-            if iteration_num == 1:
-                name_to_enhance = state["original_data_element_model"].existing_name
-                desc_to_enhance = state["original_data_element_model"].existing_description
-                data_element_for_context = state["original_data_element_model"]
-            else:
-                prev_enhancement = state.get("enhancement_result_model")
-                if prev_enhancement:
-                    name_to_enhance = prev_enhancement.enhanced_name
-                    desc_to_enhance = prev_enhancement.enhanced_description
-                    data_element_for_context = state["original_data_element_model"]
-                else: 
-                    name_to_enhance = state["original_data_element_model"].existing_name
-                    desc_to_enhance = state["original_data_element_model"].existing_description
-                    data_element_for_context = state["original_data_element_model"]
+            current_iteration = state["workflow_iterations_done"] + 1
+            logger.info(f"Workflow: Starting main enhancement process (workflow iteration {current_iteration}/{state['max_workflow_iterations']}) for {state['original_data_element'].id}")
+
+            # Initial validation of the original element to provide feedback to the enhancer
+            # This is crucial if the enhancer's first step needs to know the current state.
+            initial_validation_result = await self.validator.validate(state['original_data_element'])
+            initial_feedback_for_enhancer = initial_validation_result.feedback
+            if initial_validation_result.suggested_improvements:
+                initial_feedback_for_enhancer += "\nInitial suggestions: " + "; ".join(initial_validation_result.suggested_improvements)
+
+            if initial_validation_result.quality_status == DataQualityStatus.GOOD:
+                logger.info(f"Workflow: Initial validation of {state['original_data_element'].id} is GOOD. Enhancer will confirm or make no changes.")
+                # Enhancer's "Enhance Only If Needed" should handle this.
+                # We can pass a stronger signal in feedback.
+                initial_feedback_for_enhancer = "Initial assessment is GOOD. Confirm compliance and make no changes if already fully compliant with OPR, clarity, and layperson understandability."
 
 
-            processes_info_str = self._format_processes_info(data_element_for_context)
-            iteration_info_str = f"{iteration_num} of {state['max_iterations']}"
-            if state["max_iterations"] == 1: iteration_info_str = "1 (final attempt)"
-
-
-            llm_response_str = await self.combined_chain.ainvoke({
-                "id": data_element_for_context.id,
-                "name": name_to_enhance,
-                "description": desc_to_enhance,
-                "example": data_element_for_context.example or "Not provided",
-                "processes_info": processes_info_str,
-                "current_validation_feedback_str": state.get("current_validation_feedback_str") or "No prior feedback.",
-                "iteration_info": iteration_info_str
-            })
-
-            validation_section = ""
-            enhancement_section = ""
-            current_section = None
-
-            for line in llm_response_str.strip().split('\n'):
-                if line.upper().startswith("SECTION: VALIDATION"):
-                    current_section = "validation"
-                    continue
-                elif line.upper().startswith("SECTION: ENHANCEMENT"):
-                    current_section = "enhancement"
-                    continue
-                
-                if current_section == "validation":
-                    validation_section += line + "\n"
-                elif current_section == "enhancement":
-                    enhancement_section += line + "\n"
-            
-            if not validation_section or not enhancement_section:
-                logger.error(f"LLM output for {data_element_for_context.id} missing VALIDATION or ENHANCEMENT section. Raw: {llm_response_str[:300]}")
-                state["error"] = "LLM output format error: Missing critical sections."
-                state["is_complete"] = True
-                state["validation_result_model"] = ValidationResult(is_valid=False, quality_status=DataQualityStatus.POOR, feedback="LLM parsing error.", suggested_improvements=["Retry"])
-                state["enhancement_result_model"] = EnhancementResult(enhanced_name=name_to_enhance, enhanced_description=desc_to_enhance, feedback="LLM parsing error.", confidence=0.0)
-                return state
-
-            validation_result = self._parse_validation_result_from_combined(validation_section.strip())
-            enhancement_result = self._parse_enhancement_result_from_combined(enhancement_section.strip())
-            
-            state["validation_result_model"] = validation_result
-            state["enhancement_result_model"] = enhancement_result
-            state["iterations"] = iteration_num
-
-            original_de_dict = state["data_element"]
-            processes_list_of_models = state["original_data_element_model"].processes
-            processes_list_of_dicts = [p.dict() for p in processes_list_of_models] if processes_list_of_models else None
-
-            state["enhanced_data_model"] = EnhancedDataElement(
-                id=original_de_dict["id"],
-                existing_name=original_de_dict["existing_name"], 
-                existing_description=original_de_dict["existing_description"], 
-                example=original_de_dict.get("example"),
-                processes=processes_list_of_models, 
-                cdm=original_de_dict.get("cdm"),
-                enhanced_name=enhancement_result.enhanced_name,
-                enhanced_description=enhancement_result.enhanced_description,
-                quality_status=validation_result.quality_status, 
-                enhancement_iterations=iteration_num,
-                validation_feedback=[validation_result.feedback], 
-                enhancement_feedback=[enhancement_result.feedback], 
-                confidence_score=enhancement_result.confidence
+            # Call the EnhancerAgent's iterative process.
+            # The `enhance_until_quality` method handles its own internal loop.
+            # The `max_iterations` for `enhance_until_quality` can be set here (e.g., 1 or 2 internal enhancer iterations).
+            enhancement_result, validation_of_final_enhancement = await self.enhancer.enhance_until_quality(
+                data_element=state['original_data_element'], # Always enhance based on the original
+                validation_feedback=initial_feedback_for_enhancer,
+                max_iterations=2 # Allow enhancer 1-2 internal attempts for refinement
             )
-            
-            logger.info(f"Workflow: Iteration {iteration_num} for {original_de_dict['id']} resulted in quality: {validation_result.quality_status}")
-            return state
 
-        except Exception as e:
-            logger.error(f"Error in LLM call/parsing for element {state['data_element']['id']}: {e}", exc_info=True)
-            state["error"] = f"LLM processing error: {str(e)}"
-            state["is_complete"] = True
-            state["validation_result_model"] = ValidationResult(is_valid=False, quality_status=DataQualityStatus.POOR, feedback=f"Error: {str(e)}", suggested_improvements=["Retry"])
-            current_name = state["original_data_element_model"].existing_name
-            current_desc = state["original_data_element_model"].existing_description
-            state["enhancement_result_model"] = EnhancementResult(enhanced_name=current_name, enhanced_description=current_desc, feedback=f"Error: {str(e)}", confidence=0.0)
-            return state
-
-    def _parse_validation_result_from_combined(self, validation_text: str) -> ValidationResult:
-        lines = validation_text.strip().split("\n")
-        is_name_valid_str = ""
-        name_feedback_str = ""
-        is_desc_valid_str = ""
-        desc_feedback_str = ""
-        quality_status_str = ""
-        improvements_list = []
-
-        parsing_name_feedback = False
-        parsing_desc_feedback = False
-        parsing_improvements = False
-
-        for line in lines:
-            line_lower = line.lower()
-            
-            if line_lower.startswith("is name valid:"):
-                is_name_valid_str = line.split(":", 1)[1].strip().lower()
-                parsing_name_feedback = False; parsing_desc_feedback = False; parsing_improvements = False
-            elif line_lower.startswith("name feedback:"):
-                name_feedback_str = line.split(":", 1)[1].strip()
-                parsing_name_feedback = True; parsing_desc_feedback = False; parsing_improvements = False
-            elif line_lower.startswith("is description valid:"):
-                is_desc_valid_str = line.split(":", 1)[1].strip().lower()
-                parsing_name_feedback = False; parsing_desc_feedback = False; parsing_improvements = False
-            elif line_lower.startswith("description feedback:"):
-                desc_feedback_str = line.split(":", 1)[1].strip()
-                parsing_name_feedback = False; parsing_desc_feedback = True; parsing_improvements = False
-            elif line_lower.startswith("overall quality:"):
-                quality_status_str = line.split(":", 1)[1].strip().upper()
-                parsing_name_feedback = False; parsing_desc_feedback = False; parsing_improvements = False
-            elif line_lower.startswith("suggested improvements for current element:"):
-                first_improvement_line = line.split(":", 1)[1].strip()
-                if first_improvement_line and first_improvement_line.lower() not in ["no improvements needed for current element.", "no improvements needed."]:
-                    improvements_list.append(first_improvement_line.lstrip("- "))
-                parsing_name_feedback = False; parsing_desc_feedback = False; parsing_improvements = True
-            elif parsing_name_feedback: name_feedback_str += " " + line.strip()
-            elif parsing_desc_feedback: desc_feedback_str += " " + line.strip()
-            elif parsing_improvements:
-                if line.strip() and line.strip().lower() not in ["no improvements needed for current element.", "no improvements needed."]:
-                    improvements_list.append(line.strip().lstrip("- "))
-        
-        is_name_valid = "yes" in is_name_valid_str
-        is_desc_valid = "yes" in is_desc_valid_str
-        quality_status = DataQualityStatus.NEEDS_IMPROVEMENT 
-        if quality_status_str == "GOOD": quality_status = DataQualityStatus.GOOD
-        elif quality_status_str == "POOR": quality_status = DataQualityStatus.POOR
-        
-        if quality_status == DataQualityStatus.GOOD and (not is_name_valid or not is_desc_valid):
-            quality_status = DataQualityStatus.NEEDS_IMPROVEMENT
-            if not improvements_list or improvements_list == ["No improvements needed for current element."]:
-                 improvements_list = ["Review name and description for full ISO/IEC 11179 compliance as per feedback."]
-
-        combined_feedback = f"Name Feedback: {name_feedback_str or 'Not provided.'}\nDescription Feedback: {desc_feedback_str or 'Not provided.'}"
-        if len(improvements_list) == 1 and improvements_list[0].lower() in ["no improvements needed for current element.", "no improvements needed."]:
-            improvements_list = []
-
-        return ValidationResult(
-            is_valid=is_name_valid and is_desc_valid,
-            quality_status=quality_status,
-            feedback=combined_feedback.strip(),
-            suggested_improvements=improvements_list
-        )
-
-    def _parse_enhancement_result_from_combined(self, enhancement_text: str) -> EnhancementResult:
-        enhanced_name = ""
-        enhanced_description = ""
-        feedback = "" 
-        confidence = 0.5
-
-        lines = enhancement_text.strip().split("\n")
-
-        for line in lines:
-            if line.startswith("Enhanced Name:"):
-                enhanced_name = line.replace("Enhanced Name:", "").strip()
-                enhanced_name = re.sub(r"^\s*[\d\W]*\s*", "", enhanced_name)
-                enhanced_name = enhanced_name.strip().lower()
-                break
-        
-        desc_lines_list = []
-        in_desc_section = False
-        for line in lines:
-            if line.startswith("Enhanced Description:"):
-                in_desc_section = True
-                first_desc_line = line.replace("Enhanced Description:", "").strip()
-                first_desc_line = re.sub(r"^\s*[\d\W]*\s*", "", first_desc_line)
-                if first_desc_line: desc_lines_list.append(first_desc_line)
-                continue
-            if in_desc_section and not (line.startswith("Enhancement Notes:") or line.startswith("Confidence Score:")):
-                desc_lines_list.append(line.strip())
-            elif in_desc_section and (line.startswith("Enhancement Notes:") or line.startswith("Confidence Score:")):
-                break 
-        
-        if desc_lines_list:
-            enhanced_description = " ".join(desc_lines_list).strip()
-            if enhanced_description: 
-                enhanced_description = enhanced_description[0].upper() + enhanced_description[1:]
-                if not enhanced_description.endswith(('.', '!', '?')):
-                    enhanced_description += "."
-        
-        notes_lines_list = []
-        in_notes_section = False
-        for line in lines:
-            if line.startswith("Enhancement Notes:"):
-                in_notes_section = True
-                first_note_line = line.replace("Enhancement Notes:", "").strip()
-                if first_note_line: notes_lines_list.append(first_note_line)
-                continue
-            if in_notes_section and not line.startswith("Confidence Score:"):
-                notes_lines_list.append(line.strip())
-            elif in_notes_section and line.startswith("Confidence Score:"):
-                break 
-
-        if notes_lines_list:
-            feedback = " ".join(notes_lines_list).strip()
-
-        for line in lines:
-            if line.startswith("Confidence Score:"):
-                score_text = line.replace("Confidence Score:", "").strip()
-                match = re.search(r"(\d{1}\.\d{1,})", score_text)
-                if match:
-                    try:
-                        confidence = float(match.group(1))
-                        confidence = max(0.0, min(1.0, confidence))
-                    except ValueError:
-                        logger.warning(f"Workflow: Failed to parse confidence from '{score_text}'")
-                else:
-                    logger.warning(f"Workflow: Confidence score format error in '{score_text}'")
-                break
-        
-        if not enhanced_name: enhanced_name = "parsing_failed_name"
-        if not enhanced_description: enhanced_description = "Parsing failed to extract description."
-
-        return EnhancementResult(
-            enhanced_name=enhanced_name,
-            enhanced_description=enhanced_description,
-            feedback=feedback,
-            confidence=confidence
-        )
-
-    def _should_continue_iteration(self, state: WorkflowState) -> str:
-        if state.get("error"):
-            logger.warning(f"Workflow: Error detected for element {state['data_element']['id']}, completing. Error: {state['error']}")
-            return "finalize_node" 
-
-        validation_res = state.get("validation_result_model")
-        # The validation_result_model reflects the quality of the *input* to the LLM for the *enhancement* part.
-        # The true "quality" we care about for continuing is whether the *output* (enhanced_data_model) reached GOOD.
-        # However, the prompt asks the LLM to validate its own output. So, validation_result_model.quality_status
-        # is what the LLM *thinks* is the quality of the name/description it *just processed or generated*.
-        
-        # Check quality from the enhanced_data_model, which should reflect the latest enhanced output's quality.
-        enhanced_data_m = state.get("enhanced_data_model")
-
-        if enhanced_data_m and enhanced_data_m.quality_status == DataQualityStatus.GOOD:
-            logger.info(f"Workflow: Quality is GOOD for element {state['data_element']['id']} after {state['iterations']} iterations (based on enhanced_data_model). Completing.")
-            return "finalize_node"
-        
-        # As a fallback, also check the direct validation_result_model if enhanced_data_model isn't set or its quality is not GOOD
-        if validation_res and validation_res.quality_status == DataQualityStatus.GOOD:
-            logger.info(f"Workflow: Quality is GOOD for element {state['data_element']['id']} after {state['iterations']} iterations (based on validation_result_model). Completing.")
-            return "finalize_node"
-
-
-        if state["iterations"] >= state["max_iterations"]:
-            logger.info(f"Workflow: Max iterations ({state['max_iterations']}) reached for element {state['data_element']['id']}. Completing.")
-            return "finalize_node"
-        
-        if validation_res:
-            feedback_parts = [validation_res.feedback]
-            if validation_res.suggested_improvements:
-                feedback_parts.append("Suggestions for next attempt: " + "; ".join(validation_res.suggested_improvements))
-            state["current_validation_feedback_str"] = "\n".join(filter(None, feedback_parts))
-        else: 
-            state["current_validation_feedback_str"] = "No validation result from previous iteration."
-
-        current_quality_for_log = "Unknown"
-        if enhanced_data_m: current_quality_for_log = enhanced_data_m.quality_status.value
-        elif validation_res: current_quality_for_log = validation_res.quality_status.value
-
-        logger.info(f"Workflow: Element {state['data_element']['id']} quality is {current_quality_for_log}. Iteration {state['iterations']}/{state['max_iterations']}. Continuing.")
-        return "call_llm_node"
-
-
-    async def _finalize_workflow(self, state: WorkflowState) -> WorkflowState:
-        state["is_complete"] = True
-        logger.info(f"Workflow: Finalizing for element {state['data_element']['id']}. Iterations: {state['iterations']}. Error: {state.get('error')}")
-        
-        if not state.get("enhanced_data_model"):
-            logger.warning(f"Workflow: enhanced_data_model is missing at finalization for {state['data_element']['id']}. Using original.")
-            original_model = state["original_data_element_model"]
-            final_quality = DataQualityStatus.POOR if state.get("error") else DataQualityStatus.NEEDS_IMPROVEMENT
-            
-            val_feedback_list = []
-            if state.get("validation_result_model"):
-                val_feedback_list.append(state["validation_result_model"].feedback)
-
-            enh_feedback_list = []
-            if state.get("enhancement_result_model"):
-                enh_feedback_list.append(state["enhancement_result_model"].feedback)
-
-            state["enhanced_data_model"] = EnhancedDataElement(
+            # Construct the final EnhancedDataElement based on the results
+            original_model = state['original_data_element']
+            state["final_enhanced_data_model"] = EnhancedDataElement(
                 id=original_model.id,
                 existing_name=original_model.existing_name,
                 existing_description=original_model.existing_description,
                 example=original_model.example,
                 processes=original_model.processes,
                 cdm=original_model.cdm,
-                enhanced_name=original_model.existing_name, 
-                enhanced_description=original_model.existing_description, 
-                quality_status=final_quality,
-                enhancement_iterations=state["iterations"],
-                validation_feedback=val_feedback_list,
-                enhancement_feedback=enh_feedback_list,
-                confidence_score=0.1 
+                enhanced_name=enhancement_result.enhanced_name,
+                enhanced_description=enhancement_result.enhanced_description,
+                quality_status=validation_of_final_enhancement.quality_status,
+                enhancement_iterations=current_iteration, # This is workflow iterations. Enhancer tracks its own.
+                validation_feedback=[validation_of_final_enhancement.feedback],
+                enhancement_feedback=[enhancement_result.feedback],
+                confidence_score=enhancement_result.confidence
             )
-            if state.get("error"):
-                 state["enhanced_data_model"].enhancement_feedback.append(f"Workflow Error: {state['error']}")
+            
+            state["workflow_iterations_done"] = current_iteration
+            logger.info(f"Workflow: Main enhancement process for {original_model.id} complete. Final Quality: {validation_of_final_enhancement.quality_status.value}")
+            return state
 
-        elif state.get("error") and state.get("enhanced_data_model"):
-            state["enhanced_data_model"].quality_status = DataQualityStatus.POOR
-            state["enhanced_data_model"].enhancement_feedback.append(f"Workflow Error: {state['error']}")
-            state["enhanced_data_model"].confidence_score = min(state["enhanced_data_model"].confidence_score, 0.2)
+        except Exception as e:
+            logger.error(f"Error in _execute_enhancement_process_node for {state['original_data_element'].id}: {e}", exc_info=True)
+            state["error_message"] = f"Error during enhancement execution: {str(e)}"
+            # is_complete will be set by _should_continue_or_finalize
+            return state
+
+    def _should_continue_or_finalize(self, state: WorkflowState) -> str:
+        """
+        Determines if the workflow should continue (e.g., for more top-level iterations, though current design is 1)
+        or finalize.
+        """
+        if state.get("error_message"):
+            logger.warning(f"Workflow: Error detected for {state['original_data_element'].id}, proceeding to finalize. Error: {state['error_message']}")
+            return "finalize_workflow_node"
+
+        # Since the enhancer agent now handles its own iterations to achieve GOOD quality,
+        # this workflow typically runs the enhancement process once.
+        if state["workflow_iterations_done"] >= state["max_workflow_iterations"]:
+            logger.info(f"Workflow: Max workflow iterations ({state['max_workflow_iterations']}) reached for {state['original_data_element'].id}. Finalizing.")
+            return "finalize_workflow_node"
+        
+        # This path would be for additional top-level workflow iterations if designed.
+        # For now, it's unlikely to be taken if max_workflow_iterations is 1.
+        logger.info(f"Workflow: Element {state['original_data_element'].id} - workflow iteration {state['workflow_iterations_done']} done. Proceeding to another workflow iteration (if configured).")
+        return "execute_enhancement_node" 
+
+
+    async def _finalize_workflow_node(self, state: WorkflowState) -> WorkflowState:
+        """
+        Finalizes the workflow, ensuring a result is always populated.
+        """
+        state["is_complete"] = True
+        original_model = state["original_data_element"]
+        
+        if not state.get("final_enhanced_data_model"): # If enhancement node had an error before populating
+            logger.error(f"Workflow finalizing with error for {original_model.id}: {state.get('error_message', 'Unknown error before final model creation')}")
+            state["final_enhanced_data_model"] = EnhancedDataElement(
+                id=original_model.id, existing_name=original_model.existing_name, existing_description=original_model.existing_description,
+                example=original_model.example, processes=original_model.processes, cdm=original_model.cdm,
+                enhanced_name=original_model.existing_name, # Fallback to original
+                enhanced_description=original_model.existing_description, # Fallback to original
+                quality_status=DataQualityStatus.POOR,
+                enhancement_iterations=state["workflow_iterations_done"],
+                validation_feedback=["Error during workflow execution."],
+                enhancement_feedback=[state.get("error_message", "An unspecified error occurred.")],
+                confidence_score=0.0
+            )
+        elif state.get("error_message"): # If error occurred but model was partially populated
+            if state["final_enhanced_data_model"]:
+                 state["final_enhanced_data_model"].quality_status = DataQualityStatus.POOR
+                 state["final_enhanced_data_model"].enhancement_feedback.append(f"Workflow Error: {state['error_message']}")
+                 state["final_enhanced_data_model"].confidence_score = min(state["final_enhanced_data_model"].confidence_score, 0.1)
+
+
+        logger.info(f"Workflow finalized for element {original_model.id}. Iterations: {state['workflow_iterations_done']}. Error: {state.get('error_message')}. Final Quality: {state.get('final_enhanced_data_model').quality_status.value if state.get('final_enhanced_data_model') else 'N/A'}")
         return state
 
     def _build_graph(self) -> StateGraph:
-        workflow = StateGraph(WorkflowState)
-        workflow.add_node("call_llm_node", self._call_llm_for_enhancement)
-        workflow.add_node("finalize_node", self._finalize_workflow) # Changed from "complete" to "finalize_node"
+        """
+        Builds the LangGraph for the enhancement workflow.
+        The workflow is now simpler: Initialize -> Execute Enhancement (iterative via EnhancerAgent) -> Finalize.
+        """
+        workflow_graph = StateGraph(WorkflowState)
+        workflow_graph.add_node("initialize_state_node", self._initialize_workflow_state_node)
+        workflow_graph.add_node("execute_enhancement_node", self._execute_enhancement_process_node)
+        workflow_graph.add_node("finalize_workflow_node", self._finalize_workflow_node)
 
-        workflow.add_conditional_edges(
-            "call_llm_node",
-            self._should_continue_iteration,
+        workflow_graph.set_entry_point("initialize_state_node")
+        workflow_graph.add_edge("initialize_state_node", "execute_enhancement_node")
+        
+        workflow_graph.add_conditional_edges(
+            "execute_enhancement_node",
+            self._should_continue_or_finalize,
             {
-                "call_llm_node": "call_llm_node", # If needs more iterations
-                "finalize_node": "finalize_node"  # If complete or error
+                # This conditional logic determines if more top-level workflow iterations are needed.
+                # Given current design (enhancer handles its own loop), this usually goes to finalize.
+                "execute_enhancement_node": "execute_enhancement_node", # If more workflow iterations
+                "finalize_workflow_node": "finalize_workflow_node"    # If workflow iterations complete or error
             }
         )
-        workflow.add_edge("finalize_node", END)
-        workflow.set_entry_point("call_llm_node")
-        return workflow.compile()
+        workflow_graph.add_edge("finalize_workflow_node", END)
+        return workflow_graph.compile()
 
-    @cache_manager.async_cached(ttl=3600)
-    async def run(self, data_element: DataElement, max_iterations: int = 2) -> EnhancedDataElement:
-        logger.info(f"Workflow run: Starting enhancement for element ID: {data_element.id}, Max iterations: {max_iterations}")
+    @cache_manager.async_cached(ttl=3600) # Cache the final result of the entire workflow run
+    async def run(self, data_element: DataElement, max_iterations: int = 1) -> EnhancedDataElement:
+        """
+        Runs the entire data enhancement workflow.
+        Args:
+            data_element: The DataElement to enhance.
+            max_iterations: Maximum number of top-level workflow iterations (typically 1, as
+                            EnhancerAgent handles its own internal iterations).
+        """
+        logger.info(f"Workflow run: Element ID: {data_element.id}, Max top-level workflow iterations: {max_iterations}")
         
-        element_dict_for_state = data_element.dict()
-        if data_element.processes:
-             element_dict_for_state["processes"] = [p.dict() for p in data_element.processes]
-        else:
-            element_dict_for_state["processes"] = None
+        # `data_element` is the Pydantic model. `max_iterations` refers to workflow iterations.
+        initial_graph_input = WorkflowState(original_data_element=data_element, max_workflow_iterations=max_iterations) # type: ignore
+        
+        final_graph_state = await self.graph.ainvoke(initial_graph_input)
 
-        initial_state = WorkflowState(
-            data_element=element_dict_for_state,
-            original_data_element_model=data_element, 
-            enhanced_data_model=None,
-            validation_result_model=None,
-            enhancement_result_model=None,
-            iterations=0,
-            max_iterations=max_iterations,
-            current_validation_feedback_str="No prior feedback for this run.",
-            is_complete=False,
-            error=None
-        )
-
-        final_state = await self.graph.ainvoke(initial_state)
-
-        if final_state.get("error"):
-            logger.error(f"Workflow run for {data_element.id} completed with error: {final_state['error']}")
-            if not final_state.get("enhanced_data_model"):
-                error_enhanced_element = EnhancedDataElement(
-                    **data_element.dict(), 
-                    enhanced_name=data_element.existing_name,
-                    enhanced_description=data_element.existing_description,
-                    quality_status=DataQualityStatus.POOR,
-                    enhancement_iterations=final_state.get("iterations", 0),
-                    validation_feedback=[f"Workflow error: {final_state['error']}"],
-                    enhancement_feedback=[f"Workflow error: {final_state['error']}"],
-                    confidence_score=0.0
-                )
-                return error_enhanced_element
-
-        enhanced_result_model = final_state.get("enhanced_data_model")
-        if not enhanced_result_model: 
-            logger.critical(f"Workflow for {data_element.id} ended without an enhanced_data_model. This is a bug.")
+        final_result_model = final_graph_state.get("final_enhanced_data_model")
+        
+        if not final_result_model:
+            logger.critical(f"Workflow for {data_element.id} ended without final_enhanced_data_model. This indicates an issue in the graph finalization logic.")
+            # Construct a minimal error response
             return EnhancedDataElement(
-                 **data_element.dict(),
+                 **data_element.dict(), # Spread original data
                  enhanced_name=data_element.existing_name, 
                  enhanced_description=data_element.existing_description,
                  quality_status=DataQualityStatus.POOR,
-                 enhancement_feedback=["Critical error: Workflow finished without result model."],
+                 enhancement_feedback=["Critical error: Workflow finished without a final result model."],
                  confidence_score=0.0
             )
         
-        logger.info(f"Workflow run: Completed for element ID: {data_element.id}. Final quality: {enhanced_result_model.quality_status}, Confidence: {enhanced_result_model.confidence_score}")
-        return enhanced_result_model
+        logger.info(f"Workflow run: Completed for {data_element.id}. Final Quality: {final_result_model.quality_status.value}, Confidence: {final_result_model.confidence_score:.2f}")
+        return final_result_model
 
-    async def stream_run(self, data_element: DataElement, max_iterations: int = 2) -> AsyncGenerator[Dict[str, Any], None]:
-        logger.info(f"Workflow stream_run: Starting for element ID: {data_element.id}, Max iterations: {max_iterations}")
+
+    async def stream_run(self, data_element: DataElement, max_iterations: int = 1) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Runs the workflow and streams updates.
+        max_iterations here refers to top-level workflow iterations.
+        """
+        logger.info(f"Workflow stream_run: Element ID: {data_element.id}, Max top-level workflow iterations: {max_iterations}")
         
-        element_dict_for_state = data_element.dict()
-        if data_element.processes:
-             element_dict_for_state["processes"] = [p.dict() for p in data_element.processes]
-        else:
-            element_dict_for_state["processes"] = None
-
-        current_state = WorkflowState( # Keep using current_state as the accumulator
-            data_element=element_dict_for_state,
-            original_data_element_model=data_element,
-            enhanced_data_model=None,
-            validation_result_model=None,
-            enhancement_result_model=None,
-            iterations=0,
-            max_iterations=max_iterations,
-            current_validation_feedback_str="No prior feedback for this run.",
-            is_complete=False,
-            error=None
-        )
+        initial_graph_input = WorkflowState(original_data_element=data_element, max_workflow_iterations=max_iterations) # type: ignore
 
         yield {
-            "status": "starting",
-            "message": "Workflow initialized.",
-            "iteration": 0,
-            "progress": 0.0,
-            "element_id": data_element.id
+            "status": "starting", "message": "Workflow initialized.", 
+            "workflow_iteration": 0, "progress": 0.0, "element_id": data_element.id
         }
         
-        # The graph.astream() will manage the state internally based on the initial input (current_state here)
-        # and connections. We just observe the output of each node.
-        async for event_output in self.graph.astream(current_state, {"recursion_limit": max_iterations + 5}):
+        current_graph_state = initial_graph_input.copy()
+
+        async for event_output in self.graph.astream(initial_graph_input, {"recursion_limit": (max_iterations * 2) + 5}): # Adjusted recursion limit
             node_name = list(event_output.keys())[0]
-            node_state_output = event_output[node_name] 
+            node_state_after_execution = event_output[node_name]
+            current_graph_state.update(node_state_after_execution) # Keep local state tracker updated
 
-            # Update our local current_state with the output of the node for the next logging/yield
-            current_state.update(node_state_output)
-
-
-            current_iterations = current_state.get("iterations", 0) # Use updated current_state
-            progress = min(1.0, (current_iterations / max_iterations) if max_iterations > 0 else 1.0)
+            workflow_iters_done = current_graph_state.get("workflow_iterations_done", 0)
+            progress = min(1.0, (workflow_iters_done / max_iterations) if max_iterations > 0 else 1.0)
             
-            if current_state.get("error"): # Use updated current_state
-                yield {
-                    "status": "error",
-                    "message": f"Error during node '{node_name}': {current_state['error']}",
-                    "iteration": current_iterations,
-                    "progress": progress,
-                    "element_id": data_element.id
-                }
-                return 
+            if current_graph_state.get("error_message"):
+                yield { "status": "error", "message": f"Error during node '{node_name}': {current_graph_state['error_message']}",
+                        "workflow_iteration": workflow_iters_done, "progress": progress, "element_id": data_element.id }
+                return
 
-            if node_name == "call_llm_node": 
-                enhanced_model = current_state.get("enhanced_data_model") # Use updated current_state
-                if enhanced_model:
+            if node_name == "execute_enhancement_node": # After the main enhancement processing
+                final_model_so_far = current_graph_state.get("final_enhanced_data_model") # This is populated by the node
+                if final_model_so_far:
                     yield {
                         "status": "in_progress",
-                        "message": f"Iteration {current_iterations} completed. Quality: {enhanced_model.quality_status.value}.",
-                        "iteration": current_iterations,
-                        "progress": progress,
-                        "current_result": {
-                            "enhanced_name": enhanced_model.enhanced_name,
-                            "enhanced_description": enhanced_model.enhanced_description,
-                            "quality_status": enhanced_model.quality_status.value,
-                            "confidence_score": enhanced_model.confidence_score
+                        "message": f"Enhancement process completed. Quality of result: {final_model_so_far.quality_status.value}.",
+                        "workflow_iteration": workflow_iters_done, "progress": progress,
+                        "current_result": { # Provide snapshot of the current best enhanced version
+                            "enhanced_name": final_model_so_far.enhanced_name,
+                            "enhanced_description": final_model_so_far.enhanced_description,
+                            "quality_status": final_model_so_far.quality_status.value,
+                            "confidence_score": final_model_so_far.confidence_score
                         },
                         "element_id": data_element.id
                     }
             
-            # Check if the graph is at the END state by looking at the structure of event_output
-            # When the graph reaches END, the event_output might be structured differently, e.g. {'__end__': final_state}
-            # Or, more simply, check our is_complete flag which should be set by finalize_node
-            if node_name == "finalize_node" or current_state.get("is_complete"):
-                final_enhanced_model = current_state.get("enhanced_data_model") # Use updated current_state
-                if final_enhanced_model:
-                    yield {
-                        "status": "completed",
-                        "message": "Workflow finalized.",
-                        "iteration": current_iterations,
-                        "progress": 1.0,
-                        "result": final_enhanced_model.dict(), 
-                        "element_id": data_element.id
-                    }
-                else: 
-                     yield {
-                        "status": "error",
-                        "message": "Workflow finalized but no enhanced data model found.",
-                        "iteration": current_iterations,
-                        "progress": 1.0,
-                        "element_id": data_element.id
-                    }
+            if node_name == "finalize_workflow_node" or current_graph_state.get("is_complete"):
+                final_model = current_graph_state.get("final_enhanced_data_model")
+                if final_model:
+                    yield { "status": "completed", "message": "Workflow finalized.",
+                            "workflow_iteration": workflow_iters_done, "progress": 1.0,
+                            "result": final_model.dict(), "element_id": data_element.id }
+                else: # Should be populated by finalize_node
+                     yield { "status": "error", "message": "Workflow finalized but no final_enhanced_data_model found.",
+                             "workflow_iteration": workflow_iters_done, "progress": 1.0, "element_id": data_element.id }
                 logger.info(f"Workflow stream_run: Completed for element ID: {data_element.id}")
                 return
         
-        logger.warning(f"Workflow stream_run for {data_element.id} finished graph iteration without explicit completion event from finalize_node.")
-        last_known_enhanced_model = current_state.get("enhanced_data_model")
-        if last_known_enhanced_model:
-             yield {
-                "status": "completed", 
-                "message": "Workflow finished (stream loop ended).",
-                "iteration": current_state.get("iterations", max_iterations),
-                "progress": 1.0,
-                "result": last_known_enhanced_model.dict(),
-                "element_id": data_element.id
-            }
-        else:
-            yield {
-                "status": "error",
-                "message": "Workflow stream ended without final result after graph iteration.",
-                "iteration": current_state.get("iterations", max_iterations),
-                "progress": 1.0,
-                 "element_id": data_element.id
-            }
+        # Fallback if graph stream ends without hitting a clear "finalize_node" or "is_complete"
+        logger.warning(f"Workflow stream_run for {data_element.id} finished graph iteration unexpectedly. Last state: {current_graph_state.get('is_complete')}")
+        final_model_fallback = current_graph_state.get("final_enhanced_data_model")
+        if final_model_fallback:
+             yield { "status": "completed", "message": "Workflow finished (stream loop ended).",
+                     "workflow_iteration": current_graph_state.get("workflow_iterations_done", max_iterations), "progress": 1.0,
+                     "result": final_model_fallback.dict(), "element_id": data_element.id }
+        else: # Should have been populated by finalize or error handling
+            yield { "status": "error", "message": "Workflow stream ended without final result model.",
+                    "workflow_iteration": current_graph_state.get("workflow_iterations_done", max_iterations), "progress": 1.0,
+                    "element_id": data_element.id }
 
+# Alias for backward compatibility if any other module imports this specific name
 DataEnhancementWorkflow = OptimizedDataEnhancementWorkflow
