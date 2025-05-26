@@ -1,89 +1,109 @@
 """
-FastAPI dependencies for the Enhanced RDF Knowledge Graph Chatbot.
+Custom middleware for the Enhanced RDF Knowledge Graph Chatbot API.
 """
 
-import logging
 import time
-from typing import Optional, Dict, Any, Generator, Annotated
-from functools import lru_cache
-from fastapi import Depends, HTTPException, Request, Header, Query
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from starlette.status import HTTP_401_UNAUTHORIZED, HTTP_429_TOO_MANY_REQUESTS
+import logging
+import json
+import uuid
+from typing import Callable, Dict, Any, Optional
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response, JSONResponse
+from starlette.types import ASGIApp
+from fastapi import HTTPException
 
-from app.core.chatbot import EnhancedRDFChatbot
-from app.utils.exceptions import ChatbotException, AuthenticationError
-from app.utils.validation import validate_sparql_query, sanitize_query
+from app.utils.exceptions import ChatbotException
 
 logger = logging.getLogger(__name__)
 
-# Global instances
-_chatbot_instance: Optional[EnhancedRDFChatbot] = None
-_rate_limit_storage: Dict[str, Dict[str, Any]] = {}
-
-# Security scheme
-security = HTTPBearer(auto_error=False)
-
-class RateLimitDependency:
-    """Rate limiting dependency."""
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    """Middleware for comprehensive request/response logging."""
     
-    def __init__(self, calls: int = 100, period: int = 3600):  # 100 calls per hour
-        self.calls = calls
-        self.period = period
+    def __init__(self, app: ASGIApp, log_level: str = "INFO"):
+        super().__init__(app)
+        self.log_level = getattr(logging, log_level.upper())
     
-    def __call__(self, request: Request) -> bool:
-        """Check rate limit for the client."""
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        """Process request and log details."""
+        # Generate request ID
+        request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+        
+        # Start timing
+        start_time = time.time()
+        
+        # Extract request info
         client_ip = self._get_client_ip(request)
-        current_time = time.time()
+        user_agent = request.headers.get("User-Agent", "unknown")
         
-        # Clean old entries
-        self._cleanup_old_entries(current_time)
+        # Log request start
+        logger.log(
+            self.log_level,
+            f"Request {request_id}: {request.method} {request.url.path} "
+            f"from {client_ip} ({user_agent})"
+        )
         
-        # Get or create client entry
-        if client_ip not in _rate_limit_storage:
-            _rate_limit_storage[client_ip] = {
-                'calls': [],
-                'blocked_until': 0
-            }
+        # Add request ID to state for other middleware/handlers
+        request.state.request_id = request_id
+        request.state.start_time = start_time
+        request.state.client_ip = client_ip
         
-        client_data = _rate_limit_storage[client_ip]
-        
-        # Check if client is blocked
-        if current_time < client_data['blocked_until']:
-            raise HTTPException(
-                status_code=HTTP_429_TOO_MANY_REQUESTS,
-                detail={
-                    "error": "Rate limit exceeded",
-                    "retry_after": int(client_data['blocked_until'] - current_time)
-                }
-            )
-        
-        # Remove calls outside the time window
-        client_data['calls'] = [
-            call_time for call_time in client_data['calls']
-            if current_time - call_time < self.period
-        ]
-        
-        # Check rate limit
-        if len(client_data['calls']) >= self.calls:
-            # Block for the remaining period
-            oldest_call = min(client_data['calls'])
-            client_data['blocked_until'] = oldest_call + self.period
+        try:
+            # Process request
+            response = await call_next(request)
             
-            raise HTTPException(
-                status_code=HTTP_429_TOO_MANY_REQUESTS,
-                detail={
-                    "error": "Rate limit exceeded", 
-                    "retry_after": int(client_data['blocked_until'] - current_time)
-                }
+            # Calculate duration
+            duration = time.time() - start_time
+            
+            # Log response
+            logger.log(
+                self.log_level,
+                f"Response {request_id}: {response.status_code} "
+                f"in {duration:.3f}s"
             )
-        
-        # Record this call
-        client_data['calls'].append(current_time)
-        return True
+            
+            # Add headers
+            response.headers["X-Request-ID"] = request_id
+            response.headers["X-Process-Time"] = f"{duration:.3f}"
+            
+            # Log slow requests as warnings
+            if duration > 5.0:
+                logger.warning(
+                    f"Slow request {request_id}: {request.method} {request.url.path} "
+                    f"took {duration:.3f}s"
+                )
+            
+            return response
+            
+        except Exception as e:
+            duration = time.time() - start_time
+            
+            # Log error
+            logger.error(
+                f"Request {request_id} failed after {duration:.3f}s: {str(e)}",
+                exc_info=True
+            )
+            
+            # Return error response
+            if isinstance(e, HTTPException):
+                return JSONResponse(
+                    status_code=e.status_code,
+                    content={"detail": e.detail, "request_id": request_id},
+                    headers={"X-Request-ID": request_id}
+                )
+            else:
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "detail": "Internal server error",
+                        "request_id": request_id
+                    },
+                    headers={"X-Request-ID": request_id}
+                )
     
     def _get_client_ip(self, request: Request) -> str:
-        """Get client IP address."""
-        # Check for forwarded headers first
+        """Extract client IP from request."""
+        # Check forwarded headers
         forwarded_for = request.headers.get("X-Forwarded-For")
         if forwarded_for:
             return forwarded_for.split(",")[0].strip()
@@ -91,387 +111,327 @@ class RateLimitDependency:
         real_ip = request.headers.get("X-Real-IP")
         if real_ip:
             return real_ip
-        
-        return request.client.host if request.client else "unknown"
-    
-    def _cleanup_old_entries(self, current_time: float):
-        """Clean up old rate limit entries."""
-        for client_ip in list(_rate_limit_storage.keys()):
-            client_data = _rate_limit_storage[client_ip]
             
-            # Remove if no recent calls and not blocked
-            if (not client_data['calls'] and 
-                current_time > client_data.get('blocked_until', 0)):
-                del _rate_limit_storage[client_ip]
+        return request.client.host if request.client else "unknown"
 
-# Rate limiting instances
-standard_rate_limit = RateLimitDependency(calls=100, period=3600)  # 100/hour
-chat_rate_limit = RateLimitDependency(calls=50, period=3600)       # 50/hour  
-sparql_rate_limit = RateLimitDependency(calls=200, period=3600)    # 200/hour
-
-@lru_cache()
-def get_settings() -> Dict[str, Any]:
-    """Get application settings (cached)."""
-    import os
-    return {
-        "debug": os.getenv("DEBUG", "false").lower() == "true",
-        "log_level": os.getenv("LOG_LEVEL", "INFO"),
-        "max_query_length": int(os.getenv("MAX_QUERY_LENGTH", "10000")),
-        "max_sparql_results": int(os.getenv("MAX_SPARQL_RESULTS", "1000")),
-        "require_auth": os.getenv("REQUIRE_AUTH", "false").lower() == "true",
-        "admin_api_key": os.getenv("ADMIN_API_KEY"),
-    }
-
-def get_chatbot() -> EnhancedRDFChatbot:
-    """
-    Get the singleton chatbot instance.
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Middleware to add security headers to all responses."""
     
-    Returns:
-        EnhancedRDFChatbot instance
+    def __init__(self, app: ASGIApp):
+        super().__init__(app)
+        self.security_headers = {
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",
+            "X-XSS-Protection": "1; mode=block",
+            "Referrer-Policy": "strict-origin-when-cross-origin",
+            "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'",
+            "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
+        }
+    
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        """Add security headers to response."""
+        response = await call_next(request)
         
-    Raises:
-        HTTPException: If chatbot is not initialized
-    """
-    global _chatbot_instance
+        # Add security headers
+        for header, value in self.security_headers.items():
+            response.headers[header] = value
+        
+        return response
+
+class CORSMiddleware(BaseHTTPMiddleware):
+    """Custom CORS middleware with enhanced configuration."""
     
-    if _chatbot_instance is None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        allow_origins: list = None,
+        allow_methods: list = None,
+        allow_headers: list = None,
+        expose_headers: list = None,
+        allow_credentials: bool = False,
+        max_age: int = 600
+    ):
+        super().__init__(app)
+        self.allow_origins = allow_origins or ["*"]
+        self.allow_methods = allow_methods or ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+        self.allow_headers = allow_headers or ["*"]
+        self.expose_headers = expose_headers or ["X-Request-ID", "X-Process-Time"]
+        self.allow_credentials = allow_credentials
+        self.max_age = max_age
+    
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        """Handle CORS preflight and add CORS headers."""
+        # Handle preflight requests
+        if request.method == "OPTIONS":
+            return self._create_preflight_response(request)
+        
+        # Process normal request
+        response = await call_next(request)
+        
+        # Add CORS headers
+        self._add_cors_headers(request, response)
+        
+        return response
+    
+    def _create_preflight_response(self, request: Request) -> Response:
+        """Create response for OPTIONS preflight request."""
+        response = Response()
+        self._add_cors_headers(request, response)
+        return response
+    
+    def _add_cors_headers(self, request: Request, response: Response) -> None:
+        """Add CORS headers to response."""
+        origin = request.headers.get("Origin")
+        
+        # Check if origin is allowed
+        if origin and (self.allow_origins == ["*"] or origin in self.allow_origins):
+            response.headers["Access-Control-Allow-Origin"] = origin
+        elif self.allow_origins == ["*"]:
+            response.headers["Access-Control-Allow-Origin"] = "*"
+        
+        if self.allow_credentials:
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+        
+        response.headers["Access-Control-Allow-Methods"] = ", ".join(self.allow_methods)
+        response.headers["Access-Control-Allow-Headers"] = ", ".join(self.allow_headers)
+        response.headers["Access-Control-Expose-Headers"] = ", ".join(self.expose_headers)
+        response.headers["Access-Control-Max-Age"] = str(self.max_age)
+
+class ErrorHandlingMiddleware(BaseHTTPMiddleware):
+    """Middleware for centralized error handling and formatting."""
+    
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        """Handle errors and format responses consistently."""
         try:
-            logger.info("Initializing chatbot instance...")
-            _chatbot_instance = EnhancedRDFChatbot()
-            logger.info("Chatbot instance initialized successfully")
-        except Exception as e:
-            logger.error(f"Failed to initialize chatbot: {e}")
-            raise HTTPException(
+            return await call_next(request)
+            
+        except HTTPException:
+            # Let HTTPExceptions pass through
+            raise
+            
+        except ChatbotException as e:
+            # Handle custom chatbot exceptions
+            logger.error(f"Chatbot error: {str(e)}", exc_info=True)
+            
+            return JSONResponse(
                 status_code=500,
-                detail=f"Chatbot initialization failed: {str(e)}"
+                content={
+                    "error": "Chatbot Error",
+                    "message": str(e),
+                    "type": type(e).__name__,
+                    "request_id": getattr(request.state, "request_id", "unknown")
+                }
             )
-    
-    return _chatbot_instance
-
-def get_authenticated_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-    settings: Dict[str, Any] = Depends(get_settings)
-) -> Optional[Dict[str, str]]:
-    """
-    Authenticate user based on API key (if authentication is required).
-    
-    Args:
-        credentials: HTTP bearer token
-        settings: Application settings
-        
-    Returns:
-        User information if authenticated, None if auth not required
-        
-    Raises:
-        HTTPException: If authentication fails
-    """
-    if not settings["require_auth"]:
-        return None
-    
-    if not credentials:
-        raise HTTPException(
-            status_code=HTTP_401_UNAUTHORIZED,
-            detail="Authentication required",
-            headers={"WWW-Authenticate": "Bearer"}
-        )
-    
-    token = credentials.credentials
-    
-    # Simple API key authentication (extend for more sophisticated auth)
-    if token == settings.get("admin_api_key"):
-        return {"role": "admin", "user_id": "admin"}
-    
-    # Add more authentication logic here (JWT, OAuth, etc.)
-    raise HTTPException(
-        status_code=HTTP_401_UNAUTHORIZED,
-        detail="Invalid authentication credentials",
-        headers={"WWW-Authenticate": "Bearer"}
-    )
-
-def validate_query_parameters(
-    query: str = Query(..., description="Query string"),
-    settings: Dict[str, Any] = Depends(get_settings)
-) -> str:
-    """
-    Validate and sanitize query parameters.
-    
-    Args:
-        query: Raw query string
-        settings: Application settings
-        
-    Returns:
-        Sanitized query string
-        
-    Raises:
-        HTTPException: If validation fails
-    """
-    if not query or not query.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Query cannot be empty"
-        )
-    
-    if len(query) > settings["max_query_length"]:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Query too long. Maximum length: {settings['max_query_length']}"
-        )
-    
-    # Sanitize the query
-    sanitized_query = sanitize_query(query)
-    
-    if not sanitized_query:
-        raise HTTPException(
-            status_code=400,
-            detail="Query contains invalid characters"
-        )
-    
-    return sanitized_query
-
-def validate_sparql_parameters(
-    query: str = Query(..., description="SPARQL query"),
-    settings: Dict[str, Any] = Depends(get_settings)
-) -> str:
-    """
-    Validate SPARQL query parameters.
-    
-    Args:
-        query: SPARQL query string
-        settings: Application settings
-        
-    Returns:
-        Validated SPARQL query
-        
-    Raises:
-        HTTPException: If validation fails
-    """
-    if not query or not query.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="SPARQL query cannot be empty"
-        )
-    
-    if len(query) > settings["max_query_length"]:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Query too long. Maximum length: {settings['max_query_length']}"
-        )
-    
-    # Validate SPARQL syntax
-    if not validate_sparql_query(query):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid SPARQL query syntax"
-        )
-    
-    # Check for potentially dangerous operations
-    dangerous_keywords = ["DELETE", "INSERT", "DROP", "CREATE", "CLEAR"]
-    query_upper = query.upper()
-    
-    for keyword in dangerous_keywords:
-        if keyword in query_upper:
-            raise HTTPException(
+            
+        except ValueError as e:
+            # Handle validation errors
+            logger.warning(f"Validation error: {str(e)}")
+            
+            return JSONResponse(
                 status_code=400,
-                detail=f"SPARQL {keyword} operations are not allowed"
+                content={
+                    "error": "Validation Error",
+                    "message": str(e),
+                    "request_id": getattr(request.state, "request_id", "unknown")
+                }
             )
-    
-    return query.strip()
-
-def get_pagination_params(
-    skip: int = Query(0, ge=0, description="Number of items to skip"),
-    limit: int = Query(100, ge=1, le=1000, description="Number of items to return")
-) -> Dict[str, int]:
-    """
-    Get pagination parameters.
-    
-    Args:
-        skip: Number of items to skip
-        limit: Number of items to return
-        
-    Returns:
-        Pagination parameters
-    """
-    return {"skip": skip, "limit": limit}
-
-def get_filter_params(
-    entity_types: Optional[str] = Query(None, description="Comma-separated entity types"),
-    min_score: float = Query(0.0, ge=0.0, le=1.0, description="Minimum similarity score"),
-    include_metadata: bool = Query(True, description="Include entity metadata")
-) -> Dict[str, Any]:
-    """
-    Get filter parameters for search operations.
-    
-    Args:
-        entity_types: Comma-separated entity types
-        min_score: Minimum similarity score
-        include_metadata: Whether to include metadata
-        
-    Returns:
-        Filter parameters
-    """
-    filters = {
-        "min_score": min_score,
-        "include_metadata": include_metadata
-    }
-    
-    if entity_types:
-        # Parse and validate entity types
-        types_list = [t.strip() for t in entity_types.split(",") if t.strip()]
-        valid_types = ["Class", "ObjectProperty", "DatatypeProperty", "Individual", "Instance"]
-        
-        invalid_types = [t for t in types_list if t not in valid_types]
-        if invalid_types:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid entity types: {invalid_types}. Valid types: {valid_types}"
+            
+        except Exception as e:
+            # Handle unexpected errors
+            logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+            
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": "Internal Server Error",
+                    "message": "An unexpected error occurred",
+                    "request_id": getattr(request.state, "request_id", "unknown")
+                }
             )
-        
-        filters["entity_types"] = types_list
-    
-    return filters
 
-def get_request_id(request: Request) -> str:
-    """
-    Get or generate a request ID for tracking.
+class PerformanceMonitoringMiddleware(BaseHTTPMiddleware):
+    """Middleware for performance monitoring and metrics."""
     
-    Args:
-        request: FastAPI request object
+    def __init__(self, app: ASGIApp, slow_request_threshold: float = 2.0):
+        super().__init__(app)
+        self.slow_request_threshold = slow_request_threshold
+        self.metrics = {
+            "total_requests": 0,
+            "total_errors": 0,
+            "slow_requests": 0,
+            "average_response_time": 0.0
+        }
+    
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        """Monitor request performance."""
+        start_time = time.time()
         
-    Returns:
-        Request ID string
-    """
-    # Check for existing request ID header
-    request_id = request.headers.get("X-Request-ID")
+        try:
+            response = await call_next(request)
+            
+            # Update metrics
+            self._update_metrics(start_time, response.status_code)
+            
+            return response
+            
+        except Exception as e:
+            # Update error metrics
+            self._update_metrics(start_time, 500)
+            raise
     
-    if not request_id:
-        import uuid
-        request_id = str(uuid.uuid4())
+    def _update_metrics(self, start_time: float, status_code: int) -> None:
+        """Update performance metrics."""
+        duration = time.time() - start_time
+        
+        self.metrics["total_requests"] += 1
+        
+        if status_code >= 400:
+            self.metrics["total_errors"] += 1
+        
+        if duration > self.slow_request_threshold:
+            self.metrics["slow_requests"] += 1
+        
+        # Update average response time (simple moving average)
+        current_avg = self.metrics["average_response_time"]
+        total_requests = self.metrics["total_requests"]
+        
+        self.metrics["average_response_time"] = (
+            (current_avg * (total_requests - 1) + duration) / total_requests
+        )
     
-    return request_id
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get current performance metrics."""
+        return self.metrics.copy()
 
-def log_request_info(
-    request: Request,
-    request_id: str = Depends(get_request_id)
-) -> Dict[str, Any]:
-    """
-    Log request information for debugging and monitoring.
+class ContentValidationMiddleware(BaseHTTPMiddleware):
+    """Middleware for request content validation and sanitization."""
     
-    Args:
-        request: FastAPI request object
-        request_id: Request ID
-        
-    Returns:
-        Request information dictionary
-    """
-    client_ip = request.headers.get("X-Forwarded-For", 
-                                   request.headers.get("X-Real-IP",
-                                   request.client.host if request.client else "unknown"))
+    def __init__(self, app: ASGIApp, max_content_length: int = 10 * 1024 * 1024):  # 10MB
+        super().__init__(app)
+        self.max_content_length = max_content_length
     
-    user_agent = request.headers.get("User-Agent", "unknown")
-    
-    request_info = {
-        "request_id": request_id,
-        "method": request.method,
-        "url": str(request.url),
-        "client_ip": client_ip,
-        "user_agent": user_agent,
-        "timestamp": time.time()
-    }
-    
-    logger.info(f"Request {request_id}: {request.method} {request.url.path} from {client_ip}")
-    
-    return request_info
-
-def check_system_health(
-    chatbot: EnhancedRDFChatbot = Depends(get_chatbot)
-) -> Dict[str, Any]:
-    """
-    Check system health for endpoints that require it.
-    
-    Args:
-        chatbot: Chatbot instance
-        
-    Returns:
-        Health status
-        
-    Raises:
-        HTTPException: If system is unhealthy
-    """
-    try:
-        health = chatbot.check_health()
-        
-        if not health.get("overall_healthy", False):
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "error": "System is unhealthy",
-                    "health_status": health
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        """Validate request content."""
+        # Check content length
+        content_length = request.headers.get("Content-Length")
+        if content_length and int(content_length) > self.max_content_length:
+            return JSONResponse(
+                status_code=413,
+                content={
+                    "error": "Request Entity Too Large",
+                    "message": f"Content length exceeds {self.max_content_length} bytes"
                 }
             )
         
-        return health
+        # Validate content type for POST/PUT requests
+        if request.method in ["POST", "PUT"]:
+            content_type = request.headers.get("Content-Type", "")
+            
+            if content_type and not self._is_allowed_content_type(content_type):
+                return JSONResponse(
+                    status_code=415,
+                    content={
+                        "error": "Unsupported Media Type",
+                        "message": f"Content type '{content_type}' is not supported"
+                    }
+                )
+        
+        return await call_next(request)
     
-    except ChatbotException as e:
-        raise HTTPException(
-            status_code=503,
-            detail=f"System health check failed: {str(e)}"
-        )
+    def _is_allowed_content_type(self, content_type: str) -> bool:
+        """Check if content type is allowed."""
+        allowed_types = [
+            "application/json",
+            "application/x-www-form-urlencoded",
+            "multipart/form-data",
+            "text/plain"
+        ]
+        
+        return any(content_type.startswith(allowed) for allowed in allowed_types)
 
-def get_admin_user(
-    user: Optional[Dict[str, str]] = Depends(get_authenticated_user)
-) -> Dict[str, str]:
-    """
-    Ensure user has admin privileges.
+class MetricsMiddleware(BaseHTTPMiddleware):
+    """Middleware for collecting application metrics."""
     
-    Args:
-        user: Authenticated user information
-        
-    Returns:
-        Admin user information
-        
-    Raises:
-        HTTPException: If user is not admin
-    """
-    if not user or user.get("role") != "admin":
-        raise HTTPException(
-            status_code=403,
-            detail="Admin privileges required"
-        )
+    def __init__(self, app: ASGIApp):
+        super().__init__(app)
+        self.endpoint_metrics = {}
     
-    return user
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        """Collect endpoint-specific metrics."""
+        endpoint = self._get_endpoint(request)
+        start_time = time.time()
+        
+        try:
+            response = await call_next(request)
+            duration = time.time() - start_time
+            
+            # Update endpoint metrics
+            self._update_endpoint_metrics(endpoint, duration, response.status_code)
+            
+            return response
+            
+        except Exception as e:
+            duration = time.time() - start_time
+            self._update_endpoint_metrics(endpoint, duration, 500)
+            raise
+    
+    def _get_endpoint(self, request: Request) -> str:
+        """Extract endpoint from request path."""
+        path = request.url.path
+        method = request.method
+        
+        # Normalize path parameters
+        normalized_path = path
+        if "/entity/" in path:
+            normalized_path = "/entity/{uri}"
+        elif "/entities/type/" in path:
+            normalized_path = "/entities/type/{type}"
+        
+        return f"{method} {normalized_path}"
+    
+    def _update_endpoint_metrics(self, endpoint: str, duration: float, status_code: int) -> None:
+        """Update metrics for specific endpoint."""
+        if endpoint not in self.endpoint_metrics:
+            self.endpoint_metrics[endpoint] = {
+                "count": 0,
+                "total_time": 0.0,
+                "errors": 0,
+                "min_time": float('inf'),
+                "max_time": 0.0
+            }
+        
+        metrics = self.endpoint_metrics[endpoint]
+        metrics["count"] += 1
+        metrics["total_time"] += duration
+        metrics["min_time"] = min(metrics["min_time"], duration)
+        metrics["max_time"] = max(metrics["max_time"], duration)
+        
+        if status_code >= 400:
+            metrics["errors"] += 1
+    
+    def get_endpoint_metrics(self) -> Dict[str, Dict[str, Any]]:
+        """Get metrics for all endpoints."""
+        result = {}
+        
+        for endpoint, metrics in self.endpoint_metrics.items():
+            result[endpoint] = {
+                "count": metrics["count"],
+                "average_time": metrics["total_time"] / metrics["count"] if metrics["count"] > 0 else 0,
+                "min_time": metrics["min_time"] if metrics["min_time"] != float('inf') else 0,
+                "max_time": metrics["max_time"],
+                "error_rate": metrics["errors"] / metrics["count"] if metrics["count"] > 0 else 0,
+                "errors": metrics["errors"]
+            }
+        
+        return result
 
-# Common dependency combinations
-CommonDeps = Annotated[Dict[str, Any], Depends(log_request_info)]
-ChatDeps = Annotated[bool, Depends(chat_rate_limit)]
-SparqlDeps = Annotated[bool, Depends(sparql_rate_limit)]
-StandardDeps = Annotated[bool, Depends(standard_rate_limit)]
-AdminDeps = Annotated[Dict[str, str], Depends(get_admin_user)]
-HealthDeps = Annotated[Dict[str, Any], Depends(check_system_health)]
+# Global middleware instances for metrics access
+performance_monitor = PerformanceMonitoringMiddleware(None)
+metrics_collector = MetricsMiddleware(None)
 
-def get_performance_monitor() -> Generator[Dict[str, Any], None, None]:
-    """
-    Monitor request performance.
-    
-    Yields:
-        Performance metrics
-    """
-    start_time = time.time()
-    start_cpu = time.process_time()
-    
-    try:
-        yield {"start_time": start_time, "start_cpu": start_cpu}
-    finally:
-        end_time = time.time()
-        end_cpu = time.process_time()
-        
-        duration = end_time - start_time
-        cpu_time = end_cpu - start_cpu
-        
-        # Log performance metrics
-        if duration > 5.0:  # Log slow requests
-            logger.warning(f"Slow request: {duration:.2f}s wall time, {cpu_time:.2f}s CPU time")
-        
-        # Could send metrics to monitoring system here
-        logger.debug(f"Request completed in {duration:.2f}s (CPU: {cpu_time:.2f}s)")
-
-PerformanceDeps = Annotated[Dict[str, Any], Depends(get_performance_monitor)]
+def get_middleware_metrics() -> Dict[str, Any]:
+    """Get combined metrics from all middleware."""
+    return {
+        "performance": performance_monitor.get_metrics(),
+        "endpoints": metrics_collector.get_endpoint_metrics()
+    }
