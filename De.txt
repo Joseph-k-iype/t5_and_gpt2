@@ -302,8 +302,7 @@ class EnhancedElasticsearchVectorStore:
                                 "index_options": {
                                     "type": "hnsw",
                                     "m": 16,
-                                    "ef_construction": 200,
-                                    "ef_search": 100
+                                    "ef_construction": 100
                                 }
                             },
                             
@@ -634,19 +633,30 @@ class EnhancedElasticsearchVectorStore:
                       min_score: float = 0.6,
                       include_metadata: bool = True) -> List[Dict[str, Any]]:
         """
-        Search for entities using Elasticsearch 8.13 KNN search.
+        Search for entities using Elasticsearch 8.13 KNN search with Azure OpenAI embeddings.
         """
         try:
-            # Generate embedding for query
-            query_embedding = self.embedding_model.embed_query(query_text)
+            logger.info(f"Searching for entities similar to: '{query_text[:100]}...'")
             
-            # Build KNN search query optimized for ES 8.13
+            # Generate embedding for query using Azure OpenAI text-embedding-3-large
+            logger.debug("Generating query embedding using Azure OpenAI...")
+            cleaned_query = self._clean_text_for_embedding(query_text)
+            query_embedding = self.embedding_model.embed_query(cleaned_query)
+            
+            # Validate embedding dimension
+            if len(query_embedding) != self.embedding_dimensions:
+                logger.error(f"Query embedding dimension mismatch: expected {self.embedding_dimensions}, got {len(query_embedding)}")
+                return []
+            
+            logger.debug(f"Generated query embedding with {len(query_embedding)} dimensions")
+            
+            # Build KNN search query optimized for ES 8.13 with text-embedding-3-large
             query = {
                 "knn": {
                     "field": "embedding",
                     "query_vector": query_embedding,
-                    "k": top_k,
-                    "num_candidates": min(top_k * 3, 200),
+                    "k": min(top_k * 2, 100),  # Get more candidates for better results
+                    "num_candidates": min(top_k * 5, 200),  # Reasonable candidate pool
                     "boost": 2.0
                 },
                 "query": {
@@ -657,7 +667,8 @@ class EnhancedElasticsearchVectorStore:
                                     "query": query_text,
                                     "fields": ["text_content^2", "labels^1.5", "local_name^1.5", "comments"],
                                     "type": "best_fields",
-                                    "boost": 1.0
+                                    "boost": 1.0,
+                                    "fuzziness": "AUTO"
                                 }
                             }
                         ],
@@ -665,7 +676,10 @@ class EnhancedElasticsearchVectorStore:
                     }
                 },
                 "size": top_k,
-                "min_score": min_score
+                "min_score": min_score,
+                "_source": {
+                    "excludes": ["embedding"] if not include_metadata else []
+                }
             }
             
             # Add entity type filter if specified
@@ -675,28 +689,35 @@ class EnhancedElasticsearchVectorStore:
                 query["query"]["bool"]["filter"].append({
                     "terms": {"type": entity_types}
                 })
+                logger.debug(f"Added entity type filter: {entity_types}")
             
             # Execute search
+            logger.debug("Executing KNN search in Elasticsearch...")
             response = self.es.search(index=self.index_name, body=query)
             
             results = []
-            for hit in response['hits']['hits']:
+            hits = response.get('hits', {}).get('hits', [])
+            
+            for hit in hits:
                 score = hit['_score']
                 result = hit['_source'].copy()
                 result['similarity_score'] = score
                 result['search_type'] = 'knn_hybrid'
+                result['_id'] = hit['_id']
                 
-                # Remove embedding from result if not needed
+                # Remove embedding from result if not needed for metadata
                 if not include_metadata and 'embedding' in result:
                     del result['embedding']
                 
                 results.append(result)
             
-            logger.info(f"Found {len(results)} similar entities for query: '{query_text}'")
+            logger.info(f"Found {len(results)} similar entities (scores: {[f'{r['similarity_score']:.3f}' for r in results[:3]]})")
+            
             return results
             
         except Exception as e:
             logger.error(f"Error searching for similar entities: {e}")
+            logger.error(f"Query text: {query_text[:200]}...")
             return []
     
     def search_by_keywords(self, 
@@ -759,8 +780,17 @@ class EnhancedElasticsearchVectorStore:
             logger.error(f"Error searching by keywords: {e}")
             return []
     
-    def add_entities(self, entities: List[Dict[str, Any]], batch_size: int = 50) -> bool:
-        """Add entities to the vector store with embeddings in batches."""
+    def add_entities(self, entities: List[Dict[str, Any]], batch_size: int = 10) -> bool:
+        """
+        Add entities to the vector store with Azure OpenAI embeddings.
+        
+        Args:
+            entities: List of entity dictionaries
+            batch_size: Number of entities to process in each batch (smaller for large embeddings)
+            
+        Returns:
+            True if successful, False otherwise
+        """
         try:
             if not entities:
                 logger.warning("No entities provided for indexing")
@@ -769,65 +799,154 @@ class EnhancedElasticsearchVectorStore:
             total_entities = len(entities)
             successful_indexes = 0
             
+            logger.info(f"Processing {total_entities} entities with text-embedding-3-large model")
+            logger.info(f"Using batch size: {batch_size}")
+            
+            # Process entities in smaller batches for large embeddings
             for i in range(0, total_entities, batch_size):
                 batch = entities[i:i + batch_size]
-                logger.info(f"Processing batch {i//batch_size + 1}/{(total_entities + batch_size - 1)//batch_size}")
+                batch_num = i//batch_size + 1
+                total_batches = (total_entities + batch_size - 1)//batch_size
                 
+                logger.info(f"Processing batch {batch_num}/{total_batches} ({len(batch)} entities)")
+                
+                # Prepare texts for embedding
                 texts = []
                 valid_entities = []
                 
                 for entity in batch:
                     text_content = entity.get('text_content', '')
                     if text_content and text_content.strip():
-                        texts.append(text_content)
+                        # Clean and truncate text if needed
+                        cleaned_text = self._clean_text_for_embedding(text_content)
+                        texts.append(cleaned_text)
                         valid_entities.append(entity)
                     else:
                         logger.warning(f"Skipping entity {entity.get('uri', 'unknown')} - no text content")
                 
                 if not texts:
+                    logger.warning(f"No valid texts in batch {batch_num}, skipping")
                     continue
                 
+                # Generate embeddings using Azure OpenAI text-embedding-3-large
                 try:
+                    logger.info(f"Generating embeddings for {len(texts)} texts using Azure OpenAI...")
+                    
+                    # Use embed_documents for batch processing
                     embeddings = self.embedding_model.embed_documents(texts)
-                    logger.info(f"Generated {len(embeddings)} embeddings for batch")
+                    
+                    logger.info(f"✓ Generated {len(embeddings)} embeddings")
+                    logger.info(f"  Embedding dimensions: {len(embeddings[0]) if embeddings else 'N/A'}")
+                    
+                    # Validate embedding dimensions
+                    for j, embedding in enumerate(embeddings):
+                        if len(embedding) != self.embedding_dimensions:
+                            logger.error(f"Embedding dimension mismatch for text {j}: "
+                                       f"expected {self.embedding_dimensions}, got {len(embedding)}")
+                            raise ValueError(f"Embedding dimension mismatch")
+                    
                 except Exception as e:
-                    logger.error(f"Error generating embeddings for batch: {e}")
+                    logger.error(f"Error generating embeddings for batch {batch_num}: {e}")
+                    logger.error("Please check your Azure OpenAI configuration and model deployment")
                     continue
                 
+                # Prepare documents for Elasticsearch indexing
                 actions = []
                 for entity, embedding in zip(valid_entities, embeddings):
-                    doc = self._prepare_document(entity, embedding)
-                    action = {
-                        "_index": self.index_name,
-                        "_id": entity['uri'],
-                        "_source": doc
-                    }
-                    actions.append(action)
+                    try:
+                        # Clean and prepare the document
+                        doc = self._prepare_document(entity, embedding)
+                        
+                        action = {
+                            "_index": self.index_name,
+                            "_id": entity['uri'],
+                            "_source": doc
+                        }
+                        actions.append(action)
+                    except Exception as e:
+                        logger.error(f"Error preparing document for entity {entity.get('uri', 'unknown')}: {e}")
+                        continue
                 
+                # Bulk index documents in Elasticsearch
                 if actions:
                     try:
                         from elasticsearch.helpers import bulk
+                        
+                        logger.info(f"Indexing {len(actions)} documents in Elasticsearch...")
                         success_count, failed_items = bulk(
                             self.es, 
                             actions, 
                             chunk_size=batch_size,
-                            request_timeout=60
+                            request_timeout=120,  # Increased timeout for large embeddings
+                            max_retries=3,
+                            initial_backoff=2,
+                            max_backoff=600
                         )
+                        
                         successful_indexes += success_count
                         
                         if failed_items:
-                            logger.warning(f"Failed to index {len(failed_items)} entities in batch")
+                            logger.warning(f"Failed to index {len(failed_items)} entities in batch {batch_num}")
+                            for failed_item in failed_items[:3]:  # Show first 3 failures
+                                logger.warning(f"  Failed item: {failed_item}")
+                        
+                        logger.info(f"✓ Batch {batch_num} completed: {success_count}/{len(actions)} documents indexed")
                         
                     except Exception as e:
-                        logger.error(f"Error bulk indexing batch: {e}")
+                        logger.error(f"Error bulk indexing batch {batch_num}: {e}")
                         continue
+                else:
+                    logger.warning(f"No valid documents to index in batch {batch_num}")
             
-            logger.info(f"Successfully indexed {successful_indexes}/{total_entities} entities")
+            logger.info(f"✓ Embedding and indexing completed!")
+            logger.info(f"  Total entities processed: {total_entities}")
+            logger.info(f"  Successfully indexed: {successful_indexes}")
+            logger.info(f"  Success rate: {(successful_indexes/total_entities)*100:.1f}%")
+            
             return successful_indexes > 0
             
         except Exception as e:
             logger.error(f"Error adding entities to vector store: {e}")
             return False
+    
+    def _clean_text_for_embedding(self, text: str) -> str:
+        """
+        Clean and prepare text for embedding generation.
+        
+        Args:
+            text: Raw text content
+            
+        Returns:
+            Cleaned text suitable for embedding
+        """
+        if not text:
+            return ""
+        
+        # Basic text cleaning
+        import re
+        
+        # Remove excessive whitespace
+        text = re.sub(r'\s+', ' ', text.strip())
+        
+        # Remove very long lines that might cause issues
+        lines = text.split('\n')
+        cleaned_lines = []
+        for line in lines:
+            if len(line.strip()) > 0:
+                # Truncate very long lines
+                if len(line) > 1000:
+                    line = line[:997] + "..."
+                cleaned_lines.append(line.strip())
+        
+        text = ' '.join(cleaned_lines)
+        
+        # Ensure reasonable length for embedding (text-embedding-3-large has limits)
+        max_length = 8000  # Conservative limit for text-embedding-3-large
+        if len(text) > max_length:
+            text = text[:max_length-3] + "..."
+            logger.debug(f"Truncated text to {max_length} characters for embedding")
+        
+        return text
     
     def _prepare_document(self, entity: Dict[str, Any], embedding: List[float]) -> Dict[str, Any]:
         """Prepare a document for Elasticsearch indexing."""
