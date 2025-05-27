@@ -1,30 +1,182 @@
-def _prepare_document(self, entity: Dict[str, Any], embedding: List[float]) -> Dict[str, Any]:
-    """Prepare a document for Elasticsearch indexing."""
-    from datetime import datetime
-    
-    # Get current timestamp in ISO format
-    current_timestamp = datetime.now().isoformat()
-    
-    doc = {
-        "uri": entity.get('uri', ''),
-        "type": entity.get('type', ''),
-        "local_name": entity.get('local_name', ''),
-        "namespace": entity.get('namespace', ''),
-        "labels": entity.get('labels', []),
-        "comments": entity.get('comments', []),
-        "text_content": entity.get('text_content', ''),
-        "embedding": embedding,
-        "created_at": current_timestamp,  # Use ISO format timestamp
-        "updated_at": current_timestamp   # Use ISO format timestamp
-    }
-    
-    optional_fields = [
-        'superclasses', 'subclasses', 'related_properties', 
-        'property_values', 'metadata', 'types', 'domains', 'ranges'
-    ]
-    
-    for field in optional_fields:
-        if field in entity:
-            doc[field] = entity[field]
-    
-    return doc
+def add_entities(self, entities: List[Dict[str, Any]], batch_size: int = 10) -> bool:
+    """
+    Add entities to the vector store with direct Azure OpenAI embeddings.
+    Enhanced with better error handling and debugging.
+    """
+    try:
+        if not entities:
+            logger.warning("No entities provided for indexing")
+            return True
+        
+        total_entities = len(entities)
+        successful_indexes = 0
+        failed_entities = []
+        
+        logger.info(f"Processing {total_entities} entities with direct Azure OpenAI embedding calls")
+        logger.info(f"Using batch size: {batch_size}")
+        
+        # Process entities in smaller batches
+        for i in range(0, total_entities, batch_size):
+            batch = entities[i:i + batch_size]
+            batch_num = i//batch_size + 1
+            total_batches = (total_entities + batch_size - 1)//batch_size
+            
+            logger.info(f"Processing batch {batch_num}/{total_batches} ({len(batch)} entities)")
+            
+            # Prepare texts for embedding
+            texts = []
+            valid_entities = []
+            
+            for entity in batch:
+                text_content = entity.get('text_content', '')
+                if text_content and text_content.strip():
+                    texts.append(text_content)
+                    valid_entities.append(entity)
+                else:
+                    logger.warning(f"Skipping entity {entity.get('uri', 'unknown')} - no text content")
+            
+            if not texts:
+                logger.warning(f"No valid texts in batch {batch_num}, skipping")
+                continue
+            
+            # Generate embeddings
+            try:
+                logger.info(f"Generating embeddings for {len(texts)} texts...")
+                embeddings = self.embedding_client.embed_documents(texts)
+                logger.info(f"✓ Generated {len(embeddings)} embeddings")
+                
+                # Validate embedding dimensions
+                for idx, embedding in enumerate(embeddings):
+                    if len(embedding) != self.embedding_dimensions:
+                        logger.error(f"Embedding dimension mismatch for entity {valid_entities[idx].get('uri')}: "
+                                   f"expected {self.embedding_dimensions}, got {len(embedding)}")
+                        continue
+                        
+            except Exception as e:
+                logger.error(f"Error generating embeddings for batch {batch_num}: {e}")
+                failed_entities.extend([entity.get('uri', 'unknown') for entity in valid_entities])
+                continue
+            
+            # Prepare documents for Elasticsearch
+            actions = []
+            for entity, embedding in zip(valid_entities, embeddings):
+                try:
+                    # Clean and prepare the document
+                    doc = self._prepare_document(entity, embedding)
+                    
+                    # Validate URI for use as document ID
+                    doc_id = entity['uri']
+                    if not doc_id or not isinstance(doc_id, str):
+                        logger.error(f"Invalid URI for entity: {entity}")
+                        continue
+                    
+                    # Clean URI for use as Elasticsearch document ID
+                    # Remove any characters that might cause issues
+                    doc_id = doc_id.replace(' ', '_').replace('\n', '_').replace('\r', '_')
+                    
+                    action = {
+                        "_index": self.index_name,
+                        "_id": doc_id,
+                        "_source": doc
+                    }
+                    actions.append(action)
+                    
+                except Exception as e:
+                    logger.error(f"Error preparing document for entity {entity.get('uri', 'unknown')}: {e}")
+                    failed_entities.append(entity.get('uri', 'unknown'))
+                    continue
+            
+            # Bulk index documents
+            if actions:
+                try:
+                    from elasticsearch.helpers import bulk, BulkIndexError
+                    
+                    logger.info(f"Indexing {len(actions)} documents in Elasticsearch...")
+                    
+                    # Try bulk indexing with error handling
+                    try:
+                        success_count, errors = bulk(
+                            self.es, 
+                            actions, 
+                            chunk_size=min(batch_size, 50),  # Limit chunk size
+                            request_timeout=120,
+                            max_retries=3,
+                            initial_backoff=2,
+                            max_backoff=600,
+                            raise_on_error=False,  # Don't raise on individual failures
+                            raise_on_exception=False  # Continue on exceptions
+                        )
+                        
+                        successful_indexes += success_count
+                        
+                        # Log any errors
+                        if errors:
+                            logger.warning(f"Some documents failed to index in batch {batch_num}")
+                            for error in errors[:5]:  # Log first 5 errors
+                                if isinstance(error, dict):
+                                    error_info = error.get('index', error.get('create', error.get('update', {})))
+                                    if 'error' in error_info:
+                                        logger.error(f"  Error: {error_info['error'].get('type', 'Unknown')}: "
+                                                   f"{error_info['error'].get('reason', 'No reason given')}")
+                                        failed_entities.append(error_info.get('_id', 'unknown'))
+                                else:
+                                    logger.error(f"  Error: {error}")
+                        
+                        logger.info(f"✓ Batch {batch_num} completed: {success_count}/{len(actions)} documents indexed")
+                        
+                    except BulkIndexError as e:
+                        # Handle bulk indexing errors
+                        logger.error(f"Bulk indexing error in batch {batch_num}: {str(e)[:200]}")
+                        for error in e.errors[:5]:
+                            logger.error(f"  Document error: {error}")
+                            
+                    except Exception as e:
+                        logger.error(f"Unexpected error during bulk indexing: {type(e).__name__}: {str(e)}")
+                        # Try to index documents one by one as fallback
+                        logger.info("Falling back to individual document indexing...")
+                        for action in actions:
+                            try:
+                                self.es.index(
+                                    index=action['_index'],
+                                    id=action['_id'],
+                                    body=action['_source']
+                                )
+                                successful_indexes += 1
+                            except Exception as ind_error:
+                                logger.error(f"Failed to index document {action['_id']}: {ind_error}")
+                                failed_entities.append(action['_id'])
+                        
+                except Exception as e:
+                    logger.error(f"Critical error during bulk indexing batch {batch_num}: {e}")
+                    logger.error(f"Error type: {type(e).__name__}")
+                    logger.error(f"Error details: {str(e)[:500]}")
+                    failed_entities.extend([action['_id'] for action in actions])
+                    continue
+            else:
+                logger.warning(f"No valid documents to index in batch {batch_num}")
+        
+        # Log summary
+        logger.info(f"✓ Embedding and indexing completed!")
+        logger.info(f"  Total entities processed: {total_entities}")
+        logger.info(f"  Successfully indexed: {successful_indexes}")
+        logger.info(f"  Failed: {len(failed_entities)}")
+        logger.info(f"  Success rate: {(successful_indexes/total_entities)*100:.1f}%")
+        
+        if failed_entities:
+            logger.error(f"Failed entities: {failed_entities[:10]}...")  # Show first 10
+        
+        # Force refresh the index to make documents searchable immediately
+        try:
+            self.es.indices.refresh(index=self.index_name)
+            logger.info("Index refreshed successfully")
+        except Exception as e:
+            logger.warning(f"Failed to refresh index: {e}")
+        
+        return successful_indexes > 0
+        
+    except Exception as e:
+        logger.error(f"Critical error in add_entities: {e}")
+        logger.error(f"Error type: {type(e).__name__}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return False
