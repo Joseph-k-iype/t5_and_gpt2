@@ -19,15 +19,222 @@ import time
 import logging
 import tempfile
 import subprocess
+import re
+import hashlib
 from typing import Dict, List, Iterator, Optional
 from collections import defaultdict
-import hashlib
 import pickle
 import multiprocessing as mp
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import falkordb
 from neo4j import GraphDatabase
+from rdflib import Graph, URIRef, Literal, BNode
+from rdflib.namespace import RDF, RDFS, XSD, FOAF, SKOS
+from urllib.parse import urlparse
+
+
+class TTLToPropertyGraphConverter:
+    """
+    Basic TTL to Property Graph converter (embedded for chunk processing).
+    This is a simplified version of the original converter for use in chunks.
+    """
+    
+    def __init__(self):
+        self.rdf_graph = Graph()
+        self.nodes = {}
+        self.relationships = []
+        self.node_labels = defaultdict(set)
+        
+        # Common namespace prefixes for cleaner node IDs
+        self.namespace_prefixes = {
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#": "rdf:",
+            "http://www.w3.org/2000/01/rdf-schema#": "rdfs:",
+            "http://www.w3.org/2001/XMLSchema#": "xsd:",
+            "http://xmlns.com/foaf/0.1/": "foaf:",
+            "http://www.w3.org/2004/02/skos/core#": "skos:",
+            "http://purl.org/dc/elements/1.1/": "dc:",
+            "http://purl.org/dc/terms/": "dcterms:",
+            "http://schema.org/": "schema:",
+            "http://dbpedia.org/resource/": "dbr:",
+            "http://dbpedia.org/ontology/": "dbo:",
+            "https://www.wikidata.org/wiki/": "wd:"
+        }
+
+    def load_ttl_file(self, file_path: str) -> None:
+        """Load and parse a TTL file using RDFLib."""
+        self.rdf_graph.parse(file_path, format="turtle")
+
+    def _get_node_id(self, term) -> str:
+        """Generate a clean, unique identifier for a graph node."""
+        if isinstance(term, URIRef):
+            uri_str = str(term)
+            # Try to use namespace prefixes for cleaner IDs
+            for namespace, prefix in self.namespace_prefixes.items():
+                if uri_str.startswith(namespace):
+                    return uri_str.replace(namespace, prefix)
+            
+            # Extract the last part of the URI for cleaner IDs
+            parsed = urlparse(uri_str)
+            if parsed.fragment:
+                return f"{parsed.netloc}#{parsed.fragment}"
+            elif "/" in parsed.path:
+                return f"{parsed.netloc}{parsed.path.split('/')[-1]}"
+            else:
+                return uri_str
+                
+        elif isinstance(term, Literal):
+            # For literals, create a hash-based ID to avoid duplication
+            content = str(term)
+            if len(content) > 50:
+                hash_obj = hashlib.md5(content.encode())
+                return f"literal_{hash_obj.hexdigest()[:8]}"
+            else:
+                # Use sanitized content for short literals
+                sanitized = re.sub(r'[^\w\s-]', '_', content)
+                return f"literal_{sanitized}"
+                
+        elif isinstance(term, BNode):
+            return f"bnode_{str(term)}"
+        else:
+            return f"unknown_{str(term)}"
+
+    def _get_clean_property_name(self, predicate: URIRef) -> str:
+        """Generate a clean property name from a predicate URI."""
+        uri_str = str(predicate)
+        
+        # Use namespace prefixes
+        for namespace, prefix in self.namespace_prefixes.items():
+            if uri_str.startswith(namespace):
+                return uri_str.replace(namespace, prefix).replace(":", "_")
+        
+        # Extract the last part of the URI
+        parsed = urlparse(uri_str)
+        if parsed.fragment:
+            return parsed.fragment
+        elif "/" in parsed.path:
+            return parsed.path.split("/")[-1]
+        else:
+            return "property"
+
+    def _infer_node_labels(self, subject_id: str, subject: URIRef) -> set:
+        """Infer appropriate labels for a node based on RDF types and patterns."""
+        labels = set()
+        
+        # Check for explicit rdf:type declarations
+        for _, _, obj in self.rdf_graph.triples((subject, RDF.type, None)):
+            if isinstance(obj, URIRef):
+                type_name = self._get_clean_property_name(obj)
+                labels.add(type_name)
+        
+        # Infer labels from URI patterns
+        uri_str = str(subject)
+        if "Person" in uri_str or "people" in uri_str.lower():
+            labels.add("Person")
+        elif "Organization" in uri_str or "company" in uri_str.lower():
+            labels.add("Organization")  
+        elif "Place" in uri_str or "location" in uri_str.lower():
+            labels.add("Place")
+        elif "Event" in uri_str:
+            labels.add("Event")
+        elif "Concept" in uri_str:
+            labels.add("Concept")
+        
+        # Default label if none found
+        if not labels:
+            labels.add("Resource")
+            
+        return labels
+
+    def convert_to_property_graph(self) -> None:
+        """Convert RDF triples to property graph format."""
+        # Process all triples
+        for subject, predicate, obj in self.rdf_graph:
+            
+            # Create subject node
+            subject_id = self._get_node_id(subject)
+            if subject_id not in self.nodes:
+                self.nodes[subject_id] = {
+                    "id": subject_id,
+                    "uri": str(subject) if isinstance(subject, URIRef) else None,
+                    "type": "URI" if isinstance(subject, URIRef) else "BNode"
+                }
+                
+                # Infer labels for the subject
+                if isinstance(subject, URIRef):
+                    self.node_labels[subject_id] = self._infer_node_labels(subject_id, subject)
+            
+            # Handle object based on its type
+            if isinstance(obj, URIRef):
+                # Object is another resource - create relationship
+                obj_id = self._get_node_id(obj)
+                
+                # Create object node if it doesn't exist
+                if obj_id not in self.nodes:
+                    self.nodes[obj_id] = {
+                        "id": obj_id,
+                        "uri": str(obj),
+                        "type": "URI"
+                    }
+                    self.node_labels[obj_id] = self._infer_node_labels(obj_id, obj)
+                
+                # Create relationship
+                relationship = {
+                    "source": subject_id,
+                    "target": obj_id,
+                    "type": self._get_clean_property_name(predicate),
+                    "predicate_uri": str(predicate)
+                }
+                self.relationships.append(relationship)
+                
+            elif isinstance(obj, Literal):
+                # Object is a literal - add as node property
+                property_name = self._get_clean_property_name(predicate)
+                
+                # Handle literal value and datatype
+                value = str(obj)
+                if obj.datatype:
+                    datatype = str(obj.datatype)
+                    if datatype == str(XSD.integer):
+                        try:
+                            value = int(value)
+                        except ValueError:
+                            pass
+                    elif datatype == str(XSD.float) or datatype == str(XSD.double):
+                        try:
+                            value = float(value)
+                        except ValueError:
+                            pass
+                    elif datatype == str(XSD.boolean):
+                        value = value.lower() in ('true', '1')
+                    
+                    # Store datatype information
+                    self.nodes[subject_id][f"{property_name}_datatype"] = datatype
+                
+                # Handle language tags
+                if obj.language:
+                    self.nodes[subject_id][f"{property_name}_lang"] = obj.language
+                
+                self.nodes[subject_id][property_name] = value
+                
+            elif isinstance(obj, BNode):
+                # Object is a blank node - create relationship
+                obj_id = self._get_node_id(obj)
+                
+                if obj_id not in self.nodes:
+                    self.nodes[obj_id] = {
+                        "id": obj_id,
+                        "type": "BNode"
+                    }
+                    self.node_labels[obj_id] = {"BlankNode"}
+                
+                relationship = {
+                    "source": subject_id,
+                    "target": obj_id,
+                    "type": self._get_clean_property_name(predicate),
+                    "predicate_uri": str(predicate)
+                }
+                self.relationships.append(relationship)
 
 
 class LargeTTLConverter:
@@ -254,7 +461,7 @@ class LargeTTLConverter:
     
     def process_chunk_with_original_converter(self, chunk_file: str) -> Dict:
         """
-        Process a single chunk using the original converter.
+        Process a single chunk using the embedded converter.
         
         Args:
             chunk_file: Path to chunk file
@@ -262,8 +469,6 @@ class LargeTTLConverter:
         Returns:
             Dictionary with chunk processing results
         """
-        from ttl_converter import TTLToPropertyGraphConverter
-        
         try:
             # Create converter for this chunk
             converter = TTLToPropertyGraphConverter()
