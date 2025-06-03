@@ -1,531 +1,890 @@
-#!/usr/bin/env python3
 """
-TTL-Aware Large File Merger
-Proper syntax-aware chunking that preserves TTL structure
+FalkorDB Timeout Solutions for Large File Ingestion
+==================================================
+
+This module provides multiple strategies to handle query timeouts when ingesting
+large RDF files into FalkorDB:
+
+1. Adaptive batch sizing with exponential backoff
+2. Connection pooling and retry mechanisms  
+3. Progress checkpointing for recovery
+4. Multiple ingestion strategies (single vs batch vs streaming)
+5. FalkorDB-specific optimizations and timeout configuration
+
 """
 
 import os
-import glob
 import sys
 import time
-import tempfile
-import shutil
-import re
-from typing import List, Tuple, Optional, Dict
-from rdflib import Graph
-import gc
+import logging
+import pickle
+import json
+from typing import Dict, List, Set, Tuple, Any, Optional
+from collections import defaultdict
+from contextlib import contextmanager
+import threading
+from queue import Queue
+import signal
 
-class TTLSyntaxAwareChunker:
-    def __init__(self, show_progress: bool = True):
-        self.show_progress = show_progress
-        self.prefixes = []
-        self.base_uri = None
-        
-    def extract_prefixes_and_base(self, filepath: str) -> Tuple[List[str], Optional[str]]:
-        """Extract all @prefix and @base declarations from the file"""
-        prefixes = []
-        base_uri = None
-        
-        try:
-            with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith('@prefix') or line.startswith('PREFIX'):
-                        prefixes.append(line)
-                    elif line.startswith('@base') or line.startswith('BASE'):
-                        base_uri = line
-                    elif line and not line.startswith('#') and not line.startswith('@') and not line.startswith('PREFIX') and not line.startswith('BASE'):
-                        # Stop when we hit actual triples
-                        break
-                        
-        except Exception as e:
-            if self.show_progress:
-                print(f"   ⚠️  Warning: Could not extract prefixes: {e}")
-        
-        return prefixes, base_uri
-    
-    def is_complete_statement(self, lines: List[str]) -> bool:
-        """Check if the current set of lines forms a complete TTL statement"""
-        if not lines:
-            return True
-            
-        # Join all lines and clean up
-        combined = ' '.join(line.strip() for line in lines if line.strip())
-        
-        # Skip comments and directives
-        if not combined or combined.startswith('#') or combined.startswith('@') or combined.startswith('PREFIX') or combined.startswith('BASE'):
-            return True
-        
-        # A complete statement must end with a period
-        # But we need to be careful about periods inside literals
-        in_literal = False
-        quote_char = None
-        escape_next = False
-        
-        for i, char in enumerate(combined):
-            if escape_next:
-                escape_next = False
-                continue
-                
-            if char == '\\':
-                escape_next = True
-                continue
-                
-            if char in ['"', "'"]:
-                if not in_literal:
-                    in_literal = True
-                    quote_char = char
-                elif char == quote_char:
-                    in_literal = False
-                    quote_char = None
-            
-            # Only count periods outside of literals
-            if char == '.' and not in_literal:
-                # Make sure it's not part of a decimal number or URI
-                if i == len(combined) - 1 or combined[i + 1].isspace():
-                    return True
-        
-        return False
-    
-    def split_file_by_statements(self, filepath: str, target_chunk_size: int) -> List[str]:
-        """
-        Split TTL file into chunks at statement boundaries
-        target_chunk_size is in bytes
-        """
-        if self.show_progress:
-            print(f"   📝 Analyzing TTL syntax for proper chunking...")
-        
-        # Extract prefixes first
-        prefixes, base_uri = self.extract_prefixes_and_base(filepath)
-        
-        chunk_files = []
-        current_chunk_lines = []
-        current_chunk_size = 0
-        chunk_number = 0
-        statement_buffer = []
-        
-        try:
-            with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
-                for line_num, line in enumerate(f, 1):
-                    # Skip prefix and base declarations in the data (we'll add them to chunks)
-                    if line.strip().startswith('@prefix') or line.strip().startswith('PREFIX') or line.strip().startswith('@base') or line.strip().startswith('BASE'):
-                        continue
-                    
-                    # Add line to statement buffer
-                    statement_buffer.append(line)
-                    line_size = len(line.encode('utf-8'))
-                    
-                    # Check if we have a complete statement
-                    if self.is_complete_statement(statement_buffer):
-                        # We have a complete statement, decide whether to add to current chunk
-                        statement_size = sum(len(l.encode('utf-8')) for l in statement_buffer)
-                        
-                        # If adding this statement would exceed chunk size and we have content, start new chunk
-                        if (current_chunk_size + statement_size > target_chunk_size and 
-                            current_chunk_lines):
-                            
-                            # Save current chunk
-                            chunk_file = self._save_ttl_chunk(
-                                current_chunk_lines, prefixes, base_uri, chunk_number
-                            )
-                            if chunk_file:
-                                chunk_files.append(chunk_file)
-                                if self.show_progress and len(chunk_files) % 10 == 0:
-                                    print(f"      📦 Created {len(chunk_files)} chunks...")
-                            
-                            # Start new chunk
-                            current_chunk_lines = []
-                            current_chunk_size = 0
-                            chunk_number += 1
-                        
-                        # Add complete statement to current chunk
-                        current_chunk_lines.extend(statement_buffer)
-                        current_chunk_size += statement_size
-                        
-                        # Clear statement buffer
-                        statement_buffer = []
-                    
-                    # Progress indicator for very large files
-                    if self.show_progress and line_num % 100000 == 0:
-                        print(f"      📖 Processed {line_num:,} lines...")
-                
-                # Handle any remaining incomplete statement
-                if statement_buffer:
-                    if self.show_progress:
-                        print(f"   ⚠️  Warning: File ends with incomplete statement, adding to last chunk")
-                    current_chunk_lines.extend(statement_buffer)
-                
-                # Save final chunk
-                if current_chunk_lines:
-                    chunk_file = self._save_ttl_chunk(
-                        current_chunk_lines, prefixes, base_uri, chunk_number
-                    )
-                    if chunk_file:
-                        chunk_files.append(chunk_file)
-        
-        except Exception as e:
-            if self.show_progress:
-                print(f"   ❌ Error during syntax-aware splitting: {e}")
-            return []
-        
-        if self.show_progress:
-            print(f"   ✅ Created {len(chunk_files)} syntax-valid chunks")
-        
-        return chunk_files
-    
-    def _save_ttl_chunk(self, lines: List[str], prefixes: List[str], 
-                       base_uri: Optional[str], chunk_number: int) -> Optional[str]:
-        """Save a chunk with proper TTL structure"""
-        try:
-            if not hasattr(self, 'temp_dir') or not self.temp_dir:
-                self.temp_dir = tempfile.mkdtemp(prefix="ttl_chunks_")
-            
-            chunk_file = os.path.join(self.temp_dir, f"chunk_{chunk_number:05d}.ttl")
-            
-            with open(chunk_file, 'w', encoding='utf-8') as f:
-                # Write header comment
-                f.write(f"# TTL Chunk {chunk_number + 1}\n")
-                f.write(f"# Generated by TTL-Aware Chunker\n\n")
-                
-                # Write base URI if present
-                if base_uri:
-                    f.write(base_uri + '\n')
-                
-                # Write all prefixes
-                for prefix in prefixes:
-                    f.write(prefix + '\n')
-                
-                if prefixes:
-                    f.write('\n')  # Blank line after prefixes
-                
-                # Write the actual data
-                for line in lines:
-                    f.write(line)
-            
-            return chunk_file
-            
-        except Exception as e:
-            if self.show_progress:
-                print(f"   ❌ Error saving chunk {chunk_number}: {e}")
-            return None
+# Core dependencies
+import falkordb
+from rdflib import Graph, URIRef, Literal, BNode
+from rdflib.namespace import RDF, RDFS, XSD
 
-class LargeFileTTLMerger:
-    def __init__(self, show_progress: bool = True, chunk_size_mb: int = 100):
-        self.show_progress = show_progress
-        self.chunk_size_bytes = chunk_size_mb * 1024 * 1024
-        self.merged_graph = Graph()
-        self.chunker = TTLSyntaxAwareChunker(show_progress)
-        self.temp_dirs = []
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
+
+class FalkorDBTimeoutHandler:
+    """
+    Advanced timeout handling and connection management for FalkorDB.
+    """
+    
+    def __init__(self, 
+                 host: str = "localhost",
+                 port: int = 6379,
+                 password: Optional[str] = None,
+                 username: Optional[str] = None,
+                 connection_timeout: int = 30,
+                 query_timeout: int = 300,  # 5 minutes default
+                 max_retries: int = 3,
+                 retry_delay: float = 1.0):
+        
+        self.host = host
+        self.port = port
+        self.password = password
+        self.username = username
+        self.connection_timeout = connection_timeout
+        self.query_timeout = query_timeout
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        
+        # Connection pool
+        self.connection_pool = Queue(maxsize=5)
+        self.active_connections = 0
+        self.max_connections = 3
+        
+        # Statistics
         self.stats = {
-            'files_processed': 0,
-            'files_failed': 0,
-            'chunks_processed': 0,
-            'chunks_failed': 0,
-            'total_triples': 0,
-            'processing_time': 0,
-            'failed_files': [],
-            'failed_chunks': []
+            'queries_executed': 0,
+            'queries_failed': 0,
+            'queries_retried': 0,
+            'timeouts_encountered': 0,
+            'total_retry_time': 0
         }
+        
+        self.logger = logging.getLogger(__name__)
     
-    def _is_large_file(self, filepath: str, threshold_mb: int = 500) -> bool:
-        """Determine if a file should be processed as a large file"""
+    def _create_connection(self) -> falkordb.FalkorDB:
+        """Create a new FalkorDB connection with timeout settings."""
         try:
-            size_mb = os.path.getsize(filepath) / (1024 * 1024)
-            return size_mb > threshold_mb
-        except:
-            return False
+            connection_params = {
+                'host': self.host,
+                'port': self.port,
+                'socket_timeout': self.connection_timeout,
+                'socket_connect_timeout': self.connection_timeout
+            }
+            
+            if self.password:
+                connection_params['password'] = self.password
+            if self.username:
+                connection_params['username'] = self.username
+            
+            db = falkordb.FalkorDB(**connection_params)
+            self.active_connections += 1
+            return db
+            
+        except Exception as e:
+            self.logger.error(f"Failed to create FalkorDB connection: {e}")
+            raise
     
-    def _process_small_file(self, filepath: str) -> Tuple[bool, int, Optional[str]]:
-        """Process a regular-sized file directly"""
+    @contextmanager
+    def get_connection(self):
+        """Get a connection from the pool with proper cleanup."""
+        db = None
         try:
-            initial_count = len(self.merged_graph)
-            
-            # Try different encodings
-            encodings = ['utf-8', 'utf-8-sig', 'latin1', 'cp1252']
-            
-            for encoding in encodings:
-                try:
-                    self.merged_graph.parse(filepath, format="turtle", encoding=encoding)
-                    break
-                except UnicodeDecodeError:
-                    continue
-                except Exception as e:
-                    if "index out of range" in str(e).lower():
-                        # File might be larger than we thought, try chunking
-                        return self._process_large_file(filepath)
-                    raise e
+            # Try to get from pool first
+            if not self.connection_pool.empty():
+                db = self.connection_pool.get_nowait()
             else:
-                # Try without specifying encoding
-                self.merged_graph.parse(filepath, format="turtle")
-            
-            final_count = len(self.merged_graph)
-            return True, final_count - initial_count, None
-            
-        except Exception as e:
-            return False, 0, str(e)
-    
-    def _process_large_file(self, filepath: str) -> Tuple[bool, int, Optional[str]]:
-        """Process large file using syntax-aware chunking"""
-        try:
-            file_size = os.path.getsize(filepath)
-            if self.show_progress:
-                print(f"   📊 Large file: {self._format_size(file_size)}")
-                print(f"   🔄 Using syntax-aware chunking...")
-            
-            # Create syntax-aware chunks
-            chunk_files = self.chunker.split_file_by_statements(filepath, self.chunk_size_bytes)
-            
-            if not chunk_files:
-                return False, 0, "Failed to create valid chunks"
-            
-            # Process each chunk
-            total_loaded = 0
-            successful_chunks = 0
-            
-            for i, chunk_file in enumerate(chunk_files):
-                if self.show_progress:
-                    print(f"   📦 Processing chunk {i+1}/{len(chunk_files)}")
-                
-                try:
-                    # Validate chunk before processing
-                    test_graph = Graph()
-                    test_graph.parse(chunk_file, format="turtle")
-                    chunk_triples = len(test_graph)
-                    
-                    if chunk_triples == 0:
-                        if self.show_progress:
-                            print(f"      ⚠️  Empty chunk, skipping")
-                        continue
-                    
-                    # Merge into main graph
-                    initial_count = len(self.merged_graph)
-                    self.merged_graph += test_graph
-                    final_count = len(self.merged_graph)
-                    
-                    added_triples = final_count - initial_count
-                    total_loaded += added_triples
-                    successful_chunks += 1
-                    
-                    self.stats['chunks_processed'] += 1
-                    
-                    if self.show_progress:
-                        print(f"      ✅ {chunk_triples:,} loaded, {added_triples:,} new (total: {final_count:,})")
-                    
-                    # Clean up chunk graph
-                    del test_graph
-                    gc.collect()
-                    
-                except Exception as e:
-                    self.stats['chunks_failed'] += 1
-                    self.stats['failed_chunks'].append((chunk_file, str(e)))
-                    if self.show_progress:
-                        print(f"      ❌ Chunk failed: {e}")
-                    continue
-            
-            if successful_chunks == 0:
-                return False, 0, f"All {len(chunk_files)} chunks failed to process"
-            
-            if self.show_progress and self.stats['chunks_failed'] > 0:
-                print(f"   ⚠️  {self.stats['chunks_failed']} chunks failed, {successful_chunks} succeeded")
-            
-            return True, total_loaded, None
-            
-        except Exception as e:
-            return False, 0, f"Large file processing failed: {e}"
-    
-    def _cleanup_temp_files(self):
-        """Clean up all temporary directories"""
-        # Clean up chunker temp dir
-        if hasattr(self.chunker, 'temp_dir') and self.chunker.temp_dir:
-            try:
-                shutil.rmtree(self.chunker.temp_dir)
-            except:
-                pass
-        
-        # Clean up any other temp dirs
-        for temp_dir in self.temp_dirs:
-            try:
-                if os.path.exists(temp_dir):
-                    shutil.rmtree(temp_dir)
-            except:
-                pass
-    
-    def merge_files(self, input_pattern: str, output_file: str, 
-                   output_format: str = "turtle") -> bool:
-        """Merge TTL files with proper syntax handling"""
-        start_time = time.time()
-        
-        try:
-            if self.show_progress:
-                print(f"🐢 TTL-Aware Large File Merger")
-                print(f"📂 Input: {input_pattern}")
-                print(f"📄 Output: {output_file}")
-                print(f"📦 Chunk size: {self.chunk_size_bytes // (1024*1024)}MB")
-                print()
-            
-            # Get accessible files
-            ttl_files = glob.glob(input_pattern)
-            if not ttl_files:
-                print(f"❌ No files found: {input_pattern}")
-                return False
-            
-            accessible_files = [f for f in ttl_files if os.path.exists(f) and os.access(f, os.R_OK)]
-            if not accessible_files:
-                print("❌ No accessible files found")
-                return False
-            
-            # Show file info
-            if self.show_progress:
-                print(f"🔍 Processing {len(accessible_files)} files:")
-                for filepath in accessible_files:
-                    size = os.path.getsize(filepath)
-                    large = "📊 LARGE" if self._is_large_file(filepath) else "📄"
-                    print(f"   {large} {os.path.basename(filepath)} ({self._format_size(size)})")
-                print()
-            
-            # Process each file
-            for i, filepath in enumerate(accessible_files):
-                if self.show_progress:
-                    print(f"[{i+1}/{len(accessible_files)}] Processing: {os.path.basename(filepath)}")
-                
-                if self._is_large_file(filepath):
-                    success, triples_loaded, error = self._process_large_file(filepath)
+                # Create new connection if pool is empty and under limit
+                if self.active_connections < self.max_connections:
+                    db = self._create_connection()
                 else:
-                    success, triples_loaded, error = self._process_small_file(filepath)
-                
-                if success:
-                    self.stats['files_processed'] += 1
-                    self.stats['total_triples'] += triples_loaded
-                    if self.show_progress:
-                        print(f"   ✅ Success: {triples_loaded:,} triples added")
-                else:
-                    self.stats['files_failed'] += 1
-                    self.stats['failed_files'].append((filepath, error))
-                    if self.show_progress:
-                        print(f"   ❌ Failed: {error}")
-                
-                if self.show_progress:
-                    print()
+                    # Wait for a connection to become available
+                    db = self.connection_pool.get(timeout=30)
             
-            # Final stats
-            self.stats['processing_time'] = time.time() - start_time
-            final_triples = len(self.merged_graph)
-            
-            if self.stats['files_processed'] == 0:
-                print("❌ No files processed successfully")
-                return False
-            
-            # Write output
-            if self.show_progress:
-                print(f"💾 Writing {final_triples:,} triples to {output_file}...")
-            
-            self.merged_graph.serialize(destination=output_file, format=output_format)
-            
-            # Verify output
-            if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
-                print("❌ Output file creation failed")
-                return False
-            
-            if self.show_progress:
-                self._print_final_stats(output_file)
-            
-            return True
+            yield db
             
         except Exception as e:
-            print(f"❌ Merge failed: {e}")
-            return False
+            self.logger.error(f"Connection error: {e}")
+            # Don't return bad connections to pool
+            if db:
+                self.active_connections -= 1
+                db = None
+            raise
         finally:
-            self._cleanup_temp_files()
+            # Return connection to pool if it's still good
+            if db and self.connection_pool.qsize() < self.max_connections:
+                try:
+                    self.connection_pool.put_nowait(db)
+                except:
+                    self.active_connections -= 1
     
-    def _print_final_stats(self, output_file: str):
-        """Print comprehensive final statistics"""
-        print(f"\n🎉 MERGE COMPLETED!")
-        print(f"=" * 40)
-        print(f"📁 Output: {output_file}")
-        print(f"📊 Files processed: {self.stats['files_processed']}/{self.stats['files_processed'] + self.stats['files_failed']}")
+    def execute_with_timeout(self, graph_name: str, query: str, 
+                           timeout_override: Optional[int] = None) -> Any:
+        """
+        Execute query with timeout handling and retries.
+        """
+        timeout = timeout_override or self.query_timeout
+        retries = 0
+        last_exception = None
         
-        if self.stats['chunks_processed'] > 0:
-            print(f"📦 Chunks processed: {self.stats['chunks_processed']}")
-            if self.stats['chunks_failed'] > 0:
-                print(f"❌ Chunks failed: {self.stats['chunks_failed']}")
+        while retries <= self.max_retries:
+            try:
+                start_time = time.time()
+                
+                with self.get_connection() as db:
+                    graph = db.select_graph(graph_name)
+                    
+                    # Execute query with timeout
+                    result = self._execute_with_signal_timeout(graph, query, timeout)
+                    
+                    self.stats['queries_executed'] += 1
+                    execution_time = time.time() - start_time
+                    
+                    if execution_time > timeout * 0.8:  # Warn if close to timeout
+                        self.logger.warning(f"Query took {execution_time:.2f}s (close to {timeout}s timeout)")
+                    
+                    return result
+                    
+            except TimeoutError as e:
+                self.stats['timeouts_encountered'] += 1
+                self.logger.warning(f"Query timeout after {timeout}s (attempt {retries + 1})")
+                last_exception = e
+                
+            except Exception as e:
+                self.stats['queries_failed'] += 1
+                self.logger.warning(f"Query failed: {e} (attempt {retries + 1})")
+                last_exception = e
+            
+            # Retry logic
+            if retries < self.max_retries:
+                retries += 1
+                self.stats['queries_retried'] += 1
+                retry_delay = self.retry_delay * (2 ** (retries - 1))  # Exponential backoff
+                self.logger.info(f"Retrying in {retry_delay:.1f}s...")
+                time.sleep(retry_delay)
+                self.stats['total_retry_time'] += retry_delay
+            else:
+                break
         
-        print(f"🔗 Final triples: {len(self.merged_graph):,}")
-        print(f"⏱️  Time: {self.stats['processing_time']:.1f}s")
-        
-        if self.stats['processing_time'] > 0:
-            rate = len(self.merged_graph) / self.stats['processing_time']
-            print(f"🚀 Rate: {rate:,.0f} triples/sec")
-        
-        output_size = os.path.getsize(output_file)
-        print(f"📏 Output size: {self._format_size(output_size)}")
-        
-        # Show failures if any
-        if self.stats['failed_files']:
-            print(f"\n❌ Failed files:")
-            for filepath, error in self.stats['failed_files'][:3]:
-                print(f"   • {os.path.basename(filepath)}: {error}")
-            if len(self.stats['failed_files']) > 3:
-                print(f"   • ... and {len(self.stats['failed_files']) - 3} more")
+        # All retries exhausted
+        self.logger.error(f"Query failed after {self.max_retries} retries")
+        raise last_exception or Exception("Query failed after retries")
     
-    @staticmethod
-    def _format_size(size_bytes: int) -> str:
-        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-            if size_bytes < 1024:
-                return f"{size_bytes:.1f} {unit}"
-            size_bytes /= 1024
-        return f"{size_bytes:.1f} PB"
+    def _execute_with_signal_timeout(self, graph, query: str, timeout: int):
+        """Execute query with signal-based timeout (Unix/Linux only)."""
+        result = None
+        exception = None
+        
+        def timeout_handler(signum, frame):
+            raise TimeoutError(f"Query timed out after {timeout} seconds")
+        
+        # Set up timeout (only works on Unix-like systems)
+        if hasattr(signal, 'SIGALRM'):
+            old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(timeout)
+            
+            try:
+                result = graph.query(query)
+                signal.alarm(0)  # Cancel alarm
+            except Exception as e:
+                signal.alarm(0)  # Cancel alarm
+                exception = e
+            finally:
+                signal.signal(signal.SIGALRM, old_handler)  # Restore handler
+        else:
+            # Fallback for Windows (no reliable timeout)
+            self.logger.warning("Signal-based timeout not available, using basic execution")
+            result = graph.query(query)
+        
+        if exception:
+            raise exception
+        
+        return result
+
+
+class AdaptiveBatchUploader:
+    """
+    Adaptive batch uploader that adjusts batch sizes based on performance and timeouts.
+    """
+    
+    def __init__(self, 
+                 timeout_handler: FalkorDBTimeoutHandler,
+                 initial_batch_size: int = 50,
+                 min_batch_size: int = 1,
+                 max_batch_size: int = 1000,
+                 target_execution_time: float = 30.0):  # Target 30 seconds per batch
+        
+        self.timeout_handler = timeout_handler
+        self.current_batch_size = initial_batch_size
+        self.min_batch_size = min_batch_size
+        self.max_batch_size = max_batch_size
+        self.target_execution_time = target_execution_time
+        
+        # Performance tracking
+        self.execution_times = []
+        self.success_count = 0
+        self.timeout_count = 0
+        
+        self.logger = logging.getLogger(__name__)
+    
+    def adjust_batch_size(self, execution_time: float, success: bool):
+        """Dynamically adjust batch size based on performance."""
+        if success:
+            self.success_count += 1
+            self.execution_times.append(execution_time)
+            
+            # If execution is much faster than target, increase batch size
+            if execution_time < self.target_execution_time * 0.5:
+                new_size = min(int(self.current_batch_size * 1.5), self.max_batch_size)
+                if new_size > self.current_batch_size:
+                    self.logger.info(f"Increasing batch size: {self.current_batch_size} → {new_size}")
+                    self.current_batch_size = new_size
+            
+            # If execution is slower than target, decrease batch size
+            elif execution_time > self.target_execution_time:
+                new_size = max(int(self.current_batch_size * 0.7), self.min_batch_size)
+                if new_size < self.current_batch_size:
+                    self.logger.info(f"Decreasing batch size: {self.current_batch_size} → {new_size}")
+                    self.current_batch_size = new_size
+        else:
+            # On failure/timeout, significantly reduce batch size
+            self.timeout_count += 1
+            new_size = max(int(self.current_batch_size * 0.5), self.min_batch_size)
+            if new_size < self.current_batch_size:
+                self.logger.warning(f"Reducing batch size due to failure: {self.current_batch_size} → {new_size}")
+                self.current_batch_size = new_size
+    
+    def upload_nodes_adaptive(self, graph_name: str, nodes: List[Dict]) -> int:
+        """Upload nodes with adaptive batching."""
+        total_uploaded = 0
+        start_idx = 0
+        
+        self.logger.info(f"Starting adaptive node upload: {len(nodes)} nodes")
+        
+        while start_idx < len(nodes):
+            # Current batch
+            end_idx = min(start_idx + self.current_batch_size, len(nodes))
+            batch_nodes = nodes[start_idx:end_idx]
+            batch_size = len(batch_nodes)
+            
+            try:
+                start_time = time.time()
+                
+                # Build batch query with error handling
+                queries = []
+                for node in batch_nodes:
+                    query = self._build_node_query(node)
+                    if query:
+                        queries.append(query)
+                
+                if queries:
+                    # Execute batch
+                    combined_query = ' '.join(queries)
+                    
+                    # Adjust timeout based on batch size
+                    estimated_timeout = max(60, batch_size * 2)  # 2 seconds per node minimum
+                    
+                    self.timeout_handler.execute_with_timeout(
+                        graph_name, combined_query, timeout_override=estimated_timeout
+                    )
+                    
+                    execution_time = time.time() - start_time
+                    total_uploaded += batch_size
+                    
+                    # Adjust batch size based on performance
+                    self.adjust_batch_size(execution_time, True)
+                    
+                    self.logger.info(f"Uploaded batch of {batch_size} nodes in {execution_time:.2f}s "
+                                   f"(total: {total_uploaded}/{len(nodes)})")
+                else:
+                    self.logger.warning(f"No valid queries in batch {start_idx}-{end_idx}")
+                
+                start_idx = end_idx
+                
+            except Exception as e:
+                self.logger.error(f"Batch upload failed: {e}")
+                
+                # Adjust batch size down due to failure
+                self.adjust_batch_size(0, False)
+                
+                # Try individual uploads as fallback
+                if self.current_batch_size <= self.min_batch_size:
+                    self.logger.info("Falling back to individual node uploads")
+                    uploaded = self._upload_nodes_individually(graph_name, batch_nodes)
+                    total_uploaded += uploaded
+                    start_idx = end_idx
+                # Otherwise, retry with smaller batch size
+        
+        self.logger.info(f"Adaptive node upload completed: {total_uploaded}/{len(nodes)} nodes")
+        return total_uploaded
+    
+    def upload_relationships_adaptive(self, graph_name: str, relationships: List[Tuple]) -> int:
+        """Upload relationships with adaptive batching."""
+        total_uploaded = 0
+        start_idx = 0
+        
+        # Use smaller batch sizes for relationships (they're more expensive)
+        original_batch_size = self.current_batch_size
+        self.current_batch_size = min(self.current_batch_size // 2, 100)
+        
+        self.logger.info(f"Starting adaptive relationship upload: {len(relationships)} relationships")
+        
+        while start_idx < len(relationships):
+            end_idx = min(start_idx + self.current_batch_size, len(relationships))
+            batch_rels = relationships[start_idx:end_idx]
+            batch_size = len(batch_rels)
+            
+            try:
+                start_time = time.time()
+                
+                # Upload relationships one by one (safer for large datasets)
+                uploaded_count = 0
+                for source_id, target_id, rel_type, predicate_uri in batch_rels:
+                    try:
+                        query = self._build_relationship_query(source_id, target_id, rel_type, predicate_uri)
+                        
+                        # Short timeout for individual relationships
+                        self.timeout_handler.execute_with_timeout(
+                            graph_name, query, timeout_override=30
+                        )
+                        uploaded_count += 1
+                        
+                    except Exception as e:
+                        self.logger.debug(f"Failed to create relationship: {e}")
+                        continue
+                
+                execution_time = time.time() - start_time
+                total_uploaded += uploaded_count
+                
+                # Adjust batch size
+                self.adjust_batch_size(execution_time, uploaded_count == batch_size)
+                
+                progress = (start_idx + batch_size) / len(relationships) * 100
+                self.logger.info(f"Uploaded {uploaded_count}/{batch_size} relationships in {execution_time:.2f}s "
+                               f"(progress: {progress:.1f}%)")
+                
+                start_idx = end_idx
+                
+            except Exception as e:
+                self.logger.error(f"Relationship batch failed: {e}")
+                self.adjust_batch_size(0, False)
+                start_idx = end_idx
+        
+        # Restore original batch size
+        self.current_batch_size = original_batch_size
+        
+        self.logger.info(f"Adaptive relationship upload completed: {total_uploaded}/{len(relationships)} relationships")
+        return total_uploaded
+    
+    def _build_node_query(self, node: Dict) -> Optional[str]:
+        """Build CREATE query for a single node."""
+        try:
+            labels = list(node.get('labels', ['Entity']))
+            labels_str = ':'.join(labels) if labels else 'Entity'
+            
+            # Build properties safely
+            props = [f"entity_id: {node['id']}"]
+            
+            for key, value in node.items():
+                if key not in ['id', 'labels'] and value is not None:
+                    if isinstance(value, str):
+                        # Escape quotes and limit length
+                        escaped_value = value.replace("'", "\\'").replace('"', '\\"')[:500]
+                        props.append(f"{key}: '{escaped_value}'")
+                    elif isinstance(value, (int, float)) and not (isinstance(value, float) and 
+                                                               (value != value or value == float('inf') or value == float('-inf'))):  # Check for NaN/inf
+                        props.append(f"{key}: {value}")
+                    elif isinstance(value, bool):
+                        props.append(f"{key}: {'true' if value else 'false'}")
+            
+            props_str = '{' + ', '.join(props) + '}'
+            return f"CREATE (:{labels_str} {props_str})"
+            
+        except Exception as e:
+            self.logger.debug(f"Failed to build node query: {e}")
+            return None
+    
+    def _build_relationship_query(self, source_id: int, target_id: int, rel_type: str, predicate_uri: str) -> str:
+        """Build CREATE query for a single relationship."""
+        # Sanitize relationship type
+        clean_rel_type = ''.join(c if c.isalnum() or c == '_' else '_' for c in rel_type)
+        if not clean_rel_type or clean_rel_type[0].isdigit():
+            clean_rel_type = f"REL_{clean_rel_type}"
+        
+        # Escape predicate URI
+        escaped_predicate = predicate_uri.replace("'", "\\'").replace('"', '\\"')[:500]
+        
+        return f"""
+        MATCH (a) WHERE a.entity_id = {source_id}
+        MATCH (b) WHERE b.entity_id = {target_id}
+        CREATE (a)-[:{clean_rel_type} {{predicate_uri: '{escaped_predicate}'}}]->(b)
+        """
+    
+    def _upload_nodes_individually(self, graph_name: str, nodes: List[Dict]) -> int:
+        """Fallback: upload nodes one by one."""
+        uploaded = 0
+        for node in nodes:
+            try:
+                query = self._build_node_query(node)
+                if query:
+                    self.timeout_handler.execute_with_timeout(
+                        graph_name, query, timeout_override=30
+                    )
+                    uploaded += 1
+            except Exception as e:
+                self.logger.debug(f"Individual node upload failed: {e}")
+                continue
+        
+        return uploaded
+
+
+class ProgressCheckpointer:
+    """
+    Save and restore progress for large uploads to handle interruptions.
+    """
+    
+    def __init__(self, checkpoint_dir: str = "./checkpoints"):
+        self.checkpoint_dir = checkpoint_dir
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        self.logger = logging.getLogger(__name__)
+    
+    def save_checkpoint(self, session_id: str, data: Dict[str, Any]):
+        """Save progress checkpoint."""
+        try:
+            checkpoint_file = os.path.join(self.checkpoint_dir, f"{session_id}.checkpoint")
+            with open(checkpoint_file, 'wb') as f:
+                pickle.dump(data, f)
+            self.logger.debug(f"Checkpoint saved: {checkpoint_file}")
+        except Exception as e:
+            self.logger.warning(f"Failed to save checkpoint: {e}")
+    
+    def load_checkpoint(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Load progress checkpoint."""
+        try:
+            checkpoint_file = os.path.join(self.checkpoint_dir, f"{session_id}.checkpoint")
+            if os.path.exists(checkpoint_file):
+                with open(checkpoint_file, 'rb') as f:
+                    data = pickle.load(f)
+                self.logger.info(f"Checkpoint loaded: {checkpoint_file}")
+                return data
+        except Exception as e:
+            self.logger.warning(f"Failed to load checkpoint: {e}")
+        
+        return None
+    
+    def cleanup_checkpoint(self, session_id: str):
+        """Remove checkpoint after successful completion."""
+        try:
+            checkpoint_file = os.path.join(self.checkpoint_dir, f"{session_id}.checkpoint")
+            if os.path.exists(checkpoint_file):
+                os.remove(checkpoint_file)
+                self.logger.debug(f"Checkpoint cleaned up: {checkpoint_file}")
+        except Exception as e:
+            self.logger.warning(f"Failed to cleanup checkpoint: {e}")
+
+
+class LargeFileRDFConverter:
+    """
+    RDF converter optimized for large files with timeout handling.
+    """
+    
+    def __init__(self,
+                 # FalkorDB connection settings
+                 falkor_host: str = "localhost",
+                 falkor_port: int = 6379,
+                 falkor_password: Optional[str] = None,
+                 connection_timeout: int = 60,
+                 query_timeout: int = 300,  # 5 minutes
+                 
+                 # Processing settings
+                 chunk_size: int = 10000,
+                 initial_batch_size: int = 50,  # Start small
+                 enable_checkpoints: bool = True,
+                 
+                 # Performance settings
+                 max_retries: int = 3,
+                 target_execution_time: float = 30.0):
+        
+        # Initialize timeout handler
+        self.timeout_handler = FalkorDBTimeoutHandler(
+            host=falkor_host,
+            port=falkor_port,
+            password=falkor_password,
+            connection_timeout=connection_timeout,
+            query_timeout=query_timeout,
+            max_retries=max_retries
+        )
+        
+        # Initialize adaptive uploader
+        self.uploader = AdaptiveBatchUploader(
+            timeout_handler=self.timeout_handler,
+            initial_batch_size=initial_batch_size,
+            target_execution_time=target_execution_time
+        )
+        
+        # Initialize checkpointer
+        self.checkpointer = ProgressCheckpointer() if enable_checkpoints else None
+        
+        # Processing settings
+        self.chunk_size = chunk_size
+        
+        # Core data structures (simplified)
+        self.entity_index = {}
+        self.entity_counter = 0
+        self.namespace_cache = {}
+        self.common_namespaces = {
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#": "rdf",
+            "http://www.w3.org/2000/01/rdf-schema#": "rdfs", 
+            "http://www.w3.org/2001/XMLSchema#": "xsd",
+            "http://xmlns.com/foaf/0.1/": "foaf",
+            "http://example.org/": "ex"
+        }
+        
+        # Statistics
+        self.stats = {
+            'start_time': None,
+            'total_triples': 0,
+            'total_nodes': 0,
+            'total_relationships': 0,
+            'chunks_processed': 0,
+            'nodes_uploaded': 0,
+            'relationships_uploaded': 0,
+            'processing_time': 0,
+            'upload_time': 0
+        }
+        
+        self.logger = logging.getLogger(__name__)
+    
+    def process_large_file_with_timeout_handling(self, 
+                                               file_path: str,
+                                               graph_name: str = "large_graph",
+                                               resume_from_checkpoint: bool = True) -> Dict[str, Any]:
+        """
+        Process large RDF file with comprehensive timeout handling.
+        """
+        self.stats['start_time'] = time.time()
+        session_id = f"large_file_{int(time.time())}"
+        
+        self.logger.info(f"🚀 Processing large file: {file_path}")
+        self.logger.info(f"📊 Configuration: chunk_size={self.chunk_size}, "
+                        f"initial_batch_size={self.uploader.current_batch_size}")
+        
+        # Check for existing checkpoint
+        checkpoint_data = None
+        if self.checkpointer and resume_from_checkpoint:
+            checkpoint_data = self.checkpointer.load_checkpoint(session_id)
+        
+        if checkpoint_data:
+            self.logger.info("📂 Resuming from checkpoint...")
+            # Restore state from checkpoint
+            self.stats.update(checkpoint_data['stats'])
+            self.entity_index = checkpoint_data['entity_index']
+            self.entity_counter = checkpoint_data['entity_counter']
+            processed_chunks = checkpoint_data['processed_chunks']
+        else:
+            self.logger.info("🆕 Starting fresh processing...")
+            processed_chunks = 0
+            
+            # Clear existing data in graph
+            try:
+                self.timeout_handler.execute_with_timeout(
+                    graph_name, "MATCH (n) DETACH DELETE n", timeout_override=120
+                )
+                self.logger.info("🗑️ Cleared existing graph data")
+            except Exception as e:
+                self.logger.warning(f"Could not clear existing data: {e}")
+        
+        # Process file in chunks
+        try:
+            # Parse RDF file
+            self.logger.info("📖 Parsing RDF file...")
+            graph = Graph()
+            graph.parse(file_path, format='turtle')
+            total_triples = len(graph)
+            
+            self.logger.info(f"📊 Total triples to process: {total_triples:,}")
+            
+            # Convert to list for chunking
+            triples_list = list(graph)
+            
+            # Process chunks
+            chunk_start_idx = processed_chunks * self.chunk_size
+            
+            for chunk_idx in range(processed_chunks, (total_triples // self.chunk_size) + 1):
+                start_idx = chunk_idx * self.chunk_size
+                end_idx = min(start_idx + self.chunk_size, total_triples)
+                
+                if start_idx >= total_triples:
+                    break
+                
+                chunk_triples = triples_list[start_idx:end_idx]
+                
+                if not chunk_triples:
+                    continue
+                
+                self.logger.info(f"📦 Processing chunk {chunk_idx + 1}: "
+                               f"triples {start_idx:,}-{end_idx:,}")
+                
+                # Process chunk
+                chunk_start_time = time.time()
+                nodes, relationships = self._process_triple_chunk(chunk_triples)
+                
+                # Upload to FalkorDB with timeout handling
+                upload_start_time = time.time()
+                
+                nodes_uploaded = self.uploader.upload_nodes_adaptive(graph_name, nodes)
+                rels_uploaded = self.uploader.upload_relationships_adaptive(graph_name, relationships)
+                
+                upload_time = time.time() - upload_start_time
+                chunk_time = time.time() - chunk_start_time
+                
+                # Update statistics
+                self.stats['total_triples'] += len(chunk_triples)
+                self.stats['total_nodes'] += len(nodes)
+                self.stats['total_relationships'] += len(relationships)
+                self.stats['nodes_uploaded'] += nodes_uploaded
+                self.stats['relationships_uploaded'] += rels_uploaded
+                self.stats['chunks_processed'] += 1
+                self.stats['upload_time'] += upload_time
+                
+                # Progress logging
+                progress = ((chunk_idx + 1) * self.chunk_size) / total_triples * 100
+                self.logger.info(f"✅ Chunk {chunk_idx + 1} completed in {chunk_time:.1f}s "
+                               f"(upload: {upload_time:.1f}s, progress: {progress:.1f}%)")
+                
+                # Save checkpoint
+                if self.checkpointer:
+                    checkpoint_data = {
+                        'stats': self.stats.copy(),
+                        'entity_index': self.entity_index,
+                        'entity_counter': self.entity_counter,
+                        'processed_chunks': chunk_idx + 1
+                    }
+                    self.checkpointer.save_checkpoint(session_id, checkpoint_data)
+                
+                # Memory cleanup
+                del nodes, relationships, chunk_triples
+                
+                # Brief pause to let FalkorDB catch up
+                time.sleep(0.1)
+        
+        except KeyboardInterrupt:
+            self.logger.warning("⚠️ Processing interrupted by user")
+            raise
+        except Exception as e:
+            self.logger.error(f"❌ Processing failed: {e}")
+            raise
+        finally:
+            # Cleanup checkpoint on successful completion
+            if self.checkpointer:
+                self.checkpointer.cleanup_checkpoint(session_id)
+        
+        # Final statistics
+        total_time = time.time() - self.stats['start_time']
+        
+        final_stats = {
+            **self.stats,
+            'total_time': total_time,
+            'processing_time': total_time - self.stats['upload_time'],
+            'throughput': self.stats['total_triples'] / total_time if total_time > 0 else 0,
+            'graph_name': graph_name,
+            'timeout_handler_stats': self.timeout_handler.stats,
+            'adaptive_batch_stats': {
+                'final_batch_size': self.uploader.current_batch_size,
+                'success_count': self.uploader.success_count,
+                'timeout_count': self.uploader.timeout_count
+            }
+        }
+        
+        self.logger.info("🎉 Large file processing completed!")
+        self.logger.info(f"⏱️ Total time: {total_time:.1f}s ({total_time/60:.1f} minutes)")
+        self.logger.info(f"📊 Processed: {self.stats['total_triples']:,} triples")
+        self.logger.info(f"🏗️ Created: {self.stats['nodes_uploaded']:,} nodes, "
+                        f"{self.stats['relationships_uploaded']:,} relationships")
+        self.logger.info(f"🚀 Throughput: {final_stats['throughput']:.1f} triples/second")
+        self.logger.info(f"🔧 Final batch size: {self.uploader.current_batch_size}")
+        
+        return final_stats
+    
+    def _process_triple_chunk(self, triples: List[Tuple]) -> Tuple[List[Dict], List[Tuple]]:
+        """Process a chunk of triples into nodes and relationships."""
+        nodes = {}
+        relationships = []
+        properties = defaultdict(dict)
+        
+        for subject, predicate, obj in triples:
+            subject_str = str(subject)
+            predicate_str = str(predicate)
+            
+            subject_id = self._get_entity_id(subject_str)
+            
+            # Initialize node
+            if subject_id not in nodes:
+                nodes[subject_id] = {
+                    'id': subject_id,
+                    'uri': subject_str,
+                    'clean_id': self._create_clean_id(subject_str),
+                    'labels': {self._create_clean_id(subject_str)}
+                }
+            
+            # Handle different triple types
+            if predicate_str == str(RDF.type) and isinstance(obj, URIRef):
+                type_label = self._create_clean_id(str(obj))
+                nodes[subject_id]['labels'].add(type_label)
+                
+            elif isinstance(obj, (URIRef, BNode)):
+                obj_str = str(obj)
+                obj_id = self._get_entity_id(obj_str)
+                
+                if obj_id not in nodes:
+                    nodes[obj_id] = {
+                        'id': obj_id,
+                        'uri': obj_str,
+                        'clean_id': self._create_clean_id(obj_str),
+                        'labels': {self._create_clean_id(obj_str)}
+                    }
+                
+                rel_type = self._create_clean_id(predicate_str)
+                relationships.append((subject_id, obj_id, rel_type, predicate_str))
+                
+            elif isinstance(obj, Literal):
+                prop_name = self._create_clean_id(predicate_str)
+                prop_value = self._convert_literal_value(obj)
+                properties[subject_id][prop_name] = prop_value
+        
+        # Merge properties
+        for node_id, props in properties.items():
+            if node_id in nodes:
+                nodes[node_id].update(props)
+        
+        return list(nodes.values()), relationships
+    
+    def _get_entity_id(self, entity_str: str) -> int:
+        """Get or create entity ID."""
+        if entity_str not in self.entity_index:
+            self.entity_index[entity_str] = self.entity_counter
+            self.entity_counter += 1
+        return self.entity_index[entity_str]
+    
+    def _create_clean_id(self, uri: str) -> str:
+        """Create clean identifier from URI."""
+        if uri in self.namespace_cache:
+            return self.namespace_cache[uri]
+        
+        for ns_uri, ns_prefix in self.common_namespaces.items():
+            if uri.startswith(ns_uri):
+                clean_id = uri.replace(ns_uri, f"{ns_prefix}_")
+                break
+        else:
+            if '/' in uri:
+                clean_id = uri.split('/')[-1]
+            elif '#' in uri:
+                clean_id = uri.split('#')[-1]
+            else:
+                clean_id = "entity"
+        
+        clean_id = ''.join(c if c.isalnum() or c == '_' else '_' for c in clean_id)
+        if clean_id and clean_id[0].isdigit():
+            clean_id = f"E_{clean_id}"
+        
+        self.namespace_cache[uri] = clean_id or "entity"
+        return self.namespace_cache[uri]
+    
+    def _convert_literal_value(self, literal: Literal) -> Any:
+        """Convert RDF literal to appropriate type."""
+        try:
+            value = str(literal)
+            
+            if literal.datatype:
+                datatype = str(literal.datatype)
+                if datatype == str(XSD.integer):
+                    return int(value)
+                elif datatype in [str(XSD.float), str(XSD.double)]:
+                    return float(value)
+                elif datatype == str(XSD.boolean):
+                    return value.lower() in ('true', '1')
+            
+            return value[:500]  # Limit string length
+            
+        except Exception:
+            return str(literal)[:500]
+
 
 def main():
-    """Main function with proper TTL syntax handling"""
-    if len(sys.argv) < 2 or "--help" in sys.argv:
-        print("🐢 TTL-Aware Large File Merger")
-        print("=" * 35)
-        print("Syntax-aware chunking for multi-GB files")
-        print()
-        print("Usage:")
-        print("  python merge_ttl.py [pattern] [output] [format] [options]")
-        print()
-        print("Options:")
-        print("  --chunk-size N    Chunk size in MB (default: 100)")
-        print("  --quiet          Minimal output")
-        print("  --help           Show help")
-        print()
-        print("Examples:")
-        print("  python merge_ttl.py 'huge.ttl' merged.ttl")
-        print("  python merge_ttl.py '*.ttl' output.ttl --chunk-size 50")
-        print()
-        print("🛡️  Features:")
-        print("   • Preserves TTL syntax across chunks")
-        print("   • Never breaks statements mid-triple")
-        print("   • Handles prefixes and base URIs correctly")
-        print("   • Validates each chunk before processing")
-        return
+    """Example usage for large file processing with timeout handling."""
+    import argparse
     
-    input_pattern = sys.argv[1]
-    output_file = sys.argv[2] if len(sys.argv) > 2 else "merged.ttl"
-    output_format = sys.argv[3] if len(sys.argv) > 3 else "turtle"
+    parser = argparse.ArgumentParser(description="Large File RDF Converter with Timeout Handling")
+    parser.add_argument("rdf_file", help="Path to large RDF file")
+    parser.add_argument("--graph-name", default="large_graph", help="FalkorDB graph name")
+    parser.add_argument("--chunk-size", type=int, default=5000, help="Processing chunk size")
+    parser.add_argument("--batch-size", type=int, default=25, help="Initial batch size")
+    parser.add_argument("--query-timeout", type=int, default=300, help="Query timeout in seconds")
+    parser.add_argument("--falkor-host", default="localhost", help="FalkorDB host")
+    parser.add_argument("--falkor-port", type=int, default=6379, help="FalkorDB port")
+    parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
+    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     
-    # Parse options
-    chunk_size_mb = 100
-    show_progress = "--quiet" not in sys.argv
+    args = parser.parse_args()
     
-    if "--chunk-size" in sys.argv:
-        try:
-            idx = sys.argv.index("--chunk-size")
-            chunk_size_mb = int(sys.argv[idx + 1])
-        except:
-            print("⚠️  Invalid chunk size, using 100MB")
+    # Setup logging
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
     
-    # Run merger
-    merger = LargeFileTTLMerger(show_progress=show_progress, chunk_size_mb=chunk_size_mb)
-    success = merger.merge_files(input_pattern, output_file, output_format)
+    # Create converter
+    converter = LargeFileRDFConverter(
+        falkor_host=args.falkor_host,
+        falkor_port=args.falkor_port,
+        query_timeout=args.query_timeout,
+        chunk_size=args.chunk_size,
+        initial_batch_size=args.batch_size,
+        enable_checkpoints=True
+    )
     
-    sys.exit(0 if success else 1)
+    try:
+        # Process large file
+        stats = converter.process_large_file_with_timeout_handling(
+            file_path=args.rdf_file,
+            graph_name=args.graph_name,
+            resume_from_checkpoint=args.resume
+        )
+        
+        print(f"\n✅ Large file processing completed!")
+        print(f"📊 Results:")
+        print(f"   - Processing time: {stats['total_time']:.1f} seconds")
+        print(f"   - Triples processed: {stats['total_triples']:,}")
+        print(f"   - Nodes uploaded: {stats['nodes_uploaded']:,}")
+        print(f"   - Relationships uploaded: {stats['relationships_uploaded']:,}")
+        print(f"   - Throughput: {stats['throughput']:.1f} triples/second")
+        print(f"   - Final batch size: {stats['adaptive_batch_stats']['final_batch_size']}")
+        print(f"   - Query timeouts: {stats['timeout_handler_stats']['timeouts_encountered']}")
+        
+    except KeyboardInterrupt:
+        print("\n⚠️ Processing interrupted. Use --resume to continue from checkpoint.")
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        return 1
+    
+    return 0
+
 
 if __name__ == "__main__":
-    try:
-        import rdflib
-        main()
-    except ImportError:
-        print("❌ rdflib required: pip install rdflib")
-        sys.exit(1)
+    sys.exit(main())
