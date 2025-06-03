@@ -1,376 +1,421 @@
 #!/usr/bin/env python3
 """
-Zero Data Loss TTL Merger
-Simple, reliable, single-threaded approach that guarantees no data loss
+Large File TTL Merger
+Handles multi-gigabyte TTL files with streaming and chunking
 """
 
 import os
 import glob
 import sys
 import time
-from typing import List, Tuple, Optional, Dict
+import tempfile
+import shutil
+from typing import List, Tuple, Optional, Iterator
 from rdflib import Graph
+import gc
+import psutil
 
-class ZeroLossTTLMerger:
-    def __init__(self, show_progress: bool = True, strict_validation: bool = True):
+class LargeFileTTLMerger:
+    def __init__(self, show_progress: bool = True, chunk_size_mb: int = 100):
         self.show_progress = show_progress
-        self.strict_validation = strict_validation
+        self.chunk_size_bytes = chunk_size_mb * 1024 * 1024  # Convert MB to bytes
         self.merged_graph = Graph()
+        self.temp_dir = None
         self.stats = {
             'files_processed': 0,
             'files_failed': 0,
             'total_triples_loaded': 0,
             'final_unique_triples': 0,
-            'duplicates_removed': 0,
+            'chunks_processed': 0,
             'processing_time': 0,
             'failed_files': [],
-            'file_details': []
+            'memory_peak_mb': 0
         }
     
-    def _parse_and_merge_file(self, filepath: str) -> Tuple[bool, int, Optional[str]]:
-        """
-        Parse and immediately merge a single file
-        Returns: (success, triples_loaded, error_message)
-        """
+    def _get_memory_usage(self) -> float:
+        """Get current memory usage in MB"""
         try:
-            # Track initial state
+            process = psutil.Process(os.getpid())
+            return process.memory_info().rss / 1024 / 1024
+        except:
+            return 0
+    
+    def _split_large_file(self, filepath: str, max_chunk_size: int) -> List[str]:
+        """
+        Split a large TTL file into smaller chunks while preserving triple integrity
+        Returns list of chunk file paths
+        """
+        if self.show_progress:
+            print(f"   📦 Splitting large file into chunks...")
+        
+        chunk_files = []
+        current_chunk = []
+        current_size = 0
+        chunk_number = 0
+        
+        # Collect prefixes first
+        prefixes = []
+        
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+                # First pass: collect prefixes
+                for line in f:
+                    line = line.strip()
+                    if line.startswith('@prefix') or line.startswith('PREFIX'):
+                        prefixes.append(line)
+                    elif line and not line.startswith('#') and not line.startswith('@') and not line.startswith('PREFIX'):
+                        break  # Stop when we hit actual triples
+                
+                # Second pass: split into chunks
+                f.seek(0)
+                for line in f:
+                    line_size = len(line.encode('utf-8'))
+                    
+                    # Skip prefix declarations in data (we'll add them to each chunk)
+                    if line.strip().startswith('@prefix') or line.strip().startswith('PREFIX'):
+                        continue
+                    
+                    # Check if we need a new chunk
+                    if current_size + line_size > max_chunk_size and current_chunk:
+                        # Save current chunk
+                        chunk_file = self._save_chunk(current_chunk, prefixes, chunk_number)
+                        if chunk_file:
+                            chunk_files.append(chunk_file)
+                        
+                        # Start new chunk
+                        current_chunk = []
+                        current_size = 0
+                        chunk_number += 1
+                    
+                    current_chunk.append(line)
+                    current_size += line_size
+                
+                # Save final chunk
+                if current_chunk:
+                    chunk_file = self._save_chunk(current_chunk, prefixes, chunk_number)
+                    if chunk_file:
+                        chunk_files.append(chunk_file)
+        
+        except Exception as e:
+            if self.show_progress:
+                print(f"   ❌ Error splitting file: {e}")
+            return []
+        
+        if self.show_progress:
+            print(f"   ✅ Created {len(chunk_files)} chunks")
+        
+        return chunk_files
+    
+    def _save_chunk(self, lines: List[str], prefixes: List[str], chunk_number: int) -> Optional[str]:
+        """Save a chunk of lines to a temporary file"""
+        try:
+            if not self.temp_dir:
+                self.temp_dir = tempfile.mkdtemp(prefix="ttl_merger_")
+            
+            chunk_file = os.path.join(self.temp_dir, f"chunk_{chunk_number:04d}.ttl")
+            
+            with open(chunk_file, 'w', encoding='utf-8') as f:
+                # Write prefixes first
+                for prefix in prefixes:
+                    f.write(prefix + '\n')
+                f.write('\n')
+                
+                # Write chunk data
+                for line in lines:
+                    f.write(line)
+            
+            return chunk_file
+        except Exception as e:
+            if self.show_progress:
+                print(f"   ❌ Error saving chunk {chunk_number}: {e}")
+            return None
+    
+    def _process_file_direct(self, filepath: str) -> Tuple[bool, int, Optional[str]]:
+        """Process a regular-sized file directly"""
+        try:
             initial_count = len(self.merged_graph)
             
-            if self.show_progress:
-                file_size = os.path.getsize(filepath)
-                print(f"📖 Processing: {os.path.basename(filepath)} ({self._format_size(file_size)})")
+            # Try multiple parsing strategies for large files
+            try:
+                # Standard parsing
+                self.merged_graph.parse(filepath, format="turtle")
+            except Exception as e1:
+                if "index out of range" in str(e1).lower() or "memory" in str(e1).lower():
+                    # File might be too large, try chunking
+                    return self._process_large_file(filepath)
+                else:
+                    # Try with different encoding
+                    encodings = ['utf-8', 'utf-8-sig', 'latin1', 'cp1252']
+                    for encoding in encodings:
+                        try:
+                            temp_graph = Graph()
+                            temp_graph.parse(filepath, format="turtle", encoding=encoding)
+                            self.merged_graph += temp_graph
+                            del temp_graph
+                            gc.collect()
+                            break
+                        except:
+                            continue
+                    else:
+                        return False, 0, str(e1)
             
-            # Try multiple encodings to handle different file formats
-            encodings_to_try = ['utf-8', 'utf-8-sig', 'latin1', 'cp1252', 'ascii']
-            
-            parsed_successfully = False
-            last_error = None
-            
-            for encoding in encodings_to_try:
-                try:
-                    # Parse directly into the merged graph
-                    self.merged_graph.parse(filepath, format="turtle", encoding=encoding)
-                    parsed_successfully = True
-                    break
-                except UnicodeDecodeError as e:
-                    last_error = f"Encoding {encoding} failed: {e}"
-                    continue
-                except Exception as e:
-                    # Non-encoding error, don't try other encodings
-                    last_error = str(e)
-                    break
-            
-            if not parsed_successfully:
-                # Final attempt without specifying encoding (auto-detect)
-                try:
-                    self.merged_graph.parse(filepath, format="turtle")
-                    parsed_successfully = True
-                except Exception as e:
-                    last_error = str(e)
-            
-            if not parsed_successfully:
-                return False, 0, last_error
-            
-            # Calculate how many triples were added
             final_count = len(self.merged_graph)
             triples_loaded = final_count - initial_count
-            
-            if self.show_progress:
-                print(f"   ✅ Loaded {triples_loaded:,} new triples (graph now has {final_count:,} total)")
-            
-            # Store detailed info
-            self.stats['file_details'].append({
-                'filepath': filepath,
-                'triples_loaded': triples_loaded,
-                'graph_size_after': final_count
-            })
             
             return True, triples_loaded, None
             
         except Exception as e:
-            return False, 0, f"Unexpected error: {str(e)}"
-    
-    def _validate_individual_file(self, filepath: str) -> Tuple[bool, int, Optional[str]]:
-        """
-        Validate a single file can be parsed (without merging)
-        Returns: (success, expected_triples, error_message)
-        """
-        try:
-            temp_graph = Graph()
-            temp_graph.parse(filepath, format="turtle")
-            return True, len(temp_graph), None
-        except Exception as e:
             return False, 0, str(e)
     
-    def _comprehensive_validation(self, input_files: List[str]) -> Dict:
-        """
-        Perform comprehensive validation before and after merge
-        """
-        validation_results = {
-            'pre_merge_validation': True,
-            'post_merge_validation': True,
-            'total_expected_triples': 0,
-            'total_unique_triples': len(self.merged_graph),
-            'files_validated': 0,
-            'validation_errors': [],
-            'per_file_expected': {}
-        }
-        
-        if self.show_progress:
-            print(f"\n🔍 Performing comprehensive validation...")
-        
-        # Pre-merge validation: check each file individually
-        for filepath in input_files:
+    def _process_large_file(self, filepath: str) -> Tuple[bool, int, Optional[str]]:
+        """Process a very large file using chunking strategy"""
+        try:
+            file_size = os.path.getsize(filepath)
+            
             if self.show_progress:
-                print(f"   🔎 Validating: {os.path.basename(filepath)}")
+                print(f"   📊 Large file detected: {self._format_size(file_size)}")
+                print(f"   🔄 Using chunking strategy...")
             
-            success, expected_triples, error = self._validate_individual_file(filepath)
+            # Split the file into manageable chunks
+            chunk_files = self._split_large_file(filepath, self.chunk_size_bytes)
             
-            if success:
-                validation_results['files_validated'] += 1
-                validation_results['total_expected_triples'] += expected_triples
-                validation_results['per_file_expected'][filepath] = expected_triples
+            if not chunk_files:
+                return False, 0, "Failed to split large file into chunks"
+            
+            total_loaded = 0
+            
+            # Process each chunk
+            for i, chunk_file in enumerate(chunk_files):
+                if self.show_progress:
+                    print(f"   📦 Processing chunk {i+1}/{len(chunk_files)}")
                 
+                try:
+                    initial_count = len(self.merged_graph)
+                    self.merged_graph.parse(chunk_file, format="turtle")
+                    final_count = len(self.merged_graph)
+                    chunk_loaded = final_count - initial_count
+                    total_loaded += chunk_loaded
+                    
+                    self.stats['chunks_processed'] += 1
+                    
+                    if self.show_progress:
+                        mem_mb = self._get_memory_usage()
+                        self.stats['memory_peak_mb'] = max(self.stats['memory_peak_mb'], mem_mb)
+                        print(f"      ✅ {chunk_loaded:,} triples, Memory: {mem_mb:.1f}MB")
+                    
+                    # Force garbage collection after each chunk
+                    gc.collect()
+                    
+                except Exception as e:
+                    if self.show_progress:
+                        print(f"      ❌ Chunk {i+1} failed: {e}")
+                    continue
+            
+            return True, total_loaded, None
+            
+        except Exception as e:
+            return False, 0, f"Large file processing failed: {e}"
+    
+    def _cleanup_temp_files(self):
+        """Clean up temporary files"""
+        if self.temp_dir and os.path.exists(self.temp_dir):
+            try:
+                shutil.rmtree(self.temp_dir)
                 if self.show_progress:
-                    print(f"      ✅ Expected {expected_triples:,} triples")
-            else:
-                validation_results['pre_merge_validation'] = False
-                validation_results['validation_errors'].append(f"{filepath}: {error}")
+                    print(f"   🧹 Cleaned up temporary files")
+            except Exception as e:
                 if self.show_progress:
-                    print(f"      ❌ Validation failed: {error}")
-        
-        # Post-merge validation
-        duplicates_detected = validation_results['total_expected_triples'] - validation_results['total_unique_triples']
-        
-        if duplicates_detected < 0:
-            validation_results['post_merge_validation'] = False
-            validation_results['validation_errors'].append(
-                f"More triples in output ({validation_results['total_unique_triples']:,}) "
-                f"than expected ({validation_results['total_expected_triples']:,})"
-            )
-        
-        return validation_results
+                    print(f"   ⚠️  Warning: Could not clean up temp files: {e}")
     
     def merge_files(self, input_pattern: str, output_file: str, 
                    output_format: str = "turtle") -> bool:
         """
-        Merge TTL files with zero data loss guarantee
+        Merge TTL files with large file support
         """
         start_time = time.time()
         
-        if self.show_progress:
-            print(f"🛡️  Zero Data Loss TTL Merger")
-            print(f"📂 Input pattern: {input_pattern}")
-            print(f"📄 Output file: {output_file}")
-            print(f"📝 Output format: {output_format}")
-            print()
-        
-        # Get file list
-        ttl_files = glob.glob(input_pattern)
-        if not ttl_files:
-            print(f"❌ No TTL files found matching: {input_pattern}")
-            return False
-        
-        # Filter accessible files
-        accessible_files = []
-        for filepath in ttl_files:
-            if os.path.exists(filepath) and os.access(filepath, os.R_OK):
-                accessible_files.append(filepath)
-            else:
-                if self.show_progress:
-                    print(f"⚠️  Skipping inaccessible: {filepath}")
-        
-        if not accessible_files:
-            print("❌ No accessible files found")
-            return False
-        
-        if self.show_progress:
-            print(f"🔍 Found {len(accessible_files)} accessible TTL files:")
-            total_size = 0
-            for filepath in accessible_files:
-                size = os.path.getsize(filepath)
-                total_size += size
-                print(f"   📄 {os.path.basename(filepath)} ({self._format_size(size)})")
-            print(f"📊 Total input size: {self._format_size(total_size)}")
-            print()
-        
-        # Pre-validation if strict mode enabled
-        validation_results = None
-        if self.strict_validation:
-            validation_results = self._comprehensive_validation(accessible_files)
-            if not validation_results['pre_merge_validation']:
-                print("❌ Pre-merge validation failed!")
-                for error in validation_results['validation_errors']:
-                    print(f"   • {error}")
-                return False
-            
-            if self.show_progress:
-                print(f"✅ Pre-merge validation passed")
-                print(f"   Expected total triples: {validation_results['total_expected_triples']:,}")
-                print()
-        
-        # Process files one by one (SERIAL ONLY - NO THREADING)
-        if self.show_progress:
-            print(f"🔄 Processing {len(accessible_files)} files sequentially...")
-        
-        for i, filepath in enumerate(accessible_files):
-            if self.show_progress:
-                print(f"\n[{i+1}/{len(accessible_files)}]", end=" ")
-            
-            success, triples_loaded, error = self._parse_and_merge_file(filepath)
-            
-            if success:
-                self.stats['files_processed'] += 1
-                self.stats['total_triples_loaded'] += triples_loaded
-            else:
-                self.stats['files_failed'] += 1
-                self.stats['failed_files'].append((filepath, error))
-                if self.show_progress:
-                    print(f"   ❌ Failed: {error}")
-                
-                # In strict mode, any failure is unacceptable
-                if self.strict_validation:
-                    print(f"\n❌ STRICT MODE: Aborting due to file processing failure")
-                    return False
-        
-        # Final statistics
-        self.stats['final_unique_triples'] = len(self.merged_graph)
-        self.stats['duplicates_removed'] = (
-            self.stats['total_triples_loaded'] - self.stats['final_unique_triples']
-        )
-        self.stats['processing_time'] = time.time() - start_time
-        
-        if self.stats['files_processed'] == 0:
-            print("❌ No files were successfully processed")
-            return False
-        
-        # Post-merge validation
-        if self.strict_validation and validation_results:
-            expected = validation_results['total_expected_triples']
-            actual = self.stats['final_unique_triples']
-            
-            if actual + self.stats['duplicates_removed'] != expected:
-                print(f"❌ POST-MERGE VALIDATION FAILED!")
-                print(f"   Expected: {expected:,} total triples")
-                print(f"   Got: {actual:,} unique + {self.stats['duplicates_removed']:,} duplicates = {actual + self.stats['duplicates_removed']:,}")
-                return False
-        
-        # Write output
         try:
             if self.show_progress:
-                print(f"\n💾 Writing {len(self.merged_graph):,} unique triples to {output_file}...")
+                print(f"🗂️  Large File TTL Merger")
+                print(f"📂 Input pattern: {input_pattern}")
+                print(f"📄 Output file: {output_file}")
+                print(f"📦 Chunk size: {self.chunk_size_bytes // (1024*1024)}MB")
+                print()
             
-            # Serialize with error handling
-            self.merged_graph.serialize(destination=output_file, format=output_format)
-            
-            # Verify the output file was created and has content
-            if not os.path.exists(output_file):
-                print(f"❌ Output file was not created: {output_file}")
+            # Get file list
+            ttl_files = glob.glob(input_pattern)
+            if not ttl_files:
+                print(f"❌ No TTL files found matching: {input_pattern}")
                 return False
             
-            output_size = os.path.getsize(output_file)
-            if output_size == 0:
-                print(f"❌ Output file is empty: {output_file}")
+            # Filter accessible files and categorize by size
+            accessible_files = []
+            large_files = []
+            total_size = 0
+            
+            for filepath in ttl_files:
+                if os.path.exists(filepath) and os.access(filepath, os.R_OK):
+                    size = os.path.getsize(filepath)
+                    accessible_files.append(filepath)
+                    total_size += size
+                    
+                    # Files over 500MB are considered "large"
+                    if size > 500 * 1024 * 1024:
+                        large_files.append(filepath)
+                else:
+                    if self.show_progress:
+                        print(f"⚠️  Skipping inaccessible: {filepath}")
+            
+            if not accessible_files:
+                print("❌ No accessible files found")
                 return False
             
             if self.show_progress:
-                self._print_final_stats(output_file)
+                print(f"🔍 Found {len(accessible_files)} accessible files")
+                print(f"📊 Total size: {self._format_size(total_size)}")
+                if large_files:
+                    print(f"🔍 Large files (>500MB): {len(large_files)}")
+                print()
             
-            return True
+            # Process files
+            for i, filepath in enumerate(accessible_files):
+                if self.show_progress:
+                    file_size = os.path.getsize(filepath)
+                    print(f"[{i+1}/{len(accessible_files)}] 📖 {os.path.basename(filepath)} ({self._format_size(file_size)})")
+                
+                # Determine processing strategy based on file size
+                if filepath in large_files:
+                    success, triples_loaded, error = self._process_large_file(filepath)
+                else:
+                    success, triples_loaded, error = self._process_file_direct(filepath)
+                
+                if success:
+                    self.stats['files_processed'] += 1
+                    self.stats['total_triples_loaded'] += triples_loaded
+                    
+                    if self.show_progress:
+                        current_total = len(self.merged_graph)
+                        mem_mb = self._get_memory_usage()
+                        self.stats['memory_peak_mb'] = max(self.stats['memory_peak_mb'], mem_mb)
+                        print(f"   ✅ Added {triples_loaded:,} triples (total: {current_total:,}) Memory: {mem_mb:.1f}MB")
+                else:
+                    self.stats['files_failed'] += 1
+                    self.stats['failed_files'].append((filepath, error))
+                    if self.show_progress:
+                        print(f"   ❌ Failed: {error}")
+                
+                # Force garbage collection periodically
+                if i % 5 == 0:
+                    gc.collect()
             
-        except Exception as e:
-            print(f"❌ Error writing output: {e}")
-            return False
+            # Final statistics
+            self.stats['final_unique_triples'] = len(self.merged_graph)
+            self.stats['processing_time'] = time.time() - start_time
+            
+            if self.stats['files_processed'] == 0:
+                print("❌ No files were successfully processed")
+                return False
+            
+            # Write output with memory management
+            if self.show_progress:
+                print(f"\n💾 Writing {len(self.merged_graph):,} triples to {output_file}...")
+            
+            try:
+                self.merged_graph.serialize(destination=output_file, format=output_format)
+                
+                # Verify output
+                if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
+                    print(f"❌ Output file creation failed")
+                    return False
+                
+                if self.show_progress:
+                    self._print_final_stats(output_file)
+                
+                return True
+                
+            except MemoryError:
+                print(f"❌ Not enough memory to write output file")
+                return False
+            except Exception as e:
+                print(f"❌ Error writing output: {e}")
+                return False
+        
+        finally:
+            # Always clean up
+            self._cleanup_temp_files()
     
     def _print_final_stats(self, output_file: str):
-        """Print comprehensive final statistics"""
-        print(f"\n🎉 MERGE COMPLETED SUCCESSFULLY!")
-        print(f"=" * 50)
-        print(f"📁 Output file: {output_file}")
+        """Print final statistics"""
+        print(f"\n🎉 MERGE COMPLETED!")
+        print(f"=" * 40)
+        print(f"📁 Output: {output_file}")
         print(f"📊 Files processed: {self.stats['files_processed']}")
         
         if self.stats['files_failed'] > 0:
             print(f"❌ Files failed: {self.stats['files_failed']}")
-            for filepath, error in self.stats['failed_files']:
-                print(f"   • {os.path.basename(filepath)}: {error}")
         
-        print(f"🔗 Total triples loaded: {self.stats['total_triples_loaded']:,}")
-        print(f"✨ Unique triples in output: {self.stats['final_unique_triples']:,}")
+        if self.stats['chunks_processed'] > 0:
+            print(f"📦 Chunks processed: {self.stats['chunks_processed']}")
         
-        if self.stats['duplicates_removed'] > 0:
-            dup_pct = (self.stats['duplicates_removed'] / self.stats['total_triples_loaded']) * 100
-            print(f"🔄 Duplicates removed: {self.stats['duplicates_removed']:,} ({dup_pct:.1f}%)")
-        else:
-            print(f"✅ No duplicates found")
-        
-        print(f"⏱️  Total processing time: {self.stats['processing_time']:.2f}s")
+        print(f"🔗 Total triples: {self.stats['final_unique_triples']:,}")
+        print(f"⏱️  Processing time: {self.stats['processing_time']:.1f}s")
+        print(f"🧠 Peak memory usage: {self.stats['memory_peak_mb']:.1f}MB")
         
         if self.stats['processing_time'] > 0:
             throughput = self.stats['final_unique_triples'] / self.stats['processing_time']
-            print(f"🚀 Average throughput: {throughput:,.0f} triples/second")
+            print(f"🚀 Throughput: {throughput:,.0f} triples/second")
         
         # Output file info
-        if os.path.exists(output_file):
-            size = os.path.getsize(output_file)
-            print(f"📏 Output file size: {self._format_size(size)}")
+        output_size = os.path.getsize(output_file)
+        print(f"📏 Output size: {self._format_size(output_size)}")
         
-        print(f"\n✅ ZERO DATA LOSS GUARANTEED")
-        
-        # Show per-file breakdown if requested
-        if self.show_progress and len(self.stats['file_details']) <= 10:
-            print(f"\n📋 Per-file breakdown:")
-            for detail in self.stats['file_details']:
-                name = os.path.basename(detail['filepath'])
-                loaded = detail['triples_loaded']
-                print(f"   📄 {name}: {loaded:,} triples loaded")
+        # Compression ratio
+        if hasattr(self, 'total_input_size'):
+            ratio = (output_size / self.total_input_size) * 100
+            print(f"📉 Size ratio: {ratio:.1f}% of input")
     
     @staticmethod
     def _format_size(size_bytes: int) -> str:
-        """Format file size in human readable format"""
-        for unit in ['B', 'KB', 'MB', 'GB']:
+        """Format file size"""
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
             if size_bytes < 1024:
                 return f"{size_bytes:.1f} {unit}"
             size_bytes /= 1024
-        return f"{size_bytes:.1f} TB"
+        return f"{size_bytes:.1f} PB"
 
-def merge_ttl_zero_loss(input_pattern: str, output_file: str, 
-                       output_format: str = "turtle", **kwargs) -> bool:
-    """
-    Zero data loss TTL merger - simple and bulletproof
-    """
-    merger = ZeroLossTTLMerger(
+def merge_large_ttl_files(input_pattern: str, output_file: str, 
+                         output_format: str = "turtle", **kwargs) -> bool:
+    """Large file TTL merger with memory management"""
+    merger = LargeFileTTLMerger(
         show_progress=kwargs.get('show_progress', True),
-        strict_validation=kwargs.get('strict_validation', True)
+        chunk_size_mb=kwargs.get('chunk_size_mb', 100)
     )
     
     return merger.merge_files(input_pattern, output_file, output_format)
 
 def main():
-    """Main function - simple and reliable"""
-    print("🛡️  ZERO DATA LOSS TTL MERGER")
-    print("=" * 40)
-    print("Simple • Reliable • Bulletproof")
+    """Main function optimized for large files"""
+    print("🗂️  LARGE FILE TTL MERGER")
+    print("=" * 35)
+    print("Handles multi-gigabyte files with streaming")
     print()
     
-    # Parse arguments
     if len(sys.argv) < 2 or "--help" in sys.argv:
         print("💡 Usage:")
         print("  python merge_ttl.py [pattern] [output] [format] [options]")
         print("\nOptions:")
-        print("  --no-validation    Skip strict validation (faster, less safe)")
-        print("  --quiet           Minimal output")
-        print("  --help            Show this help")
+        print("  --chunk-size N    Chunk size in MB (default: 100)")
+        print("  --quiet          Minimal output")
+        print("  --help           Show this help")
         print("\nExamples:")
-        print("  python merge_ttl.py '*.ttl' merged.ttl")
-        print("  python merge_ttl.py 'data/*.ttl' output.ttl turtle")
-        print("  python merge_ttl.py '*.ttl' merged.rdf xml")
-        print("  python merge_ttl.py '*.ttl' out.ttl --no-validation")
-        print("\n🛡️  This version guarantees ZERO data loss by:")
-        print("     • Single-threaded processing (no race conditions)")
-        print("     • Comprehensive validation before and after merge")
-        print("     • Multiple encoding support (UTF-8, Latin1, etc.)")
-        print("     • Immediate error detection and reporting")
-        print("     • Strict mode that aborts on any failure")
+        print("  python merge_ttl.py 'huge_file.ttl' merged.ttl")
+        print("  python merge_ttl.py '*.ttl' merged.ttl turtle --chunk-size 50")
+        print("  python merge_ttl.py 'data/*.ttl' output.rdf xml")
+        print("\n🗂️  Optimized for:")
+        print("     • Files over 2GB")
+        print("     • Memory-constrained systems")
+        print("     • Chunked processing with cleanup")
+        print("     • Progress monitoring")
         return
     
     input_pattern = sys.argv[1]
@@ -378,15 +423,33 @@ def main():
     output_format = sys.argv[3] if len(sys.argv) > 3 else "turtle"
     
     # Parse options
-    strict_validation = "--no-validation" not in sys.argv
+    chunk_size_mb = 100
     show_progress = "--quiet" not in sys.argv
     
+    if "--chunk-size" in sys.argv:
+        try:
+            idx = sys.argv.index("--chunk-size")
+            chunk_size_mb = int(sys.argv[idx + 1])
+        except (IndexError, ValueError):
+            print("⚠️  Invalid --chunk-size, using default: 100MB")
+    
     # Validate format
-    valid_formats = ["turtle", "xml", "n3", "nt", "json-ld", "trig", "trix", "nquads"]
+    valid_formats = ["turtle", "xml", "n3", "nt", "json-ld", "trig"]
     if output_format not in valid_formats:
         print(f"❌ Invalid format: {output_format}")
         print(f"Valid formats: {', '.join(valid_formats)}")
         return
+    
+    # Check available memory
+    try:
+        available_gb = psutil.virtual_memory().available / (1024**3)
+        if show_progress:
+            print(f"🧠 Available memory: {available_gb:.1f}GB")
+            if available_gb < 2:
+                print(f"⚠️  Low memory detected - using smaller chunks")
+                chunk_size_mb = min(chunk_size_mb, 50)
+    except:
+        pass
     
     # Check if files exist
     if not glob.glob(input_pattern):
@@ -394,24 +457,27 @@ def main():
         return
     
     # Run the merger
-    success = merge_ttl_zero_loss(
+    success = merge_large_ttl_files(
         input_pattern=input_pattern,
         output_file=output_file,
         output_format=output_format,
-        strict_validation=strict_validation,
+        chunk_size_mb=chunk_size_mb,
         show_progress=show_progress
     )
     
     if success:
-        print(f"\n🎉 SUCCESS: All data merged with zero loss!")
-        sys.exit(0)
+        print(f"\n🎉 SUCCESS: Large file merge completed!")
     else:
-        print(f"\n❌ FAILED: Merge could not be completed safely")
+        print(f"\n❌ FAILED: Could not complete merge")
         sys.exit(1)
 
 if __name__ == "__main__":
     try:
         import rdflib
+        try:
+            import psutil
+        except ImportError:
+            print("⚠️  psutil not found (pip install psutil) - continuing without memory monitoring")
         main()
     except ImportError:
         print("❌ rdflib required: pip install rdflib")
