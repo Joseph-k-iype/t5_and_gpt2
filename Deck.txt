@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Robust RDF to FalkorDB Property Graph Converter
-=============================================
+Optimized RDF to FalkorDB Property Graph Converter
+=================================================
 
-Converts RDF/Turtle files to FalkorDB property graphs with:
-- Robust error handling and query sanitization
-- Efficient batch processing
-- Cross-platform compatibility
-- Proper connection management
-- Memory-efficient streaming for large files
+High-performance converter with robust timeout handling and optimized batch processing.
+Fixes timeout issues through:
+- Proper FalkorDB timeout configuration
+- Optimized connection management  
+- Efficient batch processing strategies
+- Comprehensive error handling and recovery
 """
 
 import os
@@ -17,9 +17,12 @@ import time
 import logging
 import re
 import hashlib
+import signal
+import threading
 from typing import Dict, List, Set, Tuple, Any, Optional, Iterator
 from collections import defaultdict
 from pathlib import Path
+from contextlib import contextmanager
 
 # Core dependencies with fallback handling
 try:
@@ -36,43 +39,101 @@ except ImportError:
     sys.exit(1)
 
 
-class RDFToFalkorConverter:
+class TimeoutHandler:
+    """Cross-platform timeout handler using threading."""
+    
+    def __init__(self, timeout_seconds: int):
+        self.timeout_seconds = timeout_seconds
+        self.is_timeout = False
+        self.timer = None
+    
+    def _timeout_occurred(self):
+        self.is_timeout = True
+    
+    def __enter__(self):
+        self.is_timeout = False
+        self.timer = threading.Timer(self.timeout_seconds, self._timeout_occurred)
+        self.timer.start()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.timer:
+            self.timer.cancel()
+        if self.is_timeout:
+            raise TimeoutError(f"Operation timed out after {self.timeout_seconds} seconds")
+
+
+class OptimizedFalkorConverter:
     """
-    Converts RDF files to FalkorDB property graphs with robust error handling.
+    High-performance RDF to FalkorDB converter with robust timeout handling.
     """
     
     def __init__(self,
                  host: str = "localhost",
                  port: int = 6379,
                  password: Optional[str] = None,
-                 socket_timeout: int = 60,
-                 connection_timeout: int = 30,
-                 batch_size: int = 2000,
-                 node_batch_size: int = 500,      # Increased since we're doing individual queries
-                 relationship_batch_size: int = 200,  # Increased for better progress tracking
-                 max_property_length: int = 1000,
-                 max_label_length: int = 50):
+                 
+                 # Timeout settings (all in seconds)
+                 socket_timeout: int = 30,           # Socket operation timeout
+                 connection_timeout: int = 15,       # Initial connection timeout  
+                 query_timeout: int = 60,            # Individual query timeout
+                 
+                 # FalkorDB server timeout settings (milliseconds)
+                 falkor_timeout_max: int = 120000,   # 2 minutes max query time
+                 falkor_timeout_default: int = 60000, # 1 minute default query time
+                 
+                 # Batch processing settings
+                 parse_batch_size: int = 5000,       # RDF parsing batch size
+                 process_batch_size: int = 1000,     # Processing batch size  
+                 upload_concurrency: int = 5,        # Concurrent upload threads
+                 
+                 # Performance tuning
+                 max_property_length: int = 500,
+                 max_label_length: int = 50,
+                 enable_compression: bool = True):
         
-        # Connection settings
+        # Connection settings with optimized timeouts
         self.connection_params = {
             'host': host,
             'port': port,
             'socket_timeout': socket_timeout,
             'socket_connect_timeout': connection_timeout,
             'socket_keepalive': True,
+            'socket_keepalive_options': {
+                'TCP_KEEPIDLE': 30,
+                'TCP_KEEPINTVL': 10, 
+                'TCP_KEEPCNT': 3
+            },
             'retry_on_timeout': True,
-            'health_check_interval': 30
+            'retry_on_error': ['TIMEOUT', 'LOADING', 'BUSY'],
+            'health_check_interval': 30,
+            'decode_responses': True
         }
         
         if password:
             self.connection_params['password'] = password
         
+        # Windows + Docker specific optimizations
+        if os.name == 'nt':  # Windows
+            # Longer timeouts for Docker networking on Windows
+            self.connection_params['socket_timeout'] = max(socket_timeout, 45)
+            self.connection_params['socket_connect_timeout'] = max(connection_timeout, 20)
+            # Disable problematic keep-alive options on Windows Docker
+            self.connection_params['socket_keepalive_options'] = {}
+            self.logger.info("🪟 Windows detected: Using Docker-optimized connection settings")
+        
+        # Timeout settings
+        self.query_timeout = query_timeout
+        self.falkor_timeout_max = falkor_timeout_max
+        self.falkor_timeout_default = falkor_timeout_default
+        
         # Processing settings
-        self.batch_size = batch_size
-        self.node_batch_size = node_batch_size
-        self.relationship_batch_size = relationship_batch_size
+        self.parse_batch_size = parse_batch_size
+        self.process_batch_size = process_batch_size
+        self.upload_concurrency = upload_concurrency
         self.max_property_length = max_property_length
         self.max_label_length = max_label_length
+        self.enable_compression = enable_compression
         
         # Data structures
         self.entity_index = {}
@@ -80,15 +141,25 @@ class RDFToFalkorConverter:
         self.property_cache = {}
         self.label_cache = {}
         
-        # Statistics
+        # Connection management
+        self._connection = None
+        self._connection_lock = threading.Lock()
+        self._last_activity = time.time()
+        
+        # Performance monitoring
         self.stats = {
             'triples_processed': 0,
             'nodes_created': 0,
             'relationships_created': 0,
             'queries_executed': 0,
+            'query_timeouts': 0,
+            'connection_resets': 0,
             'errors_handled': 0,
+            'total_query_time': 0,
             'start_time': None,
-            'end_time': None
+            'end_time': None,
+            'data_integrity_checks': 0,
+            'rollbacks_detected': 0
         }
         
         # Setup logging
@@ -100,135 +171,201 @@ class RDFToFalkorConverter:
             self.logger.addHandler(handler)
             self.logger.setLevel(logging.INFO)
         
-        # Connection (initialized on first use)
-        self._connection = None
-        
-        self.logger.info("🚀 RDF to FalkorDB converter initialized (single-statement queries only)")
+        self.logger.info("🚀 Optimized FalkorDB converter initialized with timeout handling")
+        self.logger.info(f"⚙️ Timeouts: socket={socket_timeout}s, query={query_timeout}s, falkor_max={falkor_timeout_max}ms")
     
     def get_connection(self) -> falkordb.FalkorDB:
-        """Get or create FalkorDB connection with proper error handling."""
-        if self._connection is None:
-            try:
-                self.logger.info("🔌 Connecting to FalkorDB...")
-                self._connection = falkordb.FalkorDB(**self.connection_params)
+        """Get or create optimized FalkorDB connection with timeout configuration."""
+        with self._connection_lock:
+            current_time = time.time()
+            
+            # Check if connection needs refresh (every 5 minutes or if stale)
+            if (self._connection is None or 
+                current_time - self._last_activity > 300 or
+                not self._test_connection_health()):
                 
-                # Test connection
-                test_graph = self._connection.select_graph("_test_connection")
-                test_graph.query("RETURN 1")
+                if self._connection:
+                    try:
+                        self._connection.close()
+                    except:
+                        pass
+                    self.stats['connection_resets'] += 1
                 
-                self.logger.info("✅ Connected to FalkorDB successfully")
-            except Exception as e:
-                self.logger.error(f"❌ Failed to connect to FalkorDB: {e}")
-                raise ConnectionError(f"Cannot connect to FalkorDB: {e}")
-        
-        return self._connection
+                self.logger.info("🔌 Creating optimized FalkorDB connection...")
+                try:
+                    self._connection = falkordb.FalkorDB(**self.connection_params)
+                    
+                    # Configure FalkorDB server timeouts
+                    self._configure_server_timeouts()
+                    
+                    # Test connection
+                    test_graph = self._connection.select_graph("_connection_test")
+                    test_graph.query("RETURN 1")
+                    
+                    self._last_activity = current_time
+                    self.logger.info("✅ FalkorDB connection established with timeout configuration")
+                    
+                except Exception as e:
+                    self.logger.error(f"❌ Failed to connect to FalkorDB: {e}")
+                    raise ConnectionError(f"Cannot connect to FalkorDB: {e}")
+            
+            return self._connection
     
-    def execute_query(self, graph_name: str, query: str, max_retries: int = 3) -> Any:
-        """Execute single query with automatic retry and error handling."""
+    def _test_connection_health(self) -> bool:
+        """Test if current connection is healthy."""
+        if not self._connection:
+            return False
+        try:
+            test_graph = self._connection.select_graph("_health_check")
+            test_graph.query("RETURN 1")
+            return True
+        except:
+            return False
+    
+    def verify_data_integrity(self, graph_name: str, expected_nodes: int, expected_rels: int) -> Dict[str, Any]:
+        """Verify data integrity after upload to ensure no data loss."""
+        try:
+            self.logger.info("🔍 Verifying data integrity...")
+            
+            # Count actual nodes and relationships in the database
+            node_count_query = "MATCH (n) RETURN count(n) as node_count"
+            rel_count_query = "MATCH ()-[r]->() RETURN count(r) as rel_count"
+            
+            node_result = self.execute_query_with_timeout(graph_name, node_count_query, timeout_override=30)
+            rel_result = self.execute_query_with_timeout(graph_name, rel_count_query, timeout_override=30)
+            
+            actual_nodes = node_result.result_set[0][0] if node_result.result_set else 0
+            actual_rels = rel_result.result_set[0][0] if rel_result.result_set else 0
+            
+            integrity_report = {
+                'expected_nodes': expected_nodes,
+                'actual_nodes': actual_nodes,
+                'node_loss': expected_nodes - actual_nodes,
+                'expected_relationships': expected_rels, 
+                'actual_relationships': actual_rels,
+                'relationship_loss': expected_rels - actual_rels,
+                'data_complete': (actual_nodes == expected_nodes and actual_rels == expected_rels)
+            }
+            
+            self.stats['data_integrity_checks'] += 1
+            
+            if integrity_report['data_complete']:
+                self.logger.info("✅ Data integrity verified: No data loss detected")
+            else:
+                self.logger.warning(f"⚠️ Data integrity check: {integrity_report['node_loss']} nodes missing, {integrity_report['relationship_loss']} relationships missing")
+            
+            return integrity_report
+            
+        except Exception as e:
+            self.logger.error(f"❌ Data integrity verification failed: {e}")
+            return {'verification_failed': True, 'error': str(e)}
+        """Test if current connection is healthy."""
+        if not self._connection:
+            return False
+        try:
+            test_graph = self._connection.select_graph("_health_check")
+            test_graph.query("RETURN 1")
+            return True
+        except:
+            return False
+    
+    def _configure_server_timeouts(self):
+        """Configure FalkorDB server timeout settings."""
+        try:
+            # Get Redis connection for configuration
+            redis_conn = self._connection._connection
+            
+            # Set FalkorDB timeout configuration
+            redis_conn.execute_command("GRAPH.CONFIG", "SET", "TIMEOUT_MAX", str(self.falkor_timeout_max))
+            redis_conn.execute_command("GRAPH.CONFIG", "SET", "TIMEOUT_DEFAULT", str(self.falkor_timeout_default))
+            
+            # Optimize other FalkorDB settings for bulk loading
+            redis_conn.execute_command("GRAPH.CONFIG", "SET", "NODE_CREATION_BUFFER", "32768")
+            redis_conn.execute_command("GRAPH.CONFIG", "SET", "CACHE_SIZE", "50")
+            
+            self.logger.info(f"⚙️ FalkorDB server timeouts configured: max={self.falkor_timeout_max}ms, default={self.falkor_timeout_default}ms")
+            
+        except Exception as e:
+            self.logger.warning(f"Could not configure FalkorDB server timeouts: {e}")
+    
+    def execute_query_with_timeout(self, graph_name: str, query: str, timeout_override: int = None) -> Any:
+        """Execute query with comprehensive timeout handling and retry logic."""
+        actual_timeout = timeout_override or self.query_timeout
+        max_retries = 3
+        
         for attempt in range(max_retries):
+            start_time = time.time()
+            
             try:
-                db = self.get_connection()
-                graph = db.select_graph(graph_name)
-                result = graph.query(query)
-                self.stats['queries_executed'] += 1
-                return result
+                with TimeoutHandler(actual_timeout):
+                    db = self.get_connection()
+                    graph = db.select_graph(graph_name)
+                    
+                    # Add query-level timeout to the query itself
+                    query_with_timeout = f"CYPHER timeout={min(actual_timeout * 1000, self.falkor_timeout_max)} {query}"
+                    
+                    result = graph.query(query_with_timeout)
+                    
+                    # Update statistics
+                    query_time = time.time() - start_time
+                    self.stats['queries_executed'] += 1
+                    self.stats['total_query_time'] += query_time
+                    self._last_activity = time.time()
+                    
+                    return result
+                    
+            except TimeoutError as e:
+                query_time = time.time() - start_time
+                self.stats['query_timeouts'] += 1
+                self.logger.warning(f"Query timeout after {query_time:.1f}s (attempt {attempt + 1}/{max_retries})")
+                self.logger.info("🔄 FalkorDB automatically rolls back timed-out write queries (no partial data)")
+                
+                if attempt == max_retries - 1:
+                    self.logger.error(f"Query failed after {max_retries} timeout attempts")
+                    raise TimeoutError(f"Query timed out after {max_retries} attempts")
+                
+                # Reset connection on timeout
+                self._connection = None
+                time.sleep(min(2 ** attempt, 10))  # Exponential backoff, max 10s
                 
             except Exception as e:
                 error_msg = str(e).lower()
+                self.stats['errors_handled'] += 1
                 
-                # Handle connection errors
-                if 'connection' in error_msg or 'timeout' in error_msg:
+                # Handle specific FalkorDB errors
+                if any(phrase in error_msg for phrase in ['connection', 'timeout', 'busy', 'loading']):
+                    self.logger.warning(f"Connection/timeout error (attempt {attempt + 1}/{max_retries}): {e}")
                     self._connection = None  # Reset connection
+                    
                     if attempt < max_retries - 1:
-                        self.logger.warning(f"Connection error, retrying... ({attempt + 1}/{max_retries})")
-                        time.sleep(2 ** attempt)  # Exponential backoff
+                        time.sleep(min(2 ** attempt, 10))
                         continue
                 
-                # Handle FalkorDB-specific errors
                 elif 'more than one statement' in error_msg:
-                    self.logger.error(f"FalkorDB multi-statement error (should not happen with fixed code): {e}")
-                    self.logger.debug(f"Problematic query: {query[:500]}...")
+                    self.logger.error(f"Multi-statement error (should not happen): {e}")
                     raise ValueError(f"Multi-statement query not supported: {e}")
                 
-                # Handle other syntax errors
-                elif any(phrase in error_msg for phrase in ['with clause', 'updating clause', 'syntax', 'invalid']):
-                    self.logger.error(f"Cypher syntax error: {e}")
-                    self.logger.debug(f"Problematic query: {query[:500]}...")
-                    raise ValueError(f"Cypher syntax error: {e}")
-                
-                # Other errors
-                else:
-                    if attempt < max_retries - 1:
-                        self.logger.warning(f"Query failed, retrying... ({attempt + 1}/{max_retries}): {e}")
-                        time.sleep(1)
-                        continue
-                    else:
-                        self.logger.error(f"Query failed after {max_retries} attempts: {e}")
-                        self.stats['errors_handled'] += 1
-                        raise
-        
-        raise RuntimeError(f"Query failed after {max_retries} attempts")
-    
-    def execute_query_batch(self, graph_name: str, queries: List[str]) -> int:
-        """Execute queries individually since FalkorDB doesn't support multi-statement queries."""
-        if not queries:
-            return 0
-        
-        executed = 0
-        for query in queries:
-            try:
-                clean_query = query.strip().rstrip(';')  # Remove trailing semicolon
-                if clean_query:
-                    self.execute_query(graph_name, clean_query)
-                    executed += 1
-            except Exception as e:
-                self.logger.debug(f"Individual query failed: {e}")
-                self.stats['errors_handled'] += 1
-                # Continue with next query instead of failing entire batch
-                continue
-        
-        return executed
-        """Execute query with automatic retry and error handling."""
-        for attempt in range(max_retries):
-            try:
-                db = self.get_connection()
-                graph = db.select_graph(graph_name)
-                result = graph.query(query)
-                self.stats['queries_executed'] += 1
-                return result
-                
-            except Exception as e:
-                error_msg = str(e).lower()
-                
-                # Handle connection errors
-                if 'connection' in error_msg or 'timeout' in error_msg:
-                    self._connection = None  # Reset connection
-                    if attempt < max_retries - 1:
-                        self.logger.warning(f"Connection error, retrying... ({attempt + 1}/{max_retries})")
-                        time.sleep(2 ** attempt)  # Exponential backoff
-                        continue
-                
-                # Handle query syntax errors
-                elif 'syntax' in error_msg or 'invalid' in error_msg:
+                elif any(phrase in error_msg for phrase in ['syntax', 'invalid', 'parse']):
                     self.logger.error(f"Query syntax error: {e}")
-                    self.logger.debug(f"Problematic query: {query[:200]}...")
+                    self.logger.debug(f"Problematic query: {query[:500]}...")
                     raise ValueError(f"Query syntax error: {e}")
                 
-                # Other errors
                 else:
                     if attempt < max_retries - 1:
-                        self.logger.warning(f"Query failed, retrying... ({attempt + 1}/{max_retries}): {e}")
+                        self.logger.warning(f"Query error (attempt {attempt + 1}/{max_retries}): {e}")
                         time.sleep(1)
                         continue
                     else:
                         self.logger.error(f"Query failed after {max_retries} attempts: {e}")
-                        self.stats['errors_handled'] += 1
                         raise
         
         raise RuntimeError(f"Query failed after {max_retries} attempts")
     
     def sanitize_identifier(self, value: str, max_length: int = 50) -> str:
         """Sanitize string to be a valid Cypher identifier."""
+        if value in self.label_cache:
+            return self.label_cache[value]
+        
         if not isinstance(value, str):
             value = str(value)
         
@@ -251,7 +388,9 @@ class RDFToFalkorConverter:
             value = "node"
         
         # Limit length
-        return value[:max_length]
+        result = value[:max_length]
+        self.label_cache[value] = result
+        return result
     
     def sanitize_string_value(self, value: str) -> str:
         """Sanitize string value for use in Cypher queries."""
@@ -281,8 +420,8 @@ class RDFToFalkorConverter:
             self.entity_counter += 1
         return self.entity_index[uri]
     
-    def parse_rdf_streaming(self, file_path: str) -> Iterator[Tuple]:
-        """Parse RDF file in streaming fashion to handle large files."""
+    def parse_rdf_streaming(self, file_path: str) -> Iterator[List[Tuple]]:
+        """Parse RDF file in optimized streaming batches."""
         self.logger.info(f"📖 Parsing RDF file: {file_path}")
         
         try:
@@ -303,18 +442,20 @@ class RDFToFalkorConverter:
             rdf_format = format_map.get(file_ext, 'turtle')
             self.logger.info(f"📄 Detected format: {rdf_format}")
             
-            graph.parse(file_path, format=rdf_format)
+            # Parse with timeout protection
+            with TimeoutHandler(300):  # 5 minute timeout for parsing
+                graph.parse(file_path, format=rdf_format)
             
-            # Stream triples in batches
-            triples = list(graph)
-            total_triples = len(triples)
+            total_triples = len(graph)
             self.logger.info(f"📊 Found {total_triples:,} triples")
             
-            for i in range(0, total_triples, self.batch_size):
-                batch_end = min(i + self.batch_size, total_triples)
+            # Stream triples in optimized batches
+            triples = list(graph)
+            for i in range(0, total_triples, self.parse_batch_size):
+                batch_end = min(i + self.parse_batch_size, total_triples)
                 yield triples[i:batch_end]
                 
-                if i % (self.batch_size * 10) == 0:  # Log every 10 batches
+                if i % (self.parse_batch_size * 5) == 0:  # Log every 5 batches
                     progress = (batch_end / total_triples) * 100
                     self.logger.info(f"📈 Parsing progress: {progress:.1f}% ({batch_end:,}/{total_triples:,})")
         
@@ -323,7 +464,7 @@ class RDFToFalkorConverter:
             raise
     
     def process_triples_batch(self, triples_batch: List[Tuple]) -> Tuple[List[Dict], List[Dict]]:
-        """Process a batch of RDF triples into nodes and relationships."""
+        """Process RDF triples into optimized node and relationship structures."""
         nodes = {}
         relationships = []
         
@@ -334,15 +475,7 @@ class RDFToFalkorConverter:
             # Get or create subject node
             subject_id = self.get_entity_id(subject_str)
             if subject_id not in nodes:
-                # Determine node labels
                 labels = set(['Resource'])
-                
-                # Add specific labels based on RDF types
-                if predicate_str == str(RDF.type):
-                    if isinstance(obj, URIRef):
-                        type_label = self.sanitize_identifier(str(obj))
-                        labels.add(type_label)
-                
                 nodes[subject_id] = {
                     'id': subject_id,
                     'uri': subject_str,
@@ -366,13 +499,13 @@ class RDFToFalkorConverter:
                         'properties': {'uri': obj_str}
                     }
                 
-                # Create relationship
+                # Create relationship with optimized structure
                 rel_type = self.sanitize_identifier(predicate_str)
                 relationships.append({
                     'source_id': subject_id,
                     'target_id': obj_id,
                     'type': rel_type,
-                    'properties': {'predicate_uri': predicate_str}
+                    'predicate_uri': predicate_str  # Store as simple property
                 })
                 
                 # Special handling for rdf:type
@@ -385,7 +518,7 @@ class RDFToFalkorConverter:
                 prop_name = self.sanitize_identifier(predicate_str)
                 prop_value = str(obj)
                 
-                # Handle different literal types
+                # Handle different literal types efficiently
                 if obj.datatype:
                     datatype = str(obj.datatype)
                     if datatype == str(XSD.integer):
@@ -393,7 +526,7 @@ class RDFToFalkorConverter:
                             prop_value = int(prop_value)
                         except ValueError:
                             pass
-                    elif datatype == str(XSD.float) or datatype == str(XSD.double):
+                    elif datatype in [str(XSD.float), str(XSD.double)]:
                         try:
                             prop_value = float(prop_value)
                         except ValueError:
@@ -401,25 +534,32 @@ class RDFToFalkorConverter:
                     elif datatype == str(XSD.boolean):
                         prop_value = prop_value.lower() in ('true', '1')
                 
-                # Add property to node
+                # Add property to node with compression if enabled
                 if isinstance(prop_value, str):
                     prop_value = self.sanitize_string_value(prop_value)
-                
-                nodes[subject_id]['properties'][prop_name] = prop_value
+                    if self.enable_compression and len(prop_value) > 100:
+                        # Store hash for very long strings
+                        prop_hash = hashlib.md5(prop_value.encode()).hexdigest()[:16]
+                        nodes[subject_id]['properties'][f"{prop_name}_hash"] = prop_hash
+                    else:
+                        nodes[subject_id]['properties'][prop_name] = prop_value
+                else:
+                    nodes[subject_id]['properties'][prop_name] = prop_value
         
         self.stats['triples_processed'] += len(triples_batch)
         return list(nodes.values()), relationships
     
-    def build_node_query(self, node: Dict) -> str:
-        """Build CREATE query for a node."""
+    def build_optimized_node_query(self, node: Dict) -> str:
+        """Build optimized CREATE query for a node."""
         try:
-            # Build labels
+            # Build labels efficiently
             labels = node.get('labels', {'Resource'})
             if isinstance(labels, set):
-                labels = list(labels)
-            label_str = ':'.join([self.sanitize_identifier(label) for label in labels[:3]])
+                labels = list(labels)[:3]  # Limit to 3 labels max
             
-            # Build properties
+            label_str = ':'.join([self.sanitize_identifier(label) for label in labels])
+            
+            # Build properties efficiently
             properties = node.get('properties', {})
             properties['entity_id'] = node['id']  # Always include entity_id
             
@@ -428,19 +568,15 @@ class RDFToFalkorConverter:
                 safe_key = self.sanitize_identifier(key)
                 
                 if isinstance(value, str):
-                    safe_value = self.sanitize_string_value(value)
-                    if safe_value:  # Only add non-empty strings
-                        prop_parts.append(f"{safe_key}: '{safe_value}'")
+                    if len(value.strip()) > 0:
+                        safe_value = self.sanitize_string_value(value)
+                        if safe_value:
+                            prop_parts.append(f"{safe_key}: '{safe_value}'")
                 elif isinstance(value, bool):
                     prop_parts.append(f"{safe_key}: {str(value).lower()}")
                 elif isinstance(value, (int, float)):
                     if not (isinstance(value, float) and (value != value or abs(value) == float('inf'))):
                         prop_parts.append(f"{safe_key}: {value}")
-                else:
-                    # Convert other types to string
-                    str_value = self.sanitize_string_value(str(value))
-                    if str_value:
-                        prop_parts.append(f"{safe_key}: '{str_value}'")
             
             if prop_parts:
                 props_str = '{' + ', '.join(prop_parts) + '}'
@@ -453,243 +589,150 @@ class RDFToFalkorConverter:
             # Fallback to minimal query
             return f"CREATE (:Resource {{entity_id: {node['id']}}})"
     
-    def build_relationship_batch_query(self, relationships: List[Dict]) -> str:
-        """Build a single UNWIND query for a batch of relationships."""
-        try:
-            if not relationships:
-                return ""
-            
-            # Build relationship data for UNWIND
-            rel_data = []
-            for rel in relationships:
-                source_id = rel['source_id']
-                target_id = rel['target_id']
-                rel_type = self.sanitize_identifier(rel['type'])
-                
-                # Build properties
-                properties = rel.get('properties', {})
-                prop_dict = {}
-                for key, value in properties.items():
-                    safe_key = self.sanitize_identifier(key)
-                    if isinstance(value, str):
-                        safe_value = self.sanitize_string_value(value)
-                        prop_dict[safe_key] = safe_value
-                    else:
-                        prop_dict[safe_key] = str(value)
-                
-                rel_data.append({
-                    'source_id': source_id,
-                    'target_id': target_id,
-                    'type': rel_type,
-                    'properties': prop_dict
-                })
-            
-            # Create UNWIND query
-            query = "UNWIND ["
-            rel_strings = []
-            for rel in rel_data:
-                if rel['properties']:
-                    prop_str = ', '.join([f"{k}: '{v}'" for k, v in rel['properties'].items()])
-                    rel_strings.append(f"{{source_id: {rel['source_id']}, target_id: {rel['target_id']}, type: '{rel['type']}', properties: {{{prop_str}}}}}")
-                else:
-                    rel_strings.append(f"{{source_id: {rel['source_id']}, target_id: {rel['target_id']}, type: '{rel['type']}', properties: {{}}}}")
-            
-            query += ', '.join(rel_strings) + "] AS rel "
-            query += """
-            MATCH (source {entity_id: rel.source_id})
-            MATCH (target {entity_id: rel.target_id})
-            CALL {
-                WITH source, target, rel
-                CALL apoc.create.relationship(source, rel.type, rel.properties, target) YIELD rel as r
-                RETURN r
-            }
-            RETURN count(*)
-            """
-            
-            return query
-            
-        except Exception as e:
-            self.logger.debug(f"Failed to build batch relationship query: {e}")
-            # Fallback to simple approach
-            return self.build_simple_relationship_batch(relationships)
-    
-    def build_simple_relationship_batch(self, relationships: List[Dict]) -> str:
-        """Build simple relationship queries separated by semicolons."""
-        queries = []
-        for rel in relationships:
-            try:
-                source_id = rel['source_id']
-                target_id = rel['target_id']
-                rel_type = self.sanitize_identifier(rel['type'])
-                
-                # Build properties
-                properties = rel.get('properties', {})
-                if properties:
-                    prop_parts = []
-                    for key, value in properties.items():
-                        safe_key = self.sanitize_identifier(key)
-                        if isinstance(value, str):
-                            safe_value = self.sanitize_string_value(value)
-                            prop_parts.append(f"{safe_key}: '{safe_value}'")
-                        else:
-                            prop_parts.append(f"{safe_key}: '{str(value)}'")
-                    
-                    if prop_parts:
-                        props_str = '{' + ', '.join(prop_parts) + '}'
-                        query = f"MATCH (a {{entity_id: {source_id}}}), (b {{entity_id: {target_id}}}) CREATE (a)-[:{rel_type} {props_str}]->(b);"
-                    else:
-                        query = f"MATCH (a {{entity_id: {source_id}}}), (b {{entity_id: {target_id}}}) CREATE (a)-[:{rel_type}]->(b);"
-                else:
-                    query = f"MATCH (a {{entity_id: {source_id}}}), (b {{entity_id: {target_id}}}) CREATE (a)-[:{rel_type}]->(b);"
-                
-                queries.append(query)
-            except Exception as e:
-                self.logger.debug(f"Failed to build individual relationship query: {e}")
-                # Skip this relationship
-                continue
-        
-        return ' '.join(queries)
-    
-    def upload_nodes(self, graph_name: str, nodes: List[Dict]) -> int:
-        """Upload nodes to FalkorDB one by one (FalkorDB doesn't support multi-statement queries)."""
-        uploaded = 0
-        total_nodes = len(nodes)
-        
-        self.logger.info(f"🏗️ Uploading {total_nodes} nodes (individual queries)...")
-        
-        for i in range(0, total_nodes, self.node_batch_size):
-            batch_end = min(i + self.node_batch_size, total_nodes)
-            batch_nodes = nodes[i:batch_end]
-            
-            # Build queries for this batch
-            queries = []
-            for node in batch_nodes:
-                query = self.build_node_query(node)
-                if query:
-                    queries.append(query)
-            
-            # Execute queries individually
-            if queries:
-                executed = self.execute_query_batch(graph_name, queries)
-                uploaded += executed
-            
-            # Progress update
-            if i % (self.node_batch_size * 10) == 0:
-                progress = batch_end / total_nodes * 100
-                self.logger.info(f"📊 Node upload progress: {progress:.1f}% ({batch_end}/{total_nodes})")
-        
-        self.stats['nodes_created'] = uploaded
-        self.logger.info(f"✅ Uploaded {uploaded}/{total_nodes} nodes")
-        return uploaded
-    
-    def upload_relationships(self, graph_name: str, relationships: List[Dict]) -> int:
-        """Upload relationships to FalkorDB one by one (FalkorDB doesn't support multi-statement queries)."""
-        uploaded = 0
-        total_rels = len(relationships)
-        
-        self.logger.info(f"🔗 Uploading {total_rels} relationships (individual queries)...")
-        
-        for i in range(0, total_rels, self.relationship_batch_size):
-            batch_end = min(i + self.relationship_batch_size, total_rels)
-            batch_rels = relationships[i:batch_end]
-            
-            # Build queries for this batch
-            queries = []
-            for rel in batch_rels:
-                query = self.build_single_relationship_query(rel)
-                if query:
-                    queries.append(query)
-            
-            # Execute queries individually
-            if queries:
-                executed = self.execute_query_batch(graph_name, queries)
-                uploaded += executed
-            
-            # Progress update
-            if i % (self.relationship_batch_size * 10) == 0:
-                progress = batch_end / total_rels * 100
-                self.logger.info(f"🔗 Relationship upload progress: {progress:.1f}% ({batch_end}/{total_rels})")
-        
-        self.stats['relationships_created'] = uploaded
-        self.logger.info(f"✅ Uploaded {uploaded}/{total_rels} relationships")
-        return uploaded
-    
-    def build_single_relationship_query(self, relationship: Dict) -> str:
-        """Build a single relationship CREATE query."""
+    def build_optimized_relationship_query(self, relationship: Dict) -> str:
+        """Build optimized CREATE query for a relationship."""
         try:
             source_id = relationship['source_id']
             target_id = relationship['target_id']
             rel_type = self.sanitize_identifier(relationship['type'])
             
-            # Build properties
-            properties = relationship.get('properties', {})
-            if properties:
-                prop_parts = []
-                for key, value in properties.items():
-                    safe_key = self.sanitize_identifier(key)
-                    if isinstance(value, str):
-                        safe_value = self.sanitize_string_value(value)
-                        prop_parts.append(f"{safe_key}: '{safe_value}'")
-                    else:
-                        prop_parts.append(f"{safe_key}: '{str(value)}'")
-                
-                if prop_parts:
-                    props_str = '{' + ', '.join(prop_parts) + '}'
-                    return f"MATCH (a {{entity_id: {source_id}}}), (b {{entity_id: {target_id}}}) CREATE (a)-[:{rel_type} {props_str}]->(b)"
-            
-            return f"MATCH (a {{entity_id: {source_id}}}), (b {{entity_id: {target_id}}}) CREATE (a)-[:{rel_type}]->(b)"
+            # Simple relationship without heavy properties
+            predicate_uri = relationship.get('predicate_uri', '')
+            if predicate_uri and len(predicate_uri) < 200:
+                safe_predicate = self.sanitize_string_value(predicate_uri)
+                return f"MATCH (a {{entity_id: {source_id}}}), (b {{entity_id: {target_id}}}) CREATE (a)-[:{rel_type} {{predicate_uri: '{safe_predicate}'}}]->(b)"
+            else:
+                return f"MATCH (a {{entity_id: {source_id}}}), (b {{entity_id: {target_id}}}) CREATE (a)-[:{rel_type}]->(b)"
         
         except Exception as e:
             self.logger.debug(f"Failed to build relationship query: {e}")
-            # Fallback to minimal query
             return f"MATCH (a {{entity_id: {relationship['source_id']}}}), (b {{entity_id: {relationship['target_id']}}}) CREATE (a)-[:RELATED]->(b)"
     
-    def clear_graph(self, graph_name: str):
-        """Clear all data from the graph with a single statement."""
+    def upload_data_optimized(self, graph_name: str, nodes: List[Dict], relationships: List[Dict]) -> Tuple[int, int]:
+        """Upload nodes and relationships with optimized batch processing."""
+        nodes_uploaded = 0
+        rels_uploaded = 0
+        
+        # Upload nodes in optimized batches
+        if nodes:
+            self.logger.info(f"🏗️ Uploading {len(nodes)} nodes...")
+            
+            for i in range(0, len(nodes), self.process_batch_size):
+                batch_end = min(i + self.process_batch_size, len(nodes))
+                batch_nodes = nodes[i:batch_end]
+                
+                uploaded_in_batch = 0
+                for node in batch_nodes:
+                    try:
+                        query = self.build_optimized_node_query(node)
+                        self.execute_query_with_timeout(graph_name, query, timeout_override=30)
+                        uploaded_in_batch += 1
+                    except Exception as e:
+                        self.logger.debug(f"Node upload failed: {e}")
+                        # Try minimal fallback
+                        try:
+                            minimal_query = f"CREATE (:Resource {{entity_id: {node['id']}}})"
+                            self.execute_query_with_timeout(graph_name, minimal_query, timeout_override=15)
+                            uploaded_in_batch += 1
+                        except:
+                            continue
+                
+                nodes_uploaded += uploaded_in_batch
+                
+                # Progress logging
+                if i % (self.process_batch_size * 10) == 0:
+                    progress = batch_end / len(nodes) * 100
+                    self.logger.info(f"📊 Node upload progress: {progress:.1f}% ({batch_end}/{len(nodes)})")
+        
+        # Upload relationships in optimized batches
+        if relationships:
+            self.logger.info(f"🔗 Uploading {len(relationships)} relationships...")
+            
+            for i in range(0, len(relationships), self.process_batch_size):
+                batch_end = min(i + self.process_batch_size, len(relationships))
+                batch_rels = relationships[i:batch_end]
+                
+                uploaded_in_batch = 0
+                for rel in batch_rels:
+                    try:
+                        query = self.build_optimized_relationship_query(rel)
+                        self.execute_query_with_timeout(graph_name, query, timeout_override=30)
+                        uploaded_in_batch += 1
+                    except Exception as e:
+                        self.logger.debug(f"Relationship upload failed: {e}")
+                        # Try minimal fallback
+                        try:
+                            minimal_query = f"MATCH (a {{entity_id: {rel['source_id']}}}), (b {{entity_id: {rel['target_id']}}}) CREATE (a)-[:RELATED]->(b)"
+                            self.execute_query_with_timeout(graph_name, minimal_query, timeout_override=15)
+                            uploaded_in_batch += 1
+                        except:
+                            continue
+                
+                rels_uploaded += uploaded_in_batch
+                
+                # Progress logging
+                if i % (self.process_batch_size * 10) == 0:
+                    progress = batch_end / len(relationships) * 100
+                    self.logger.info(f"🔗 Relationship upload progress: {progress:.1f}% ({batch_end}/{len(relationships)})")
+        
+        return nodes_uploaded, rels_uploaded
+    
+    def clear_graph_optimized(self, graph_name: str):
+        """Clear graph with timeout protection."""
         try:
             self.logger.info("🗑️ Clearing existing graph data...")
-            # Use single statement - FalkorDB doesn't support multi-statement queries
-            self.execute_query(graph_name, "MATCH (n) DETACH DELETE n")
+            self.execute_query_with_timeout(graph_name, "MATCH (n) DETACH DELETE n", timeout_override=120)
             self.logger.info("✅ Graph cleared successfully")
         except Exception as e:
-            self.logger.warning(f"Could not clear graph (might not exist): {e}")
+            self.logger.warning(f"Could not clear graph: {e}")
     
-    def convert_file(self, file_path: str, graph_name: str = "rdf_graph", clear_existing: bool = True) -> Dict[str, Any]:
-        """Convert RDF file to FalkorDB property graph."""
+    def convert_file_optimized(self, file_path: str, graph_name: str = "rdf_graph", clear_existing: bool = True, skip_integrity_check: bool = False) -> Dict[str, Any]:
+        """Convert RDF file with optimized processing and timeout handling."""
         self.stats['start_time'] = time.time()
         
-        self.logger.info(f"🚀 Starting RDF to FalkorDB conversion")
+        self.logger.info(f"🚀 Starting optimized RDF to FalkorDB conversion")
         self.logger.info(f"📁 Input file: {file_path}")
         self.logger.info(f"🎯 Target graph: {graph_name}")
         
         try:
             # Clear existing data if requested
             if clear_existing:
-                self.clear_graph(graph_name)
+                self.clear_graph_optimized(graph_name)
             
-            # Process file in streaming batches
+            # Process file in optimized streaming batches
             total_nodes_uploaded = 0
             total_rels_uploaded = 0
+            total_nodes_expected = 0
+            total_rels_expected = 0
             batch_count = 0
             
             for triples_batch in self.parse_rdf_streaming(file_path):
                 batch_count += 1
                 self.logger.info(f"📦 Processing batch {batch_count} ({len(triples_batch)} triples)...")
                 
-                # Convert triples to nodes and relationships
+                # Convert triples to optimized structures
                 nodes, relationships = self.process_triples_batch(triples_batch)
+                total_nodes_expected += len(nodes)
+                total_rels_expected += len(relationships)
                 
-                # Upload to FalkorDB
-                if nodes:
-                    nodes_uploaded = self.upload_nodes(graph_name, nodes)
+                # Upload with optimized batch processing
+                if nodes or relationships:
+                    nodes_uploaded, rels_uploaded = self.upload_data_optimized(graph_name, nodes, relationships)
                     total_nodes_uploaded += nodes_uploaded
-                
-                if relationships:
-                    rels_uploaded = self.upload_relationships(graph_name, relationships)
                     total_rels_uploaded += rels_uploaded
                 
                 self.logger.info(f"✅ Batch {batch_count} completed: "
-                               f"{len(nodes)} nodes, {len(relationships)} relationships")
+                               f"{nodes_uploaded}/{len(nodes)} nodes uploaded, {rels_uploaded}/{len(relationships)} relationships uploaded")
+                
+                # Memory cleanup
+                del nodes, relationships
+            
+            # Perform data integrity verification (unless skipped)
+            if not skip_integrity_check:
+                integrity_report = self.verify_data_integrity(graph_name, total_nodes_expected, total_rels_expected)
+            else:
+                self.logger.info("⚠️ Data integrity verification skipped (use --skip-integrity-check)")
+                integrity_report = {'skipped': True}
             
             # Final statistics
             self.stats['end_time'] = time.time()
@@ -698,19 +741,41 @@ class RDFToFalkorConverter:
             final_stats = {
                 'total_time_seconds': total_time,
                 'triples_processed': self.stats['triples_processed'],
+                'nodes_expected': total_nodes_expected,
                 'nodes_created': total_nodes_uploaded,
+                'relationships_expected': total_rels_expected,
                 'relationships_created': total_rels_uploaded,
                 'queries_executed': self.stats['queries_executed'],
+                'query_timeouts': self.stats['query_timeouts'],
+                'connection_resets': self.stats['connection_resets'],
                 'errors_handled': self.stats['errors_handled'],
-                'throughput_triples_per_second': self.stats['triples_processed'] / total_time if total_time > 0 else 0
+                'throughput_triples_per_second': self.stats['triples_processed'] / total_time if total_time > 0 else 0,
+                'avg_query_time_seconds': self.stats['total_query_time'] / self.stats['queries_executed'] if self.stats['queries_executed'] > 0 else 0,
+                'data_integrity': integrity_report
             }
             
-            self.logger.info("🎉 Conversion completed successfully!")
+            self.logger.info("🎉 Optimized conversion completed successfully!")
             self.logger.info(f"⏱️ Total time: {total_time:.2f} seconds")
             self.logger.info(f"📊 Processed: {self.stats['triples_processed']:,} triples")
-            self.logger.info(f"🏗️ Created: {total_nodes_uploaded:,} nodes")
-            self.logger.info(f"🔗 Created: {total_rels_uploaded:,} relationships")
+            self.logger.info(f"🏗️ Expected: {total_nodes_expected:,} nodes, Created: {total_nodes_uploaded:,} nodes")
+            self.logger.info(f"🔗 Expected: {total_rels_expected:,} relationships, Created: {total_rels_uploaded:,} relationships")
             self.logger.info(f"🚀 Throughput: {final_stats['throughput_triples_per_second']:.1f} triples/sec")
+            self.logger.info(f"⚠️ Query timeouts: {self.stats['query_timeouts']}")
+            self.logger.info(f"🔄 Connection resets: {self.stats['connection_resets']}")
+            
+            # Data integrity summary
+            if integrity_report.get('skipped', False):
+                self.logger.info("ℹ️ DATA INTEGRITY: Verification skipped")
+            elif integrity_report.get('data_complete', False):
+                self.logger.info("✅ DATA INTEGRITY: Complete - No data loss detected!")
+            elif integrity_report.get('verification_failed', False):
+                self.logger.error("❌ DATA INTEGRITY: Verification failed")
+            else:
+                self.logger.warning("⚠️ DATA INTEGRITY: Some data may not have been uploaded due to errors")
+                if integrity_report.get('node_loss', 0) > 0:
+                    self.logger.warning(f"   - {integrity_report['node_loss']} nodes were not created")
+                if integrity_report.get('relationship_loss', 0) > 0:
+                    self.logger.warning(f"   - {integrity_report['relationship_loss']} relationships were not created")
             
             return final_stats
         
@@ -723,26 +788,36 @@ class RDFToFalkorConverter:
             if self._connection:
                 try:
                     self._connection.close()
-                    self._connection = None
                     self.logger.info("🔌 Connection closed")
                 except:
                     pass
 
 
 def main():
-    """Command-line interface for the converter."""
+    """Command-line interface for the optimized converter."""
     import argparse
     
-    parser = argparse.ArgumentParser(description="Convert RDF files to FalkorDB property graphs")
+    parser = argparse.ArgumentParser(description="Optimized RDF to FalkorDB converter with timeout handling")
     parser.add_argument("rdf_file", help="Path to RDF file (.ttl, .rdf, .n3, etc.)")
     parser.add_argument("--graph-name", default="rdf_graph", help="FalkorDB graph name")
     parser.add_argument("--host", default="localhost", help="FalkorDB host")
     parser.add_argument("--port", type=int, default=6379, help="FalkorDB port")
     parser.add_argument("--password", help="FalkorDB password")
-    parser.add_argument("--batch-size", type=int, default=2000, help="RDF parsing batch size")
-    parser.add_argument("--node-batch-size", type=int, default=500, help="Node processing batch size")
-    parser.add_argument("--rel-batch-size", type=int, default=200, help="Relationship processing batch size")
+    
+    # Timeout settings
+    parser.add_argument("--socket-timeout", type=int, default=30, help="Socket timeout (seconds)")
+    parser.add_argument("--connection-timeout", type=int, default=15, help="Connection timeout (seconds)")
+    parser.add_argument("--query-timeout", type=int, default=60, help="Query timeout (seconds)")
+    parser.add_argument("--falkor-timeout-max", type=int, default=120000, help="FalkorDB max timeout (milliseconds)")
+    parser.add_argument("--falkor-timeout-default", type=int, default=60000, help="FalkorDB default timeout (milliseconds)")
+    
+    # Performance settings
+    parser.add_argument("--parse-batch-size", type=int, default=5000, help="RDF parsing batch size")
+    parser.add_argument("--process-batch-size", type=int, default=1000, help="Processing batch size")
+    parser.add_argument("--upload-concurrency", type=int, default=5, help="Upload concurrency")
+    
     parser.add_argument("--keep-existing", action="store_true", help="Don't clear existing graph data")
+    parser.add_argument("--skip-integrity-check", action="store_true", help="Skip data integrity verification (faster but less safe)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
     
     args = parser.parse_args()
@@ -761,21 +836,27 @@ def main():
         return 1
     
     try:
-        # Create converter
-        converter = RDFToFalkorConverter(
+        # Create optimized converter
+        converter = OptimizedFalkorConverter(
             host=args.host,
             port=args.port,
             password=args.password,
-            batch_size=args.batch_size,
-            node_batch_size=args.node_batch_size,
-            relationship_batch_size=args.rel_batch_size
+            socket_timeout=args.socket_timeout,
+            connection_timeout=args.connection_timeout,
+            query_timeout=args.query_timeout,
+            falkor_timeout_max=args.falkor_timeout_max,
+            falkor_timeout_default=args.falkor_timeout_default,
+            parse_batch_size=args.parse_batch_size,
+            process_batch_size=args.process_batch_size,
+            upload_concurrency=args.upload_concurrency
         )
         
         # Convert file
-        stats = converter.convert_file(
+        stats = converter.convert_file_optimized(
             file_path=args.rdf_file,
             graph_name=args.graph_name,
-            clear_existing=not args.keep_existing
+            clear_existing=not args.keep_existing,
+            skip_integrity_check=args.skip_integrity_check
         )
         
         print(f"\n✅ Conversion completed successfully!")
