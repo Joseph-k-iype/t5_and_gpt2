@@ -24,12 +24,40 @@ logger = logging.getLogger(__name__)
 class TTLToFalkorDB:
     def __init__(self, redis_host='localhost', redis_port=6379, db_name='knowledge_graph', password=None):
         """Initialize the converter with FalkorDB connection"""
+        # Set longer timeouts for large operations
+        socket_timeout = 300  # 5 minutes
+        socket_connect_timeout = 30  # 30 seconds
+        
         if password:
-            self.redis_client = redis.Redis(host=redis_host, port=redis_port, password=password, decode_responses=True)
-            self.db = falkordb.FalkorDB(host=redis_host, port=redis_port, password=password).select_graph(db_name)
+            self.redis_client = redis.Redis(
+                host=redis_host, 
+                port=redis_port, 
+                password=password, 
+                decode_responses=True,
+                socket_timeout=socket_timeout,
+                socket_connect_timeout=socket_connect_timeout,
+                retry_on_timeout=True,
+                health_check_interval=30
+            )
+            self.db = falkordb.FalkorDB(
+                host=redis_host, 
+                port=redis_port, 
+                password=password
+            ).select_graph(db_name)
         else:
-            self.redis_client = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
-            self.db = falkordb.FalkorDB(host=redis_host, port=redis_port).select_graph(db_name)
+            self.redis_client = redis.Redis(
+                host=redis_host, 
+                port=redis_port, 
+                decode_responses=True,
+                socket_timeout=socket_timeout,
+                socket_connect_timeout=socket_connect_timeout,
+                retry_on_timeout=True,
+                health_check_interval=30
+            )
+            self.db = falkordb.FalkorDB(
+                host=redis_host, 
+                port=redis_port
+            ).select_graph(db_name)
         self.batch_size = 1000
         self.node_cache = set()
         self.edge_cache = set()
@@ -229,70 +257,100 @@ class TTLToFalkorDB:
         
         return "{" + ", ".join(prop_parts) + "}"
     
+    def execute_query_with_retry(self, query, max_retries=3, delay=1):
+        """Execute query with retry logic for timeout handling"""
+        for attempt in range(max_retries):
+            try:
+                result = self.db.query(query)
+                return result
+            except (redis.exceptions.TimeoutError, redis.exceptions.ConnectionError) as e:
+                logger.warning(f"Query timeout/connection error (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(delay * (attempt + 1))  # Exponential backoff
+                    # Try to reconnect
+                    try:
+                        self.redis_client.ping()
+                    except:
+                        logger.warning("Reconnecting to FalkorDB...")
+                        time.sleep(2)
+                else:
+                    logger.error(f"Query failed after {max_retries} attempts: {query[:100]}...")
+                    raise
+            except Exception as e:
+                logger.error(f"Unexpected error in query: {e}")
+                logger.error(f"Query: {query[:200]}...")
+                raise
+    
     def ingest_nodes_batch(self, nodes: List[Dict], batch_start: int, batch_end: int):
-        """Ingest a batch of nodes into FalkorDB"""
+        """Ingest a batch of nodes into FalkorDB with timeout handling"""
         batch_nodes = nodes[batch_start:batch_end]
         
         if not batch_nodes:
             return
         
-        # Create MERGE statements for nodes to avoid duplicates
-        cypher_parts = []
-        for node in batch_nodes:
-            node_id = node['id']
-            node_type = node['type']
-            properties_str = self.create_cypher_properties(node['properties'])
-            
-            cypher_parts.append(f"MERGE (n{node_id}:Node:{node_type} {{id: '{node_id}'}}) SET n{node_id} += {properties_str}")
+        # Use smaller sub-batches to prevent timeouts
+        sub_batch_size = min(50, len(batch_nodes))  # Process max 50 nodes at once
         
-        # Execute batch
-        try:
-            for cypher in cypher_parts:
-                self.db.query(cypher)
-        except Exception as e:
-            logger.error(f"Error in batch nodes ingestion: {e}")
-            # Try individual inserts
-            for i, cypher in enumerate(cypher_parts):
+        for i in range(0, len(batch_nodes), sub_batch_size):
+            sub_batch = batch_nodes[i:i + sub_batch_size]
+            
+            # Create individual MERGE statements to avoid complex batch operations
+            for node in sub_batch:
                 try:
-                    self.db.query(cypher)
-                except Exception as inner_e:
-                    logger.error(f"Error inserting node {batch_start + i}: {inner_e}")
+                    node_id = node['id']
+                    node_type = node['type']
+                    properties_str = self.create_cypher_properties(node['properties'])
+                    
+                    # Use simpler query structure
+                    cypher = f"MERGE (n:Node:{node_type} {{id: '{node_id}'}}) SET n += {properties_str}"
+                    
+                    self.execute_query_with_retry(cypher)
+                    
+                except Exception as e:
+                    logger.error(f"Error inserting node {node_id}: {e}")
+                    # Continue with next node instead of failing completely
+                    continue
+            
+            # Small delay between sub-batches
+            time.sleep(0.05)
     
     def ingest_edges_batch(self, edges: List[Dict], batch_start: int, batch_end: int):
-        """Ingest a batch of edges into FalkorDB"""
+        """Ingest a batch of edges into FalkorDB with timeout handling"""
         batch_edges = edges[batch_start:batch_end]
         
         if not batch_edges:
             return
         
-        # Create MATCH and MERGE statements for edges
-        cypher_parts = []
-        for edge in batch_edges:
-            from_id = edge['from']
-            to_id = edge['to']
-            relationship = edge['relationship']
-            properties_str = self.create_cypher_properties(edge['properties'])
-            
-            cypher = f"""
-            MATCH (from:Node {{id: '{from_id}'}})
-            MATCH (to:Node {{id: '{to_id}'}})
-            MERGE (from)-[r:{relationship}]->(to)
-            SET r += {properties_str}
-            """
-            cypher_parts.append(cypher.strip())
+        # Use smaller sub-batches for edges too
+        sub_batch_size = min(25, len(batch_edges))  # Even smaller for edges
         
-        # Execute batch
-        try:
-            for cypher in cypher_parts:
-                self.db.query(cypher)
-        except Exception as e:
-            logger.error(f"Error in batch edges ingestion: {e}")
-            # Try individual inserts
-            for i, cypher in enumerate(cypher_parts):
+        for i in range(0, len(batch_edges), sub_batch_size):
+            sub_batch = batch_edges[i:i + sub_batch_size]
+            
+            for edge in sub_batch:
                 try:
-                    self.db.query(cypher)
-                except Exception as inner_e:
-                    logger.error(f"Error inserting edge {batch_start + i}: {inner_e}")
+                    from_id = edge['from']
+                    to_id = edge['to']
+                    relationship = edge['relationship']
+                    properties_str = self.create_cypher_properties(edge['properties'])
+                    
+                    # Simplified edge creation query
+                    cypher = f"""
+                    MATCH (from:Node {{id: '{from_id}'}})
+                    MATCH (to:Node {{id: '{to_id}'}})
+                    MERGE (from)-[r:{relationship}]->(to)
+                    SET r += {properties_str}
+                    """
+                    
+                    self.execute_query_with_retry(cypher.strip())
+                    
+                except Exception as e:
+                    logger.error(f"Error inserting edge {from_id}->{to_id}: {e}")
+                    # Continue with next edge
+                    continue
+            
+            # Small delay between sub-batches
+            time.sleep(0.05)
     
     def ingest_to_falkordb(self, nodes: List[Dict], edges: List[Dict]):
         """Ingest nodes and edges into FalkorDB with batching"""
@@ -373,14 +431,22 @@ def main():
     if batch_size == 0:
         file_size_mb = os.path.getsize(args.ttl_file) / (1024 * 1024)
         if file_size_mb > 1000:  # >1GB
-            batch_size = 200
+            batch_size = 50  # Much smaller for very large files
             logger.info(f"Large file detected ({file_size_mb:.1f}MB), using batch_size={batch_size}")
         elif file_size_mb > 100:  # >100MB
-            batch_size = 500
+            batch_size = 100  # Smaller for medium files
             logger.info(f"Medium file detected ({file_size_mb:.1f}MB), using batch_size={batch_size}")
         else:
-            batch_size = 1000
+            batch_size = 200  # Conservative for small files
             logger.info(f"Small file detected ({file_size_mb:.1f}MB), using batch_size={batch_size}")
+    
+    logger.info("=== TIMEOUT PREVENTION TIPS ===")
+    logger.info("If you experience timeouts:")
+    logger.info("1. Restart FalkorDB with: docker restart falkordb")
+    logger.info("2. Use smaller batch size: --batch_size 25")
+    logger.info("3. Increase FalkorDB memory: docker run -m 16g ...")
+    logger.info("4. The script will auto-retry failed operations")
+    logger.info("================================")
     
     # Test connection first
     try:
