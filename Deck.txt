@@ -497,7 +497,49 @@ class TTLToCSVConverter:
         logger.info(f"Summary: {len(all_node_ids):,} nodes, {len(edge_references):,} edge references")
         return len(validation_errors) == 0
     
-    def find_bulk_loader(self) -> Optional[str]:
+    def test_falkordb_connection(self, host: str, port: int, password: Optional[str] = None):
+        """Test connection to FalkorDB before attempting bulk load"""
+        logger.info(f"[TEST] Testing connection to FalkorDB at {host}:{port}...")
+        
+        try:
+            import redis
+            
+            # Create Redis connection
+            if password:
+                r = redis.Redis(host=host, port=port, password=password, decode_responses=True)
+            else:
+                r = redis.Redis(host=host, port=port, decode_responses=True)
+            
+            # Test basic connection
+            response = r.ping()
+            if response:
+                logger.info("[OK] Redis connection successful")
+            else:
+                logger.error("[ERROR] Redis ping failed")
+                return False
+            
+            # Test FalkorDB module
+            try:
+                modules = r.module_list()
+                falkor_loaded = any('graph' in str(module).lower() for module in modules)
+                if falkor_loaded:
+                    logger.info("[OK] FalkorDB module is loaded")
+                else:
+                    logger.warning("[WARN] FalkorDB module not detected in module list")
+                    logger.info("Available modules:", modules)
+            except Exception as e:
+                logger.warning(f"[WARN] Could not check modules: {e}")
+            
+            return True
+            
+        except ImportError:
+            logger.warning("[WARN] redis-py not installed, skipping connection test")
+            logger.info("Install with: pip install redis")
+            return True  # Don't fail if redis-py not available
+            
+        except Exception as e:
+            logger.error(f"[ERROR] Connection test failed: {e}")
+            return False
         """Find available FalkorDB bulk loader command"""
         commands_to_try = [
             'falkordb-bulk-insert',
@@ -526,6 +568,11 @@ class TTLToCSVConverter:
                               host: str = '127.0.0.1', port: int = 6379, password: Optional[str] = None):
         """Run FalkorDB bulk loader with proper error handling"""
         
+        # Test connection first
+        if not self.test_falkordb_connection(host, port, password):
+            logger.error("[ERROR] Connection test failed - cannot proceed with bulk loading")
+            return False
+        
         # Find bulk loader
         self.bulk_loader_cmd = self.find_bulk_loader()
         
@@ -542,6 +589,22 @@ class TTLToCSVConverter:
         if not node_files:
             logger.error("[ERROR] No node files found - cannot proceed with bulk loading")
             return False
+        
+        # Validate CSV files exist and are readable
+        for file_type, filename in csv_files:
+            if not os.path.exists(filename):
+                logger.error(f"[ERROR] CSV file not found: {filename}")
+                return False
+            
+            try:
+                with open(filename, 'r', encoding='utf-8') as f:
+                    lines = sum(1 for _ in f)
+                    logger.info(f"[CHECK] {filename}: {lines} lines")
+                    if lines < 2:  # Header + at least one data row
+                        logger.warning(f"[WARN] {filename} has very few lines ({lines})")
+            except Exception as e:
+                logger.error(f"[ERROR] Cannot read {filename}: {e}")
+                return False
         
         # Build command using latest FalkorDB bulk loader format
         cmd_parts = self.bulk_loader_cmd.split()
@@ -567,12 +630,71 @@ class TTLToCSVConverter:
         
         # Execute bulk loader
         logger.info(f"[EXEC] Executing bulk loader:")
-        logger.info(f"  Command: {' '.join(cmd_parts[:3])} [connection params] {' '.join(cmd_parts[-len(node_files + rel_files)*2:])}")
+        # Create safe command for logging (hide password)
+        safe_cmd = []
+        skip_next = False
+        for i, part in enumerate(cmd_parts):
+            if skip_next:
+                safe_cmd.append("****")
+                skip_next = False
+            elif part == '--password':
+                safe_cmd.append(part)
+                skip_next = True
+            else:
+                safe_cmd.append(part)
+        
+        logger.info(f"  Command: {' '.join(safe_cmd)}")
         logger.info(f"  Graph: {graph_name}")
         logger.info(f"  Host: {host}:{port}")
         logger.info(f"  Authentication: {'Yes' if password else 'No'}")
         logger.info(f"  Schema mode: {self.use_schema}")
         logger.info(f"  Files: {len(node_files)} node files, {len(rel_files)} relationship files")
+        
+        # Try a simple test first with just one node file
+        if len(node_files) > 0:
+            test_graph = f"{graph_name}_test"
+            test_cmd = cmd_parts[:4]  # Basic command + graph name + connection
+            if password:
+                test_cmd.extend(['--password', password])
+            if self.use_schema:
+                test_cmd.append('--enforce-schema')
+            test_cmd.extend(['-n', node_files[0]])  # Just first node file
+            
+            logger.info(f"[TEST] Running simple test with one file...")
+            logger.info(f"  Test graph: {test_graph}")
+            
+            try:
+                test_result = subprocess.run(
+                    test_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,  # 5 minutes for test
+                    check=False
+                )
+                
+                if test_result.returncode == 0:
+                    logger.info("[OK] Simple test succeeded, proceeding with full load")
+                    # Clean up test graph
+                    try:
+                        import redis
+                        if password:
+                            r = redis.Redis(host=host, port=port, password=password)
+                        else:
+                            r = redis.Redis(host=host, port=port)
+                        r.execute_command("GRAPH.DELETE", test_graph)
+                        logger.info(f"[CLEAN] Deleted test graph {test_graph}")
+                    except:
+                        logger.warning(f"[WARN] Could not clean up test graph {test_graph}")
+                else:
+                    logger.error(f"[ERROR] Simple test failed (exit code {test_result.returncode})")
+                    logger.error("STDOUT:", test_result.stdout)
+                    logger.error("STDERR:", test_result.stderr)
+                    self.diagnose_bulk_loader_failure(test_result, test_cmd, host, port, password)
+                    return False
+                    
+            except Exception as e:
+                logger.error(f"[ERROR] Test failed with exception: {e}")
+                return False
         
         try:
             start_time = time.time()
@@ -632,31 +754,61 @@ class TTLToCSVConverter:
         
         stderr_lower = process.stderr.lower() if process.stderr else ""
         stdout_lower = process.stdout.lower() if process.stdout else ""
+        error_text = (stderr_lower + " " + stdout_lower).strip()
         
-        if "connection" in stderr_lower or "redis" in stderr_lower:
+        if "connection" in error_text or "redis" in error_text or "refused" in error_text:
             logger.error("• Connection issue - check if FalkorDB is running:")
             logger.error("  docker run -p 6379:6379 falkordb/falkordb:latest")
+            logger.error("  # Or with password:")
+            logger.error("  docker run -p 6379:6379 -e REQUIREPASS=falkordb falkordb/falkordb:latest")
             if password:
                 logger.error(f"  redis-cli -h {host} -p {port} -a {password} ping")
             else:
                 logger.error(f"  redis-cli -h {host} -p {port} ping")
         
-        if "permission" in stderr_lower or "auth" in stderr_lower:
-            logger.error("• Permission/auth issue - check Redis configuration")
+        if "auth" in error_text or "password" in error_text or "permission" in error_text:
+            logger.error("• Authentication issue:")
+            logger.error("  - Check if password is correct")
+            logger.error("  - Try without password if FalkorDB has no auth")
+            logger.error("  - Check if user 'default' has correct permissions")
         
-        if "format" in stderr_lower or "parse" in stderr_lower or "csv" in stderr_lower:
-            logger.error("• CSV format issue - check file encoding and structure")
-            logger.error("  Try without --enforce-schema flag")
+        if "format" in error_text or "parse" in error_text or "csv" in error_text or "header" in error_text:
+            logger.error("• CSV format issue:")
+            logger.error("  - Check CSV file encoding (should be UTF-8)")
+            logger.error("  - Try without --enforce-schema flag")
+            logger.error("  - Verify first few lines of CSV files")
         
-        if "memory" in stderr_lower or "token" in stderr_lower:
-            logger.error("• Memory issue - try reducing batch sizes:")
-            logger.error("  Add --max-token-count 512 --max-buffer-size 32")
+        if "memory" in error_text or "token" in error_text or "size" in error_text:
+            logger.error("• Memory/size issue:")
+            logger.error("  - Add --max-token-count 512 --max-buffer-size 32")
+            logger.error("  - Split large files into smaller chunks")
         
-        if "already exists" in stderr_lower or "graph" in stderr_lower:
-            logger.error("• Graph already exists - choose different name or delete existing graph")
+        if "exists" in error_text or "graph" in error_text and "name" in error_text:
+            logger.error("• Graph already exists:")
+            logger.error(f"  - Choose different graph name")
+            logger.error(f"  - Delete existing graph: redis-cli GRAPH.DELETE {cmd_parts[1] if len(cmd_parts) > 1 else 'graph_name'}")
         
-        logger.error("• Test with simpler command:")
-        logger.error(f"  falkordb-bulk-insert test_graph -n {cmd_parts[-2]}")
+        if "module" in error_text or "command" in error_text:
+            logger.error("• FalkorDB module issue:")
+            logger.error("  - Ensure FalkorDB is installed (not just Redis)")
+            logger.error("  - Check: redis-cli MODULE LIST")
+            logger.error("  - Expected to see 'graph' module loaded")
+        
+        if "file" in error_text or "no such" in error_text:
+            logger.error("• File access issue:")
+            logger.error("  - Check if CSV files exist and are readable")
+            logger.error("  - Use absolute paths for CSV files")
+        
+        if not error_text:
+            logger.error("• No error details available. Try:")
+            logger.error("  - Running with --verbose flag if available")
+            logger.error("  - Checking FalkorDB logs")
+            logger.error("  - Testing with smaller dataset")
+        
+        logger.error("• Quick test commands:")
+        logger.error(f"  redis-cli -h {host} -p {port} ping")
+        logger.error(f"  redis-cli -h {host} -p {port} MODULE LIST")
+        logger.error(f"  falkordb-bulk-insert test_graph -n {cmd_parts[-1] if cmd_parts else 'test.csv'}")
         
     def print_manual_instructions(self, csv_files: List[Tuple[str, str]], graph_name: str,
                                 host: str, port: int, password: Optional[str]):
@@ -719,6 +871,7 @@ def main():
     parser.add_argument('--output_dir', default='csv_output', help='Output directory for CSV files')
     parser.add_argument('--keep_csv', action='store_true', help='Keep CSV files after loading')
     parser.add_argument('--csv_only', action='store_true', help='Only convert to CSV, skip bulk loading')
+    parser.add_argument('--test_connection', action='store_true', help='Test FalkorDB connection only')
     parser.add_argument('--no_schema', action='store_true', help='Use simple CSV format instead of schema format')
     
     args = parser.parse_args()
@@ -734,6 +887,17 @@ def main():
     # Create converter
     use_schema = not args.no_schema
     converter = TTLToCSVConverter(args.output_dir, use_schema=use_schema)
+    
+    # Test connection only if requested
+    if args.test_connection:
+        logger.info("[TEST] Connection test mode")
+        success = converter.test_falkordb_connection(args.host, args.port, args.password)
+        if success:
+            logger.info("[OK] Connection test passed!")
+            sys.exit(0)
+        else:
+            logger.error("[ERROR] Connection test failed!")
+            sys.exit(1)
     
     try:
         # Convert TTL to CSV
@@ -769,6 +933,16 @@ def main():
         else:
             logger.error("[ERROR] Pipeline failed during bulk loading")
             logger.info(f"[FOLDER] CSV files preserved in: {args.output_dir}")
+            logger.error("\n[NEXT STEPS] To troubleshoot:")
+            logger.error("1. Test connection first:")
+            logger.error(f"   python3 {sys.argv[0]} {args.ttl_file} --test_connection --password {args.password if args.password else 'YOUR_PASSWORD'}")
+            logger.error("2. Check CSV files:")
+            logger.error(f"   ls -la {args.output_dir}/")
+            logger.error(f"   head -5 {args.output_dir}/*.csv")
+            logger.error("3. Try manual bulk load:")
+            logger.error(f"   falkordb-bulk-insert test_graph --host {args.host} --port {args.port} --password {args.password or 'YOUR_PASSWORD'} -n {args.output_dir}/*.csv")
+            logger.error("4. Check FalkorDB status:")
+            logger.error("   docker logs YOUR_FALKORDB_CONTAINER")
             sys.exit(1)
             
     except KeyboardInterrupt:
