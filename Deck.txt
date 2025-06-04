@@ -34,10 +34,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class TTLToCSVConverter:
-    def __init__(self, output_dir='csv_output', use_schema=True):
+    def __init__(self, output_dir='csv_output', use_schema=True, use_hash_ids=False):
         """Initialize the TTL to CSV converter"""
         self.output_dir = Path(output_dir)
         self.use_schema = use_schema  # Use enforce-schema format for better compatibility
+        self.use_hash_ids = use_hash_ids  # Use hash-based IDs instead of sequential
         self.nodes_by_type = {}  # type -> dict of {id: properties}
         self.edges_by_type = {}  # relationship -> list of edges
         self.node_id_map = {}    # URI -> unique_id
@@ -96,8 +97,28 @@ class TTLToCSVConverter:
         """Get or create a unique sequential ID for a resource"""
         uri = str(resource)
         if uri not in self.node_id_map:
-            self.node_id_map[uri] = str(self.next_id)
-            self.next_id += 1
+            if self.use_hash_ids:
+                # Use hash-based IDs to avoid large integer issues
+                hash_obj = hashlib.md5(uri.encode('utf-8'))
+                # Use first 8 characters of hex digest for shorter IDs
+                node_id = hash_obj.hexdigest()[:8]
+                # Ensure uniqueness by adding counter if collision occurs
+                original_id = node_id
+                counter = 1
+                while node_id in self.node_id_map.values():
+                    node_id = f"{original_id}_{counter}"
+                    counter += 1
+                self.node_id_map[uri] = node_id
+            else:
+                # Use shorter IDs to avoid integer overflow issues
+                # Reset counter if it gets too large
+                if self.next_id > 2147483647:  # Max 32-bit signed integer
+                    logger.warning("[WARN] ID counter reset due to size limit")
+                    self.next_id = 1
+                
+                # Use shorter ID format to avoid C long conversion issues
+                self.node_id_map[uri] = str(self.next_id)
+                self.next_id += 1
         return self.node_id_map[uri]
     
     def extract_properties_from_uri(self, uri: URIRef) -> Dict[str, str]:
@@ -126,17 +147,25 @@ class TTLToCSVConverter:
             if literal.datatype:
                 datatype_str = str(literal.datatype)
                 
-                # Handle common XSD datatypes
+                # Handle common XSD datatypes with size validation
                 if any(x in datatype_str.lower() for x in ['integer', 'int', 'long']):
                     try:
-                        int(literal)  # Validate it's actually an integer
+                        int_val = int(literal)
+                        # Check if integer is within safe range
+                        if abs(int_val) > 2147483647:  # Max 32-bit signed int
+                            logger.warning(f"[WARN] Large integer {int_val} stored as string")
+                            return str(literal), 'STRING'
                         return str(literal), 'INT'
                     except ValueError:
                         return str(literal), 'STRING'
                         
                 elif any(x in datatype_str.lower() for x in ['decimal', 'double', 'float']):
                     try:
-                        float(literal)  # Validate it's actually a number
+                        float_val = float(literal)
+                        # Check if float is within reasonable range
+                        if abs(float_val) > 1e15:
+                            logger.warning(f"[WARN] Large float {float_val} stored as string")
+                            return str(literal), 'STRING'
                         return str(literal), 'DOUBLE'
                     except ValueError:
                         return str(literal), 'STRING'
@@ -150,20 +179,56 @@ class TTLToCSVConverter:
                 else:
                     return str(literal), 'STRING'
             else:
-                # No datatype specified
-                return str(literal), 'STRING'
+                # No datatype specified - try to infer but be conservative
+                literal_str = str(literal)
+                
+                # Try to detect if it's a number
+                try:
+                    if '.' in literal_str:
+                        float_val = float(literal_str)
+                        if abs(float_val) <= 1e15:
+                            return literal_str, 'DOUBLE'
+                    else:
+                        int_val = int(literal_str)
+                        if abs(int_val) <= 2147483647:
+                            return literal_str, 'INT'
+                    # If number is too large, treat as string
+                    return literal_str, 'STRING'
+                except ValueError:
+                    # Not a number
+                    return literal_str, 'STRING'
                 
         except Exception as e:
             logger.warning(f"Error processing literal {literal}: {e}")
             return str(literal), 'STRING'
     
     def sanitize_csv_value(self, value: Any) -> str:
-        """Sanitize value for CSV output"""
+        """Sanitize value for CSV output with size limits"""
         if value is None:
             return ''
         
         if isinstance(value, bool):
             return 'true' if value else 'false'
+        
+        # Handle numeric values with size constraints
+        if isinstance(value, int):
+            # Ensure integer is within safe range for C long
+            if value > 2147483647:  # Max 32-bit signed int
+                logger.warning(f"[WARN] Large integer {value} converted to string")
+                return str(value)
+            elif value < -2147483648:  # Min 32-bit signed int
+                logger.warning(f"[WARN] Large negative integer {value} converted to string")
+                return str(value)
+            else:
+                return str(value)
+        
+        if isinstance(value, float):
+            # Handle very large floats
+            if abs(value) > 1e15:  # Very large float
+                logger.warning(f"[WARN] Large float {value} converted to string")
+                return str(value)
+            else:
+                return str(value)
         
         if isinstance(value, (list, dict)):
             # Convert arrays to string representation for CSV
@@ -176,6 +241,16 @@ class TTLToCSVConverter:
         # Convert to string and clean
         str_value = str(value).strip()
         
+        # Check if string represents a large number
+        try:
+            # If it's a numeric string, validate the size
+            if str_value.isdigit() or (str_value.startswith('-') and str_value[1:].isdigit()):
+                num_val = int(str_value)
+                if abs(num_val) > 2147483647:
+                    logger.warning(f"[WARN] Large numeric string {str_value} detected")
+        except ValueError:
+            pass  # Not a number, continue with string processing
+        
         # Replace problematic characters for CSV
         str_value = str_value.replace('\r\n', ' ').replace('\r', ' ').replace('\n', ' ')
         str_value = re.sub(r'\s+', ' ', str_value)  # Normalize whitespace
@@ -184,11 +259,18 @@ class TTLToCSVConverter:
         if '"' in str_value:
             str_value = str_value.replace('"', '""')
         
+        # Limit string length to prevent memory issues
+        if len(str_value) > 1000:
+            logger.warning(f"[WARN] Very long string truncated (length: {len(str_value)})")
+            str_value = str_value[:1000] + "..."
+        
         return str_value
     
-    def convert_ttl_to_csv(self, ttl_file_path: str):
+    def convert_ttl_to_csv(self, ttl_file_path: str, max_rows: Optional[int] = None):
         """Convert TTL file to CSV format optimized for FalkorDB bulk loader"""
         logger.info(f"Converting {ttl_file_path} to CSV format...")
+        if max_rows:
+            logger.info(f"[LIMIT] Processing max {max_rows} triples for testing")
         
         # Parse TTL file
         graph = Graph()
@@ -205,14 +287,25 @@ class TTLToCSVConverter:
             logger.warning("No triples found in the TTL file!")
             return []
         
+        # Apply row limit if specified
+        if max_rows and max_rows < total_triples:
+            logger.info(f"[LIMIT] Processing only first {max_rows} of {total_triples} triples")
+            total_triples = max_rows
+        
         # Track properties and their types for schema
         node_properties = {}  # node_type -> dict of {prop_name: datatype}
         edge_properties = {}  # edge_type -> dict of {prop_name: datatype}
         
         logger.info("Processing triples and building data structures...")
+        processed_count = 0
         with tqdm(total=total_triples, desc="Processing triples") as pbar:
             for subject, predicate, obj in graph:
+                if max_rows and processed_count >= max_rows:
+                    logger.info(f"[LIMIT] Reached max_rows limit of {max_rows}")
+                    break
+                
                 pbar.update(1)
+                processed_count += 1
                 
                 # Get or create subject node
                 subject_id = self.get_or_create_node_id(subject)
@@ -898,6 +991,8 @@ def main():
     parser.add_argument('--csv_only', action='store_true', help='Only convert to CSV, skip bulk loading')
     parser.add_argument('--test_connection', action='store_true', help='Test FalkorDB connection only')
     parser.add_argument('--no_schema', action='store_true', help='Use simple CSV format instead of schema format')
+    parser.add_argument('--use_hash_ids', action='store_true', help='Use hash-based IDs instead of sequential numbers (fixes large int issues)')
+    parser.add_argument('--max_rows', type=int, help='Limit number of rows per CSV file for testing')
     
     args = parser.parse_args()
     
@@ -911,7 +1006,7 @@ def main():
     
     # Create converter
     use_schema = not args.no_schema
-    converter = TTLToCSVConverter(args.output_dir, use_schema=use_schema)
+    converter = TTLToCSVConverter(args.output_dir, use_schema=use_schema, use_hash_ids=args.use_hash_ids)
     
     # Test connection only if requested
     if args.test_connection:
@@ -927,7 +1022,7 @@ def main():
     try:
         # Convert TTL to CSV
         start_time = time.time()
-        csv_files = converter.convert_ttl_to_csv(args.ttl_file)
+        csv_files = converter.convert_ttl_to_csv(args.ttl_file, args.max_rows)
         conversion_time = time.time() - start_time
         
         logger.info(f"[OK] TTL->CSV conversion: {conversion_time:.1f}s ({file_size_mb/conversion_time:.1f} MB/s)")
@@ -958,16 +1053,17 @@ def main():
         else:
             logger.error("[ERROR] Pipeline failed during bulk loading")
             logger.info(f"[FOLDER] CSV files preserved in: {args.output_dir}")
-            logger.error("\n[NEXT STEPS] To troubleshoot:")
-            logger.error("1. Test connection first:")
-            logger.error(f"   python3 {sys.argv[0]} {args.ttl_file} --test_connection --password {args.password if args.password else 'YOUR_PASSWORD'}")
-            logger.error("2. Check CSV files:")
-            logger.error(f"   ls -la {args.output_dir}/")
-            logger.error(f"   head -5 {args.output_dir}/*.csv")
-            logger.error("3. Try manual bulk load:")
-            logger.error(f"   falkordb-bulk-insert test_graph --host {args.host} --port {args.port} --password {args.password or 'YOUR_PASSWORD'} -n {args.output_dir}/*.csv")
-            logger.error("4. Check FalkorDB status:")
-            logger.error("   docker logs YOUR_FALKORDB_CONTAINER")
+            logger.error("\n[NEXT STEPS] To troubleshoot the 'int too large' error:")
+            logger.error("1. Try with hash-based IDs:")
+            logger.error(f"   python3 {sys.argv[0]} {args.ttl_file} --use_hash_ids --password {args.password if args.password else 'YOUR_PASSWORD'}")
+            logger.error("2. Try without schema format:")
+            logger.error(f"   python3 {sys.argv[0]} {args.ttl_file} --no_schema --password {args.password if args.password else 'YOUR_PASSWORD'}")
+            logger.error("3. Test with smaller dataset:")
+            logger.error(f"   python3 {sys.argv[0]} {args.ttl_file} --max_rows 1000 --password {args.password if args.password else 'YOUR_PASSWORD'}")
+            logger.error("4. Check CSV files for large numbers:")
+            logger.error(f"   grep -E '[0-9]{{10,}}' {args.output_dir}/*.csv")
+            logger.error("5. Try manual bulk load with specific file:")
+            logger.error(f"   falkordb-bulk-insert test_graph --host {args.host} --port {args.port} --password {args.password or 'YOUR_PASSWORD'} -n {args.output_dir}/YourNodeType.csv")
             sys.exit(1)
             
     except KeyboardInterrupt:
