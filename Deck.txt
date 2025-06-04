@@ -1,995 +1,411 @@
 #!/usr/bin/env python3
 """
-Production-Ready RDF to FalkorDB Converter
-==========================================
-
-Optimized async implementation with:
-- Proper connection pooling and timeout handling
-- Circuit breaker pattern for resilience
-- Memory-efficient RDF parsing with streaming
-- Adaptive batch sizing and performance monitoring
-- Comprehensive error handling and recovery
-- Production deployment features
+TTL to FalkorDB Property Graph Converter
+Converts RDF triples from TTL files to property graph model and ingests into FalkorDB
 """
 
-import os
-import sys
+import rdflib
+from rdflib import Graph, URIRef, Literal, BNode
+import redis
+import falkordb
+import hashlib
+import json
 import time
 import logging
+from typing import Dict, Set, List, Tuple, Any
+from urllib.parse import urlparse
 import re
-import hashlib
-import asyncio
-import gc
-import psutil
-import random
-from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Set, Tuple, Any, Optional, Iterator, AsyncIterator
-from collections import defaultdict, deque
-from pathlib import Path
-from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
-import json
+from tqdm import tqdm
 
-# Core dependencies with fallback handling
-try:
-    import falkordb
-    from falkordb.asyncio import FalkorDB as AsyncFalkorDB
-except ImportError:
-    print("❌ FalkorDB not installed. Install with: pip install falkordb")
-    sys.exit(1)
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-try:
-    from rdflib import Graph, URIRef, Literal, BNode
-    from rdflib.namespace import RDF, RDFS, XSD, FOAF
-    from rdflib.plugins.parsers.ntriples import NTriplesParser, Sink
-except ImportError:
-    print("❌ RDFLib not installed. Install with: pip install rdflib")
-    sys.exit(1)
-
-try:
-    import pybreaker
-except ImportError:
-    print("⚠️ pybreaker not installed. Install with: pip install pybreaker")
-    print("Circuit breaker functionality will be disabled.")
-    pybreaker = None
-
-try:
-    import aiofiles
-except ImportError:
-    print("⚠️ aiofiles not installed. Install with: pip install aiofiles")
-    print("Falling back to synchronous file operations.")
-    aiofiles = None
-
-
-@dataclass
-class ConverterConfig:
-    """Configuration for production deployment"""
-    falkor_host: str = "localhost"
-    falkor_port: int = 6379
-    falkor_password: Optional[str] = None
-    max_connections: int = 32
-    connection_timeout: int = 30
-    socket_timeout: int = 30
-    query_timeout: int = 60000  # milliseconds
-    batch_size: int = 1000
-    max_retries: int = 3
-    circuit_breaker_threshold: int = 5
-    circuit_breaker_recovery_timeout: int = 60
-    enable_monitoring: bool = True
-    log_level: str = "INFO"
-    chunk_size: int = 10000
-    gc_threshold: int = 10000
-    memory_limit_mb: int = 2048
-    use_streaming_parser: bool = True
-    create_indexes: bool = True
-    enable_adaptive_batching: bool = True
-
-
-class PerformanceMonitor:
-    """Monitor and adapt performance during conversion"""
-    
-    def __init__(self, config: ConverterConfig):
-        self.config = config
-        self.metrics = defaultdict(list)
-        self.adaptive_batch_size = config.batch_size
-        self.min_batch_size = max(10, config.batch_size // 10)
-        self.max_batch_size = config.batch_size * 10
-        self.start_time = time.time()
-        
-    def record_operation(self, operation_type: str, duration: float, 
-                        batch_size: int, success: bool = True, error_msg: str = None):
-        """Record operation metrics"""
-        self.metrics[operation_type].append({
-            'duration': duration,
-            'batch_size': batch_size,
-            'success': success,
-            'error_msg': error_msg,
-            'timestamp': time.time()
-        })
-        
-        # Adapt batch size based on performance
-        if self.config.enable_adaptive_batching and operation_type in ['node_creation', 'relationship_creation']:
-            self._adapt_batch_size(operation_type, duration, batch_size, success)
-    
-    def _adapt_batch_size(self, operation_type: str, duration: float, 
-                         batch_size: int, success: bool):
-        """Dynamically adjust batch size based on performance"""
-        
-        if not success:
-            # Reduce batch size on failure
-            self.adaptive_batch_size = max(
-                self.min_batch_size,
-                int(self.adaptive_batch_size * 0.6)
-            )
-        elif duration < 1.0 and batch_size < self.max_batch_size:
-            # Increase batch size if operation is fast
-            self.adaptive_batch_size = min(
-                self.max_batch_size,
-                int(self.adaptive_batch_size * 1.1)
-            )
-        elif duration > 30.0:
-            # Reduce batch size if operation is too slow
-            self.adaptive_batch_size = max(
-                self.min_batch_size,
-                int(self.adaptive_batch_size * 0.7)
-            )
-    
-    def get_memory_usage(self) -> float:
-        """Get current memory usage in MB"""
-        try:
-            process = psutil.Process()
-            return process.memory_info().rss / 1024 / 1024
-        except:
-            return 0.0
-    
-    def should_trigger_gc(self) -> bool:
-        """Determine if garbage collection should be triggered"""
-        memory_mb = self.get_memory_usage()
-        return memory_mb > self.config.memory_limit_mb
-    
-    def get_statistics(self) -> Dict[str, Any]:
-        """Get comprehensive performance statistics"""
-        total_time = time.time() - self.start_time
-        
-        stats = {
-            'total_runtime_seconds': total_time,
-            'memory_usage_mb': self.get_memory_usage(),
-            'adaptive_batch_size': self.adaptive_batch_size,
-            'operations': {}
-        }
-        
-        for op_type, records in self.metrics.items():
-            if records:
-                successful = [r for r in records if r['success']]
-                failed = [r for r in records if not r['success']]
-                
-                stats['operations'][op_type] = {
-                    'total_operations': len(records),
-                    'successful_operations': len(successful),
-                    'failed_operations': len(failed),
-                    'success_rate': len(successful) / len(records) if records else 0,
-                    'average_duration': sum(r['duration'] for r in successful) / len(successful) if successful else 0,
-                    'total_duration': sum(r['duration'] for r in records)
-                }
-        
-        return stats
-
-
-class OptimizedPatterns:
-    """Pre-compiled regex patterns for fast string operations"""
-    
-    def __init__(self):
-        self.uri_fragment = re.compile(r'[#/]([^#/]*)$')
-        self.invalid_chars = re.compile(r'[^\w]')
-        self.control_chars = re.compile(r'[\x00-\x1F\x7F]')
-        self.whitespace = re.compile(r'\s+')
-        self.quote_escape = str.maketrans({"'": "\\'", '"': '\\"', '\\': '\\\\'})
-    
-    def extract_fragment(self, uri: str) -> str:
-        """Extract fragment from URI"""
-        match = self.uri_fragment.search(uri)
-        return match.group(1) if match else uri.split('/')[-1] or uri
-    
-    def sanitize_identifier(self, value: str) -> str:
-        """Sanitize string for use as identifier"""
-        if value.startswith('http'):
-            value = self.extract_fragment(value)
-        
-        value = self.invalid_chars.sub('_', value)
-        
-        if value and value[0].isdigit():
-            value = f"n_{value}"
-        
-        return value[:50] if value else "node"
-    
-    def sanitize_string(self, value: str) -> str:
-        """Sanitize string for safe usage"""
-        if len(value) > 500:
-            value = value[:500]
-        
-        value = value.translate(self.quote_escape)
-        value = self.control_chars.sub('', value)
-        value = self.whitespace.sub(' ', value).strip()
-        
-        return value
-
-
-class StreamingRDFSink(Sink):
-    """Custom sink for streaming RDF processing"""
-    
-    def __init__(self, batch_processor, batch_size: int = 1000):
-        self.batch_processor = batch_processor
-        self.batch_size = batch_size
-        self.current_batch = []
-        self.count = 0
-    
-    def triple(self, s, p, o):
-        """Process each triple as it's parsed"""
-        self.current_batch.append((str(s), str(p), str(o)))
-        self.count += 1
-        
-        if len(self.current_batch) >= self.batch_size:
-            # Process batch and clear memory
-            self.batch_processor(self.current_batch)
-            self.current_batch = []
-            
-            if self.count % 50000 == 0:
-                print(f"Streamed {self.count:,} triples")
-    
-    def finalize(self):
-        """Process remaining triples"""
-        if self.current_batch:
-            self.batch_processor(self.current_batch)
-
-
-class FalkorDBConnectionManager:
-    """Manages FalkorDB connections with proper pooling and health checking"""
-    
-    def __init__(self, config: ConverterConfig):
-        self.config = config
-        self.pool = None
-        self.db = None
-        self.logger = logging.getLogger(__name__)
-        
-        # Circuit breaker for database operations
-        if pybreaker:
-            self.circuit_breaker = pybreaker.CircuitBreaker(
-                fail_max=config.circuit_breaker_threshold,
-                reset_timeout=config.circuit_breaker_recovery_timeout,
-                exclude=[KeyError, ValueError]
-            )
+class TTLToFalkorDB:
+    def __init__(self, redis_host='localhost', redis_port=6379, db_name='knowledge_graph', password=None):
+        """Initialize the converter with FalkorDB connection"""
+        if password:
+            self.redis_client = redis.Redis(host=redis_host, port=redis_port, password=password, decode_responses=True)
+            self.db = falkordb.FalkorDB(host=redis_host, port=redis_port, password=password).select_graph(db_name)
         else:
-            self.circuit_breaker = None
-    
-    async def connect(self):
-        """Establish connection with optimized settings"""
-        try:
-            connection_params = {
-                'host': self.config.falkor_host,
-                'port': self.config.falkor_port,
-                'socket_timeout': self.config.socket_timeout,
-                'socket_connect_timeout': self.config.connection_timeout,
-                'decode_responses': True,
-                'retry_on_timeout': True,
-                'health_check_interval': 30
-            }
-            
-            if self.config.falkor_password:
-                connection_params['password'] = self.config.falkor_password
-            
-            self.db = falkordb.FalkorDB(**connection_params)
-            
-            # Test connection
-            await self._verify_connection()
-            self.logger.info("✅ FalkorDB connection established successfully")
-            
-        except Exception as e:
-            self.logger.error(f"❌ Failed to connect to FalkorDB: {e}")
-            raise
-    
-    async def disconnect(self):
-        """Properly close connections"""
-        if self.db:
-            try:
-                self.db.close()
-                self.logger.info("🔌 FalkorDB connection closed")
-            except Exception as e:
-                self.logger.warning(f"Warning during disconnect: {e}")
-    
-    async def _verify_connection(self):
-        """Verify database connection is healthy"""
-        try:
-            # Use Redis PING command to test connection
-            result = self.db.execute_command("PING")
-            if result != b'PONG' and result != 'PONG':
-                raise Exception("Unexpected PING response")
-        except Exception as e:
-            raise Exception(f"Connection verification failed: {e}")
-    
-    async def execute_query(self, graph_name: str, query: str, params: Dict = None, timeout: int = None):
-        """Execute query with circuit breaker protection"""
-        if timeout is None:
-            timeout = self.config.query_timeout
+            self.redis_client = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+            self.db = falkordb.FalkorDB(host=redis_host, port=redis_port).select_graph(db_name)
+        self.batch_size = 1000
+        self.node_cache = set()
+        self.edge_cache = set()
         
-        async def _execute():
-            graph = self.db.select_graph(graph_name)
-            return graph.query(query, params or {}, timeout=timeout)
-        
-        if self.circuit_breaker:
-            return self.circuit_breaker(_execute)()
+    def clean_identifier(self, uri_or_literal: str) -> str:
+        """Clean and create valid identifier for nodes/properties"""
+        if isinstance(uri_or_literal, URIRef):
+            # Extract meaningful part from URI
+            parsed = urlparse(str(uri_or_literal))
+            if parsed.fragment:
+                return re.sub(r'[^a-zA-Z0-9_]', '_', parsed.fragment)
+            elif parsed.path:
+                return re.sub(r'[^a-zA-Z0-9_]', '_', parsed.path.split('/')[-1])
+            else:
+                return re.sub(r'[^a-zA-Z0-9_]', '_', str(uri_or_literal))
         else:
-            return await _execute()
+            return re.sub(r'[^a-zA-Z0-9_]', '_', str(uri_or_literal))
     
-    async def configure_database(self, graph_name: str):
-        """Configure FalkorDB for optimal performance"""
-        try:
-            graph = self.db.select_graph(graph_name)
-            
-            # Configure timeouts
-            try:
-                graph.db.execute_command("GRAPH.CONFIG", "SET", "TIMEOUT_DEFAULT", str(self.config.query_timeout))
-                graph.db.execute_command("GRAPH.CONFIG", "SET", "TIMEOUT_MAX", str(self.config.query_timeout * 2))
-                graph.db.execute_command("GRAPH.CONFIG", "SET", "MAX_QUEUED_QUERIES", "50")
-                self.logger.info("✅ FalkorDB timeout configuration applied")
-            except Exception as e:
-                self.logger.warning(f"Could not configure timeouts: {e}")
-            
-            # Configure memory settings
-            try:
-                graph.db.execute_command("GRAPH.CONFIG", "SET", "QUERY_MEM_CAPACITY", "134217728")  # 128MB
-                graph.db.execute_command("GRAPH.CONFIG", "SET", "NODE_CREATION_BUFFER", "32768")
-                graph.db.execute_command("GRAPH.CONFIG", "SET", "RESULTSET_SIZE", "50000")
-                self.logger.info("✅ FalkorDB memory optimization applied")
-            except Exception as e:
-                self.logger.warning(f"Could not configure memory settings: {e}")
-                
-        except Exception as e:
-            self.logger.error(f"❌ Database configuration failed: {e}")
-            raise
-
-
-@asynccontextmanager
-async def managed_falkor_connection(config: ConverterConfig):
-    """Context manager for proper connection lifecycle"""
-    connection_manager = FalkorDBConnectionManager(config)
-    await connection_manager.connect()
-    
-    try:
-        yield connection_manager
-    except Exception as e:
-        logging.getLogger(__name__).error(f"Database error: {e}")
-        raise
-    finally:
-        await connection_manager.disconnect()
-
-
-class RDFParser:
-    """Efficient RDF parsing with multiple strategies"""
-    
-    def __init__(self, config: ConverterConfig):
-        self.config = config
-        self.logger = logging.getLogger(__name__)
-        self.patterns = OptimizedPatterns()
-    
-    def parse_rdf_streaming(self, file_path: str) -> Iterator[List[Tuple[str, str, str]]]:
-        """Memory-efficient streaming RDF parser"""
-        self.logger.info(f"📖 Parsing RDF file: {file_path}")
-        
-        # Determine format
-        file_ext = Path(file_path).suffix.lower()
-        format_map = {
-            '.ttl': 'turtle', '.turtle': 'turtle',
-            '.rdf': 'xml', '.xml': 'xml',
-            '.n3': 'n3', '.nt': 'nt',
-            '.jsonld': 'json-ld'
-        }
-        
-        rdf_format = format_map.get(file_ext, 'turtle')
-        self.logger.info(f"📄 Format detected: {rdf_format}")
-        
-        if self.config.use_streaming_parser and rdf_format == 'nt':
-            # Use streaming parser for N-Triples
-            yield from self._stream_ntriples(file_path)
+    def create_node_id(self, resource) -> str:
+        """Create unique node ID from resource"""
+        if isinstance(resource, BNode):
+            return f"bnode_{str(resource)}"
         else:
-            # Use chunked parsing for other formats
-            yield from self._parse_chunked(file_path, rdf_format)
+            # Use hash for consistent IDs
+            return hashlib.md5(str(resource).encode()).hexdigest()[:12]
     
-    def _stream_ntriples(self, file_path: str) -> Iterator[List[Tuple[str, str, str]]]:
-        """Stream N-Triples format efficiently"""
-        batch = []
-        batch_count = 0
+    def extract_properties_from_uri(self, uri: URIRef) -> Dict[str, Any]:
+        """Extract meaningful properties from URI"""
+        properties = {}
+        uri_str = str(uri)
         
-        def batch_processor(triples):
-            nonlocal batch, batch_count
-            batch.extend(triples)
-            if len(batch) >= self.config.chunk_size:
-                batch_count += 1
-                yield batch
-                batch = []
-                
-                if batch_count % 10 == 0:
-                    self.logger.info(f"📈 Processed {batch_count * self.config.chunk_size:,} triples")
+        properties['uri'] = uri_str
         
-        sink = StreamingRDFSink(batch_processor, self.config.batch_size)
-        parser = NTriplesParser(sink)
+        # Extract namespace and local name
+        parsed = urlparse(uri_str)
+        if parsed.fragment:
+            properties['local_name'] = parsed.fragment
+            properties['namespace'] = uri_str.replace('#' + parsed.fragment, '')
+        elif parsed.path:
+            parts = parsed.path.strip('/').split('/')
+            if parts and parts[-1]:
+                properties['local_name'] = parts[-1]
+                properties['namespace'] = uri_str.replace(parts[-1], '').rstrip('/')
         
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                parser.parse(f)
-            sink.finalize()
-            
-            if batch:
-                yield batch
-                
-        except Exception as e:
-            self.logger.error(f"Streaming parse failed: {e}")
-            # Fallback to chunked parsing
-            yield from self._parse_chunked(file_path, 'nt')
+        return properties
     
-    def _parse_chunked(self, file_path: str, rdf_format: str) -> Iterator[List[Tuple[str, str, str]]]:
-        """Parse RDF file in memory-managed chunks"""
+    def process_literal_value(self, literal: Literal) -> Tuple[Any, str]:
+        """Process literal value and return (value, datatype)"""
+        if literal.datatype:
+            datatype = str(literal.datatype)
+            # Handle common datatypes
+            if 'integer' in datatype or 'int' in datatype:
+                try:
+                    return int(literal), 'integer'
+                except:
+                    return str(literal), 'string'
+            elif 'decimal' in datatype or 'double' in datatype or 'float' in datatype:
+                try:
+                    return float(literal), 'float'
+                except:
+                    return str(literal), 'string'
+            elif 'boolean' in datatype:
+                return str(literal).lower() in ('true', '1'), 'boolean'
+            elif 'date' in datatype:
+                return str(literal), 'date'
+            else:
+                return str(literal), 'string'
+        else:
+            return str(literal), 'string'
+    
+    def parse_ttl_streaming(self, ttl_file_path: str):
+        """Parse TTL file in streaming fashion"""
+        logger.info(f"Starting to parse {ttl_file_path}")
+        
         graph = Graph()
         
-        # Disable GC during parsing for performance
-        gc_was_enabled = gc.isenabled()
-        if gc_was_enabled:
-            gc.disable()
-        
+        # Parse the file
         try:
-            # Parse file
-            graph.parse(file_path, format=rdf_format)
-            total_triples = len(graph)
-            self.logger.info(f"📊 Loaded {total_triples:,} triples into memory")
-            
-            # Convert to list for chunking
-            triples = [(str(s), str(p), str(o)) for s, p, o in graph]
-            
-            # Yield in chunks
-            for i in range(0, total_triples, self.config.chunk_size):
-                chunk_end = min(i + self.config.chunk_size, total_triples)
-                chunk = triples[i:chunk_end]
-                yield chunk
-                
-                if i % (self.config.chunk_size * 5) == 0:
-                    progress = (chunk_end / total_triples) * 100
-                    self.logger.info(f"📈 Parsing: {progress:.1f}% ({chunk_end:,}/{total_triples:,})")
+            graph.parse(ttl_file_path, format='turtle')
+            logger.info(f"Successfully parsed TTL file. Found {len(graph)} triples.")
+        except Exception as e:
+            logger.error(f"Error parsing TTL file: {e}")
+            raise
         
-        finally:
-            if gc_was_enabled:
-                gc.enable()
-            graph.close()
-            gc.collect()
-
-
-class GraphDataProcessor:
-    """Process RDF triples into graph data structures"""
+        return graph
     
-    def __init__(self, config: ConverterConfig):
-        self.config = config
-        self.patterns = OptimizedPatterns()
-        self.entity_map = {}
-        self.entity_counter = 0
-        self.logger = logging.getLogger(__name__)
-    
-    def get_entity_id(self, uri: str) -> int:
-        """Get or create entity ID"""
-        if uri not in self.entity_map:
-            self.entity_map[uri] = self.entity_counter
-            self.entity_counter += 1
-        return self.entity_map[uri]
-    
-    def process_triples_batch(self, triples: List[Tuple[str, str, str]]) -> Tuple[List[Dict], List[Dict]]:
-        """Process batch of triples into nodes and relationships"""
+    def convert_to_property_graph(self, graph: Graph):
+        """Convert RDF graph to property graph model"""
+        logger.info("Converting RDF triples to property graph model...")
+        
         nodes = {}
-        relationships = []
+        edges = []
+        literal_properties = {}  # subject -> {predicate: value}
         
-        for subject, predicate, obj in triples:
-            subject_id = self.get_entity_id(subject)
-            
-            # Create or update subject node
-            if subject_id not in nodes:
-                nodes[subject_id] = {
-                    'id': subject_id,
-                    'uri': subject,
-                    'labels': {'Resource'},
-                    'properties': {'uri': subject, 'entity_id': subject_id}
-                }
-            
-            if isinstance(obj, str) and (obj.startswith('http://') or obj.startswith('https://')):
-                # Object is a URI - create relationship
-                obj_id = self.get_entity_id(obj)
+        total_triples = len(graph)
+        processed = 0
+        
+        with tqdm(total=total_triples, desc="Processing triples") as pbar:
+            for subject, predicate, obj in graph:
+                processed += 1
+                pbar.update(1)
                 
-                if obj_id not in nodes:
-                    nodes[obj_id] = {
-                        'id': obj_id,
-                        'uri': obj,
-                        'labels': {'Resource'},
-                        'properties': {'uri': obj, 'entity_id': obj_id}
+                subject_id = self.create_node_id(subject)
+                predicate_clean = self.clean_identifier(predicate)
+                
+                # Create subject node if not exists
+                if subject_id not in nodes:
+                    if isinstance(subject, URIRef):
+                        properties = self.extract_properties_from_uri(subject)
+                        node_type = 'Resource'
+                    else:  # BNode
+                        properties = {'uri': str(subject)}
+                        node_type = 'BlankNode'
+                    
+                    nodes[subject_id] = {
+                        'id': subject_id,
+                        'type': node_type,
+                        'properties': properties
                     }
                 
-                rel_type = self.patterns.sanitize_identifier(predicate)
-                relationships.append({
-                    'source_id': subject_id,
-                    'target_id': obj_id,
-                    'type': rel_type,
-                    'properties': {'predicate': predicate}
-                })
+                # Handle object
+                if isinstance(obj, Literal):
+                    # Object is a literal - add as property to subject node
+                    if subject_id not in literal_properties:
+                        literal_properties[subject_id] = {}
+                    
+                    value, datatype = self.process_literal_value(obj)
+                    literal_properties[subject_id][predicate_clean] = {
+                        'value': value,
+                        'datatype': datatype
+                    }
+                    
+                    # Also store language if present
+                    if obj.language:
+                        literal_properties[subject_id][f"{predicate_clean}_lang"] = obj.language
                 
-                # Handle rdf:type specially
-                if predicate == str(RDF.type):
-                    type_label = self.patterns.sanitize_identifier(obj)
-                    nodes[subject_id]['labels'].add(type_label)
-            
+                else:
+                    # Object is a resource - create edge
+                    object_id = self.create_node_id(obj)
+                    
+                    # Create object node if not exists
+                    if object_id not in nodes:
+                        if isinstance(obj, URIRef):
+                            properties = self.extract_properties_from_uri(obj)
+                            node_type = 'Resource'
+                        else:  # BNode
+                            properties = {'uri': str(obj)}
+                            node_type = 'BlankNode'
+                        
+                        nodes[object_id] = {
+                            'id': object_id,
+                            'type': node_type,
+                            'properties': properties
+                        }
+                    
+                    # Create edge
+                    edge = {
+                        'from': subject_id,
+                        'to': object_id,
+                        'relationship': predicate_clean,
+                        'properties': {
+                            'predicate_uri': str(predicate)
+                        }
+                    }
+                    edges.append(edge)
+        
+        # Merge literal properties into nodes
+        for node_id, props in literal_properties.items():
+            if node_id in nodes:
+                for prop_name, prop_data in props.items():
+                    nodes[node_id]['properties'][prop_name] = prop_data['value']
+                    nodes[node_id]['properties'][f"{prop_name}_datatype"] = prop_data['datatype']
+        
+        logger.info(f"Conversion complete. Created {len(nodes)} nodes and {len(edges)} edges.")
+        return list(nodes.values()), edges
+    
+    def escape_cypher_string(self, value: str) -> str:
+        """Escape string for Cypher query"""
+        if isinstance(value, str):
+            return value.replace("'", "\\'").replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r')
+        return str(value)
+    
+    def create_cypher_properties(self, properties: Dict[str, Any]) -> str:
+        """Convert properties dict to Cypher properties string"""
+        prop_parts = []
+        for key, value in properties.items():
+            if isinstance(value, str):
+                escaped_value = self.escape_cypher_string(value)
+                prop_parts.append(f"{key}: '{escaped_value}'")
+            elif isinstance(value, (int, float)):
+                prop_parts.append(f"{key}: {value}")
+            elif isinstance(value, bool):
+                prop_parts.append(f"{key}: {str(value).lower()}")
             else:
-                # Object is a literal - add as property
-                prop_name = self.patterns.sanitize_identifier(predicate)
-                prop_value = self._convert_literal_value(obj)
-                nodes[subject_id]['properties'][prop_name] = prop_value
+                escaped_value = self.escape_cypher_string(str(value))
+                prop_parts.append(f"{key}: '{escaped_value}'")
         
-        return list(nodes.values()), relationships
+        return "{" + ", ".join(prop_parts) + "}"
     
-    def _convert_literal_value(self, value: str) -> Any:
-        """Convert string value to appropriate Python type"""
-        # Try to detect and convert common data types
-        value_str = str(value).strip()
+    def ingest_nodes_batch(self, nodes: List[Dict], batch_start: int, batch_end: int):
+        """Ingest a batch of nodes into FalkorDB"""
+        batch_nodes = nodes[batch_start:batch_end]
         
-        # Boolean
-        if value_str.lower() in ('true', 'false'):
-            return value_str.lower() == 'true'
+        if not batch_nodes:
+            return
         
-        # Integer
+        # Create MERGE statements for nodes to avoid duplicates
+        cypher_parts = []
+        for node in batch_nodes:
+            node_id = node['id']
+            node_type = node['type']
+            properties_str = self.create_cypher_properties(node['properties'])
+            
+            cypher_parts.append(f"MERGE (n{node_id}:Node:{node_type} {{id: '{node_id}'}}) SET n{node_id} += {properties_str}")
+        
+        # Execute batch
         try:
-            if '.' not in value_str and 'e' not in value_str.lower():
-                return int(value_str)
-        except ValueError:
-            pass
-        
-        # Float
-        try:
-            return float(value_str)
-        except ValueError:
-            pass
-        
-        # String (sanitized)
-        return self.patterns.sanitize_string(value_str)
-
-
-class BulkOperations:
-    """Optimized bulk database operations"""
-    
-    def __init__(self, connection_manager: FalkorDBConnectionManager, monitor: PerformanceMonitor):
-        self.connection_manager = connection_manager
-        self.monitor = monitor
-        self.logger = logging.getLogger(__name__)
-    
-    async def create_indexes(self, graph_name: str):
-        """Create optimized indexes before bulk operations"""
-        index_queries = [
-            "CREATE INDEX FOR (n:Resource) ON (n.entity_id)",
-            "CREATE INDEX FOR (n:Resource) ON (n.uri)",
-            "CREATE CONSTRAINT ON (n:Resource) ASSERT n.entity_id IS UNIQUE"
-        ]
-        
-        for query in index_queries:
-            try:
-                await self.connection_manager.execute_query(graph_name, query, timeout=30000)
-                self.logger.info(f"✅ Created index: {query}")
-            except Exception as e:
-                self.logger.warning(f"Index creation failed: {query} - {e}")
-    
-    async def bulk_create_nodes(self, graph_name: str, nodes: List[Dict]) -> int:
-        """Optimized bulk node creation"""
-        if not nodes:
-            return 0
-        
-        start_time = time.time()
-        batch_size = self.monitor.adaptive_batch_size
-        created_count = 0
-        
-        # Process in adaptive batches
-        for i in range(0, len(nodes), batch_size):
-            batch = nodes[i:i + batch_size]
-            batch_start_time = time.time()
-            
-            try:
-                # Prepare batch data
-                batch_data = []
-                for node in batch:
-                    labels = ':'.join(sorted(node.get('labels', {'Resource'})))
-                    properties = node.get('properties', {})
-                    
-                    batch_data.append({
-                        'labels': labels,
-                        'properties': properties
-                    })
-                
-                # Execute bulk query
-                query = """
-                UNWIND $batch AS item
-                CALL {
-                    WITH item
-                    CREATE (n)
-                    SET n += item.properties
-                    FOREACH (label IN split(item.labels, ':') | 
-                        CALL apoc.create.addLabels(n, [label])
-                    )
-                } IN TRANSACTIONS OF 1000 ROWS
-                """
-                
-                # Fallback query if APOC is not available
-                fallback_query = """
-                UNWIND $batch AS item
-                CREATE (n:Resource)
-                SET n += item.properties
-                """
-                
-                try:
-                    await self.connection_manager.execute_query(
-                        graph_name, query, {'batch': batch_data}, timeout=90000
-                    )
-                except Exception:
-                    # Use fallback query
-                    await self.connection_manager.execute_query(
-                        graph_name, fallback_query, {'batch': batch_data}, timeout=90000
-                    )
-                
-                created_count += len(batch)
-                batch_duration = time.time() - batch_start_time
-                
-                self.monitor.record_operation('node_creation', batch_duration, len(batch), True)
-                
-                if i % (batch_size * 10) == 0:
-                    self.logger.info(f"🏗️ Created {created_count:,}/{len(nodes):,} nodes")
-                
-            except Exception as e:
-                batch_duration = time.time() - batch_start_time
-                self.monitor.record_operation('node_creation', batch_duration, len(batch), False, str(e))
-                self.logger.error(f"Node batch failed at {i}: {e}")
-                
-                # Try individual creation as fallback
-                created_count += await self._fallback_individual_nodes(graph_name, batch)
-        
-        total_duration = time.time() - start_time
-        self.logger.info(f"✅ Node creation completed: {created_count:,} nodes in {total_duration:.2f}s")
-        return created_count
-    
-    async def bulk_create_relationships(self, graph_name: str, relationships: List[Dict]) -> int:
-        """Optimized bulk relationship creation"""
-        if not relationships:
-            return 0
-        
-        start_time = time.time()
-        # Use smaller batches for relationships due to complexity
-        batch_size = min(self.monitor.adaptive_batch_size // 2, 500)
-        created_count = 0
-        
-        for i in range(0, len(relationships), batch_size):
-            batch = relationships[i:i + batch_size]
-            batch_start_time = time.time()
-            
-            try:
-                query = """
-                UNWIND $batch AS rel
-                MATCH (a:Resource {entity_id: rel.source_id})
-                MATCH (b:Resource {entity_id: rel.target_id})
-                CALL apoc.create.relationship(a, rel.type, rel.properties, b)
-                YIELD rel as created_rel
-                RETURN count(created_rel)
-                """
-                
-                # Fallback query without APOC
-                fallback_query = """
-                UNWIND $batch AS rel
-                MATCH (a:Resource {entity_id: rel.source_id})
-                MATCH (b:Resource {entity_id: rel.target_id})
-                CREATE (a)-[r:RELATED]->(b)
-                SET r += rel.properties
-                SET r.type = rel.type
-                """
-                
-                try:
-                    await self.connection_manager.execute_query(
-                        graph_name, query, {'batch': batch}, timeout=120000
-                    )
-                except Exception:
-                    # Use fallback query
-                    await self.connection_manager.execute_query(
-                        graph_name, fallback_query, {'batch': batch}, timeout=120000
-                    )
-                
-                created_count += len(batch)
-                batch_duration = time.time() - batch_start_time
-                
-                self.monitor.record_operation('relationship_creation', batch_duration, len(batch), True)
-                
-                if i % (batch_size * 10) == 0:
-                    self.logger.info(f"🔗 Created {created_count:,}/{len(relationships):,} relationships")
-                
-            except Exception as e:
-                batch_duration = time.time() - batch_start_time
-                self.monitor.record_operation('relationship_creation', batch_duration, len(batch), False, str(e))
-                self.logger.error(f"Relationship batch failed at {i}: {e}")
-                
-                # Try individual creation as fallback
-                created_count += await self._fallback_individual_relationships(graph_name, batch)
-        
-        total_duration = time.time() - start_time
-        self.logger.info(f"✅ Relationship creation completed: {created_count:,} relationships in {total_duration:.2f}s")
-        return created_count
-    
-    async def _fallback_individual_nodes(self, graph_name: str, nodes: List[Dict]) -> int:
-        """Fallback to individual node creation"""
-        created_count = 0
-        for node in nodes:
-            try:
-                properties = node.get('properties', {})
-                query = "CREATE (n:Resource) SET n += $properties"
-                await self.connection_manager.execute_query(graph_name, query, {'properties': properties}, timeout=10000)
-                created_count += 1
-            except Exception as e:
-                self.logger.debug(f"Individual node creation failed: {e}")
-        return created_count
-    
-    async def _fallback_individual_relationships(self, graph_name: str, relationships: List[Dict]) -> int:
-        """Fallback to individual relationship creation"""
-        created_count = 0
-        for rel in relationships:
-            try:
-                query = """
-                MATCH (a:Resource {entity_id: $source_id})
-                MATCH (b:Resource {entity_id: $target_id})
-                CREATE (a)-[r:RELATED]->(b)
-                SET r += $properties
-                """
-                await self.connection_manager.execute_query(graph_name, query, rel, timeout=10000)
-                created_count += 1
-            except Exception as e:
-                self.logger.debug(f"Individual relationship creation failed: {e}")
-        return created_count
-
-
-class ProductionRDFConverter:
-    """Production-ready RDF to FalkorDB converter"""
-    
-    def __init__(self, config: ConverterConfig):
-        self.config = config
-        self.monitor = PerformanceMonitor(config)
-        self.parser = RDFParser(config)
-        self.processor = GraphDataProcessor(config)
-        self.setup_logging()
-    
-    def setup_logging(self):
-        """Configure comprehensive logging"""
-        logging.basicConfig(
-            level=getattr(logging, self.config.log_level),
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.StreamHandler(),
-                logging.FileHandler('rdf_converter.log')
-            ]
-        )
-        self.logger = logging.getLogger(__name__)
-    
-    async def convert_files(self, rdf_files: List[str], graph_name: str = "rdf_graph", 
-                           clear_existing: bool = True) -> Dict[str, Any]:
-        """Main conversion method with full error handling"""
-        
-        self.logger.info(f"🚀 Starting RDF conversion")
-        self.logger.info(f"📁 Files: {len(rdf_files)}")
-        self.logger.info(f"🎯 Graph: {graph_name}")
-        self.logger.info(f"⚙️ Config: batch_size={self.config.batch_size}, memory_limit={self.config.memory_limit_mb}MB")
-        
-        results = {
-            'processed_files': 0,
-            'failed_files': [],
-            'total_triples': 0,
-            'total_nodes': 0,
-            'total_relationships': 0,
-            'errors': [],
-            'performance_stats': {}
-        }
-        
-        async with managed_falkor_connection(self.config) as connection_manager:
-            # Configure database for optimal performance
-            await connection_manager.configure_database(graph_name)
-            
-            # Clear existing data if requested
-            if clear_existing:
-                await self._clear_graph(connection_manager, graph_name)
-            
-            # Create bulk operations handler
-            bulk_ops = BulkOperations(connection_manager, self.monitor)
-            
-            # Create indexes before bulk operations
-            if self.config.create_indexes:
-                await bulk_ops.create_indexes(graph_name)
-            
-            # Process files
-            for rdf_file in rdf_files:
-                try:
-                    file_results = await self._process_single_file(
-                        connection_manager, bulk_ops, graph_name, rdf_file
-                    )
-                    
-                    results['processed_files'] += 1
-                    results['total_triples'] += file_results['triples']
-                    results['total_nodes'] += file_results['nodes']
-                    results['total_relationships'] += file_results['relationships']
-                    
-                    self.logger.info(f"✅ Completed {rdf_file}: {file_results}")
-                    
-                except Exception as e:
-                    self.logger.error(f"❌ File processing failed: {rdf_file} - {e}")
-                    results['failed_files'].append(rdf_file)
-                    results['errors'].append(str(e))
-            
-            # Generate performance report
-            if self.config.enable_monitoring:
-                results['performance_stats'] = self.monitor.get_statistics()
-                self.logger.info(f"📊 Performance Report: {json.dumps(results['performance_stats'], indent=2)}")
-        
-        return results
-    
-    async def _clear_graph(self, connection_manager: FalkorDBConnectionManager, graph_name: str):
-        """Clear existing graph data"""
-        try:
-            self.logger.info("🗑️ Clearing existing graph data...")
-            await connection_manager.execute_query(graph_name, "MATCH (n) DETACH DELETE n", timeout=60000)
-            self.logger.info("✅ Graph cleared successfully")
+            for cypher in cypher_parts:
+                self.db.query(cypher)
         except Exception as e:
-            self.logger.error(f"❌ Failed to clear graph: {e}")
-            raise
+            logger.error(f"Error in batch nodes ingestion: {e}")
+            # Try individual inserts
+            for i, cypher in enumerate(cypher_parts):
+                try:
+                    self.db.query(cypher)
+                except Exception as inner_e:
+                    logger.error(f"Error inserting node {batch_start + i}: {inner_e}")
     
-    async def _process_single_file(self, connection_manager: FalkorDBConnectionManager, 
-                                  bulk_ops: BulkOperations, graph_name: str, filename: str) -> Dict[str, Any]:
-        """Process single RDF file with monitoring"""
+    def ingest_edges_batch(self, edges: List[Dict], batch_start: int, batch_end: int):
+        """Ingest a batch of edges into FalkorDB"""
+        batch_edges = edges[batch_start:batch_end]
         
-        self.logger.info(f"📖 Processing file: {filename}")
-        start_time = time.time()
+        if not batch_edges:
+            return
         
-        total_nodes = 0
-        total_relationships = 0
-        total_triples = 0
+        # Create MATCH and MERGE statements for edges
+        cypher_parts = []
+        for edge in batch_edges:
+            from_id = edge['from']
+            to_id = edge['to']
+            relationship = edge['relationship']
+            properties_str = self.create_cypher_properties(edge['properties'])
+            
+            cypher = f"""
+            MATCH (from:Node {{id: '{from_id}'}})
+            MATCH (to:Node {{id: '{to_id}'}})
+            MERGE (from)-[r:{relationship}]->(to)
+            SET r += {properties_str}
+            """
+            cypher_parts.append(cypher.strip())
         
+        # Execute batch
         try:
-            # Process file in streaming chunks
-            for chunk_idx, batch in enumerate(self.parser.parse_rdf_streaming(filename)):
-                chunk_start_time = time.time()
-                
-                # Process triples into graph elements
-                nodes, relationships = self.processor.process_triples_batch(batch)
-                total_triples += len(batch)
-                
-                # Bulk create nodes
-                if nodes:
-                    created_nodes = await bulk_ops.bulk_create_nodes(graph_name, nodes)
-                    total_nodes += created_nodes
-                
-                # Bulk create relationships
-                if relationships:
-                    created_rels = await bulk_ops.bulk_create_relationships(graph_name, relationships)
-                    total_relationships += created_rels
-                
-                chunk_duration = time.time() - chunk_start_time
-                
-                # Memory management
-                if self.monitor.should_trigger_gc():
-                    gc.collect()
-                    memory_mb = self.monitor.get_memory_usage()
-                    self.logger.info(f"🧹 Garbage collection triggered, memory: {memory_mb:.1f}MB")
-                
-                # Progress reporting
-                if chunk_idx % 10 == 0:
-                    self.logger.info(f"📈 Chunk {chunk_idx}: {len(batch)} triples processed in {chunk_duration:.2f}s")
-        
+            for cypher in cypher_parts:
+                self.db.query(cypher)
         except Exception as e:
-            self.logger.error(f"❌ Error processing {filename}: {e}")
+            logger.error(f"Error in batch edges ingestion: {e}")
+            # Try individual inserts
+            for i, cypher in enumerate(cypher_parts):
+                try:
+                    self.db.query(cypher)
+                except Exception as inner_e:
+                    logger.error(f"Error inserting edge {batch_start + i}: {inner_e}")
+    
+    def ingest_to_falkordb(self, nodes: List[Dict], edges: List[Dict]):
+        """Ingest nodes and edges into FalkorDB with batching"""
+        logger.info("Starting ingestion into FalkorDB...")
+        
+        # Create indexes for better performance
+        try:
+            self.db.query("CREATE INDEX ON :Node(id)")
+            self.db.query("CREATE INDEX ON :Resource(uri)")
+        except Exception as e:
+            logger.warning(f"Index creation warning (may already exist): {e}")
+        
+        # Ingest nodes in batches
+        logger.info(f"Ingesting {len(nodes)} nodes in batches of {self.batch_size}...")
+        for i in tqdm(range(0, len(nodes), self.batch_size), desc="Ingesting nodes"):
+            batch_end = min(i + self.batch_size, len(nodes))
+            self.ingest_nodes_batch(nodes, i, batch_end)
+            time.sleep(0.01)  # Small delay to prevent overwhelming the database
+        
+        # Ingest edges in batches
+        logger.info(f"Ingesting {len(edges)} edges in batches of {self.batch_size}...")
+        for i in tqdm(range(0, len(edges), self.batch_size), desc="Ingesting edges"):
+            batch_end = min(i + self.batch_size, len(edges))
+            self.ingest_edges_batch(edges, i, batch_end)
+            time.sleep(0.01)  # Small delay to prevent overwhelming the database
+        
+        logger.info("Ingestion completed successfully!")
+    
+    def convert_and_ingest(self, ttl_file_path: str):
+        """Main method to convert TTL file and ingest into FalkorDB"""
+        try:
+            # Parse TTL file
+            graph = self.parse_ttl_streaming(ttl_file_path)
+            
+            # Convert to property graph
+            nodes, edges = self.convert_to_property_graph(graph)
+            
+            # Ingest into FalkorDB
+            self.ingest_to_falkordb(nodes, edges)
+            
+            # Print summary
+            result = self.db.query("MATCH (n) RETURN count(n) as node_count")
+            node_count = result.result_set[0][0] if result.result_set else 0
+            
+            result = self.db.query("MATCH ()-[r]->() RETURN count(r) as edge_count")
+            edge_count = result.result_set[0][0] if result.result_set else 0
+            
+            logger.info(f"Final database statistics:")
+            logger.info(f"  Nodes: {node_count}")
+            logger.info(f"  Edges: {edge_count}")
+            
+        except Exception as e:
+            logger.error(f"Error in conversion and ingestion: {e}")
             raise
-        
-        duration = time.time() - start_time
-        
-        return {
-            'filename': filename,
-            'nodes': total_nodes,
-            'relationships': total_relationships,
-            'triples': total_triples,
-            'duration': duration,
-            'throughput_triples_per_second': total_triples / duration if duration > 0 else 0
-        }
 
-
-async def main():
-    """Main async entry point"""
+def main():
+    """Main function with example usage"""
     import argparse
+    import os
     
-    parser = argparse.ArgumentParser(description="Production RDF to FalkorDB converter")
-    parser.add_argument("rdf_files", nargs='+', help="RDF files to convert")
-    parser.add_argument("--graph-name", default="rdf_graph", help="FalkorDB graph name")
-    parser.add_argument("--host", default="localhost", help="FalkorDB host")
-    parser.add_argument("--port", type=int, default=6379, help="FalkorDB port")
-    parser.add_argument("--password", help="FalkorDB password")
-    
-    # Performance settings
-    parser.add_argument("--batch-size", type=int, default=1000, help="Processing batch size")
-    parser.add_argument("--max-connections", type=int, default=32, help="Max database connections")
-    parser.add_argument("--memory-limit", type=int, default=2048, help="Memory limit in MB")
-    parser.add_argument("--query-timeout", type=int, default=60000, help="Query timeout in ms")
-    
-    # Feature flags
-    parser.add_argument("--keep-existing", action="store_true", help="Don't clear existing data")
-    parser.add_argument("--disable-monitoring", action="store_true", help="Disable performance monitoring")
-    parser.add_argument("--disable-indexes", action="store_true", help="Don't create indexes")
-    parser.add_argument("--disable-adaptive", action="store_true", help="Disable adaptive batching")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
+    parser = argparse.ArgumentParser(description='Convert TTL file to FalkorDB property graph')
+    parser.add_argument('ttl_file', help='Path to TTL file')
+    parser.add_argument('--host', default='localhost', help='Redis/FalkorDB host (default: localhost)')
+    parser.add_argument('--port', type=int, default=6379, help='Redis/FalkorDB port (default: 6379)')
+    parser.add_argument('--db_name', default='knowledge_graph', help='Database name (default: knowledge_graph)')
+    parser.add_argument('--batch_size', type=int, default=0, help='Batch size for ingestion (0=auto-detect)')
+    parser.add_argument('--password', help='Redis password if required')
     
     args = parser.parse_args()
     
-    # Validate input files
-    for rdf_file in args.rdf_files:
-        if not os.path.exists(rdf_file):
-            print(f"❌ File not found: {rdf_file}")
-            return 1
+    # Check if file exists
+    if not os.path.exists(args.ttl_file):
+        logger.error(f"TTL file not found: {args.ttl_file}")
+        return
     
-    # Create configuration
-    config = ConverterConfig(
-        falkor_host=args.host,
-        falkor_port=args.port,
-        falkor_password=args.password,
-        batch_size=args.batch_size,
-        max_connections=args.max_connections,
-        memory_limit_mb=args.memory_limit,
-        query_timeout=args.query_timeout,
-        enable_monitoring=not args.disable_monitoring,
-        create_indexes=not args.disable_indexes,
-        enable_adaptive_batching=not args.disable_adaptive,
-        log_level="DEBUG" if args.verbose else "INFO"
-    )
+    # Auto-detect batch size based on file size
+    batch_size = args.batch_size
+    if batch_size == 0:
+        file_size_mb = os.path.getsize(args.ttl_file) / (1024 * 1024)
+        if file_size_mb > 1000:  # >1GB
+            batch_size = 200
+            logger.info(f"Large file detected ({file_size_mb:.1f}MB), using batch_size={batch_size}")
+        elif file_size_mb > 100:  # >100MB
+            batch_size = 500
+            logger.info(f"Medium file detected ({file_size_mb:.1f}MB), using batch_size={batch_size}")
+        else:
+            batch_size = 1000
+            logger.info(f"Small file detected ({file_size_mb:.1f}MB), using batch_size={batch_size}")
     
+    # Test connection first
     try:
-        # Create and run converter
-        converter = ProductionRDFConverter(config)
-        results = await converter.convert_files(
-            rdf_files=args.rdf_files,
-            graph_name=args.graph_name,
-            clear_existing=not args.keep_existing
-        )
-        
-        # Print summary
-        print(f"\n✅ Conversion completed successfully!")
-        print(f"📊 Files processed: {results['processed_files']}")
-        print(f"🏗️ Nodes created: {results['total_nodes']:,}")
-        print(f"🔗 Relationships created: {results['total_relationships']:,}")
-        print(f"📈 Total triples: {results['total_triples']:,}")
-        
-        if results['failed_files']:
-            print(f"❌ Failed files: {len(results['failed_files'])}")
-            for failed_file in results['failed_files']:
-                print(f"  - {failed_file}")
-        
-        if results['performance_stats']:
-            stats = results['performance_stats']
-            print(f"⚡ Runtime: {stats['total_runtime_seconds']:.2f}s")
-            print(f"💾 Peak memory: {stats['memory_usage_mb']:.1f}MB")
-            
-            if 'operations' in stats and 'node_creation' in stats['operations']:
-                node_stats = stats['operations']['node_creation']
-                print(f"🏗️ Node creation success rate: {node_stats['success_rate']:.1%}")
-        
-        return 0
-        
-    except KeyboardInterrupt:
-        print("\n⚠️ Conversion interrupted by user")
-        return 1
+        if args.password:
+            test_client = redis.Redis(host=args.host, port=args.port, password=args.password, decode_responses=True)
+        else:
+            test_client = redis.Redis(host=args.host, port=args.port, decode_responses=True)
+        test_client.ping()
+        logger.info(f"Successfully connected to FalkorDB at {args.host}:{args.port}")
     except Exception as e:
-        print(f"\n❌ Conversion failed: {e}")
-        logging.getLogger(__name__).exception("Conversion failed")
-        return 1
-
-
-def sync_main():
-    """Synchronous entry point for compatibility"""
-    return asyncio.run(main())
-
+        logger.error(f"Failed to connect to FalkorDB at {args.host}:{args.port}: {e}")
+        logger.error("Please ensure FalkorDB is running and accessible")
+        return
+    
+    # Create converter
+    converter = TTLToFalkorDB(
+        redis_host=args.host,
+        redis_port=args.port,
+        db_name=args.db_name,
+        password=args.password
+    )
+    converter.batch_size = batch_size
+    
+    # Convert and ingest
+    converter.convert_and_ingest(args.ttl_file)
 
 if __name__ == "__main__":
-    sys.exit(sync_main())
+    main()
