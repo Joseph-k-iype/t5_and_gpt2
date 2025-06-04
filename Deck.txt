@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-TTL to CSV to FalkorDB Ultra-Fast Pipeline (Updated for Latest FalkorDB API)
-Converts TTL to CSV format then uses FalkorDB's native bulk loader for maximum speed
+TTL to FalkorDB Pipeline using LOAD CSV
+Converts TTL to CSV format then uses FalkorDB's LOAD CSV Cypher commands
 """
 
 import rdflib
@@ -12,7 +12,6 @@ import json
 import time
 import logging
 import os
-import subprocess
 from typing import Dict, Set, List, Tuple, Any, Optional
 from urllib.parse import urlparse
 import re
@@ -33,22 +32,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class TTLToCSVConverter:
-    def __init__(self, output_dir='csv_output', use_schema=True, use_hash_ids=False):
-        """Initialize the TTL to CSV converter"""
+class TTLToFalkorDBConverter:
+    def __init__(self, output_dir='csv_output'):
+        """Initialize the TTL to FalkorDB converter"""
         self.output_dir = Path(output_dir)
-        self.use_schema = use_schema  # Use enforce-schema format for better compatibility
-        self.use_hash_ids = use_hash_ids  # Use hash-based IDs instead of sequential
-        self.nodes_by_type = {}  # type -> dict of {id: properties}
-        self.edges_by_type = {}  # relationship -> list of edges
-        self.node_id_map = {}    # URI -> unique_id
+        self.nodes = {}  # node_id -> {node_type, properties}
+        self.edges = []  # list of {source_id, target_id, edge_type, properties}
+        self.node_id_map = {}  # URI -> unique_id
         self.next_id = 1
-        self.bulk_loader_cmd = None
         
         # Create output directory
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # CSV writing parameters for consistency
+        # CSV writing parameters
         self.csv_params = {
             'quoting': csv.QUOTE_MINIMAL,
             'quotechar': '"',
@@ -94,31 +90,21 @@ class TTLToCSVConverter:
             return (cleaned or "literal")[:50]
     
     def get_or_create_node_id(self, resource) -> str:
-        """Get or create a unique sequential ID for a resource"""
+        """Get or create a unique ID for a resource"""
         uri = str(resource)
         if uri not in self.node_id_map:
-            if self.use_hash_ids:
-                # Use hash-based IDs to avoid large integer issues
-                hash_obj = hashlib.md5(uri.encode('utf-8'))
-                # Use first 8 characters of hex digest for shorter IDs
-                node_id = hash_obj.hexdigest()[:8]
-                # Ensure uniqueness by adding counter if collision occurs
-                original_id = node_id
-                counter = 1
-                while node_id in self.node_id_map.values():
-                    node_id = f"{original_id}_{counter}"
-                    counter += 1
-                self.node_id_map[uri] = node_id
-            else:
-                # Use shorter IDs to avoid integer overflow issues
-                # Reset counter if it gets too large
-                if self.next_id > 2147483647:  # Max 32-bit signed integer
-                    logger.warning("[WARN] ID counter reset due to size limit")
-                    self.next_id = 1
-                
-                # Use shorter ID format to avoid C long conversion issues
-                self.node_id_map[uri] = str(self.next_id)
-                self.next_id += 1
+            # Use hash-based IDs to avoid integer overflow issues
+            hash_obj = hashlib.md5(uri.encode('utf-8'))
+            node_id = f"n_{hash_obj.hexdigest()[:8]}"
+            
+            # Ensure uniqueness
+            original_id = node_id
+            counter = 1
+            while node_id in [node['id'] for node in self.nodes.values()]:
+                node_id = f"{original_id}_{counter}"
+                counter += 1
+            
+            self.node_id_map[uri] = node_id
         return self.node_id_map[uri]
     
     def extract_properties_from_uri(self, uri: URIRef) -> Dict[str, str]:
@@ -141,115 +127,20 @@ class TTLToCSVConverter:
         
         return properties
     
-    def process_literal_value(self, literal: Literal) -> Tuple[str, str]:
-        """Process literal value and return (cleaned_value, datatype)"""
-        try:
-            if literal.datatype:
-                datatype_str = str(literal.datatype)
-                
-                # Handle common XSD datatypes with size validation
-                if any(x in datatype_str.lower() for x in ['integer', 'int', 'long']):
-                    try:
-                        int_val = int(literal)
-                        # Check if integer is within safe range
-                        if abs(int_val) > 2147483647:  # Max 32-bit signed int
-                            logger.warning(f"[WARN] Large integer {int_val} stored as string")
-                            return str(literal), 'STRING'
-                        return str(literal), 'INT'
-                    except ValueError:
-                        return str(literal), 'STRING'
-                        
-                elif any(x in datatype_str.lower() for x in ['decimal', 'double', 'float']):
-                    try:
-                        float_val = float(literal)
-                        # Check if float is within reasonable range
-                        if abs(float_val) > 1e15:
-                            logger.warning(f"[WARN] Large float {float_val} stored as string")
-                            return str(literal), 'STRING'
-                        return str(literal), 'DOUBLE'
-                    except ValueError:
-                        return str(literal), 'STRING'
-                        
-                elif 'boolean' in datatype_str.lower():
-                    return str(literal).lower(), 'BOOL'
-                    
-                elif any(x in datatype_str.lower() for x in ['date', 'time']):
-                    return str(literal), 'STRING'  # Store dates as strings
-                    
-                else:
-                    return str(literal), 'STRING'
-            else:
-                # No datatype specified - try to infer but be conservative
-                literal_str = str(literal)
-                
-                # Try to detect if it's a number
-                try:
-                    if '.' in literal_str:
-                        float_val = float(literal_str)
-                        if abs(float_val) <= 1e15:
-                            return literal_str, 'DOUBLE'
-                    else:
-                        int_val = int(literal_str)
-                        if abs(int_val) <= 2147483647:
-                            return literal_str, 'INT'
-                    # If number is too large, treat as string
-                    return literal_str, 'STRING'
-                except ValueError:
-                    # Not a number
-                    return literal_str, 'STRING'
-                
-        except Exception as e:
-            logger.warning(f"Error processing literal {literal}: {e}")
-            return str(literal), 'STRING'
-    
     def sanitize_csv_value(self, value: Any) -> str:
-        """Sanitize value for CSV output with size limits"""
+        """Sanitize value for CSV output"""
         if value is None:
             return ''
         
         if isinstance(value, bool):
             return 'true' if value else 'false'
         
-        # Handle numeric values with size constraints
-        if isinstance(value, int):
-            # Ensure integer is within safe range for C long
-            if value > 2147483647:  # Max 32-bit signed int
-                logger.warning(f"[WARN] Large integer {value} converted to string")
-                return str(value)
-            elif value < -2147483648:  # Min 32-bit signed int
-                logger.warning(f"[WARN] Large negative integer {value} converted to string")
-                return str(value)
-            else:
-                return str(value)
-        
-        if isinstance(value, float):
-            # Handle very large floats
-            if abs(value) > 1e15:  # Very large float
-                logger.warning(f"[WARN] Large float {value} converted to string")
-                return str(value)
-            else:
-                return str(value)
-        
         if isinstance(value, (list, dict)):
-            # Convert arrays to string representation for CSV
-            if isinstance(value, list):
-                # Join array elements with semicolon (safer than comma)
-                return ';'.join(str(item) for item in value)
-            else:
-                return json.dumps(value, ensure_ascii=False)
+            # Convert to JSON string for complex data
+            return json.dumps(value, ensure_ascii=False)
         
         # Convert to string and clean
         str_value = str(value).strip()
-        
-        # Check if string represents a large number
-        try:
-            # If it's a numeric string, validate the size
-            if str_value.isdigit() or (str_value.startswith('-') and str_value[1:].isdigit()):
-                num_val = int(str_value)
-                if abs(num_val) > 2147483647:
-                    logger.warning(f"[WARN] Large numeric string {str_value} detected")
-        except ValueError:
-            pass  # Not a number, continue with string processing
         
         # Replace problematic characters for CSV
         str_value = str_value.replace('\r\n', ' ').replace('\r', ' ').replace('\n', ' ')
@@ -260,17 +151,55 @@ class TTLToCSVConverter:
             str_value = str_value.replace('"', '""')
         
         # Limit string length to prevent memory issues
-        if len(str_value) > 1000:
+        if len(str_value) > 500:
             logger.warning(f"[WARN] Very long string truncated (length: {len(str_value)})")
-            str_value = str_value[:1000] + "..."
+            str_value = str_value[:500] + "..."
         
         return str_value
     
-    def convert_ttl_to_csv(self, ttl_file_path: str, max_rows: Optional[int] = None):
-        """Convert TTL file to CSV format optimized for FalkorDB bulk loader"""
-        logger.info(f"Converting {ttl_file_path} to CSV format...")
-        if max_rows:
-            logger.info(f"[LIMIT] Processing max {max_rows} triples for testing")
+    def process_literal_value(self, literal: Literal) -> str:
+        """Process literal value and return cleaned string"""
+        try:
+            if literal.datatype:
+                datatype_str = str(literal.datatype)
+                
+                # Handle common XSD datatypes
+                if any(x in datatype_str.lower() for x in ['integer', 'int', 'long']):
+                    try:
+                        int_val = int(literal)
+                        # Keep reasonable sized integers
+                        if abs(int_val) <= 2147483647:
+                            return str(int_val)
+                        else:
+                            return str(literal)  # Keep as string if too large
+                    except ValueError:
+                        return str(literal)
+                        
+                elif any(x in datatype_str.lower() for x in ['decimal', 'double', 'float']):
+                    try:
+                        float_val = float(literal)
+                        if abs(float_val) <= 1e15:
+                            return str(float_val)
+                        else:
+                            return str(literal)
+                    except ValueError:
+                        return str(literal)
+                        
+                elif 'boolean' in datatype_str.lower():
+                    return str(literal).lower()
+                    
+                else:
+                    return str(literal)
+            else:
+                return str(literal)
+                
+        except Exception as e:
+            logger.warning(f"Error processing literal {literal}: {e}")
+            return str(literal)
+    
+    def convert_ttl_to_csv(self, ttl_file_path: str, max_triples: Optional[int] = None):
+        """Convert TTL file to CSV format for FalkorDB LOAD CSV"""
+        logger.info(f"Converting {ttl_file_path} to CSV format for LOAD CSV...")
         
         # Parse TTL file
         graph = Graph()
@@ -287,21 +216,16 @@ class TTLToCSVConverter:
             logger.warning("No triples found in the TTL file!")
             return []
         
-        # Apply row limit if specified
-        if max_rows and max_rows < total_triples:
-            logger.info(f"[LIMIT] Processing only first {max_rows} of {total_triples} triples")
-            total_triples = max_rows
-        
-        # Track properties and their types for schema
-        node_properties = {}  # node_type -> dict of {prop_name: datatype}
-        edge_properties = {}  # edge_type -> dict of {prop_name: datatype}
+        # Apply limit if specified
+        if max_triples and max_triples < total_triples:
+            logger.info(f"[LIMIT] Processing only first {max_triples} of {total_triples} triples")
+            total_triples = max_triples
         
         logger.info("Processing triples and building data structures...")
         processed_count = 0
         with tqdm(total=total_triples, desc="Processing triples") as pbar:
             for subject, predicate, obj in graph:
-                if max_rows and processed_count >= max_rows:
-                    logger.info(f"[LIMIT] Reached max_rows limit of {max_rows}")
+                if max_triples and processed_count >= max_triples:
                     break
                 
                 pbar.update(1)
@@ -312,13 +236,8 @@ class TTLToCSVConverter:
                 subject_type = self.clean_identifier(subject)
                 predicate_clean = self.clean_identifier(predicate)
                 
-                # Initialize node type tracking
-                if subject_type not in self.nodes_by_type:
-                    self.nodes_by_type[subject_type] = {}
-                    node_properties[subject_type] = {}
-                
                 # Initialize subject node if not exists
-                if subject_id not in self.nodes_by_type[subject_type]:
+                if subject_id not in self.nodes:
                     if isinstance(subject, URIRef):
                         base_props = self.extract_properties_from_uri(subject)
                     else:  # BNode
@@ -327,32 +246,25 @@ class TTLToCSVConverter:
                             'resource_type': 'blank_node'
                         }
                     
-                    self.nodes_by_type[subject_type][subject_id] = base_props
-                    
-                    # Track properties with types
-                    for prop_name, prop_value in base_props.items():
-                        node_properties[subject_type][prop_name] = 'STRING'
+                    self.nodes[subject_id] = {
+                        'id': subject_id,
+                        'node_type': subject_type,
+                        'properties': base_props
+                    }
                 
                 # Handle object
                 if isinstance(obj, Literal):
                     # Add as property to subject node
-                    value, datatype = self.process_literal_value(obj)
+                    value = self.process_literal_value(obj)
+                    prop_name = predicate_clean
                     
-                    # Clean property name
-                    clean_prop = predicate_clean
-                    
-                    # Store the value
-                    current_node = self.nodes_by_type[subject_type][subject_id]
-                    current_node[clean_prop] = self.sanitize_csv_value(value)
-                    
-                    # Track property type
-                    node_properties[subject_type][clean_prop] = datatype
+                    # Store the value as a property
+                    self.nodes[subject_id]['properties'][prop_name] = value
                     
                     # Store language if present
                     if obj.language:
-                        lang_prop = f"{clean_prop}_lang"
-                        current_node[lang_prop] = obj.language
-                        node_properties[subject_type][lang_prop] = 'STRING'
+                        lang_prop = f"{prop_name}_lang"
+                        self.nodes[subject_id]['properties'][lang_prop] = obj.language
                 
                 else:
                     # Object is a resource - create edge
@@ -360,11 +272,7 @@ class TTLToCSVConverter:
                     object_type = self.clean_identifier(obj)
                     
                     # Initialize object node if not exists
-                    if object_type not in self.nodes_by_type:
-                        self.nodes_by_type[object_type] = {}
-                        node_properties[object_type] = {}
-                    
-                    if object_id not in self.nodes_by_type[object_type]:
+                    if object_id not in self.nodes:
                         if isinstance(obj, URIRef):
                             base_props = self.extract_properties_from_uri(obj)
                         else:  # BNode
@@ -373,225 +281,194 @@ class TTLToCSVConverter:
                                 'resource_type': 'blank_node'
                             }
                         
-                        self.nodes_by_type[object_type][object_id] = base_props
-                        
-                        # Track properties with types
-                        for prop_name, prop_value in base_props.items():
-                            node_properties[object_type][prop_name] = 'STRING'
+                        self.nodes[object_id] = {
+                            'id': object_id,
+                            'node_type': object_type,
+                            'properties': base_props
+                        }
                     
                     # Create edge
-                    if predicate_clean not in self.edges_by_type:
-                        self.edges_by_type[predicate_clean] = []
-                        edge_properties[predicate_clean] = {'predicate_uri': 'STRING'}
-                    
                     edge = {
                         'source_id': subject_id,
                         'target_id': object_id,
-                        'predicate_uri': self.sanitize_csv_value(str(predicate))
+                        'edge_type': predicate_clean,
+                        'properties': {
+                            'predicate_uri': str(predicate)
+                        }
                     }
-                    self.edges_by_type[predicate_clean].append(edge)
+                    self.edges.append(edge)
         
-        logger.info("Schema analysis complete:")
-        logger.info(f"  Node types: {len(self.nodes_by_type)} ({list(self.nodes_by_type.keys())})")
-        logger.info(f"  Edge types: {len(self.edges_by_type)} ({list(self.edges_by_type.keys())})")
+        logger.info(f"Data processing complete:")
+        logger.info(f"  Nodes: {len(self.nodes):,}")
+        logger.info(f"  Edges: {len(self.edges):,}")
         
-        # Write CSV files in FalkorDB format
+        # Write CSV files
+        csv_files = self.write_csv_files()
+        
+        # Generate Cypher commands
+        cypher_file = self.generate_cypher_commands()
+        
+        return csv_files, cypher_file
+    
+    def write_csv_files(self):
+        """Write nodes and edges to CSV files"""
         csv_files = []
         
-        # Write node CSV files
-        logger.info("Writing node CSV files...")
-        for node_type, nodes in self.nodes_by_type.items():
-            if not nodes:
-                logger.warning(f"Skipping empty node type: {node_type}")
-                continue
-                
-            # Use proper filename (label derived from filename)
-            filename = self.output_dir / f"{node_type}.csv"
-            csv_files.append(('nodes', str(filename)))
-            
-            # Get properties for this node type
-            props_with_types = node_properties.get(node_type, {})
-            
-            try:
-                with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
-                    writer = csv.writer(csvfile, **self.csv_params)
-                    
-                    if self.use_schema:
-                        # Use schema format with type annotations
-                        headers = [':ID']  # ID column first
-                        for prop_name, prop_type in sorted(props_with_types.items()):
-                            headers.append(f"{prop_name}:{prop_type}")
-                    else:
-                        # Use simple format (ID first, then properties)
-                        headers = ['id'] + sorted(props_with_types.keys())
-                    
-                    writer.writerow(headers)
-                    
-                    for node_id, node_data in sorted(nodes.items()):
-                        row = [node_id]  # ID first
-                        for prop_name in sorted(props_with_types.keys()):
-                            value = node_data.get(prop_name, '')
-                            row.append(self.sanitize_csv_value(value))
-                        writer.writerow(row)
-                
-                logger.info(f"  [OK] Written {len(nodes):,} {node_type} nodes to {filename.name}")
-                
-            except Exception as e:
-                logger.error(f"Error writing node file {filename}: {e}")
-                raise
+        # Write nodes CSV
+        nodes_file = self.output_dir / "nodes.csv"
+        csv_files.append(('nodes', str(nodes_file)))
         
-        # Write edge CSV files
-        logger.info("Writing edge CSV files...")
-        for edge_type, edges in self.edges_by_type.items():
-            if not edges:
-                logger.warning(f"Skipping empty edge type: {edge_type}")
-                continue
-                
-            # Use proper filename (relationship type derived from filename)
-            filename = self.output_dir / f"{edge_type}.csv"
-            csv_files.append(('relationships', str(filename)))
-            
-            # Get properties for this edge type
-            props_with_types = edge_properties[edge_type]
-            
-            try:
-                with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
-                    writer = csv.writer(csvfile, **self.csv_params)
-                    
-                    if self.use_schema:
-                        # Use schema format
-                        headers = [':START_ID', ':END_ID']  # Required first two columns
-                        for prop_name, prop_type in sorted(props_with_types.items()):
-                            if prop_name not in ['source_id', 'target_id']:
-                                headers.append(f"{prop_name}:{prop_type}")
-                    else:
-                        # Use simple format
-                        headers = ['source_id', 'target_id']
-                        for prop_name in sorted(props_with_types.keys()):
-                            if prop_name not in ['source_id', 'target_id']:
-                                headers.append(prop_name)
-                    
-                    writer.writerow(headers)
-                    
-                    for edge in edges:
-                        row = [edge['source_id'], edge['target_id']]
-                        for prop_name in sorted(props_with_types.keys()):
-                            if prop_name not in ['source_id', 'target_id']:
-                                value = edge.get(prop_name, '')
-                                row.append(self.sanitize_csv_value(value))
-                        writer.writerow(row)
-                
-                logger.info(f"  [OK] Written {len(edges):,} {edge_type} edges to {filename.name}")
-                
-            except Exception as e:
-                logger.error(f"Error writing edge file {filename}: {e}")
-                raise
+        # Get all possible property names from all nodes
+        all_properties = set()
+        for node in self.nodes.values():
+            all_properties.update(node['properties'].keys())
         
-        # Validate CSV files
-        self.validate_csv_files(csv_files)
+        all_properties = sorted(all_properties)
         
-        logger.info(f"[OK] CSV conversion completed! {len(csv_files)} files in {self.output_dir}/")
+        try:
+            with open(nodes_file, 'w', newline='', encoding='utf-8') as csvfile:
+                # Headers: id, node_type, then all properties
+                headers = ['id', 'node_type'] + all_properties
+                writer = csv.writer(csvfile, **self.csv_params)
+                writer.writerow(headers)
+                
+                for node in self.nodes.values():
+                    row = [
+                        node['id'],
+                        node['node_type']
+                    ]
+                    
+                    # Add property values
+                    for prop in all_properties:
+                        value = node['properties'].get(prop, '')
+                        row.append(self.sanitize_csv_value(value))
+                    
+                    writer.writerow(row)
+            
+            logger.info(f"[OK] Written {len(self.nodes):,} nodes to {nodes_file.name}")
+            
+        except Exception as e:
+            logger.error(f"Error writing nodes file {nodes_file}: {e}")
+            raise
+        
+        # Write edges CSV
+        edges_file = self.output_dir / "edges.csv"
+        csv_files.append(('edges', str(edges_file)))
+        
+        # Get all possible edge property names
+        all_edge_properties = set()
+        for edge in self.edges:
+            all_edge_properties.update(edge['properties'].keys())
+        
+        all_edge_properties = sorted(all_edge_properties)
+        
+        try:
+            with open(edges_file, 'w', newline='', encoding='utf-8') as csvfile:
+                # Headers: source_id, target_id, edge_type, then all properties
+                headers = ['source_id', 'target_id', 'edge_type'] + all_edge_properties
+                writer = csv.writer(csvfile, **self.csv_params)
+                writer.writerow(headers)
+                
+                for edge in self.edges:
+                    row = [
+                        edge['source_id'],
+                        edge['target_id'],
+                        edge['edge_type']
+                    ]
+                    
+                    # Add property values
+                    for prop in all_edge_properties:
+                        value = edge['properties'].get(prop, '')
+                        row.append(self.sanitize_csv_value(value))
+                    
+                    writer.writerow(row)
+            
+            logger.info(f"[OK] Written {len(self.edges):,} edges to {edges_file.name}")
+            
+        except Exception as e:
+            logger.error(f"Error writing edges file {edges_file}: {e}")
+            raise
+        
         return csv_files
     
-    def validate_csv_files(self, csv_files: List[Tuple[str, str]]):
-        """Validate CSV files for FalkorDB bulk loader compatibility"""
-        logger.info("Validating CSV files...")
+    def generate_cypher_commands(self):
+        """Generate Cypher LOAD CSV commands"""
+        cypher_file = self.output_dir / "load_data.cypher"
         
-        all_node_ids = set()
-        edge_references = set()
-        validation_errors = []
+        try:
+            with open(cypher_file, 'w', encoding='utf-8') as f:
+                f.write("// FalkorDB LOAD CSV Commands\n")
+                f.write("// Generated automatically from TTL data\n\n")
+                
+                f.write("// Clear existing data (optional)\n")
+                f.write("// MATCH (n) DETACH DELETE n;\n\n")
+                
+                f.write("// Load Nodes\n")
+                f.write("LOAD CSV WITH HEADERS FROM 'file://nodes.csv' AS row\n")
+                f.write("CALL {\n")
+                f.write("  WITH row\n")
+                f.write("  CREATE (n)\n")
+                f.write("  CALL apoc.create.addLabels(n, [row.node_type])\n")
+                f.write("  SET n = row\n")
+                f.write("  REMOVE n.node_type\n")  # Remove node_type from properties
+                f.write("  RETURN n\n")
+                f.write("} IN TRANSACTIONS OF 1000 ROWS;\n\n")
+                
+                f.write("// Alternative simpler node loading (if above doesn't work)\n")
+                f.write("// LOAD CSV WITH HEADERS FROM 'file://nodes.csv' AS row\n")
+                f.write("// CREATE (n {id: row.id})\n")
+                f.write("// SET n = row\n")
+                f.write("// REMOVE n.node_type;\n\n")
+                
+                f.write("// Load Edges\n")
+                f.write("LOAD CSV WITH HEADERS FROM 'file://edges.csv' AS row\n")
+                f.write("MATCH (source {id: row.source_id})\n")
+                f.write("MATCH (target {id: row.target_id})\n")
+                f.write("CALL {\n")
+                f.write("  WITH source, target, row\n")
+                f.write("  CALL apoc.create.relationship(source, row.edge_type, {}, target)\n")
+                f.write("  YIELD rel\n")
+                f.write("  SET rel = row\n")
+                f.write("  REMOVE rel.source_id, rel.target_id, rel.edge_type\n")
+                f.write("  RETURN rel\n")
+                f.write("} IN TRANSACTIONS OF 1000 ROWS;\n\n")
+                
+                f.write("// Alternative simpler edge loading (if above doesn't work)\n")
+                f.write("// LOAD CSV WITH HEADERS FROM 'file://edges.csv' AS row\n")
+                f.write("// MATCH (source {id: row.source_id})\n")
+                f.write("// MATCH (target {id: row.target_id})\n")
+                f.write("// CREATE (source)-[r:RELATED_TO]->(target)\n")
+                f.write("// SET r = row\n")
+                f.write("// REMOVE r.source_id, r.target_id, r.edge_type;\n\n")
+                
+                f.write("// Basic loading without dynamic types (most compatible)\n")
+                f.write("// Load all nodes with a generic label\n")
+                f.write("// LOAD CSV WITH HEADERS FROM 'file://nodes.csv' AS row\n")
+                f.write("// CREATE (n:Entity)\n")
+                f.write("// SET n = row;\n\n")
+                
+                f.write("// Load all edges with a generic relationship type\n")
+                f.write("// LOAD CSV WITH HEADERS FROM 'file://edges.csv' AS row\n")
+                f.write("// MATCH (source:Entity {id: row.source_id})\n")
+                f.write("// MATCH (target:Entity {id: row.target_id})\n")
+                f.write("// CREATE (source)-[r:CONNECTED_TO]->(target)\n")
+                f.write("// SET r = row\n")
+                f.write("// REMOVE r.source_id, r.target_id;\n\n")
+                
+                f.write("// Verify data loaded\n")
+                f.write("MATCH (n) RETURN count(n) AS node_count;\n")
+                f.write("MATCH ()-[r]->() RETURN count(r) AS edge_count;\n")
+            
+            logger.info(f"[OK] Generated Cypher commands in {cypher_file.name}")
+            
+        except Exception as e:
+            logger.error(f"Error writing Cypher file {cypher_file}: {e}")
+            raise
         
-        for file_type, filename in csv_files:
-            try:
-                with open(filename, 'r', encoding='utf-8') as f:
-                    reader = csv.reader(f)
-                    
-                    try:
-                        headers = next(reader)
-                    except StopIteration:
-                        validation_errors.append(f"Empty file: {filename}")
-                        continue
-                    
-                    row_count = 0
-                    for row_num, row in enumerate(reader, 1):
-                        if not row or len(row) != len(headers):
-                            if len(row) > 0:  # Only report non-empty rows with wrong length
-                                validation_errors.append(
-                                    f"{filename}:{row_num} - Row length mismatch: "
-                                    f"expected {len(headers)}, got {len(row)}"
-                                )
-                            continue
-                        
-                        row_count += 1
-                        
-                        if file_type == 'nodes':
-                            # Check ID column (first column)
-                            expected_id_col = ':ID' if self.use_schema else 'id'
-                            if headers[0] != expected_id_col:
-                                validation_errors.append(
-                                    f"{filename} - First column should be '{expected_id_col}', found '{headers[0]}'"
-                                )
-                            
-                            node_id = row[0]
-                            if not node_id:
-                                validation_errors.append(f"{filename}:{row_num} - Empty node ID")
-                            else:
-                                all_node_ids.add(node_id)
-                        
-                        elif file_type == 'relationships':
-                            # Check source/target columns
-                            if self.use_schema:
-                                expected_src, expected_tgt = ':START_ID', ':END_ID'
-                            else:
-                                expected_src, expected_tgt = 'source_id', 'target_id'
-                            
-                            if len(headers) < 2:
-                                validation_errors.append(f"{filename} - Must have at least 2 columns")
-                            elif headers[0] != expected_src or headers[1] != expected_tgt:
-                                validation_errors.append(
-                                    f"{filename} - First two columns should be '{expected_src}', '{expected_tgt}', "
-                                    f"found '{headers[0]}', '{headers[1]}'"
-                                )
-                            
-                            if len(row) >= 2:
-                                source_id, target_id = row[0], row[1]
-                                if not source_id or not target_id:
-                                    validation_errors.append(
-                                        f"{filename}:{row_num} - Empty source or target ID"
-                                    )
-                                else:
-                                    edge_references.add(source_id)
-                                    edge_references.add(target_id)
-                    
-                    logger.info(f"  File {filename}: {row_count:,} rows, {len(headers)} columns")
-                    
-            except Exception as e:
-                validation_errors.append(f"Error reading {filename}: {e}")
-        
-        # Check referential integrity
-        missing_nodes = edge_references - all_node_ids
-        if missing_nodes:
-            validation_errors.append(
-                f"Found {len(missing_nodes)} edge references without corresponding nodes"
-            )
-            if len(missing_nodes) <= 10:
-                validation_errors.append(f"Missing node IDs: {sorted(list(missing_nodes))}")
-        
-        # Report validation results
-        if validation_errors:
-            logger.warning(f"[WARN] Found {len(validation_errors)} validation issues:")
-            for error in validation_errors[:10]:  # Show first 10 errors
-                logger.warning(f"  - {error}")
-            if len(validation_errors) > 10:
-                logger.warning(f"  ... and {len(validation_errors) - 10} more")
-        else:
-            logger.info("[OK] All CSV files passed validation")
-        
-        logger.info(f"Summary: {len(all_node_ids):,} nodes, {len(edge_references):,} edge references")
-        return len(validation_errors) == 0
+        return str(cypher_file)
     
     def test_falkordb_connection(self, host: str, port: int, password: Optional[str] = None):
-        """Test connection to FalkorDB before attempting bulk load"""
+        """Test connection to FalkorDB"""
         logger.info(f"[TEST] Testing connection to FalkorDB at {host}:{port}...")
         
         try:
@@ -633,366 +510,92 @@ class TTLToCSVConverter:
         except Exception as e:
             logger.error(f"[ERROR] Connection test failed: {e}")
             return False
-
-    def find_bulk_loader(self) -> Optional[str]:
-        """Find available FalkorDB bulk loader command"""
-        commands_to_try = [
-            'falkordb-bulk-insert',
-            'python3 -m falkordb_bulk_loader',
-            'python -m falkordb_bulk_loader'
-        ]
-        
-        for cmd in commands_to_try:
-            try:
-                # Test if command exists by checking help
-                process = subprocess.run(
-                    cmd.split() + ['--help'],
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
-                if process.returncode == 0:
-                    logger.info(f"[OK] Found bulk loader: {cmd}")
-                    return cmd
-            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-                continue
-        
-        return None
-        """Find available FalkorDB bulk loader command"""
-        commands_to_try = [
-            'falkordb-bulk-insert',
-            'python3 -m falkordb_bulk_loader',
-            'python -m falkordb_bulk_loader'
-        ]
-        
-        for cmd in commands_to_try:
-            try:
-                # Test if command exists by checking help
-                process = subprocess.run(
-                    cmd.split() + ['--help'],
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
-                if process.returncode == 0:
-                    logger.info(f"[OK] Found bulk loader: {cmd}")
-                    return cmd
-            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-                continue
-        
-        return None
     
-    def run_falkor_bulk_loader(self, csv_files: List[Tuple[str, str]], graph_name: str,
-                              host: str = '127.0.0.1', port: int = 6379, password: Optional[str] = None):
-        """Run FalkorDB bulk loader with proper error handling"""
-        
-        # Test connection first
-        if not self.test_falkordb_connection(host, port, password):
-            logger.error("[ERROR] Connection test failed - cannot proceed with bulk loading")
-            return False
-        
-        # Find bulk loader
-        self.bulk_loader_cmd = self.find_bulk_loader()
-        
-        if not self.bulk_loader_cmd:
-            logger.error("[ERROR] FalkorDB bulk loader not found!")
-            logger.error("Install it with: pip install falkordb-bulk-loader")
-            self.print_manual_instructions(csv_files, graph_name, host, port, password)
-            return False
-        
-        # Separate node and relationship files
-        node_files = [f for f_type, f in csv_files if f_type == 'nodes']
-        rel_files = [f for f_type, f in csv_files if f_type == 'relationships']
-        
-        if not node_files:
-            logger.error("[ERROR] No node files found - cannot proceed with bulk loading")
-            return False
-        
-        # Validate CSV files exist and are readable
-        for file_type, filename in csv_files:
-            if not os.path.exists(filename):
-                logger.error(f"[ERROR] CSV file not found: {filename}")
-                return False
-            
-            try:
-                with open(filename, 'r', encoding='utf-8') as f:
-                    lines = sum(1 for _ in f)
-                    logger.info(f"[CHECK] {filename}: {lines} lines")
-                    if lines < 2:  # Header + at least one data row
-                        logger.warning(f"[WARN] {filename} has very few lines ({lines})")
-            except Exception as e:
-                logger.error(f"[ERROR] Cannot read {filename}: {e}")
-                return False
-        
-        # Build command using latest FalkorDB bulk loader format
-        cmd_parts = self.bulk_loader_cmd.split()
-        cmd_parts.append(graph_name)  # Graph name is positional
-        
-        # Add connection parameters
-        cmd_parts.extend(['--host', host])
-        cmd_parts.extend(['--port', str(port)])
-        if password:
-            cmd_parts.extend(['--password', password])
-        
-        # Add schema flag if using schema format
-        if self.use_schema:
-            cmd_parts.append('--enforce-schema')
-        
-        # Add node files with -n flag
-        for filename in node_files:
-            cmd_parts.extend(['-n', filename])
-        
-        # Add relationship files with -r flag
-        for filename in rel_files:
-            cmd_parts.extend(['-r', filename])
-        
-        # Execute bulk loader
-        logger.info(f"[EXEC] Executing bulk loader:")
-        # Create safe command for logging (hide password)
-        safe_cmd = []
-        skip_next = False
-        for i, part in enumerate(cmd_parts):
-            if skip_next:
-                safe_cmd.append("****")
-                skip_next = False
-            elif part == '--password':
-                safe_cmd.append(part)
-                skip_next = True
-            else:
-                safe_cmd.append(part)
-        
-        logger.info(f"  Command: {' '.join(safe_cmd)}")
-        logger.info(f"  Graph: {graph_name}")
-        logger.info(f"  Host: {host}:{port}")
-        logger.info(f"  Authentication: {'Yes' if password else 'No'}")
-        logger.info(f"  Schema mode: {self.use_schema}")
-        logger.info(f"  Files: {len(node_files)} node files, {len(rel_files)} relationship files")
-        
-        # Try a simple test first with just one node file
-        if len(node_files) > 0:
-            test_graph = f"{graph_name}_test"
-            test_cmd = cmd_parts[:4]  # Basic command + graph name + connection
-            if password:
-                test_cmd.extend(['--password', password])
-            if self.use_schema:
-                test_cmd.append('--enforce-schema')
-            test_cmd.extend(['-n', node_files[0]])  # Just first node file
-            
-            logger.info(f"[TEST] Running simple test with one file...")
-            logger.info(f"  Test graph: {test_graph}")
-            
-            try:
-                test_result = subprocess.run(
-                    test_cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=300,  # 5 minutes for test
-                    check=False
-                )
-                
-                if test_result.returncode == 0:
-                    logger.info("[OK] Simple test succeeded, proceeding with full load")
-                    # Clean up test graph
-                    try:
-                        import redis
-                        if password:
-                            r = redis.Redis(host=host, port=port, password=password)
-                        else:
-                            r = redis.Redis(host=host, port=port)
-                        r.execute_command("GRAPH.DELETE", test_graph)
-                        logger.info(f"[CLEAN] Deleted test graph {test_graph}")
-                    except:
-                        logger.warning(f"[WARN] Could not clean up test graph {test_graph}")
-                else:
-                    logger.error(f"[ERROR] Simple test failed (exit code {test_result.returncode})")
-                    logger.error("STDOUT:", test_result.stdout)
-                    logger.error("STDERR:", test_result.stderr)
-                    self.diagnose_bulk_loader_failure(test_result, test_cmd, host, port, password)
-                    return False
-                    
-            except Exception as e:
-                logger.error(f"[ERROR] Test failed with exception: {e}")
-                return False
+    def execute_cypher_commands(self, cypher_file: str, graph_name: str, 
+                              host: str = '127.0.0.1', port: int = 6379, 
+                              password: Optional[str] = None):
+        """Execute the generated Cypher commands on FalkorDB"""
+        logger.info(f"[EXEC] Executing Cypher commands on graph '{graph_name}'...")
         
         try:
-            start_time = time.time()
+            import redis
             
-            process = subprocess.run(
-                cmd_parts,
-                capture_output=True,
-                text=True,
-                timeout=1800,  # 30 minutes
-                check=False  # Don't raise exception on non-zero exit
-            )
-            
-            duration = time.time() - start_time
-            
-            # Process results
-            if process.returncode == 0:
-                logger.info(f"[OK] Bulk loading completed successfully in {duration:.1f}s!")
-                
-                if process.stdout:
-                    logger.info("[INFO] Output:")
-                    for line in process.stdout.strip().split('\n'):
-                        if line.strip():
-                            logger.info(f"  {line}")
-                
-                return True
+            # Create Redis connection
+            if password:
+                r = redis.Redis(host=host, port=port, password=password, decode_responses=True)
             else:
-                logger.error(f"[ERROR] Bulk loading failed (exit code {process.returncode})")
-                
-                if process.stdout:
-                    logger.error("STDOUT:")
-                    for line in process.stdout.strip().split('\n'):
-                        if line.strip():
-                            logger.error(f"  {line}")
-                
-                if process.stderr:
-                    logger.error("STDERR:")
-                    for line in process.stderr.strip().split('\n'):
-                        if line.strip():
-                            logger.error(f"  {line}")
-                
-                self.diagnose_bulk_loader_failure(process, cmd_parts, host, port, password)
+                r = redis.Redis(host=host, port=port, decode_responses=True)
+            
+            # Test connection
+            r.ping()
+            
+            # Read and execute basic Cypher commands
+            with open(cypher_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Extract the basic loading commands (most compatible approach)
+            logger.info("[EXEC] Loading nodes...")
+            nodes_query = """
+            LOAD CSV WITH HEADERS FROM 'file://nodes.csv' AS row
+            CREATE (n:Entity)
+            SET n = row
+            """
+            
+            try:
+                result = r.execute_command("GRAPH.QUERY", graph_name, nodes_query)
+                logger.info(f"[OK] Nodes loaded: {result}")
+            except Exception as e:
+                logger.error(f"[ERROR] Failed to load nodes: {e}")
                 return False
-                
-        except subprocess.TimeoutExpired:
-            logger.error("[ERROR] Bulk loading timed out (>30 minutes)")
-            self.print_manual_instructions(csv_files, graph_name, host, port, password)
+            
+            logger.info("[EXEC] Loading edges...")
+            edges_query = """
+            LOAD CSV WITH HEADERS FROM 'file://edges.csv' AS row
+            MATCH (source:Entity {id: row.source_id})
+            MATCH (target:Entity {id: row.target_id})
+            CREATE (source)-[r:CONNECTED_TO]->(target)
+            SET r = row
+            REMOVE r.source_id, r.target_id
+            """
+            
+            try:
+                result = r.execute_command("GRAPH.QUERY", graph_name, edges_query)
+                logger.info(f"[OK] Edges loaded: {result}")
+            except Exception as e:
+                logger.error(f"[ERROR] Failed to load edges: {e}")
+                return False
+            
+            # Verify data
+            count_query = "MATCH (n) RETURN count(n) AS node_count"
+            try:
+                result = r.execute_command("GRAPH.QUERY", graph_name, count_query)
+                logger.info(f"[VERIFY] Total nodes in graph: {result}")
+            except Exception as e:
+                logger.warning(f"[WARN] Could not verify node count: {e}")
+            
+            return True
+            
+        except ImportError:
+            logger.error("[ERROR] redis-py not installed. Install with: pip install redis")
             return False
             
         except Exception as e:
-            logger.error(f"[ERROR] Unexpected error running bulk loader: {e}")
-            self.print_manual_instructions(csv_files, graph_name, host, port, password)
+            logger.error(f"[ERROR] Failed to execute Cypher commands: {e}")
             return False
-    
-    def diagnose_bulk_loader_failure(self, process, cmd_parts, host: str, port: int, password: Optional[str]):
-        """Provide diagnostic information for bulk loader failures"""
-        logger.error("\n[FIX] Troubleshooting suggestions:")
-        
-        stderr_lower = process.stderr.lower() if process.stderr else ""
-        stdout_lower = process.stdout.lower() if process.stdout else ""
-        error_text = (stderr_lower + " " + stdout_lower).strip()
-        
-        if "connection" in error_text or "redis" in error_text or "refused" in error_text:
-            logger.error("• Connection issue - check if FalkorDB is running:")
-            logger.error("  docker run -p 6379:6379 falkordb/falkordb:latest")
-            logger.error("  # Or with password:")
-            logger.error("  docker run -p 6379:6379 -e REQUIREPASS=falkordb falkordb/falkordb:latest")
-            if password:
-                logger.error(f"  redis-cli -h {host} -p {port} -a {password} ping")
-            else:
-                logger.error(f"  redis-cli -h {host} -p {port} ping")
-        
-        if "auth" in error_text or "password" in error_text or "permission" in error_text:
-            logger.error("• Authentication issue:")
-            logger.error("  - Check if password is correct")
-            logger.error("  - Try without password if FalkorDB has no auth")
-            logger.error("  - Check if user 'default' has correct permissions")
-        
-        if "format" in error_text or "parse" in error_text or "csv" in error_text or "header" in error_text:
-            logger.error("• CSV format issue:")
-            logger.error("  - Check CSV file encoding (should be UTF-8)")
-            logger.error("  - Try without --enforce-schema flag")
-            logger.error("  - Verify first few lines of CSV files")
-        
-        if "memory" in error_text or "token" in error_text or "size" in error_text:
-            logger.error("• Memory/size issue:")
-            logger.error("  - Add --max-token-count 512 --max-buffer-size 32")
-            logger.error("  - Split large files into smaller chunks")
-        
-        if "exists" in error_text or "graph" in error_text and "name" in error_text:
-            logger.error("• Graph already exists:")
-            logger.error(f"  - Choose different graph name")
-            logger.error(f"  - Delete existing graph: redis-cli GRAPH.DELETE {cmd_parts[1] if len(cmd_parts) > 1 else 'graph_name'}")
-        
-        if "module" in error_text or "command" in error_text:
-            logger.error("• FalkorDB module issue:")
-            logger.error("  - Ensure FalkorDB is installed (not just Redis)")
-            logger.error("  - Check: redis-cli MODULE LIST")
-            logger.error("  - Expected to see 'graph' module loaded")
-        
-        if "file" in error_text or "no such" in error_text:
-            logger.error("• File access issue:")
-            logger.error("  - Check if CSV files exist and are readable")
-            logger.error("  - Use absolute paths for CSV files")
-        
-        if not error_text:
-            logger.error("• No error details available. Try:")
-            logger.error("  - Running with --verbose flag if available")
-            logger.error("  - Checking FalkorDB logs")
-            logger.error("  - Testing with smaller dataset")
-        
-        logger.error("• Quick test commands:")
-        logger.error(f"  redis-cli -h {host} -p {port} ping")
-        logger.error(f"  redis-cli -h {host} -p {port} MODULE LIST")
-        logger.error(f"  falkordb-bulk-insert test_graph -n {cmd_parts[-1] if cmd_parts else 'test.csv'}")
-        
-    def print_manual_instructions(self, csv_files: List[Tuple[str, str]], graph_name: str,
-                                host: str, port: int, password: Optional[str]):
-        """Print manual instructions"""
-        logger.info("\n" + "="*70)
-        logger.info("[INFO] MANUAL BULK LOADER INSTRUCTIONS")
-        logger.info("="*70)
-        
-        # Build manual command using correct FalkorDB format
-        cmd_parts = ['falkordb-bulk-insert', graph_name]
-        cmd_parts.extend(['--host', host])
-        cmd_parts.extend(['--port', str(port)])
-        if password:
-            cmd_parts.extend(['--password', password])
-        
-        if self.use_schema:
-            cmd_parts.append('--enforce-schema')
-        
-        node_files = [f for f_type, f in csv_files if f_type == 'nodes']
-        rel_files = [f for f_type, f in csv_files if f_type == 'relationships']
-        
-        for filename in node_files:
-            cmd_parts.extend(['-n', filename])
-        
-        for filename in rel_files:
-            cmd_parts.extend(['-r', filename])
-        
-        logger.info("1. Install bulk loader if needed:")
-        logger.info("   pip install --upgrade falkordb-bulk-loader")
-        logger.info("")
-        logger.info("2. Ensure FalkorDB is running:")
-        logger.info("   docker run -p 6379:6379 falkordb/falkordb:latest")
-        logger.info("   # Or with authentication:")
-        logger.info("   docker run -p 6379:6379 -e FALKORDB_PASSWORD=falkordb falkordb/falkordb:latest")
-        logger.info("")
-        logger.info("3. Run bulk loader manually:")
-        # Hide password in logs
-        safe_cmd = [part if part != password else "****" for part in cmd_parts] if password else cmd_parts
-        logger.info(f"   {' '.join(safe_cmd)}")
-        logger.info("")
-        logger.info("Alternative commands to try:")
-        safe_cmd_alt = [part if part != password else "****" for part in cmd_parts[1:]] if password else cmd_parts[1:]
-        logger.info(f"   python3 -m falkordb_bulk_loader {' '.join(safe_cmd_alt)}")
-        logger.info("")
-        logger.info("Created CSV files:")
-        for file_type, filename in csv_files:
-            logger.info(f"  {file_type}: {filename}")
-        logger.info("")
-        logger.info("Format used: Schema format" if self.use_schema else "Format used: Simple format")
-        logger.info("="*70)
 
 def main():
     """Main function"""
-    parser = argparse.ArgumentParser(description='Convert TTL to CSV and bulk load into FalkorDB')
+    parser = argparse.ArgumentParser(description='Convert TTL to FalkorDB using LOAD CSV')
     parser.add_argument('ttl_file', help='Path to TTL file')
     parser.add_argument('--graph_name', default='knowledge_graph', help='FalkorDB graph name')
     parser.add_argument('--host', default='127.0.0.1', help='FalkorDB host (default: 127.0.0.1)')
     parser.add_argument('--port', type=int, default=6379, help='FalkorDB port (default: 6379)')
     parser.add_argument('--password', help='FalkorDB password (default: none)')
     parser.add_argument('--output_dir', default='csv_output', help='Output directory for CSV files')
-    parser.add_argument('--keep_csv', action='store_true', help='Keep CSV files after loading')
-    parser.add_argument('--csv_only', action='store_true', help='Only convert to CSV, skip bulk loading')
+    parser.add_argument('--csv_only', action='store_true', help='Only convert to CSV, skip loading')
     parser.add_argument('--test_connection', action='store_true', help='Test FalkorDB connection only')
-    parser.add_argument('--no_schema', action='store_true', help='Use simple CSV format instead of schema format')
-    parser.add_argument('--use_hash_ids', action='store_true', help='Use hash-based IDs instead of sequential numbers (fixes large int issues)')
-    parser.add_argument('--max_rows', type=int, help='Limit number of rows per CSV file for testing')
+    parser.add_argument('--max_triples', type=int, help='Limit number of triples to process for testing')
+    parser.add_argument('--execute_cypher', action='store_true', help='Execute Cypher commands automatically')
     
     args = parser.parse_args()
     
@@ -1005,8 +608,7 @@ def main():
     logger.info(f"[FILE] Processing TTL file: {args.ttl_file} ({file_size_mb:.1f}MB)")
     
     # Create converter
-    use_schema = not args.no_schema
-    converter = TTLToCSVConverter(args.output_dir, use_schema=use_schema, use_hash_ids=args.use_hash_ids)
+    converter = TTLToFalkorDBConverter(args.output_dir)
     
     # Test connection only if requested
     if args.test_connection:
@@ -1022,49 +624,46 @@ def main():
     try:
         # Convert TTL to CSV
         start_time = time.time()
-        csv_files = converter.convert_ttl_to_csv(args.ttl_file, args.max_rows)
+        csv_files, cypher_file = converter.convert_ttl_to_csv(args.ttl_file, args.max_triples)
         conversion_time = time.time() - start_time
         
         logger.info(f"[OK] TTL->CSV conversion: {conversion_time:.1f}s ({file_size_mb/conversion_time:.1f} MB/s)")
         
         if args.csv_only:
-            logger.info("[TARGET] CSV-only mode: Skipping bulk loading")
-            logger.info(f"[FOLDER] CSV files available in: {args.output_dir}")
+            logger.info("[TARGET] CSV-only mode: Files generated successfully")
+            logger.info(f"[FOLDER] CSV files: {args.output_dir}/")
+            logger.info(f"[CYPHER] Commands: {cypher_file}")
+            logger.info("\n[NEXT STEPS]:")
+            logger.info("1. Copy CSV files to FalkorDB data directory")
+            logger.info("2. Connect to FalkorDB and run the Cypher commands")
+            logger.info("3. Or use --execute_cypher flag to run automatically")
             return
         
-        # Run bulk loader
-        success = converter.run_falkor_bulk_loader(
-            csv_files, args.graph_name, args.host, args.port, args.password
-        )
-        
-        total_time = time.time() - start_time
-        
-        if success:
-            logger.info(f"[OK] PIPELINE SUCCESS! Total time: {total_time:.1f}s")
-            logger.info(f"   Performance: {file_size_mb/total_time:.1f} MB/s")
+        # Execute Cypher commands if requested
+        if args.execute_cypher:
+            success = converter.execute_cypher_commands(
+                cypher_file, args.graph_name, args.host, args.port, args.password
+            )
             
-            # Cleanup if requested
-            if not args.keep_csv:
-                try:
-                    shutil.rmtree(args.output_dir)
-                    logger.info(f"[CLEAN] Cleaned up CSV files in {args.output_dir}")
-                except Exception as e:
-                    logger.warning(f"Could not cleanup {args.output_dir}: {e}")
+            total_time = time.time() - start_time
+            
+            if success:
+                logger.info(f"[OK] PIPELINE SUCCESS! Total time: {total_time:.1f}s")
+                logger.info(f"   Performance: {file_size_mb/total_time:.1f} MB/s")
+                logger.info(f"[GRAPH] Data loaded into graph: {args.graph_name}")
+            else:
+                logger.error("[ERROR] Failed to execute Cypher commands")
+                sys.exit(1)
         else:
-            logger.error("[ERROR] Pipeline failed during bulk loading")
-            logger.info(f"[FOLDER] CSV files preserved in: {args.output_dir}")
-            logger.error("\n[NEXT STEPS] To troubleshoot the 'int too large' error:")
-            logger.error("1. Try with hash-based IDs:")
-            logger.error(f"   python3 {sys.argv[0]} {args.ttl_file} --use_hash_ids --password {args.password if args.password else 'YOUR_PASSWORD'}")
-            logger.error("2. Try without schema format:")
-            logger.error(f"   python3 {sys.argv[0]} {args.ttl_file} --no_schema --password {args.password if args.password else 'YOUR_PASSWORD'}")
-            logger.error("3. Test with smaller dataset:")
-            logger.error(f"   python3 {sys.argv[0]} {args.ttl_file} --max_rows 1000 --password {args.password if args.password else 'YOUR_PASSWORD'}")
-            logger.error("4. Check CSV files for large numbers:")
-            logger.error(f"   grep -E '[0-9]{{10,}}' {args.output_dir}/*.csv")
-            logger.error("5. Try manual bulk load with specific file:")
-            logger.error(f"   falkordb-bulk-insert test_graph --host {args.host} --port {args.port} --password {args.password or 'YOUR_PASSWORD'} -n {args.output_dir}/YourNodeType.csv")
-            sys.exit(1)
+            logger.info("[MANUAL] CSV files and Cypher commands generated")
+            logger.info(f"[FOLDER] Files in: {args.output_dir}/")
+            logger.info(f"[CYPHER] Commands in: {cypher_file}")
+            logger.info("\n[MANUAL STEPS]:")
+            logger.info("1. Copy CSV files to FalkorDB import directory")
+            logger.info("2. Connect to FalkorDB:")
+            logger.info(f"   redis-cli -h {args.host} -p {args.port}" + (f" -a {args.password}" if args.password else ""))
+            logger.info("3. Run the Cypher commands from the .cypher file")
+            logger.info("4. Or use --execute_cypher flag for automatic execution")
             
     except KeyboardInterrupt:
         logger.error("[ERROR] Pipeline interrupted by user")
