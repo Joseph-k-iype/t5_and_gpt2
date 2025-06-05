@@ -2,32 +2,30 @@
 """
 Contextual Case Mapping System using LangChain, LangGraph, and OpenAI o3-mini
 Uses ReAct agent pattern for intelligent matching with reasoning and confidence scores.
+Updated for LangChain v0.3+ and Pydantic v2
 """
 
 import json
 import csv
 import os
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Annotated, Literal
 from dataclasses import dataclass
 from pathlib import Path
 
-# LangChain imports
+# Modern LangChain imports (v0.3+)
 from langchain_openai import ChatOpenAI
-from langchain.schema import BaseMessage, HumanMessage, SystemMessage
-from langchain.tools import BaseTool
-from langchain.pydantic_v1 import BaseModel, Field
+from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage, AIMessage
+from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.memory import MemorySaver
 
-# LangGraph imports
-from langgraph.graph import StateGraph, END
-from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode, tools_condition
-from langgraph.checkpoint.sqlite import SqliteSaver
+# Pydantic v2 imports
+from pydantic import BaseModel, Field, ConfigDict
 
-# Additional imports
-import sqlite3
-from functools import lru_cache
+# Standard library imports
 import logging
 from datetime import datetime
+import re
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -42,89 +40,6 @@ class MappingResult:
     confidence_score: float
     reasoning: str
     definition_used: str
-
-class CaseMatchingTool(BaseTool):
-    """Tool for matching cases to names using contextual analysis"""
-    
-    name = "case_matching_tool"
-    description = "Analyzes a case text and matches it to the most appropriate name based on definitions"
-    
-    def __init__(self, names_definitions: Dict[str, str]):
-        super().__init__()
-        self.names_definitions = names_definitions
-    
-    class CaseMatchingInput(BaseModel):
-        case_text: str = Field(description="The case text to analyze and match")
-        
-    args_schema = CaseMatchingInput
-    
-    def _run(self, case_text: str) -> str:
-        """Execute the case matching logic"""
-        results = []
-        
-        for name, definition in self.names_definitions.items():
-            # Create a prompt for semantic similarity analysis
-            analysis_prompt = f"""
-            Analyze the semantic similarity between:
-            
-            Case: "{case_text}"
-            
-            Name: "{name}"
-            Definition: "{definition}"
-            
-            Provide a relevance score (0-100) and brief reasoning for how well the case matches this name/definition.
-            Format: Score: [number] | Reasoning: [explanation]
-            """
-            
-            results.append({
-                'name': name,
-                'definition': definition,
-                'analysis_prompt': analysis_prompt
-            })
-        
-        return json.dumps(results, indent=2)
-
-class ConfidenceAnalysisTool(BaseTool):
-    """Tool for analyzing confidence and providing final reasoning"""
-    
-    name = "confidence_analysis_tool"
-    description = "Analyzes matching results and provides confidence scores with detailed reasoning"
-    
-    class ConfidenceInput(BaseModel):
-        matching_results: str = Field(description="JSON string of matching analysis results")
-        case_text: str = Field(description="Original case text")
-        
-    args_schema = ConfidenceInput
-    
-    def _run(self, matching_results: str, case_text: str) -> str:
-        """Analyze confidence and provide reasoning"""
-        try:
-            results = json.loads(matching_results)
-            
-            confidence_prompt = f"""
-            Based on the matching analysis for case: "{case_text}"
-            
-            Analysis Results: {json.dumps(results, indent=2)}
-            
-            Determine:
-            1. The best matching name
-            2. Confidence score (0-100)
-            3. Detailed reasoning for the match
-            4. Why other options were less suitable
-            
-            Return in JSON format:
-            {{
-                "best_match": "name",
-                "confidence": score,
-                "reasoning": "detailed explanation",
-                "alternatives_considered": ["other names considered"]
-            }}
-            """
-            
-            return confidence_prompt
-            
-        except json.JSONDecodeError:
-            return f"Error: Invalid JSON in matching results: {matching_results}"
 
 class ContextualMapper:
     """Main class for contextual case mapping using LangGraph ReAct agent"""
@@ -145,9 +60,92 @@ class ContextualMapper:
         
         self.names_definitions = {}
         self.cases = []
-        self.tools = []
-        self.graph = None
+        self.agent = None
         
+    def setup_tools_and_agent(self):
+        """Setup tools and create the ReAct agent"""
+        if not self.names_definitions:
+            raise ValueError("Names and definitions must be loaded before setting up the agent")
+        
+        # Convert definitions to a formatted string for the tools
+        definitions_text = json.dumps(self.names_definitions, indent=2)
+        
+        @tool
+        def analyze_case_similarity(case_text: str) -> str:
+            """
+            Analyze semantic similarity between a case and all available name-definition pairs.
+            Returns analysis of how well the case matches each possible name.
+            """
+            analysis_results = []
+            
+            for name, definition in self.names_definitions.items():
+                analysis_results.append({
+                    'name': name,
+                    'definition': definition,
+                    'analysis_needed': f"Compare case '{case_text}' with {name}: {definition}"
+                })
+            
+            return json.dumps({
+                'case_analyzed': case_text,
+                'available_options': analysis_results,
+                'instruction': 'Analyze semantic similarity and relevance for each option'
+            }, indent=2)
+        
+        @tool
+        def calculate_confidence_and_reasoning(
+            case_text: str, 
+            analysis_summary: str
+        ) -> str:
+            """
+            Calculate final confidence score and provide detailed reasoning for the best match.
+            Takes the case text and analysis summary to determine the most appropriate match.
+            """
+            return json.dumps({
+                'case': case_text,
+                'analysis_input': analysis_summary,
+                'instruction': 'Provide final decision with confidence score (0.0-1.0) and detailed reasoning',
+                'required_format': {
+                    'matched_name': 'best_matching_name',
+                    'confidence_score': 'float_between_0_and_1',
+                    'reasoning': 'detailed_explanation',
+                    'definition_used': 'definition_that_led_to_match'
+                }
+            }, indent=2)
+        
+        # Create tools list
+        tools = [analyze_case_similarity, calculate_confidence_and_reasoning]
+        
+        # Create system prompt
+        system_prompt = f"""You are an expert at contextual matching and semantic analysis. Your task is to match cases to the most appropriate names based on their definitions.
+
+Available names and definitions:
+{definitions_text}
+
+Process:
+1. Use analyze_case_similarity to understand how the case relates to each name/definition
+2. Use calculate_confidence_and_reasoning to make the final decision
+3. Provide your final answer in this EXACT JSON format:
+
+{{
+    "matched_name": "the_best_matching_name",
+    "confidence_score": 0.XX,
+    "reasoning": "detailed explanation of why this match was chosen, considering the case content and definition",
+    "definition_used": "the exact definition that led to this match"
+}}
+
+Be thorough in your analysis and provide clear reasoning for your decisions."""
+
+        # Create the ReAct agent with memory
+        memory = MemorySaver()
+        
+        self.agent = create_react_agent(
+            model=self.llm,
+            tools=tools,
+            checkpointer=memory
+        )
+        
+        logger.info("ReAct agent created successfully with o3-mini model")
+    
     def load_json_definitions(self, json_file_path: str) -> None:
         """Load name-definition mappings from JSON file"""
         try:
@@ -200,116 +198,32 @@ class ContextualMapper:
         except Exception as e:
             raise ValueError(f"Error reading CSV file {csv_file_path}: {e}")
     
-    def setup_react_agent(self) -> None:
-        """Setup the ReAct agent using LangGraph"""
-        if not self.names_definitions:
-            raise ValueError("Names and definitions must be loaded before setting up the agent")
-        
-        # Initialize tools
-        self.tools = [
-            CaseMatchingTool(self.names_definitions),
-            ConfidenceAnalysisTool()
-        ]
-        
-        # Create LangGraph state
-        class AgentState(BaseModel):
-            messages: List[BaseMessage] = Field(default_factory=list)
-            case_text: str = ""
-            matching_results: str = ""
-            final_result: str = ""
-        
-        # Define the agent workflow
-        def call_model(state: AgentState):
-            """Call the LLM with current state"""
-            messages = state.messages
-            response = self.llm.invoke(messages)
-            return {"messages": [response]}
-        
-        def should_continue(state: AgentState):
-            """Determine if the agent should continue or end"""
-            last_message = state.messages[-1]
-            
-            # If the last message contains a tool call, continue to tools
-            if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
-                return "tools"
-            
-            # If we have a final result, end
-            if "final_result" in str(last_message.content).lower():
-                return "end"
-            
-            return "end"
-        
-        # Create the graph
-        workflow = StateGraph(AgentState)
-        
-        # Add nodes
-        workflow.add_node("agent", call_model)
-        workflow.add_node("tools", ToolNode(self.tools))
-        
-        # Add edges
-        workflow.set_entry_point("agent")
-        workflow.add_conditional_edges(
-            "agent",
-            should_continue,
-            {
-                "tools": "tools",
-                "end": END
-            }
-        )
-        workflow.add_edge("tools", "agent")
-        
-        # Create checkpointer for memory
-        checkpointer = SqliteSaver.from_conn_string(":memory:")
-        
-        # Compile the graph
-        self.graph = workflow.compile(checkpointer=checkpointer)
-    
     def match_case_to_name(self, case_id: str, case_text: str) -> MappingResult:
         """Match a single case to the most appropriate name"""
-        if not self.graph:
-            self.setup_react_agent()
+        if not self.agent:
+            self.setup_tools_and_agent()
         
-        # Create the initial prompt for the ReAct agent
-        system_prompt = f"""
-        You are an expert at contextual matching. You have access to tools to:
-        1. Analyze semantic similarity between cases and name/definition pairs
-        2. Calculate confidence scores and provide detailed reasoning
-        
-        Your task is to match this case to the most appropriate name:
-        Case: "{case_text}"
-        
-        Available names and definitions:
-        {json.dumps(self.names_definitions, indent=2)}
-        
-        Use the tools systematically:
-        1. First use case_matching_tool to analyze the case against all names
-        2. Then use confidence_analysis_tool to determine the best match with reasoning
-        
-        Provide your final answer in this exact JSON format:
-        {{
-            "matched_name": "best_matching_name",
-            "confidence_score": confidence_as_float_0_to_1,
-            "reasoning": "detailed_explanation_of_why_this_match_was_chosen",
-            "definition_used": "the_definition_that_led_to_this_match"
-        }}
-        """
-        
-        initial_message = HumanMessage(content=system_prompt)
-        
-        # Run the agent
+        # Create the user message
+        user_message = f"""Please analyze and match this case to the most appropriate name:
+
+Case ID: {case_id}
+Case Text: "{case_text}"
+
+Use the tools systematically to analyze the case and provide your final decision in the required JSON format."""
+
+        # Configure the conversation
         config = {"configurable": {"thread_id": f"case_{case_id}"}}
         
         try:
-            final_state = self.graph.invoke(
-                {"messages": [initial_message], "case_text": case_text},
+            # Invoke the agent
+            response = self.agent.invoke(
+                {"messages": [HumanMessage(content=user_message)]},
                 config
             )
             
-            # Extract the final result from the last message
-            last_message = final_state["messages"][-1].content
-            
-            # Try to parse JSON result from the response
-            result_data = self._extract_json_result(last_message)
+            # Extract the final result from the agent's response
+            final_message = response["messages"][-1].content
+            result_data = self._extract_json_result(final_message)
             
             return MappingResult(
                 case_id=case_id,
@@ -334,24 +248,54 @@ class ContextualMapper:
     def _extract_json_result(self, text: str) -> Dict[str, Any]:
         """Extract JSON result from agent response"""
         try:
-            # Look for JSON in the text
-            start_idx = text.find('{')
-            end_idx = text.rfind('}') + 1
+            # Try to find JSON in the text
+            json_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
+            matches = re.findall(json_pattern, text, re.DOTALL)
             
-            if start_idx != -1 and end_idx != 0:
-                json_str = text[start_idx:end_idx]
-                return json.loads(json_str)
+            for match in matches:
+                try:
+                    parsed = json.loads(match)
+                    if 'matched_name' in parsed and 'confidence_score' in parsed:
+                        return parsed
+                except json.JSONDecodeError:
+                    continue
             
-        except json.JSONDecodeError:
-            pass
+            # Fallback: look for specific patterns in text
+            matched_name = self._extract_field(text, 'matched_name')
+            confidence = self._extract_field(text, 'confidence_score')
+            reasoning = self._extract_field(text, 'reasoning')
+            definition = self._extract_field(text, 'definition_used')
+            
+            return {
+                'matched_name': matched_name or 'Unknown',
+                'confidence_score': float(confidence) if confidence else 0.5,
+                'reasoning': reasoning or 'Could not parse reasoning from response',
+                'definition_used': definition or 'N/A'
+            }
+            
+        except Exception as e:
+            logger.warning(f"Error extracting JSON result: {e}")
+            return {
+                'matched_name': 'Parse Error',
+                'confidence_score': 0.0,
+                'reasoning': 'Failed to parse agent response',
+                'definition_used': 'N/A'
+            }
+    
+    def _extract_field(self, text: str, field_name: str) -> str:
+        """Extract a specific field from text using patterns"""
+        patterns = [
+            rf'"{field_name}":\s*"([^"]+)"',
+            rf'{field_name}:\s*"([^"]+)"',
+            rf'{field_name}:\s*([^\n,}}]+)',
+        ]
         
-        # Fallback: try to extract information using patterns
-        return {
-            'matched_name': 'Unknown',
-            'confidence_score': 0.5,
-            'reasoning': 'Could not parse agent response',
-            'definition_used': 'N/A'
-        }
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+        
+        return None
     
     def process_all_cases(self) -> List[MappingResult]:
         """Process all loaded cases and return mapping results"""
