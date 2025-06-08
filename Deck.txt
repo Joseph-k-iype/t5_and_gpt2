@@ -1,414 +1,1120 @@
 #!/usr/bin/env python3
 """
-Contextual Case Mapping System using LangChain, LangGraph, and OpenAI o3-mini
-Uses ReAct agent pattern for intelligent matching with reasoning and confidence scores.
-Updated for LangChain v0.3+ and Pydantic v2
+Production-Ready RDF to FalkorDB Property Graph Converter
+=========================================================
+
+A comprehensive, high-performance converter optimized for 6M+ triples using:
+- Latest FalkorDB bulk loading utilities
+- Academic research on RDF-to-property-graph transformations
+- Memory-optimized streaming processing
+- Intelligent property graph mapping
+
+Requirements:
+    pip install falkordb rdflib psutil tqdm falkordb-bulk-loader pyyaml
 """
 
-import json
-import csv
 import os
-from typing import Dict, List, Any, Annotated, Literal
-from dataclasses import dataclass
-from pathlib import Path
-
-# Modern LangChain imports (v0.3+)
-from langchain_openai import ChatOpenAI
-from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage, AIMessage
-from langgraph.prebuilt import create_react_agent
-from langgraph.checkpoint.memory import MemorySaver
-
-# Pydantic v2 imports
-from pydantic import BaseModel, Field, ConfigDict
-
-# Standard library imports
+import gc
+import csv
+import json
+import time
 import logging
-from datetime import datetime
-import re
+import hashlib
+import tempfile
+import subprocess
+from pathlib import Path
+from typing import Dict, List, Set, Tuple, Optional, Iterator, Any, Union
+from dataclasses import dataclass, field
+from collections import defaultdict, Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Core libraries
+import psutil
+import yaml
+from tqdm import tqdm
+
+# RDF processing
+import rdflib
+from rdflib import Graph, URIRef, Literal, BNode
+from rdflib.namespace import RDF, RDFS, OWL, XSD, FOAF, DC, DCTERMS, SKOS
+
+# FalkorDB
+import falkordb
+
 
 @dataclass
-class MappingResult:
-    """Result structure for case mapping"""
-    case_id: str
-    case_text: str
-    matched_name: str
-    confidence_score: float
-    reasoning: str
-    definition_used: str
-
-class ContextualMapper:
-    """Main class for contextual case mapping using LangGraph ReAct agent"""
+class PerformanceMetrics:
+    """Performance tracking for the conversion process."""
+    start_time: float = 0.0
+    end_time: float = 0.0
+    total_triples: int = 0
+    processed_triples: int = 0
+    nodes_created: int = 0
+    edges_created: int = 0
+    memory_peak_mb: float = 0.0
+    processing_rate: float = 0.0
     
-    def __init__(self, openai_api_key: str = None):
-        """Initialize the mapper with OpenAI API key"""
-        self.api_key = openai_api_key or os.getenv('OPENAI_API_KEY')
-        if not self.api_key:
-            raise ValueError("OpenAI API key is required. Set OPENAI_API_KEY environment variable or pass it directly.")
-        
-        # Initialize o3-mini model
-        self.llm = ChatOpenAI(
-            model="o3-mini",
-            api_key=self.api_key,
-            temperature=0.1,  # Low temperature for consistent reasoning
-            max_tokens=2048
-        )
-        
-        self.names_definitions = {}
-        self.cases = []
-        self.agent = None
-        
-    def setup_tools_and_agent(self):
-        """Setup tools and create the ReAct agent"""
-        if not self.names_definitions:
-            raise ValueError("Names and definitions must be loaded before setting up the agent")
-        
-        # Convert definitions to a formatted string for the tools
-        definitions_text = json.dumps(self.names_definitions, indent=2)
-        
-        @tool
-        def analyze_case_similarity(case_text: str) -> str:
-            """
-            Analyze semantic similarity between a case and all available name-definition pairs.
-            Returns analysis of how well the case matches each possible name.
-            """
-            analysis_results = []
-            
-            for name, definition in self.names_definitions.items():
-                analysis_results.append({
-                    'name': name,
-                    'definition': definition,
-                    'analysis_needed': f"Compare case '{case_text}' with {name}: {definition}"
-                })
-            
-            return json.dumps({
-                'case_analyzed': case_text,
-                'available_options': analysis_results,
-                'instruction': 'Analyze semantic similarity and relevance for each option'
-            }, indent=2)
-        
-        @tool
-        def calculate_confidence_and_reasoning(
-            case_text: str, 
-            analysis_summary: str
-        ) -> str:
-            """
-            Calculate final confidence score and provide detailed reasoning for the best match.
-            Takes the case text and analysis summary to determine the most appropriate match.
-            """
-            return json.dumps({
-                'case': case_text,
-                'analysis_input': analysis_summary,
-                'instruction': 'Provide final decision with confidence score (0.0-1.0) and detailed reasoning',
-                'required_format': {
-                    'matched_name': 'best_matching_name',
-                    'confidence_score': 'float_between_0_and_1',
-                    'reasoning': 'detailed_explanation',
-                    'definition_used': 'definition_that_led_to_match'
-                }
-            }, indent=2)
-        
-        # Create tools list
-        tools = [analyze_case_similarity, calculate_confidence_and_reasoning]
-        
-        # Create system prompt
-        system_prompt = f"""You are an expert at contextual matching and semantic analysis. Your task is to match cases to the most appropriate names based on their definitions.
-
-Available names and definitions:
-{definitions_text}
-
-Process:
-1. Use analyze_case_similarity to understand how the case relates to each name/definition
-2. Use calculate_confidence_and_reasoning to make the final decision
-3. Provide your final answer in this EXACT JSON format:
-
-{{
-    "matched_name": "the_best_matching_name",
-    "confidence_score": 0.XX,
-    "reasoning": "detailed explanation of why this match was chosen, considering the case content and definition",
-    "definition_used": "the exact definition that led to this match"
-}}
-
-Be thorough in your analysis and provide clear reasoning for your decisions."""
-
-        # Create the ReAct agent with memory
-        memory = MemorySaver()
-        
-        self.agent = create_react_agent(
-            model=self.llm,
-            tools=tools,
-            checkpointer=memory
-        )
-        
-        logger.info("ReAct agent created successfully with o3-mini model")
+    @property
+    def processing_time(self) -> float:
+        return self.end_time - self.start_time if self.end_time > 0 else time.time() - self.start_time
     
-    def load_json_definitions(self, json_file_path: str) -> None:
-        """Load name-definition mappings from JSON file"""
+    @property
+    def rate_per_second(self) -> float:
+        if self.processing_time > 0:
+            return (self.nodes_created + self.edges_created) / self.processing_time
+        return 0.0
+
+
+@dataclass
+class ConversionConfig:
+    """Comprehensive configuration for RDF to FalkorDB conversion."""
+    # Processing parameters (optimized for 6M triples)
+    chunk_size: int = 50000                 # RDF parsing chunk size
+    node_batch_size: int = 25000            # Node creation batch
+    edge_batch_size: int = 50000            # Edge creation batch
+    max_memory_mb: int = 2000               # Memory limit
+    gc_frequency: int = 50000               # Garbage collection interval
+    
+    # Database connection
+    host: str = "localhost"
+    port: int = 6379
+    password: Optional[str] = None
+    graph_name: str = "knowledge_graph"
+    
+    # Optimization settings
+    use_bulk_loader: bool = True            # Use falkordb-bulk-loader for maximum performance
+    create_indexes: bool = True             # Create performance indexes
+    compress_uris: bool = True              # Compress URIs with namespaces
+    preserve_blank_nodes: bool = True       # Preserve blank node structure
+    literal_node_threshold: int = 50        # Create nodes for frequently referenced literals
+    max_property_values: int = 10           # Max values per property (prevent explosion)
+    
+    # File handling
+    temp_dir: Optional[str] = None          # Temporary directory for CSV files
+    cleanup_temp_files: bool = True         # Clean up temporary files
+    parallel_processing: bool = True        # Enable parallel processing
+    max_workers: int = 4                    # Number of worker threads
+    
+    # Schema handling
+    infer_schema: bool = True               # Infer property graph schema
+    auto_detect_types: bool = True          # Auto-detect data types
+    handle_reification: bool = True         # Handle RDF reification patterns
+    merge_equivalent_properties: bool = True # Merge equivalent properties
+
+
+class NamespaceRegistry:
+    """Advanced namespace management with compression and expansion."""
+    
+    def __init__(self):
+        self.prefixes: Dict[str, str] = {}
+        self.reverse_lookup: Dict[str, str] = {}
+        self.usage_stats: Counter = Counter()
+        
+        # Initialize with standard namespaces
+        self._init_standard_namespaces()
+    
+    def _init_standard_namespaces(self):
+        """Initialize with W3C and common namespaces."""
+        standard = {
+            'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
+            'rdfs': 'http://www.w3.org/2000/01/rdf-schema#',
+            'owl': 'http://www.w3.org/2002/07/owl#',
+            'xsd': 'http://www.w3.org/2001/XMLSchema#',
+            'foaf': 'http://xmlns.com/foaf/0.1/',
+            'dc': 'http://purl.org/dc/elements/1.1/',
+            'dct': 'http://purl.org/dc/terms/',
+            'skos': 'http://www.w3.org/2004/02/skos/core#',
+            'geo': 'http://www.w3.org/2003/01/geo/wgs84_pos#',
+            'time': 'http://www.w3.org/2006/time#',
+            'prov': 'http://www.w3.org/ns/prov#',
+            'void': 'http://rdfs.org/ns/void#',
+            'dbp': 'http://dbpedia.org/property/',
+            'dbo': 'http://dbpedia.org/ontology/',
+            'dbr': 'http://dbpedia.org/resource/',
+            'wdt': 'http://www.wikidata.org/prop/direct/',
+            'wd': 'http://www.wikidata.org/entity/',
+        }
+        
+        for prefix, uri in standard.items():
+            self.register(prefix, uri)
+    
+    def register(self, prefix: str, namespace_uri: str):
+        """Register a namespace prefix."""
+        self.prefixes[prefix] = namespace_uri
+        self.reverse_lookup[namespace_uri] = prefix
+    
+    def auto_register(self, uri: str) -> str:
+        """Auto-register namespace from URI."""
+        # Extract potential namespace and local name
+        for sep in ['#', '/']:
+            if sep in uri:
+                namespace_uri = uri.rsplit(sep, 1)[0] + sep
+                if namespace_uri not in self.reverse_lookup:
+                    # Generate prefix from URI
+                    prefix = self._generate_prefix(namespace_uri)
+                    self.register(prefix, namespace_uri)
+                return self.compress(uri)
+        return uri
+    
+    def _generate_prefix(self, namespace_uri: str) -> str:
+        """Generate a prefix for a namespace URI."""
+        # Extract meaningful parts from URI
+        parts = namespace_uri.rstrip('/#').split('/')
+        if len(parts) > 2:
+            candidate = parts[-1] or parts[-2]
+            # Clean up candidate
+            candidate = ''.join(c for c in candidate if c.isalnum()).lower()[:10]
+            
+            # Ensure uniqueness
+            base = candidate
+            counter = 1
+            while candidate in self.prefixes:
+                candidate = f"{base}{counter}"
+                counter += 1
+            
+            return candidate
+        
+        # Fallback to hash-based prefix
+        return f"ns{abs(hash(namespace_uri)) % 10000}"
+    
+    def compress(self, uri: str) -> str:
+        """Compress URI using registered namespaces."""
+        self.usage_stats[uri] += 1
+        
+        for namespace_uri, prefix in self.reverse_lookup.items():
+            if uri.startswith(namespace_uri):
+                local_name = uri[len(namespace_uri):]
+                return f"{prefix}:{local_name}"
+        
+        return uri
+    
+    def expand(self, compressed_uri: str) -> str:
+        """Expand compressed URI to full form."""
+        if ':' in compressed_uri and not compressed_uri.startswith('http'):
+            prefix, local_name = compressed_uri.split(':', 1)
+            if prefix in self.prefixes:
+                return f"{self.prefixes[prefix]}{local_name}"
+        return compressed_uri
+
+
+class PropertyGraphSchema:
+    """Intelligent schema inference for property graphs."""
+    
+    def __init__(self, config: ConversionConfig):
+        self.config = config
+        self.node_labels: Set[str] = set()
+        self.edge_types: Set[str] = set()
+        self.node_properties: Dict[str, Set[str]] = defaultdict(set)
+        self.edge_properties: Dict[str, Set[str]] = defaultdict(set)
+        self.property_types: Dict[str, str] = {}
+        self.cardinalities: Dict[str, str] = {}  # "one", "many"
+    
+    def analyze_triple(self, subject: Any, predicate: Any, obj: Any):
+        """Analyze a triple to build schema information."""
+        pred_str = str(predicate)
+        
+        # Handle rdf:type specially
+        if pred_str in [str(RDF.type), 'rdf:type']:
+            if isinstance(obj, URIRef):
+                label = self._extract_label(str(obj))
+                self.node_labels.add(label)
+        else:
+            # Regular predicate
+            edge_type = self._extract_label(pred_str)
+            self.edge_types.add(edge_type)
+            
+            if isinstance(obj, Literal):
+                # Data property - becomes node property
+                subj_types = self._get_subject_types(subject)
+                for subj_type in subj_types:
+                    self.node_properties[subj_type].add(edge_type)
+                    self.property_types[f"{subj_type}.{edge_type}"] = self._infer_datatype(obj)
+            else:
+                # Object property - becomes edge
+                self.edge_properties[edge_type].add("uri")
+    
+    def _extract_label(self, uri: str) -> str:
+        """Extract meaningful label from URI."""
+        # Remove common prefixes and extract local name
+        for sep in ['#', '/']:
+            if sep in uri:
+                local = uri.rsplit(sep, 1)[-1]
+                if local:
+                    return self._clean_label(local)
+        return self._clean_label(uri)
+    
+    def _clean_label(self, label: str) -> str:
+        """Clean and normalize labels for use in property graphs."""
+        # Remove non-alphanumeric characters, keep underscores
+        cleaned = ''.join(c if c.isalnum() or c == '_' else '_' for c in label)
+        # Ensure it starts with a letter
+        if cleaned and not cleaned[0].isalpha():
+            cleaned = f"n_{cleaned}"
+        return cleaned or "Node"
+    
+    def _get_subject_types(self, subject: Any) -> List[str]:
+        """Get types for a subject (simplified)."""
+        # In a full implementation, this would track rdf:type assertions
+        if isinstance(subject, URIRef):
+            return ["Resource"]
+        elif isinstance(subject, BNode):
+            return ["BlankNode"]
+        else:
+            return ["Entity"]
+    
+    def _infer_datatype(self, literal: Literal) -> str:
+        """Infer property type from literal."""
+        if literal.datatype:
+            dt = str(literal.datatype)
+            if 'integer' in dt or 'int' in dt:
+                return 'INTEGER'
+            elif 'decimal' in dt or 'double' in dt or 'float' in dt:
+                return 'FLOAT'
+            elif 'boolean' in dt:
+                return 'BOOLEAN'
+            elif 'date' in dt:
+                return 'STRING'  # Store dates as strings for now
+        
+        # Try to infer from value
         try:
-            with open(json_file_path, 'r', encoding='utf-8') as file:
-                data = json.load(file)
+            int(literal)
+            return 'INTEGER'
+        except ValueError:
+            try:
+                float(literal)
+                return 'FLOAT'
+            except ValueError:
+                if str(literal).lower() in ['true', 'false']:
+                    return 'BOOLEAN'
+        
+        return 'STRING'
+
+
+class RDFStreamProcessor:
+    """High-performance streaming RDF processor."""
+    
+    def __init__(self, config: ConversionConfig):
+        self.config = config
+        self.namespace_registry = NamespaceRegistry()
+        self.schema = PropertyGraphSchema(config)
+        self.resource_ids: Dict[str, str] = {}
+        self.next_id = 0
+        self.lock = threading.Lock()
+        
+        # Statistics
+        self.stats = {
+            'literals_as_properties': 0,
+            'literals_as_nodes': 0,
+            'resources_processed': 0,
+            'blank_nodes_processed': 0,
+        }
+    
+    def get_resource_id(self, resource: Any) -> str:
+        """Get unique ID for any RDF resource."""
+        with self.lock:
+            if isinstance(resource, URIRef):
+                uri_str = str(resource)
+                if uri_str not in self.resource_ids:
+                    # Use hash of URI for consistent IDs
+                    uri_hash = hashlib.md5(uri_str.encode()).hexdigest()[:12]
+                    self.resource_ids[uri_str] = f"uri_{uri_hash}"
+                return self.resource_ids[uri_str]
+            
+            elif isinstance(resource, BNode):
+                bnode_str = str(resource)
+                if bnode_str not in self.resource_ids:
+                    self.resource_ids[bnode_str] = f"bn_{self.next_id}"
+                    self.next_id += 1
+                return self.resource_ids[bnode_str]
+            
+            elif isinstance(resource, Literal):
+                literal_str = str(resource)
+                if literal_str not in self.resource_ids:
+                    # Only create nodes for frequently referenced literals
+                    if len(literal_str) > 100:  # Long literals become nodes
+                        literal_hash = hashlib.md5(literal_str.encode()).hexdigest()[:12]
+                        self.resource_ids[literal_str] = f"lit_{literal_hash}"
+                        return self.resource_ids[literal_str]
+                return None  # Will be handled as property
+            
+            return None
+    
+    def process_triples_to_csv(self, triples: Iterator[Tuple], temp_dir: Path) -> Tuple[str, str]:
+        """Process RDF triples and output to CSV files for bulk loading."""
+        nodes_file = temp_dir / f"nodes_{threading.current_thread().ident}.csv"
+        edges_file = temp_dir / f"edges_{threading.current_thread().ident}.csv"
+        
+        nodes_data = defaultdict(lambda: defaultdict(list))  # id -> property -> [values]
+        edges_data = []
+        
+        processed_count = 0
+        
+        # Process triples
+        for subject, predicate, obj in triples:
+            try:
+                self._process_single_triple(subject, predicate, obj, nodes_data, edges_data)
+                processed_count += 1
                 
-            # Handle different JSON structures
-            if isinstance(data, list):
-                # If it's a list of objects with name and definition
-                for item in data:
-                    if 'name' in item and 'definition' in item:
-                        self.names_definitions[item['name']] = item['definition']
-            elif isinstance(data, dict):
-                # If it's a direct name->definition mapping
-                if all(isinstance(v, str) for v in data.values()):
-                    self.names_definitions = data
-                else:
-                    # If it's a dict with name/definition structure
-                    for key, value in data.items():
-                        if isinstance(value, dict) and 'definition' in value:
-                            self.names_definitions[key] = value['definition']
-                        elif isinstance(value, str):
-                            self.names_definitions[key] = value
-            
-            logger.info(f"Loaded {len(self.names_definitions)} name-definition pairs")
-            
-        except FileNotFoundError:
-            raise FileNotFoundError(f"JSON file not found: {json_file_path}")
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Invalid JSON format in {json_file_path}: {e}")
+                if processed_count % 10000 == 0:
+                    gc.collect()  # Periodic cleanup
+                    
+            except Exception as e:
+                logging.warning(f"Error processing triple: {e}")
+                continue
+        
+        # Write CSV files
+        self._write_nodes_csv(nodes_data, nodes_file)
+        self._write_edges_csv(edges_data, edges_file)
+        
+        return str(nodes_file), str(edges_file)
     
-    def load_csv_cases(self, csv_file_path: str) -> None:
-        """Load cases from CSV file"""
-        try:
-            with open(csv_file_path, 'r', encoding='utf-8') as file:
-                reader = csv.DictReader(file)
-                self.cases = []
-                
-                for row in reader:
-                    if 'id' in row and 'case' in row:
-                        self.cases.append({
-                            'id': row['id'].strip(),
-                            'case': row['case'].strip()
-                        })
-                
-            logger.info(f"Loaded {len(self.cases)} cases from CSV")
-            
-        except FileNotFoundError:
-            raise FileNotFoundError(f"CSV file not found: {csv_file_path}")
-        except Exception as e:
-            raise ValueError(f"Error reading CSV file {csv_file_path}: {e}")
-    
-    def match_case_to_name(self, case_id: str, case_text: str) -> MappingResult:
-        """Match a single case to the most appropriate name"""
-        if not self.agent:
-            self.setup_tools_and_agent()
+    def _process_single_triple(self, subject: Any, predicate: Any, obj: Any,
+                              nodes_data: Dict, edges_data: List):
+        """Process a single RDF triple."""
+        # Analyze for schema
+        self.schema.analyze_triple(subject, predicate, obj)
         
-        # Create the user message
-        user_message = f"""Please analyze and match this case to the most appropriate name:
-
-Case ID: {case_id}
-Case Text: "{case_text}"
-
-Use the tools systematically to analyze the case and provide your final decision in the required JSON format."""
-
-        # Configure the conversation
-        config = {"configurable": {"thread_id": f"case_{case_id}"}}
-        
-        try:
-            # Invoke the agent
-            response = self.agent.invoke(
-                {"messages": [HumanMessage(content=user_message)]},
-                config
-            )
-            
-            # Extract the final result from the agent's response
-            final_message = response["messages"][-1].content
-            result_data = self._extract_json_result(final_message)
-            
-            return MappingResult(
-                case_id=case_id,
-                case_text=case_text,
-                matched_name=result_data.get('matched_name', 'Unknown'),
-                confidence_score=float(result_data.get('confidence_score', 0.0)),
-                reasoning=result_data.get('reasoning', 'No reasoning provided'),
-                definition_used=result_data.get('definition_used', 'No definition found')
-            )
-            
-        except Exception as e:
-            logger.error(f"Error processing case {case_id}: {e}")
-            return MappingResult(
-                case_id=case_id,
-                case_text=case_text,
-                matched_name='Error',
-                confidence_score=0.0,
-                reasoning=f'Error during processing: {str(e)}',
-                definition_used='N/A'
-            )
-    
-    def _extract_json_result(self, text: str) -> Dict[str, Any]:
-        """Extract JSON result from agent response"""
-        try:
-            # Try to find JSON in the text
-            json_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
-            matches = re.findall(json_pattern, text, re.DOTALL)
-            
-            for match in matches:
-                try:
-                    parsed = json.loads(match)
-                    if 'matched_name' in parsed and 'confidence_score' in parsed:
-                        return parsed
-                except json.JSONDecodeError:
-                    continue
-            
-            # Fallback: look for specific patterns in text
-            matched_name = self._extract_field(text, 'matched_name')
-            confidence = self._extract_field(text, 'confidence_score')
-            reasoning = self._extract_field(text, 'reasoning')
-            definition = self._extract_field(text, 'definition_used')
-            
-            return {
-                'matched_name': matched_name or 'Unknown',
-                'confidence_score': float(confidence) if confidence else 0.5,
-                'reasoning': reasoning or 'Could not parse reasoning from response',
-                'definition_used': definition or 'N/A'
-            }
-            
-        except Exception as e:
-            logger.warning(f"Error extracting JSON result: {e}")
-            return {
-                'matched_name': 'Parse Error',
-                'confidence_score': 0.0,
-                'reasoning': 'Failed to parse agent response',
-                'definition_used': 'N/A'
-            }
-    
-    def _extract_field(self, text: str, field_name: str) -> str:
-        """Extract a specific field from text using patterns"""
-        patterns = [
-            rf'"{field_name}":\s*"([^"]+)"',
-            rf'{field_name}:\s*"([^"]+)"',
-            rf'{field_name}:\s*([^\n,}}]+)',
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                return match.group(1).strip()
-        
-        return None
-    
-    def process_all_cases(self) -> List[MappingResult]:
-        """Process all loaded cases and return mapping results"""
-        if not self.cases:
-            raise ValueError("No cases loaded. Use load_csv_cases() first.")
-        
-        if not self.names_definitions:
-            raise ValueError("No definitions loaded. Use load_json_definitions() first.")
-        
-        results = []
-        total_cases = len(self.cases)
-        
-        logger.info(f"Processing {total_cases} cases...")
-        
-        for i, case in enumerate(self.cases, 1):
-            logger.info(f"Processing case {i}/{total_cases}: {case['id']}")
-            
-            result = self.match_case_to_name(case['id'], case['case'])
-            results.append(result)
-            
-            # Log progress
-            if i % 5 == 0 or i == total_cases:
-                logger.info(f"Completed {i}/{total_cases} cases")
-        
-        return results
-    
-    def save_results(self, results: List[MappingResult], output_file: str) -> None:
-        """Save mapping results to a JSON file"""
-        output_data = []
-        
-        for result in results:
-            output_data.append({
-                'case_id': result.case_id,
-                'case_text': result.case_text,
-                'matched_name': result.matched_name,
-                'confidence_score': result.confidence_score,
-                'reasoning': result.reasoning,
-                'definition_used': result.definition_used,
-                'timestamp': datetime.now().isoformat()
-            })
-        
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(output_data, f, indent=2, ensure_ascii=False)
-        
-        logger.info(f"Results saved to {output_file}")
-    
-    def print_summary(self, results: List[MappingResult]) -> None:
-        """Print a summary of the mapping results"""
-        if not results:
-            print("No results to summarize.")
+        # Get subject ID
+        subj_id = self.get_resource_id(subject)
+        if not subj_id:
             return
         
-        print("\n" + "="*50)
-        print("CONTEXTUAL MAPPING SUMMARY")
-        print("="*50)
+        pred_str = str(predicate)
+        if self.config.compress_uris:
+            pred_str = self.namespace_registry.compress(pred_str)
         
-        # Overall statistics
-        total_cases = len(results)
-        avg_confidence = sum(r.confidence_score for r in results) / total_cases
-        high_confidence = sum(1 for r in results if r.confidence_score >= 0.8)
+        # Ensure subject node exists
+        if subj_id not in nodes_data:
+            nodes_data[subj_id]['id'] = [subj_id]
+            nodes_data[subj_id]['uri'] = [str(subject)] if isinstance(subject, URIRef) else ['']
+            nodes_data[subj_id]['labels'] = []
         
-        print(f"Total Cases Processed: {total_cases}")
-        print(f"Average Confidence: {avg_confidence:.2f}")
-        print(f"High Confidence Matches (≥0.8): {high_confidence}")
-        print(f"Success Rate: {(high_confidence/total_cases)*100:.1f}%")
+        # Handle different object types
+        if isinstance(obj, Literal):
+            self._handle_literal_object(subj_id, pred_str, obj, nodes_data)
+        else:
+            self._handle_resource_object(subj_id, pred_str, obj, nodes_data, edges_data)
         
-        # Name distribution
-        name_counts = {}
-        for result in results:
-            name_counts[result.matched_name] = name_counts.get(result.matched_name, 0) + 1
-        
-        print(f"\nName Distribution:")
-        for name, count in sorted(name_counts.items()):
-            print(f"  {name}: {count} cases")
-        
-        # Sample results
-        print(f"\nSample Results:")
-        for i, result in enumerate(results[:3], 1):
-            print(f"\n{i}. Case ID: {result.case_id}")
-            print(f"   Case: {result.case_text[:100]}...")
-            print(f"   Matched: {result.matched_name}")
-            print(f"   Confidence: {result.confidence_score:.2f}")
-            print(f"   Reasoning: {result.reasoning[:150]}...")
-
-def main():
-    """Main function to run the contextual mapping"""
-    # Configuration
-    JSON_FILE = "names_definitions.json"  # Update with your JSON file path
-    CSV_FILE = "cases.csv"                # Update with your CSV file path
-    OUTPUT_FILE = "mapping_results.json"
+        # Handle special predicates
+        self._handle_special_predicates(subj_id, pred_str, obj, nodes_data)
     
-    # Initialize the mapper
+    def _handle_literal_object(self, subject_id: str, predicate: str, literal: Literal,
+                              nodes_data: Dict):
+        """Handle literal objects."""
+        obj_id = self.get_resource_id(literal)
+        
+        if obj_id:  # Create separate node for complex literals
+            if obj_id not in nodes_data:
+                nodes_data[obj_id]['id'] = [obj_id]
+                nodes_data[obj_id]['value'] = [str(literal)]
+                nodes_data[obj_id]['labels'] = ['Literal']
+                
+                if literal.datatype:
+                    nodes_data[obj_id]['datatype'] = [str(literal.datatype)]
+                if literal.language:
+                    nodes_data[obj_id]['language'] = [literal.language]
+            
+            self.stats['literals_as_nodes'] += 1
+        else:
+            # Add as property to subject
+            value = self._convert_literal_value(literal)
+            
+            # Limit property values to prevent explosion
+            if len(nodes_data[subject_id].get(predicate, [])) < self.config.max_property_values:
+                nodes_data[subject_id][predicate].append(value)
+            
+            self.stats['literals_as_properties'] += 1
+    
+    def _handle_resource_object(self, subject_id: str, predicate: str, obj: Any,
+                               nodes_data: Dict, edges_data: List):
+        """Handle resource objects."""
+        obj_id = self.get_resource_id(obj)
+        if not obj_id:
+            return
+        
+        # Ensure object node exists
+        if obj_id not in nodes_data:
+            nodes_data[obj_id]['id'] = [obj_id]
+            nodes_data[obj_id]['uri'] = [str(obj)] if isinstance(obj, URIRef) else ['']
+            nodes_data[obj_id]['labels'] = []
+        
+        # Create edge
+        edge_type = self._clean_edge_type(predicate)
+        edges_data.append({
+            'source': subject_id,
+            'target': obj_id,
+            'type': edge_type,
+            'uri': predicate if self.config.compress_uris else str(predicate)
+        })
+    
+    def _handle_special_predicates(self, subject_id: str, predicate: str, obj: Any,
+                                  nodes_data: Dict):
+        """Handle special RDF predicates."""
+        if predicate in [str(RDF.type), 'rdf:type']:
+            if isinstance(obj, URIRef):
+                label = self.schema._extract_label(str(obj))
+                if label not in nodes_data[subject_id]['labels']:
+                    nodes_data[subject_id]['labels'].append(label)
+    
+    def _convert_literal_value(self, literal: Literal) -> Any:
+        """Convert RDF literal to appropriate Python type."""
+        if literal.datatype:
+            datatype = str(literal.datatype)
+            try:
+                if 'integer' in datatype or 'int' in datatype:
+                    return int(literal)
+                elif 'decimal' in datatype or 'double' in datatype or 'float' in datatype:
+                    return float(literal)
+                elif 'boolean' in datatype:
+                    return str(literal).lower() in ('true', '1')
+            except (ValueError, TypeError):
+                pass
+        
+        return str(literal)
+    
+    def _clean_edge_type(self, predicate: str) -> str:
+        """Clean predicate for use as edge type."""
+        # Extract local name and clean for Cypher
+        label = predicate.split('#')[-1].split('/')[-1]
+        # Replace problematic characters
+        cleaned = ''.join(c if c.isalnum() or c == '_' else '_' for c in label)
+        return cleaned or 'RELATED_TO'
+    
+    def _write_nodes_csv(self, nodes_data: Dict, output_file: Path):
+        """Write nodes data to CSV."""
+        if not nodes_data:
+            return
+        
+        # Determine all possible columns
+        all_properties = set()
+        for node_props in nodes_data.values():
+            all_properties.update(node_props.keys())
+        
+        # Define column order
+        fixed_cols = ['id', 'uri', 'labels']
+        property_cols = sorted(all_properties - set(fixed_cols))
+        columns = fixed_cols + property_cols
+        
+        with open(output_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
+            
+            # Write header with type hints for bulk loader
+            header = []
+            for col in columns:
+                if col == 'id':
+                    header.append('id:ID')
+                elif col == 'labels':
+                    header.append('labels:LABEL')
+                else:
+                    header.append(col)
+            writer.writerow(header)
+            
+            # Write data
+            for node_id, properties in nodes_data.items():
+                row = []
+                for col in columns:
+                    values = properties.get(col, [])
+                    if col == 'labels':
+                        # Join multiple labels with semicolon
+                        row.append(';'.join(values) if values else 'Node')
+                    elif len(values) == 1:
+                        row.append(values[0])
+                    elif len(values) > 1:
+                        # Multiple values as JSON array
+                        row.append(json.dumps(values))
+                    else:
+                        row.append('')
+                writer.writerow(row)
+    
+    def _write_edges_csv(self, edges_data: List, output_file: Path):
+        """Write edges data to CSV."""
+        if not edges_data:
+            return
+        
+        with open(output_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
+            
+            # Write header
+            writer.writerow(['source:START_ID', 'target:END_ID', 'type:TYPE', 'uri'])
+            
+            # Write edges
+            for edge in edges_data:
+                writer.writerow([
+                    edge['source'],
+                    edge['target'],
+                    edge['type'],
+                    edge.get('uri', '')
+                ])
+
+
+class FalkorDBBulkIngestor:
+    """Advanced bulk ingestor using FalkorDB's bulk loader."""
+    
+    def __init__(self, config: ConversionConfig):
+        self.config = config
+        self.db = None
+        self.graph = None
+        
+    def connect(self):
+        """Connect to FalkorDB."""
+        try:
+            self.db = falkordb.FalkorDB(
+                host=self.config.host,
+                port=self.config.port,
+                password=self.config.password
+            )
+            self.graph = self.db.select_graph(self.config.graph_name)
+            logging.info(f"Connected to FalkorDB at {self.config.host}:{self.config.port}")
+        except Exception as e:
+            logging.error(f"Failed to connect to FalkorDB: {e}")
+            raise
+    
+    def setup_indexes(self):
+        """Create performance indexes."""
+        if not self.config.create_indexes:
+            return
+        
+        index_queries = [
+            "CREATE INDEX FOR (n:Resource) ON (n.uri)",
+            "CREATE INDEX FOR (n:Entity) ON (n.id)",
+            "CREATE INDEX FOR (n:BlankNode) ON (n.id)",
+            "CREATE INDEX FOR (n:Literal) ON (n.value)",
+        ]
+        
+        for query in index_queries:
+            try:
+                self.graph.query(query)
+                logging.info(f"Created index: {query}")
+            except Exception as e:
+                logging.warning(f"Index creation failed: {query} - {e}")
+    
+    def bulk_load_csv_files(self, nodes_files: List[str], edges_files: List[str]) -> Dict[str, int]:
+        """Load CSV files using falkordb-bulk-loader."""
+        if not (nodes_files or edges_files):
+            return {"nodes": 0, "edges": 0}
+        
+        try:
+            # Combine CSV files if multiple
+            combined_nodes = self._combine_csv_files(nodes_files, "nodes")
+            combined_edges = self._combine_csv_files(edges_files, "edges")
+            
+            # Use falkordb-bulk-insert command
+            cmd = [
+                "falkordb-bulk-insert",
+                self.config.graph_name,
+                "--host", self.config.host,
+                "--port", str(self.config.port)
+            ]
+            
+            if self.config.password:
+                cmd.extend(["--password", self.config.password])
+            
+            if combined_nodes and Path(combined_nodes).exists():
+                cmd.extend(["--nodes", combined_nodes])
+            
+            if combined_edges and Path(combined_edges).exists():
+                cmd.extend(["--relations", combined_edges])
+            
+            # Add performance flags
+            cmd.extend([
+                "--max-token-count", "8192",
+                "--max-buffer-size", "2048",
+                "--enforce-schema"
+            ])
+            
+            logging.info(f"Running bulk loader: {' '.join(cmd)}")
+            
+            # Execute bulk loader
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            
+            logging.info("Bulk loading completed successfully")
+            logging.info(f"Bulk loader output: {result.stdout}")
+            
+            # Parse output to get counts (implementation specific)
+            return self._parse_bulk_loader_output(result.stdout)
+            
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Bulk loader failed: {e}")
+            logging.error(f"Error output: {e.stderr}")
+            # Fallback to direct loading
+            return self._fallback_direct_load(nodes_files, edges_files)
+        
+        except Exception as e:
+            logging.error(f"Bulk loading error: {e}")
+            return self._fallback_direct_load(nodes_files, edges_files)
+    
+    def _combine_csv_files(self, files: List[str], file_type: str) -> Optional[str]:
+        """Combine multiple CSV files into one."""
+        if not files:
+            return None
+        
+        if len(files) == 1:
+            return files[0]
+        
+        # Create combined file
+        temp_dir = Path(self.config.temp_dir or tempfile.gettempdir())
+        combined_file = temp_dir / f"combined_{file_type}_{int(time.time())}.csv"
+        
+        with open(combined_file, 'w', newline='', encoding='utf-8') as outf:
+            writer = None
+            header_written = False
+            
+            for file_path in files:
+                if not Path(file_path).exists():
+                    continue
+                    
+                with open(file_path, 'r', encoding='utf-8') as inf:
+                    reader = csv.reader(inf)
+                    header = next(reader, None)
+                    
+                    if not header_written:
+                        writer = csv.writer(outf)
+                        writer.writerow(header)
+                        header_written = True
+                    
+                    # Copy data rows
+                    for row in reader:
+                        writer.writerow(row)
+        
+        return str(combined_file)
+    
+    def _parse_bulk_loader_output(self, output: str) -> Dict[str, int]:
+        """Parse bulk loader output to extract statistics."""
+        # Implementation depends on falkordb-bulk-loader output format
+        stats = {"nodes": 0, "edges": 0}
+        
+        for line in output.split('\n'):
+            if 'nodes' in line.lower() and 'created' in line.lower():
+                # Extract number from line
+                numbers = [int(s) for s in line.split() if s.isdigit()]
+                if numbers:
+                    stats["nodes"] = max(numbers)
+            
+            elif 'relations' in line.lower() or 'edges' in line.lower():
+                numbers = [int(s) for s in line.split() if s.isdigit()]
+                if numbers:
+                    stats["edges"] = max(numbers)
+        
+        return stats
+    
+    def _fallback_direct_load(self, nodes_files: List[str], edges_files: List[str]) -> Dict[str, int]:
+        """Fallback to direct Cypher loading if bulk loader fails."""
+        logging.info("Using fallback direct loading method")
+        
+        total_nodes = 0
+        total_edges = 0
+        
+        # Load nodes
+        for nodes_file in nodes_files:
+            if not Path(nodes_file).exists():
+                continue
+                
+            query = f"""
+            LOAD CSV WITH HEADERS FROM 'file:///{nodes_file}' AS row
+            CREATE (n)
+            SET n = row
+            """
+            
+            try:
+                result = self.graph.query(query)
+                total_nodes += result.result_set[0][0] if result.result_set else 0
+            except Exception as e:
+                logging.error(f"Failed to load nodes from {nodes_file}: {e}")
+        
+        # Load edges
+        for edges_file in edges_files:
+            if not Path(edges_file).exists():
+                continue
+                
+            query = f"""
+            LOAD CSV WITH HEADERS FROM 'file:///{edges_file}' AS row
+            MATCH (a {{id: row.source}}), (b {{id: row.target}})
+            CREATE (a)-[r:RELATED]->(b)
+            SET r.type = row.type, r.uri = row.uri
+            """
+            
+            try:
+                result = self.graph.query(query)
+                total_edges += result.result_set[0][0] if result.result_set else 0
+            except Exception as e:
+                logging.error(f"Failed to load edges from {edges_file}: {e}")
+        
+        return {"nodes": total_nodes, "edges": total_edges}
+
+
+class RDFToFalkorDBConverter:
+    """Main converter orchestrating the entire conversion process."""
+    
+    def __init__(self, config: ConversionConfig):
+        self.config = config
+        self.metrics = PerformanceMetrics()
+        self.temp_files: List[str] = []
+        
+        # Setup logging
+        self._setup_logging()
+        
+        # Setup temporary directory
+        if not self.config.temp_dir:
+            self.config.temp_dir = tempfile.mkdtemp(prefix="rdf_conversion_")
+        
+        self.temp_dir = Path(self.config.temp_dir)
+        self.temp_dir.mkdir(exist_ok=True)
+        
+        logging.info(f"Initialized converter with temp dir: {self.temp_dir}")
+    
+    def _setup_logging(self):
+        """Setup comprehensive logging."""
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.StreamHandler(),
+                logging.FileHandler('rdf_conversion.log')
+            ]
+        )
+    
+    def convert_rdf_file(self, rdf_file_path: str) -> PerformanceMetrics:
+        """Convert RDF file to FalkorDB property graph."""
+        self.metrics.start_time = time.time()
+        
+        try:
+            logging.info(f"Starting conversion of {rdf_file_path}")
+            
+            # Initialize components
+            processor = RDFStreamProcessor(self.config)
+            ingestor = FalkorDBBulkIngestor(self.config)
+            
+            # Connect to database
+            ingestor.connect()
+            ingestor.setup_indexes()
+            
+            # Process RDF file
+            nodes_files, edges_files = self._process_rdf_streaming(rdf_file_path, processor)
+            
+            # Bulk load into FalkorDB
+            load_stats = ingestor.bulk_load_csv_files(nodes_files, edges_files)
+            
+            # Update metrics
+            self.metrics.nodes_created = load_stats.get("nodes", 0)
+            self.metrics.edges_created = load_stats.get("edges", 0)
+            self.metrics.end_time = time.time()
+            
+            # Cleanup
+            if self.config.cleanup_temp_files:
+                self._cleanup_temp_files()
+            
+            logging.info(f"Conversion completed in {self.metrics.processing_time:.2f} seconds")
+            logging.info(f"Created {self.metrics.nodes_created:,} nodes and {self.metrics.edges_created:,} edges")
+            
+            return self.metrics
+            
+        except Exception as e:
+            logging.error(f"Conversion failed: {e}")
+            raise
+        finally:
+            self.metrics.end_time = time.time()
+    
+    def _process_rdf_streaming(self, rdf_file_path: str, processor: RDFStreamProcessor) -> Tuple[List[str], List[str]]:
+        """Process RDF file using streaming approach."""
+        file_path = Path(rdf_file_path)
+        
+        if not file_path.exists():
+            raise FileNotFoundError(f"RDF file not found: {file_path}")
+        
+        # Determine format
+        format_map = {
+            '.ttl': 'turtle', '.turtle': 'turtle',
+            '.nt': 'nt', '.ntriples': 'nt',
+            '.rdf': 'xml', '.xml': 'xml',
+            '.jsonld': 'json-ld', '.json': 'json-ld',
+            '.n3': 'n3', '.nq': 'nquads'
+        }
+        
+        file_format = format_map.get(file_path.suffix.lower(), 'turtle')
+        logging.info(f"Processing {file_path} as {file_format}")
+        
+        # Choose processing strategy based on file size
+        file_size_mb = file_path.stat().st_size / (1024 * 1024)
+        logging.info(f"File size: {file_size_mb:.1f} MB")
+        
+        if file_size_mb > 500:  # > 500MB use streaming
+            return self._process_large_file_streaming(file_path, file_format, processor)
+        else:
+            return self._process_standard_file(file_path, file_format, processor)
+    
+    def _process_large_file_streaming(self, file_path: Path, file_format: str, 
+                                    processor: RDFStreamProcessor) -> Tuple[List[str], List[str]]:
+        """Process very large files with streaming."""
+        logging.info("Using streaming processing for large file")
+        
+        nodes_files = []
+        edges_files = []
+        
+        if file_format == 'nt':
+            # N-Triples can be processed line by line
+            chunk_triples = []
+            
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    
+                    try:
+                        # Parse single triple
+                        g = Graph()
+                        g.parse(data=line, format='nt')
+                        chunk_triples.extend(list(g))
+                        
+                        # Process chunk when it reaches target size
+                        if len(chunk_triples) >= self.config.chunk_size:
+                            nodes_file, edges_file = processor.process_triples_to_csv(
+                                iter(chunk_triples), self.temp_dir
+                            )
+                            nodes_files.append(nodes_file)
+                            edges_files.append(edges_file)
+                            
+                            self.metrics.processed_triples += len(chunk_triples)
+                            chunk_triples = []
+                            
+                            self._monitor_memory()
+                            
+                    except Exception as e:
+                        logging.warning(f"Error parsing line {line_num}: {e}")
+                        continue
+            
+            # Process remaining triples
+            if chunk_triples:
+                nodes_file, edges_file = processor.process_triples_to_csv(
+                    iter(chunk_triples), self.temp_dir
+                )
+                nodes_files.append(nodes_file)
+                edges_files.append(edges_file)
+                self.metrics.processed_triples += len(chunk_triples)
+        
+        else:
+            # For other formats, use chunked loading
+            return self._process_standard_file(file_path, file_format, processor)
+        
+        return nodes_files, edges_files
+    
+    def _process_standard_file(self, file_path: Path, file_format: str, 
+                             processor: RDFStreamProcessor) -> Tuple[List[str], List[str]]:
+        """Process files by loading into memory."""
+        try:
+            g = Graph()
+            logging.info("Loading RDF file into memory...")
+            g.parse(str(file_path), format=file_format)
+            
+            self.metrics.total_triples = len(g)
+            logging.info(f"Loaded {self.metrics.total_triples:,} triples")
+            
+            # Process in parallel chunks
+            if self.config.parallel_processing and self.metrics.total_triples > 100000:
+                return self._process_parallel_chunks(g, processor)
+            else:
+                return self._process_sequential_chunks(g, processor)
+            
+        except Exception as e:
+            logging.error(f"Failed to process RDF file: {e}")
+            raise
+    
+    def _process_parallel_chunks(self, graph: Graph, processor: RDFStreamProcessor) -> Tuple[List[str], List[str]]:
+        """Process RDF graph using parallel workers."""
+        logging.info(f"Processing with {self.config.max_workers} parallel workers")
+        
+        # Split triples into chunks
+        all_triples = list(graph)
+        chunk_size = self.config.chunk_size
+        chunks = [all_triples[i:i + chunk_size] for i in range(0, len(all_triples), chunk_size)]
+        
+        nodes_files = []
+        edges_files = []
+        
+        with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
+            # Submit all chunks
+            futures = []
+            for i, chunk in enumerate(chunks):
+                future = executor.submit(processor.process_triples_to_csv, iter(chunk), self.temp_dir)
+                futures.append(future)
+            
+            # Collect results with progress bar
+            with tqdm(total=len(chunks), desc="Processing chunks") as pbar:
+                for future in as_completed(futures):
+                    try:
+                        nodes_file, edges_file = future.result()
+                        nodes_files.append(nodes_file)
+                        edges_files.append(edges_file)
+                        pbar.update(1)
+                        
+                        self.metrics.processed_triples += chunk_size
+                        self._monitor_memory()
+                        
+                    except Exception as e:
+                        logging.error(f"Chunk processing failed: {e}")
+        
+        return nodes_files, edges_files
+    
+    def _process_sequential_chunks(self, graph: Graph, processor: RDFStreamProcessor) -> Tuple[List[str], List[str]]:
+        """Process RDF graph sequentially."""
+        logging.info("Processing sequentially")
+        
+        nodes_files = []
+        edges_files = []
+        
+        chunk_triples = []
+        
+        with tqdm(total=self.metrics.total_triples, desc="Processing triples") as pbar:
+            for triple in graph:
+                chunk_triples.append(triple)
+                
+                if len(chunk_triples) >= self.config.chunk_size:
+                    nodes_file, edges_file = processor.process_triples_to_csv(
+                        iter(chunk_triples), self.temp_dir
+                    )
+                    nodes_files.append(nodes_file)
+                    edges_files.append(edges_file)
+                    
+                    self.metrics.processed_triples += len(chunk_triples)
+                    pbar.update(len(chunk_triples))
+                    chunk_triples = []
+                    
+                    self._monitor_memory()
+            
+            # Process remaining triples
+            if chunk_triples:
+                nodes_file, edges_file = processor.process_triples_to_csv(
+                    iter(chunk_triples), self.temp_dir
+                )
+                nodes_files.append(nodes_file)
+                edges_files.append(edges_file)
+                self.metrics.processed_triples += len(chunk_triples)
+                pbar.update(len(chunk_triples))
+        
+        return nodes_files, edges_files
+    
+    def _monitor_memory(self):
+        """Monitor memory usage and trigger cleanup if needed."""
+        process = psutil.Process()
+        memory_mb = process.memory_info().rss / 1024 / 1024
+        
+        if memory_mb > self.metrics.memory_peak_mb:
+            self.metrics.memory_peak_mb = memory_mb
+        
+        if memory_mb > self.config.max_memory_mb:
+            logging.warning(f"Memory usage ({memory_mb:.1f}MB) exceeds threshold")
+            gc.collect()
+    
+    def _cleanup_temp_files(self):
+        """Clean up temporary files."""
+        try:
+            for file_path in self.temp_dir.glob("*"):
+                file_path.unlink()
+            self.temp_dir.rmdir()
+            logging.info("Cleaned up temporary files")
+        except Exception as e:
+            logging.warning(f"Failed to clean up temp files: {e}")
+    
+    def get_validation_queries(self) -> List[str]:
+        """Get validation queries for checking conversion quality."""
+        return [
+            "MATCH (n) RETURN count(n) as total_nodes",
+            "MATCH ()-[r]->() RETURN count(r) as total_edges",
+            "MATCH (n) RETURN labels(n)[0] as label, count(n) as count ORDER BY count DESC LIMIT 10",
+            "MATCH ()-[r]->() RETURN type(r) as relationship_type, count(r) as count ORDER BY count DESC LIMIT 10",
+            "MATCH (n) WHERE n.uri IS NOT NULL RETURN count(n) as nodes_with_uri",
+            "MATCH (n:Resource) RETURN count(n) as resource_nodes",
+            "MATCH (n:Literal) RETURN count(n) as literal_nodes",
+            "MATCH (n:BlankNode) RETURN count(n) as blank_nodes",
+        ]
+
+
+# Configuration loading utilities
+def load_config_from_yaml(config_path: str) -> ConversionConfig:
+    """Load configuration from YAML file."""
+    with open(config_path, 'r') as f:
+        config_dict = yaml.safe_load(f)
+    
+    # Flatten nested configuration
+    flat_config = {}
+    for section, values in config_dict.items():
+        if isinstance(values, dict):
+            flat_config.update(values)
+        else:
+            flat_config[section] = values
+    
+    return ConversionConfig(**flat_config)
+
+
+# Example usage and main function
+def main():
+    """Example usage of the RDF to FalkorDB converter."""
+    
+    # Configuration optimized for 6M triples
+    config = ConversionConfig(
+        chunk_size=50000,
+        node_batch_size=25000,
+        edge_batch_size=50000,
+        max_memory_mb=2000,
+        use_bulk_loader=True,
+        create_indexes=True,
+        parallel_processing=True,
+        max_workers=4,
+        host="localhost",
+        port=6379,
+        graph_name="knowledge_graph_6m"
+    )
+    
+    # Initialize converter
+    converter = RDFToFalkorDBConverter(config)
+    
     try:
-        mapper = ContextualMapper()
+        # Convert your RDF file
+        rdf_file_path = "your_large_rdf_file.ttl"  # Replace with your file
         
-        # Load data
-        print("Loading data files...")
-        mapper.load_json_definitions(JSON_FILE)
-        mapper.load_csv_cases(CSV_FILE)
+        if not Path(rdf_file_path).exists():
+            print(f"Please provide a valid RDF file path. Current: {rdf_file_path}")
+            return
         
-        # Process cases
-        print("Setting up ReAct agent...")
-        results = mapper.process_all_cases()
+        print(f"Starting conversion of {rdf_file_path}")
+        print(f"Target: FalkorDB graph '{config.graph_name}' at {config.host}:{config.port}")
         
-        # Save and display results
-        mapper.save_results(results, OUTPUT_FILE)
-        mapper.print_summary(results)
+        # Perform conversion
+        metrics = converter.convert_rdf_file(rdf_file_path)
         
-        print(f"\nProcessing complete! Results saved to {OUTPUT_FILE}")
+        # Display results
+        print("\n" + "="*60)
+        print("CONVERSION COMPLETED SUCCESSFULLY")
+        print("="*60)
+        print(f"Processing time: {metrics.processing_time:.2f} seconds")
+        print(f"Total triples processed: {metrics.processed_triples:,}")
+        print(f"Nodes created: {metrics.nodes_created:,}")
+        print(f"Edges created: {metrics.edges_created:,}")
+        print(f"Peak memory usage: {metrics.memory_peak_mb:.1f} MB")
+        print(f"Processing rate: {metrics.rate_per_second:.0f} elements/second")
         
+        # Validate results
+        print("\n" + "="*60)
+        print("VALIDATION RESULTS")
+        print("="*60)
+        
+        db = falkordb.FalkorDB(host=config.host, port=config.port, password=config.password)
+        graph = db.select_graph(config.graph_name)
+        
+        for query in converter.get_validation_queries():
+            try:
+                result = graph.query(query)
+                if result.result_set:
+                    print(f"{query}: {result.result_set[0]}")
+            except Exception as e:
+                print(f"Validation query failed: {query} - {e}")
+    
     except Exception as e:
-        logger.error(f"Error in main execution: {e}")
-        print(f"Error: {e}")
+        print(f"Conversion failed: {e}")
+        import traceback
+        traceback.print_exc()
+
 
 if __name__ == "__main__":
     main()
