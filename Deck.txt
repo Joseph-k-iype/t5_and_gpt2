@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-Query-Driven RDF to FalkorDB Property Graph Converter
+Triple-Based RDF to FalkorDB Property Graph Converter
 
-This module provides a flexible solution for converting RDF data from SPARQL endpoints
-to FalkorDB property graphs using custom SPARQL queries for nodes and edges.
+This module converts RDF data to FalkorDB property graphs using a single SPARQL query
+that returns enriched triples with subject/object class information.
+
+Query Format: SELECT ?subject ?subjectClass ?predicate ?predicateClass ?object ?objectClass
 
 Features:
-- Custom SPARQL queries for nodes and edges
-- Consistent labeling between nodes and relationships
-- Streaming conversion with configurable batching
-- Authentication support for secured endpoints
-- Comprehensive error handling and monitoring
+- Single query approach with 6-variable triples
+- Automatic node vs relationship detection based on object type
+- Class-based node labeling
+- Predicate-based relationship typing
+- Streaming conversion with batching
 
 Dependencies:
     pip install rdflib falkordb urllib3 requests
@@ -19,7 +21,7 @@ Dependencies:
 import logging
 import json
 import time
-from typing import Dict, List, Set, Tuple, Optional, Any, Iterator
+from typing import Dict, List, Set, Tuple, Optional, Any, Union
 from dataclasses import dataclass, asdict
 from collections import defaultdict, Counter
 from urllib.parse import urlparse
@@ -40,10 +42,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 @dataclass
-class QueryConfig:
-    """Configuration for SPARQL queries"""
-    nodes_query: str
-    edges_query: str
+class TripleConfig:
+    """Configuration for triple-based RDF conversion"""
+    # The main SPARQL query with 6 variables
+    triples_query: str
     sparql_endpoint: str
     username: Optional[str] = None
     password: Optional[str] = None
@@ -63,6 +65,11 @@ class QueryConfig:
     use_shortened_uris: bool = True
     preserve_uri_properties: bool = True
     create_indexes: bool = True
+    default_node_label: str = 'Resource'
+    
+    # Filtering
+    exclude_rdf_type_properties: bool = True
+    literal_properties_only: Set[str] = None  # If set, only these predicates become properties
     
     # Monitoring
     export_stats: bool = True
@@ -74,21 +81,36 @@ class ConversionStats:
     start_time: datetime
     end_time: Optional[datetime] = None
     
-    # Query execution stats
-    nodes_query_time: float = 0.0
-    edges_query_time: float = 0.0
+    # Query execution
+    query_execution_time: float = 0.0
+    total_triples_retrieved: int = 0
     
     # Processing stats
-    total_node_triples: int = 0
-    total_edge_triples: int = 0
-    processed_nodes: int = 0
-    processed_edges: int = 0
+    processed_triples: int = 0
+    property_triples: int = 0  # literal objects
+    relationship_triples: int = 0  # URI objects
+    
+    # Created entities
+    unique_subjects: int = 0
+    unique_objects: int = 0
     created_nodes: int = 0
     created_relationships: int = 0
     
-    # Error tracking
-    node_errors: int = 0
-    edge_errors: int = 0
+    # Discovered metadata
+    subject_classes: Set[str] = None
+    object_classes: Set[str] = None
+    predicates_used: Set[str] = None
+    
+    # Errors
+    processing_errors: int = 0
+    
+    def __post_init__(self):
+        if self.subject_classes is None:
+            self.subject_classes = set()
+        if self.object_classes is None:
+            self.object_classes = set()
+        if self.predicates_used is None:
+            self.predicates_used = set()
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert stats to dictionary for JSON serialization"""
@@ -97,10 +119,16 @@ class ConversionStats:
         if self.end_time:
             result['end_time'] = self.end_time.isoformat()
             result['duration_seconds'] = (self.end_time - self.start_time).total_seconds()
+        
+        # Convert sets to lists for JSON serialization
+        result['subject_classes'] = list(self.subject_classes)
+        result['object_classes'] = list(self.object_classes) 
+        result['predicates_used'] = list(self.predicates_used)
+        
         return result
 
 class URIProcessor:
-    """Handles URI processing and shortening"""
+    """Handles URI processing and identifier creation"""
     
     def __init__(self, use_shortened_uris: bool = True):
         self.use_shortened_uris = use_shortened_uris
@@ -121,20 +149,17 @@ class URIProcessor:
             'http://schema.org/': 'schema',
             'http://dbpedia.org/resource/': 'dbr',
             'http://dbpedia.org/ontology/': 'dbo',
-            'http://www.w3.org/2004/02/skos/core#': 'skos'
+            'http://www.w3.org/2004/02/skos/core#': 'skos',
+            'http://purl.obolibrary.org/obo/': 'obo'
         }
         
         for namespace, prefix in common_namespaces.items():
             self.namespace_map[namespace] = prefix
     
-    def add_namespace(self, namespace: str, prefix: str):
-        """Add custom namespace mapping"""
-        self.namespace_map[namespace] = prefix
-    
     def process_uri(self, uri_str: str) -> str:
         """Process URI for use as identifier or label"""
         if not self.use_shortened_uris:
-            return uri_str
+            return self._clean_identifier(uri_str)
         
         # Check cache first
         if uri_str in self.uri_cache:
@@ -180,10 +205,82 @@ class URIProcessor:
         
         return self._clean_identifier(local_name)
 
+class NodeManager:
+    """Manages node creation and properties"""
+    
+    def __init__(self, uri_processor: URIProcessor, config: TripleConfig):
+        self.uri_processor = uri_processor
+        self.config = config
+        self.nodes: Dict[str, Dict[str, Any]] = {}
+    
+    def ensure_node_exists(self, uri: str, class_uri: Optional[str] = None):
+        """Ensure a node exists with appropriate labeling"""
+        if uri not in self.nodes:
+            self._create_node(uri, class_uri)
+    
+    def _create_node(self, uri: str, class_uri: Optional[str] = None):
+        """Create a new node entry"""
+        labels = {self.config.default_node_label}
+        
+        # Add class-based label if available
+        if class_uri and class_uri != str(RDF.Resource):
+            class_label = self.uri_processor.process_uri(class_uri)
+            labels.add(class_label)
+        
+        # Handle blank nodes
+        if uri.startswith('_:'):
+            labels.add('BlankNode')
+        
+        node_data = {
+            'labels': labels,
+            'properties': {}
+        }
+        
+        # Add URI properties if requested
+        if self.config.preserve_uri_properties:
+            node_data['properties']['uri'] = uri
+        
+        # Add processed identifier for easier querying
+        node_data['properties']['id'] = self.uri_processor.process_uri(uri)
+        
+        self.nodes[uri] = node_data
+    
+    def add_property(self, subject_uri: str, predicate_uri: str, literal_value: Any):
+        """Add a property to a node"""
+        if subject_uri not in self.nodes:
+            logger.warning(f"Node {subject_uri} not found when adding property")
+            return
+        
+        # Skip rdf:type if configured to do so
+        if (self.config.exclude_rdf_type_properties and 
+            predicate_uri == str(RDF.type)):
+            return
+        
+        prop_name = self.uri_processor.process_uri(predicate_uri)
+        
+        # Handle multiple values for the same property
+        properties = self.nodes[subject_uri]['properties']
+        if prop_name in properties:
+            existing = properties[prop_name]
+            if isinstance(existing, list):
+                existing.append(literal_value)
+            else:
+                properties[prop_name] = [existing, literal_value]
+        else:
+            properties[prop_name] = literal_value
+    
+    def get_nodes(self) -> Dict[str, Dict[str, Any]]:
+        """Get all nodes"""
+        return self.nodes
+    
+    def clear(self):
+        """Clear all nodes"""
+        self.nodes.clear()
+
 class FalkorDBManager:
     """Manages FalkorDB connection and operations"""
     
-    def __init__(self, config: QueryConfig):
+    def __init__(self, config: TripleConfig):
         self.config = config
         self.db = None
         self.graph = None
@@ -245,7 +342,79 @@ class FalkorDBManager:
                     logger.error(f"Query failed after {max_retries} attempts: {e}")
                     raise
                 logger.warning(f"Query attempt {attempt + 1} failed, retrying: {e}")
-                time.sleep(2 ** attempt)  # Exponential backoff
+                time.sleep(2 ** attempt)
+    
+    def create_node(self, uri: str, node_data: Dict[str, Any]) -> bool:
+        """Create a node in FalkorDB"""
+        try:
+            # Prepare labels
+            labels = [self.config.default_node_label if not label else label 
+                     for label in node_data['labels']]
+            labels_str = ':'.join(sorted(set(labels)))
+            
+            # Prepare properties
+            properties = dict(node_data['properties'])
+            
+            # Build and execute query
+            if properties:
+                props_clause = ', '.join([f"{k}: ${k}" for k in properties.keys()])
+                query = f"CREATE (n:{labels_str} {{{props_clause}}})"
+                self.execute_query(query, properties)
+            else:
+                query = f"CREATE (n:{labels_str})"
+                self.execute_query(query)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error creating node {uri}: {e}")
+            return False
+    
+    def create_relationship(self, subject_uri: str, predicate_uri: str, object_uri: str) -> bool:
+        """Create a relationship in FalkorDB"""
+        try:
+            # Process predicate for relationship type
+            from urllib.parse import urlparse
+            parsed = urlparse(predicate_uri)
+            if parsed.fragment:
+                rel_type = parsed.fragment
+            else:
+                rel_type = predicate_uri.split('/')[-1] if '/' in predicate_uri else predicate_uri
+            
+            # Clean relationship type
+            rel_type = re.sub(r'[^a-zA-Z0-9_]', '_', rel_type)
+            if not rel_type:
+                rel_type = 'RELATED_TO'
+            
+            # Create relationship with optional properties
+            rel_props = {}
+            if self.config.preserve_uri_properties:
+                rel_props['predicate_uri'] = predicate_uri
+            
+            if rel_props:
+                props_clause = '{' + ', '.join([f"{k}: ${k}" for k in rel_props.keys()]) + '}'
+                query = f"""
+                MATCH (s {{uri: $subject_uri}}), (o {{uri: $object_uri}})
+                CREATE (s)-[:{rel_type} {props_clause}]->(o)
+                """
+            else:
+                query = f"""
+                MATCH (s {{uri: $subject_uri}}), (o {{uri: $object_uri}})
+                CREATE (s)-[:{rel_type}]->(o)
+                """
+            
+            params = {
+                'subject_uri': subject_uri,
+                'object_uri': object_uri,
+                **rel_props
+            }
+            
+            self.execute_query(query, params)
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error creating relationship {subject_uri} -> {object_uri}: {e}")
+            return False
     
     def get_graph_stats(self) -> Dict[str, int]:
         """Get current graph statistics"""
@@ -261,19 +430,19 @@ class FalkorDBManager:
             logger.error(f"Error getting statistics: {e}")
             return {'nodes': 0, 'relationships': 0}
 
-class QueryDrivenConverter:
-    """Main converter class using custom SPARQL queries"""
+class TripleBasedConverter:
+    """Main converter using 6-variable triple query"""
     
-    def __init__(self, config: QueryConfig):
+    def __init__(self, config: TripleConfig):
         self.config = config
         self.stats = ConversionStats(start_time=datetime.now())
         self.uri_processor = URIProcessor(config.use_shortened_uris)
+        self.node_manager = NodeManager(self.uri_processor, config)
         self.falkordb_manager = FalkorDBManager(config)
         self.rdf_graph = None
         
-        # Processing caches
-        self.node_cache: Dict[str, Dict[str, Any]] = {}
-        self.predicate_types: Set[str] = set()  # Track predicates for consistent edge types
+        # Processing state
+        self.relationships_to_create: List[Tuple[str, str, str]] = []
         
         self._setup_rdf_connection()
     
@@ -300,27 +469,28 @@ class QueryDrivenConverter:
     def convert(self) -> ConversionStats:
         """Main conversion method"""
         try:
-            logger.info("Starting query-driven RDF to FalkorDB conversion...")
+            logger.info("Starting triple-based RDF to FalkorDB conversion...")
             
             # Clear existing data
             self.falkordb_manager.clear_graph()
             
-            # Step 1: Process nodes using nodes query
-            logger.info("Processing nodes...")
-            self._process_nodes()
+            # Execute the main query and process results
+            self._execute_and_process_query()
             
-            # Step 2: Process edges using edges query  
-            logger.info("Processing edges...")
-            self._process_edges()
+            # Create nodes in FalkorDB
+            self._create_nodes_in_falkordb()
             
-            # Step 3: Create indexes
+            # Create relationships in FalkorDB
+            self._create_relationships_in_falkordb()
+            
+            # Create indexes
             self.falkordb_manager.create_indexes()
             
-            # Step 4: Validate if requested
+            # Validate if requested
             if self.config.validate_conversion:
                 self._validate_conversion()
             
-            # Step 5: Finalize statistics
+            # Finalize statistics
             self._finalize_stats()
             
             logger.info("Conversion completed successfully!")
@@ -330,244 +500,129 @@ class QueryDrivenConverter:
             logger.error(f"Conversion failed: {e}")
             raise
     
-    def _process_nodes(self):
-        """Process nodes using the custom nodes query"""
+    def _execute_and_process_query(self):
+        """Execute the main SPARQL query and process results"""
         start_time = time.time()
         
         try:
-            logger.info(f"Executing nodes query...")
-            results = list(self.rdf_graph.query(self.config.nodes_query))
-            self.stats.total_node_triples = len(results)
-            self.stats.nodes_query_time = time.time() - start_time
+            logger.info("Executing triples query...")
+            results = list(self.rdf_graph.query(self.config.triples_query))
             
-            logger.info(f"Retrieved {len(results)} node triples, processing in batches...")
+            self.stats.query_execution_time = time.time() - start_time
+            self.stats.total_triples_retrieved = len(results)
+            
+            logger.info(f"Retrieved {len(results)} triples, processing in batches...")
             
             # Process in batches
             batch_size = self.config.batch_size
             for i in range(0, len(results), batch_size):
                 batch = results[i:i+batch_size]
-                self._process_node_batch(batch)
+                self._process_triple_batch(batch)
                 
                 progress = (i + len(batch)) / len(results) * 100
-                logger.info(f"Node processing progress: {progress:.1f}%")
-            
-            # Commit all nodes to FalkorDB
-            self._commit_nodes()
+                logger.info(f"Processing progress: {progress:.1f}%")
             
         except Exception as e:
-            logger.error(f"Error processing nodes: {e}")
+            logger.error(f"Error executing/processing query: {e}")
             raise
     
-    def _process_node_batch(self, batch: List[Tuple]):
-        """Process a batch of node triples"""
+    def _process_triple_batch(self, batch: List[Tuple]):
+        """Process a batch of 6-variable triples"""
         for triple in batch:
             try:
-                if len(triple) >= 3:
-                    subject, predicate, obj = triple[0], triple[1], triple[2]
-                    self._process_node_triple(subject, predicate, obj)
-                    self.stats.processed_nodes += 1
+                if len(triple) >= 6:
+                    subject, subject_class, predicate, predicate_class, obj, object_class = triple[:6]
+                    self._process_single_triple(subject, subject_class, predicate, predicate_class, obj, object_class)
+                    self.stats.processed_triples += 1
                 else:
-                    logger.warning(f"Invalid triple format: {triple}")
+                    logger.warning(f"Invalid triple format (expected 6 variables): {triple}")
             except Exception as e:
-                logger.warning(f"Error processing node triple {triple}: {e}")
-                self.stats.node_errors += 1
+                logger.warning(f"Error processing triple {triple}: {e}")
+                self.stats.processing_errors += 1
     
-    def _process_node_triple(self, subject, predicate, obj):
-        """Process individual node triple (subject, predicate, object)"""
+    def _process_single_triple(self, subject, subject_class, predicate, predicate_class, obj, object_class):
+        """Process a single 6-variable triple"""
         subject_uri = str(subject)
         predicate_uri = str(predicate)
         
-        # Ensure node exists in cache
-        if subject_uri not in self.node_cache:
-            self._create_node_entry(subject_uri, subject)
+        # Track metadata
+        self.stats.predicates_used.add(predicate_uri)
+        if subject_class:
+            self.stats.subject_classes.add(str(subject_class))
         
-        # Handle the predicate-object relationship
-        if predicate_uri == str(RDF.type):
-            # rdf:type becomes a node label
-            type_label = self.uri_processor.process_uri(str(obj))
-            self.node_cache[subject_uri]['labels'].add(type_label)
-        else:
-            # Regular property
-            prop_name = self.uri_processor.process_uri(predicate_uri)
-            prop_value = self._convert_value(obj)
-            
-            # Handle multiple values for the same property
-            if prop_name in self.node_cache[subject_uri]['properties']:
-                existing = self.node_cache[subject_uri]['properties'][prop_name]
-                if isinstance(existing, list):
-                    existing.append(prop_value)
-                else:
-                    self.node_cache[subject_uri]['properties'][prop_name] = [existing, prop_value]
-            else:
-                self.node_cache[subject_uri]['properties'][prop_name] = prop_value
-    
-    def _create_node_entry(self, uri: str, rdf_node):
-        """Create a new node entry in cache"""
-        node_data = {
-            'labels': {'Resource'},  # Default label
-            'properties': {}
-        }
+        # Ensure subject node exists
+        self.node_manager.ensure_node_exists(subject_uri, str(subject_class) if subject_class else None)
         
-        # Always preserve original URI if requested
-        if self.config.preserve_uri_properties:
-            node_data['properties']['uri'] = uri
-        
-        # Handle blank nodes
-        if isinstance(rdf_node, BNode):
-            node_data['labels'].add('BlankNode')
-            node_data['properties']['blank_node_id'] = str(rdf_node)
-        
-        # Add a processed identifier for easier queries
-        node_data['properties']['id'] = self.uri_processor.process_uri(uri)
-        
-        self.node_cache[uri] = node_data
-    
-    def _convert_value(self, obj) -> Any:
-        """Convert RDF value to appropriate Python type"""
+        # Determine if this creates a property or relationship
         if isinstance(obj, Literal):
-            try:
-                if obj.datatype:
-                    if obj.datatype == XSD.integer:
-                        return int(obj)
-                    elif obj.datatype in (XSD.decimal, XSD.float, XSD.double):
-                        return float(obj)
-                    elif obj.datatype == XSD.boolean:
-                        return str(obj).lower() in ('true', '1')
-                    elif obj.datatype in (XSD.dateTime, XSD.date, XSD.time):
-                        return str(obj)  # Keep as string for FalkorDB
-                    else:
-                        return str(obj)
-                else:
-                    # Handle language tags
-                    if obj.language:
-                        return f"{obj}@{obj.language}"
-                    return str(obj)
-            except Exception as e:
-                logger.warning(f"Error converting literal {obj}: {e}")
-                return str(obj)
+            # Object is literal -> add as property
+            literal_value = self._convert_literal_value(obj)
+            self.node_manager.add_property(subject_uri, predicate_uri, literal_value)
+            self.stats.property_triples += 1
+            
+        elif isinstance(obj, (URIRef, BNode)):
+            # Object is URI/BNode -> create relationship
+            object_uri = str(obj)
+            
+            # Track object class
+            if object_class:
+                self.stats.object_classes.add(str(object_class))
+            
+            # Ensure object node exists
+            self.node_manager.ensure_node_exists(object_uri, str(object_class) if object_class else None)
+            
+            # Queue relationship for creation
+            self.relationships_to_create.append((subject_uri, predicate_uri, object_uri))
+            self.stats.relationship_triples += 1
         else:
-            # URI or BNode reference
-            return str(obj)
+            logger.warning(f"Unknown object type: {type(obj)} for {obj}")
     
-    def _commit_nodes(self):
-        """Commit all cached nodes to FalkorDB"""
-        logger.info(f"Committing {len(self.node_cache)} nodes to FalkorDB...")
-        
-        for uri, node_data in self.node_cache.items():
-            try:
-                self._create_falkordb_node(uri, node_data)
-                self.stats.created_nodes += 1
-            except Exception as e:
-                logger.error(f"Error creating node {uri}: {e}")
-                self.stats.node_errors += 1
-        
-        logger.info(f"Successfully created {self.stats.created_nodes} nodes")
-    
-    def _create_falkordb_node(self, uri: str, node_data: Dict[str, Any]):
-        """Create individual node in FalkorDB"""
-        # Prepare labels - clean and join
-        labels = [self.uri_processor._clean_identifier(label) for label in node_data['labels']]
-        labels_str = ':'.join(sorted(labels))
-        
-        # Prepare properties
-        properties = dict(node_data['properties'])
-        
-        # Build Cypher query
-        if properties:
-            props_clause = ', '.join([f"{k}: ${k}" for k in properties.keys()])
-            query = f"CREATE (n:{labels_str} {{{props_clause}}})"
-            self.falkordb_manager.execute_query(query, properties)
-        else:
-            query = f"CREATE (n:{labels_str})"
-            self.falkordb_manager.execute_query(query)
-    
-    def _process_edges(self):
-        """Process edges using the custom edges query"""
-        start_time = time.time()
-        
+    def _convert_literal_value(self, literal: Literal) -> Any:
+        """Convert RDF literal to appropriate Python value"""
         try:
-            logger.info(f"Executing edges query...")
-            results = list(self.rdf_graph.query(self.config.edges_query))
-            self.stats.total_edge_triples = len(results)
-            self.stats.edges_query_time = time.time() - start_time
-            
-            logger.info(f"Retrieved {len(results)} edge triples, processing in batches...")
-            
-            # Process in batches
-            batch_size = self.config.batch_size
-            for i in range(0, len(results), batch_size):
-                batch = results[i:i+batch_size]
-                self._process_edge_batch(batch)
-                
-                progress = (i + len(batch)) / len(results) * 100
-                logger.info(f"Edge processing progress: {progress:.1f}%")
-            
-        except Exception as e:
-            logger.error(f"Error processing edges: {e}")
-            raise
-    
-    def _process_edge_batch(self, batch: List[Tuple]):
-        """Process a batch of edge triples"""
-        for triple in batch:
-            try:
-                if len(triple) >= 3:
-                    subject, predicate, obj = triple[0], triple[1], triple[2]
-                    self._process_edge_triple(subject, predicate, obj)
-                    self.stats.processed_edges += 1
+            if literal.datatype:
+                if literal.datatype == XSD.integer:
+                    return int(literal)
+                elif literal.datatype in (XSD.decimal, XSD.float, XSD.double):
+                    return float(literal)
+                elif literal.datatype == XSD.boolean:
+                    return str(literal).lower() in ('true', '1')
+                elif literal.datatype in (XSD.dateTime, XSD.date, XSD.time):
+                    return str(literal)  # Keep as string for FalkorDB
                 else:
-                    logger.warning(f"Invalid edge triple format: {triple}")
-            except Exception as e:
-                logger.warning(f"Error processing edge triple {triple}: {e}")
-                self.stats.edge_errors += 1
-    
-    def _process_edge_triple(self, subject, predicate, obj):
-        """Process individual edge triple (subject, predicate, object)"""
-        subject_uri = str(subject)
-        predicate_uri = str(predicate)
-        object_uri = str(obj)
-        
-        # Create relationship using the predicate as the relationship type
-        rel_type = self.uri_processor.process_uri(predicate_uri)
-        self.predicate_types.add(rel_type)
-        
-        # Create the relationship in FalkorDB
-        try:
-            self._create_falkordb_relationship(subject_uri, rel_type, object_uri, predicate_uri)
-            self.stats.created_relationships += 1
+                    return str(literal)
+            else:
+                # Handle language tags
+                if literal.language:
+                    return f"{literal}@{literal.language}"
+                return str(literal)
         except Exception as e:
-            logger.error(f"Error creating relationship {subject_uri} -> {object_uri}: {e}")
-            self.stats.edge_errors += 1
+            logger.warning(f"Error converting literal {literal}: {e}")
+            return str(literal)
     
-    def _create_falkordb_relationship(self, subject_uri: str, rel_type: str, object_uri: str, predicate_uri: str):
-        """Create relationship in FalkorDB"""
-        # Clean relationship type
-        clean_rel_type = self.uri_processor._clean_identifier(rel_type)
+    def _create_nodes_in_falkordb(self):
+        """Create all nodes in FalkorDB"""
+        nodes = self.node_manager.get_nodes()
+        logger.info(f"Creating {len(nodes)} nodes in FalkorDB...")
         
-        # Build relationship properties
-        rel_props = {}
-        if self.config.preserve_uri_properties:
-            rel_props['predicate_uri'] = predicate_uri
+        created_count = 0
+        for uri, node_data in nodes.items():
+            if self.falkordb_manager.create_node(uri, node_data):
+                created_count += 1
         
-        # Build Cypher query
-        if rel_props:
-            props_clause = '{' + ', '.join([f"{k}: ${k}" for k in rel_props.keys()]) + '}'
-            query = f"""
-            MATCH (s {{uri: $subject_uri}}), (o {{uri: $object_uri}})
-            CREATE (s)-[:{clean_rel_type} {props_clause}]->(o)
-            """
-        else:
-            query = f"""
-            MATCH (s {{uri: $subject_uri}}), (o {{uri: $object_uri}})
-            CREATE (s)-[:{clean_rel_type}]->(o)
-            """
+        self.stats.unique_subjects = len(nodes)
+        logger.info(f"Successfully created {created_count} nodes")
+    
+    def _create_relationships_in_falkordb(self):
+        """Create all relationships in FalkorDB"""
+        logger.info(f"Creating {len(self.relationships_to_create)} relationships in FalkorDB...")
         
-        params = {
-            'subject_uri': subject_uri,
-            'object_uri': object_uri,
-            **rel_props
-        }
+        created_count = 0
+        for subject_uri, predicate_uri, object_uri in self.relationships_to_create:
+            if self.falkordb_manager.create_relationship(subject_uri, predicate_uri, object_uri):
+                created_count += 1
         
-        self.falkordb_manager.execute_query(query, params)
+        logger.info(f"Successfully created {created_count} relationships")
     
     def _validate_conversion(self):
         """Validate the conversion results"""
@@ -578,8 +633,8 @@ class QueryDrivenConverter:
         if falkor_stats['nodes'] == 0:
             logger.warning("No nodes were created in FalkorDB")
         
-        if self.stats.processed_edges > 0 and falkor_stats['relationships'] == 0:
-            logger.warning("No relationships were created despite processing edge triples")
+        if self.stats.relationship_triples > 0 and falkor_stats['relationships'] == 0:
+            logger.warning("No relationships were created despite processing relationship triples")
         
         logger.info(f"Validation complete: {falkor_stats['nodes']} nodes, {falkor_stats['relationships']} relationships")
     
@@ -592,6 +647,16 @@ class QueryDrivenConverter:
         self.stats.created_nodes = falkor_stats['nodes']
         self.stats.created_relationships = falkor_stats['relationships']
         
+        # Calculate unique entities
+        nodes = self.node_manager.get_nodes()
+        self.stats.unique_subjects = len(nodes)
+        
+        # Count unique objects from relationships
+        unique_objects = set()
+        for _, _, obj_uri in self.relationships_to_create:
+            unique_objects.add(obj_uri)
+        self.stats.unique_objects = len(unique_objects)
+        
         if self.config.export_stats:
             self.export_stats()
     
@@ -602,11 +667,8 @@ class QueryDrivenConverter:
             filename = f"conversion_stats_{self.config.graph_name}_{timestamp}.json"
         
         try:
-            stats_data = self.stats.to_dict()
-            stats_data['predicate_types_used'] = list(self.predicate_types)
-            
             with open(filename, 'w') as f:
-                json.dump(stats_data, f, indent=2)
+                json.dump(self.stats.to_dict(), f, indent=2)
             logger.info(f"Statistics exported to {filename}")
         except Exception as e:
             logger.warning(f"Could not export statistics: {e}")
@@ -635,68 +697,54 @@ def validate_sparql_endpoint(endpoint: str, username: str = None, password: str 
         logger.error(f"SPARQL endpoint validation failed: {e}")
         return False
 
-def create_sample_queries():
-    """Create sample SPARQL queries for common patterns"""
-    return {
-        'nodes_query_example': """
-        # Example nodes query - extracts entities and their properties
-        SELECT ?subject ?predicate ?object WHERE {
-            ?subject ?predicate ?object .
-            # Filter for specific entity types or patterns
-            ?subject a ?type .
-            FILTER(?type IN (
-                <http://xmlns.com/foaf/0.1/Person>,
-                <http://schema.org/Organization>,
-                <http://dbpedia.org/ontology/Place>
-            ))
-            # Exclude relationship predicates (those will be in edges query)
-            FILTER(?predicate NOT IN (
-                <http://xmlns.com/foaf/0.1/knows>,
-                <http://schema.org/memberOf>,
-                <http://dbpedia.org/ontology/locatedIn>
-            ))
-        }
-        """,
+def create_sample_query():
+    """Create a sample 6-variable SPARQL query"""
+    return """
+    # Sample 6-variable triple query
+    SELECT ?subject ?subjectClass ?predicate ?predicateClass ?object ?objectClass WHERE {
+        ?subject ?predicate ?object .
         
-        'edges_query_example': """
-        # Example edges query - extracts relationships between entities
-        SELECT ?subject ?predicate ?object WHERE {
-            ?subject ?predicate ?object .
-            # Only include relationship predicates
-            FILTER(?predicate IN (
-                <http://xmlns.com/foaf/0.1/knows>,
-                <http://schema.org/memberOf>,
-                <http://dbpedia.org/ontology/locatedIn>,
-                <http://purl.org/dc/terms/partOf>
-            ))
-            # Ensure both subject and object are entities (not literals)
+        # Get subject class (optional)
+        OPTIONAL {
+            ?subject a ?subjectClass .
+        }
+        
+        # Get predicate class (optional) 
+        OPTIONAL {
+            ?predicate a ?predicateClass .
+        }
+        
+        # Get object class (optional, only for URI objects)
+        OPTIONAL {
+            ?object a ?objectClass .
             FILTER(isURI(?object))
         }
-        """
+        
+        # Example filters (customize as needed)
+        FILTER(?subject != ?object)  # Avoid self-loops
+        
+        # Optional: Filter by specific types
+        # FILTER(?subjectClass IN (<http://xmlns.com/foaf/0.1/Person>, <http://schema.org/Organization>))
     }
+    LIMIT 10000
+    """
 
 def main():
     """Example usage"""
     
-    # Sample queries (replace with your actual queries)
-    sample_queries = create_sample_queries()
+    # Sample query
+    sample_query = create_sample_query()
     
-    config = QueryConfig(
-        # Your custom SPARQL queries
-        nodes_query=sample_queries['nodes_query_example'],
-        edges_query=sample_queries['edges_query_example'],
-        
-        # SPARQL endpoint configuration
+    config = TripleConfig(
+        triples_query=sample_query,
         sparql_endpoint="https://dbpedia.org/sparql",
-        username=None,  # Set if authentication required
-        password=None,  # Set if authentication required
+        username=None,
+        password=None,
         
-        # FalkorDB configuration
         falkordb_host='localhost',
         falkordb_port=6379,
-        graph_name='custom_rdf_graph',
+        graph_name='triple_based_graph',
         
-        # Processing configuration
         batch_size=1000,
         use_shortened_uris=True,
         preserve_uri_properties=True,
@@ -712,25 +760,29 @@ def main():
             return
         
         # Run conversion
-        converter = QueryDrivenConverter(config)
+        converter = TripleBasedConverter(config)
         stats = converter.convert()
         
         # Print results
-        print("\n" + "="*50)
-        print("CONVERSION COMPLETED")
-        print("="*50)
-        print(f"Node triples processed: {stats.processed_nodes}")
-        print(f"Edge triples processed: {stats.processed_edges}")
+        print("\n" + "="*60)
+        print("TRIPLE-BASED CONVERSION COMPLETED")
+        print("="*60)
+        print(f"Total triples retrieved: {stats.total_triples_retrieved}")
+        print(f"Property triples (literals): {stats.property_triples}")
+        print(f"Relationship triples (URIs): {stats.relationship_triples}")
+        print(f"Unique subjects: {stats.unique_subjects}")
+        print(f"Unique objects: {stats.unique_objects}")
         print(f"Nodes created: {stats.created_nodes}")
         print(f"Relationships created: {stats.created_relationships}")
-        print(f"Node query time: {stats.nodes_query_time:.2f}s")
-        print(f"Edge query time: {stats.edges_query_time:.2f}s")
+        
+        print(f"\nDiscovered {len(stats.subject_classes)} subject classes")
+        print(f"Discovered {len(stats.object_classes)} object classes") 
+        print(f"Used {len(stats.predicates_used)} different predicates")
         
         if stats.end_time:
             duration = (stats.end_time - stats.start_time).total_seconds()
-            print(f"Total duration: {duration:.2f}s")
-        
-        print(f"\nPredicate types used as relationships: {len(converter.predicate_types)}")
+            print(f"\nTotal duration: {duration:.2f} seconds")
+            print(f"Query execution: {stats.query_execution_time:.2f} seconds")
         
         print("\nSample Cypher queries to explore your data:")
         for i, query in enumerate(converter.get_sample_queries(), 1):
