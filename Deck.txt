@@ -1,946 +1,473 @@
-#!/usr/bin/env python3
-"""
-Robust Large-Scale RDF to FalkorDB Converter
-============================================
-
-Handles massive TTL files (17GB+) with:
-- True streaming processing (no full file loading)
-- Robust error handling for malformed data
-- Memory-efficient chunk processing
-- Safe string operations with edge case handling
-- Progressive schema discovery during streaming
-
-Requirements:
-    pip install falkordb rdflib psutil tqdm pyyaml
-"""
-
+import re
 import gc
 import time
 import logging
 import hashlib
+import subprocess
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Set, Tuple, Optional, Any, Union, Iterator
-from dataclasses import dataclass, field
+from typing import Dict, List, Set, Tuple, Optional, Any, Iterator
+from dataclasses import dataclass
 from collections import defaultdict, Counter
-from urllib.parse import urlparse
-import re
-import sys
+import json
 
 # Core libraries
 import psutil
 from tqdm import tqdm
-
-# RDF processing
-import rdflib
-from rdflib import Graph, URIRef, Literal, BNode
-from rdflib.namespace import RDF, RDFS, OWL, XSD
 
 # FalkorDB
 import falkordb
 
 
 @dataclass
-class ConversionMetrics:
-    """Comprehensive metrics for the conversion process."""
+class ProcessingStats:
+    """Statistics for alternative processing approaches."""
     start_time: float = 0.0
     end_time: float = 0.0
-    
-    # RDF Analysis
-    total_triples: int = 0
-    processed_triples: int = 0
-    error_triples: int = 0
-    unique_subjects: int = 0
-    unique_predicates: int = 0
-    unique_objects: int = 0
-    
-    # Schema Discovery
-    discovered_classes: int = 0
-    discovered_properties: int = 0
-    namespaces_found: int = 0
-    
-    # Conversion Results
+    total_lines: int = 0
+    processed_lines: int = 0
+    error_lines: int = 0
+    skipped_lines: int = 0
     nodes_created: int = 0
     edges_created: int = 0
-    properties_set: int = 0
-    
-    # Performance
     memory_peak_mb: float = 0.0
-    processing_chunks: int = 0
-    file_size_gb: float = 0.0
     
     @property
     def processing_time(self) -> float:
         return (self.end_time or time.time()) - self.start_time
 
 
-@dataclass
-class ConversionConfig:
-    """Configuration optimized for large-scale conversion."""
-    # Processing (optimized for 17GB+ files)
-    stream_chunk_size: int = 10000     # Process N triples at a time in streaming
-    parse_chunk_size: int = 1000000    # Parse N-Triples chunk size for huge files
-    max_memory_mb: int = 4000           # Memory limit before aggressive cleanup
-    batch_size: int = 500               # Smaller batches for stability
-    
-    # Database
-    host: str = "localhost"
-    port: int = 6379
-    password: Optional[str] = None
-    graph_name: str = "knowledge_graph"
-    
-    # Safety and robustness
-    max_uri_length: int = 2000          # Skip extremely long URIs
-    max_literal_length: int = 10000     # Skip extremely long literals
-    error_tolerance: float = 0.01       # Allow 1% error rate
-    progressive_commit: bool = True     # Commit progress regularly
-    commit_frequency: int = 10000       # Commit every N operations
-    
-    # Analysis
-    analyze_schema: bool = True
-    preserve_namespaces: bool = True
-    create_indexes: bool = True
-    normalize_labels: bool = True
-    
-    # Large file optimization
-    use_streaming_parser: bool = True   # Use streaming for large files
-    cleanup_frequency: int = 5000       # Memory cleanup frequency
-    progress_reporting: int = 100000    # Report progress every N triples
-
-
-class SafeStringProcessor:
-    """Safe string processing with comprehensive error handling."""
-    
-    @staticmethod
-    def safe_extract_namespace(uri: str) -> Tuple[Optional[str], str]:
-        """Safely extract namespace from URI with error handling."""
-        if not uri or not isinstance(uri, str):
-            return None, str(uri) if uri else ""
-        
-        try:
-            # Limit URI length for safety
-            if len(uri) > 2000:
-                logging.warning(f"Skipping extremely long URI (length: {len(uri)})")
-                return None, uri[:100] + "..."
-            
-            # Try different separators
-            for sep in ['#', '/']:
-                if sep in uri:
-                    try:
-                        parts = uri.rsplit(sep, 1)
-                        if len(parts) == 2 and parts[1]:  # Has local part
-                            namespace = parts[0] + sep
-                            local_name = parts[1]
-                            return namespace, local_name
-                    except (IndexError, ValueError) as e:
-                        logging.debug(f"Error splitting URI {uri}: {e}")
-                        continue
-            
-            # No separator found or splitting failed
-            return None, uri
-            
-        except Exception as e:
-            logging.warning(f"Error processing URI '{uri}': {e}")
-            return None, str(uri) if uri else ""
-    
-    @staticmethod
-    def safe_clean_label(label: str) -> str:
-        """Safely clean a label for Cypher with comprehensive error handling."""
-        if not label or not isinstance(label, str):
-            return "Entity"
-        
-        try:
-            # Handle very long labels
-            if len(label) > 100:
-                label = label[:100]
-            
-            # Remove special characters safely
-            cleaned = re.sub(r'[^a-zA-Z0-9_]', '_', label)
-            if not cleaned:
-                return "Entity"
-            
-            # Collapse multiple underscores
-            cleaned = re.sub(r'_+', '_', cleaned)
-            cleaned = cleaned.strip('_')
-            
-            if not cleaned:
-                return "Entity"
-            
-            # Ensure starts with letter
-            if not cleaned[0].isalpha():
-                cleaned = f"E_{cleaned}"
-            
-            # Capitalize for convention
-            result = cleaned.capitalize()
-            return result if result else "Entity"
-            
-        except Exception as e:
-            logging.warning(f"Error cleaning label '{label}': {e}")
-            return "Entity"
-    
-    @staticmethod
-    def safe_clean_property(prop_name: str) -> str:
-        """Safely clean property name for Cypher."""
-        if not prop_name or not isinstance(prop_name, str):
-            return "property"
-        
-        try:
-            # Handle very long property names
-            if len(prop_name) > 50:
-                prop_name = prop_name[:50]
-            
-            # Clean safely
-            cleaned = re.sub(r'[^a-zA-Z0-9_]', '_', prop_name)
-            if not cleaned:
-                return "property"
-            
-            cleaned = re.sub(r'_+', '_', cleaned)
-            cleaned = cleaned.strip('_')
-            
-            if not cleaned:
-                return "property"
-            
-            # Ensure starts with letter or underscore
-            if not (cleaned[0].isalpha() or cleaned[0] == '_'):
-                cleaned = f"p_{cleaned}"
-            
-            result = cleaned.lower()
-            return result if result else "property"
-            
-        except Exception as e:
-            logging.warning(f"Error cleaning property '{prop_name}': {e}")
-            return "property"
-
-
-class RobustNamespaceAnalyzer:
-    """Robust namespace analyzer with progressive discovery."""
+class ManualTTLParser:
+    """Manual TTL/N-Triples parser using regex - bypasses RDFLib completely."""
     
     def __init__(self):
-        self.namespace_map: Dict[str, str] = {}
-        self.prefix_map: Dict[str, str] = {}
-        self.usage_counts: Counter = Counter()
-        self.discovered_count = 0
+        # Compiled regex patterns for efficiency
+        self.ntriples_pattern = re.compile(
+            r'^<([^>]+)>\s+<([^>]+)>\s+(?:<([^>]+)>|"([^"]*)"(?:\^\^<([^>]+)>)?(?:@([a-z-]+))?)\s*\.\s*$'
+        )
         
-    def discover_namespace(self, uri: str) -> Optional[str]:
-        """Discover and register namespace from a single URI."""
+        self.prefix_pattern = re.compile(r'@prefix\s+([^:]*):?\s+<([^>]+)>\s*\.')
+        self.base_pattern = re.compile(r'@base\s+<([^>]+)>\s*\.')
+        
+        self.prefixes = {}
+        self.base_uri = ""
+        
+    def parse_line_safe(self, line: str) -> Optional[Tuple[str, str, str, str]]:
+        """Safely parse a single line using regex."""
         try:
-            namespace, local_name = SafeStringProcessor.safe_extract_namespace(uri)
-            if namespace and namespace not in self.namespace_map:
-                prefix = self._generate_safe_prefix(namespace)
-                self.register_namespace(prefix, namespace)
-                self.discovered_count += 1
-                if self.discovered_count % 100 == 0:
-                    logging.debug(f"Discovered {self.discovered_count} namespaces")
-            return namespace
+            line = line.strip()
+            if not line or line.startswith('#'):
+                return None
+            
+            # Handle prefixes
+            prefix_match = self.prefix_pattern.match(line)
+            if prefix_match:
+                prefix, uri = prefix_match.groups()
+                self.prefixes[prefix] = uri
+                return None
+            
+            # Handle base
+            base_match = self.base_pattern.match(line)
+            if base_match:
+                self.base_uri = base_match.group(1)
+                return None
+            
+            # Handle N-Triples format
+            nt_match = self.ntriples_pattern.match(line)
+            if nt_match:
+                subject, predicate, obj_uri, obj_literal, obj_datatype, obj_lang = nt_match.groups()
+                
+                # Determine object value and type
+                if obj_uri:
+                    obj_value = obj_uri
+                    obj_type = "uri"
+                elif obj_literal:
+                    obj_value = obj_literal
+                    obj_type = "literal"
+                    if obj_datatype:
+                        obj_type = f"literal^^{obj_datatype}"
+                    elif obj_lang:
+                        obj_type = f"literal@{obj_lang}"
+                else:
+                    return None
+                
+                return subject, predicate, obj_value, obj_type
+            
+            # Try simple TTL triple pattern
+            simple_match = re.match(r'([^<>\s]+:\w+|<[^>]+>)\s+([^<>\s]+:\w+|<[^>]+>)\s+(.+?)\s*\.', line)
+            if simple_match:
+                subject, predicate, obj = simple_match.groups()
+                
+                # Expand prefixed names
+                subject = self._expand_prefixed_name(subject.strip())
+                predicate = self._expand_prefixed_name(predicate.strip())
+                
+                # Handle object
+                obj = obj.strip()
+                if obj.startswith('<') and obj.endswith('>'):
+                    obj_value = obj[1:-1]
+                    obj_type = "uri"
+                elif obj.startswith('"'):
+                    # Simple quoted literal
+                    obj_value = obj.strip('"')
+                    obj_type = "literal"
+                else:
+                    obj_value = self._expand_prefixed_name(obj)
+                    obj_type = "uri"
+                
+                return subject, predicate, obj_value, obj_type
+            
+            return None
+            
         except Exception as e:
-            logging.debug(f"Error discovering namespace for {uri}: {e}")
+            logging.debug(f"Error parsing line: {e}")
             return None
     
-    def register_namespace(self, prefix: str, namespace: str):
-        """Register a namespace with its prefix."""
+    def _expand_prefixed_name(self, name: str) -> str:
+        """Expand prefixed name to full URI."""
         try:
-            self.namespace_map[namespace] = prefix
-            self.prefix_map[prefix] = namespace
-            self.usage_counts[namespace] += 1
-        except Exception as e:
-            logging.warning(f"Error registering namespace {prefix}:{namespace}: {e}")
-    
-    def _generate_safe_prefix(self, namespace: str) -> str:
-        """Generate a safe prefix for a namespace."""
-        try:
-            # Try to extract from URL structure
-            parsed = urlparse(namespace)
-            
-            candidates = []
-            if parsed.netloc:
-                # Extract from domain
-                domain_parts = parsed.netloc.split('.')
-                for part in reversed(domain_parts):
-                    if part and part not in ['www', 'com', 'org', 'net', 'edu']:
-                        candidates.append(part)
-            
-            if parsed.path:
-                # Extract from path
-                path_parts = [p for p in parsed.path.split('/') if p and p != '#']
-                candidates.extend(path_parts[-2:])
-            
-            # Try candidates
-            for candidate in candidates:
-                if candidate:
-                    clean = re.sub(r'[^a-zA-Z0-9]', '', candidate).lower()
-                    if clean and len(clean) >= 2:
-                        base_prefix = clean[:8]
-                        prefix = base_prefix
-                        counter = 1
-                        while prefix in self.prefix_map:
-                            prefix = f"{base_prefix}{counter}"
-                            counter += 1
-                        return prefix
-            
-            # Fallback to hash-based prefix
-            hash_val = abs(hash(namespace)) % 10000
-            prefix = f"ns{hash_val}"
-            while prefix in self.prefix_map:
-                hash_val = (hash_val + 1) % 10000
-                prefix = f"ns{hash_val}"
-            return prefix
-            
-        except Exception as e:
-            logging.warning(f"Error generating prefix for {namespace}: {e}")
-            return f"ns{abs(hash(namespace)) % 10000}"
-    
-    def get_local_name(self, uri: str) -> Tuple[Optional[str], str]:
-        """Get namespace prefix and local name for URI."""
-        try:
-            namespace, local_name = SafeStringProcessor.safe_extract_namespace(uri)
-            if namespace and namespace in self.namespace_map:
-                return self.namespace_map[namespace], local_name
-            return None, local_name or uri
-        except Exception as e:
-            logging.debug(f"Error getting local name for {uri}: {e}")
-            return None, str(uri)
+            if ':' in name and not name.startswith('<'):
+                prefix, local = name.split(':', 1)
+                if prefix in self.prefixes:
+                    return f"{self.prefixes[prefix]}{local}"
+            elif name.startswith('<') and name.endswith('>'):
+                return name[1:-1]
+            return name
+        except Exception:
+            return name
 
 
-class ProgressiveSchemaAnalyzer:
-    """Progressive schema analyzer for streaming processing."""
+class FilePreprocessor:
+    """Preprocesses large files to identify and handle problematic lines."""
     
-    def __init__(self, namespace_analyzer: RobustNamespaceAnalyzer):
-        self.namespace_analyzer = namespace_analyzer
-        
-        # Schema elements
-        self.classes: Set[str] = set()
-        self.properties: Set[str] = set()
-        self.data_properties: Set[str] = set()
-        self.object_properties: Set[str] = set()
-        
-        # Statistics
-        self.subject_types: Dict[str, Set[str]] = defaultdict(set)
-        self.predicate_usage: Counter = Counter()
-        self.literal_datatypes: Counter = Counter()
-        
-        # Progress tracking
-        self.analyzed_triples = 0
+    def __init__(self, input_file: str, output_file: str = None):
+        self.input_file = Path(input_file)
+        self.output_file = Path(output_file) if output_file else self.input_file.with_suffix('.clean.nt')
+        self.stats = {
+            'total_lines': 0,
+            'valid_lines': 0,
+            'invalid_lines': 0,
+            'empty_lines': 0,
+            'comment_lines': 0
+        }
     
-    def analyze_triple(self, subject: Any, predicate: Any, obj: Any) -> bool:
-        """Analyze a single triple progressively."""
+    def preprocess_file(self) -> str:
+        """Preprocess file to clean and validate lines."""
+        logging.info(f"Preprocessing {self.input_file} -> {self.output_file}")
+        
+        with open(self.input_file, 'r', encoding='utf-8', errors='ignore') as infile, \
+             open(self.output_file, 'w', encoding='utf-8') as outfile:
+            
+            for line_num, line in enumerate(tqdm(infile, desc="Preprocessing"), 1):
+                self.stats['total_lines'] += 1
+                
+                try:
+                    line = line.strip()
+                    
+                    # Skip empty lines
+                    if not line:
+                        self.stats['empty_lines'] += 1
+                        continue
+                    
+                    # Skip comments
+                    if line.startswith('#'):
+                        self.stats['comment_lines'] += 1
+                        continue
+                    
+                    # Basic validation
+                    if self._is_valid_line(line):
+                        outfile.write(line + '\n')
+                        self.stats['valid_lines'] += 1
+                    else:
+                        self.stats['invalid_lines'] += 1
+                        logging.debug(f"Invalid line {line_num}: {line[:100]}...")
+                
+                except Exception as e:
+                    self.stats['invalid_lines'] += 1
+                    logging.debug(f"Error processing line {line_num}: {e}")
+        
+        logging.info(f"Preprocessing complete: {self.stats}")
+        return str(self.output_file)
+    
+    def _is_valid_line(self, line: str) -> bool:
+        """Basic validation of RDF line."""
         try:
-            self.analyzed_triples += 1
-            
-            s_str = str(subject) if subject else ""
-            p_str = str(predicate) if predicate else ""
-            o_str = str(obj) if obj else ""
-            
-            # Skip if any part is problematic
-            if not s_str or not p_str:
+            # Check for basic structure
+            if not line.endswith('.'):
                 return False
             
-            # Discover namespaces
-            self.namespace_analyzer.discover_namespace(s_str)
-            self.namespace_analyzer.discover_namespace(p_str)
-            if isinstance(obj, URIRef):
-                self.namespace_analyzer.discover_namespace(o_str)
+            # Check for reasonable length
+            if len(line) > 50000:  # Skip extremely long lines
+                return False
             
-            # Track predicate usage
-            self.predicate_usage[p_str] += 1
+            # Check for basic RDF patterns
+            if not any(pattern in line for pattern in ['<', '"', 'prefix', '@']):
+                return False
             
-            # Handle rdf:type triples
-            if p_str == str(RDF.type) or p_str.endswith('#type') or p_str.endswith('/type'):
-                if isinstance(obj, URIRef) and o_str:
-                    self.classes.add(o_str)
-                    self.subject_types[s_str].add(o_str)
-            
-            # Classify properties
-            if isinstance(obj, Literal):
-                self.data_properties.add(p_str)
-                if obj.datatype:
-                    self.literal_datatypes[str(obj.datatype)] += 1
-            else:
-                self.object_properties.add(p_str)
-            
-            self.properties.add(p_str)
             return True
             
-        except Exception as e:
-            logging.debug(f"Error analyzing triple: {e}")
+        except Exception:
             return False
-    
-    def get_class_label(self, class_uri: str) -> str:
-        """Get a clean label for a class."""
-        try:
-            prefix, local_name = self.namespace_analyzer.get_local_name(class_uri)
-            if local_name and local_name != class_uri:
-                return SafeStringProcessor.safe_clean_label(local_name)
-            else:
-                # Extract from URI
-                parts = class_uri.split('/')
-                if parts:
-                    last_part = parts[-1]
-                    if '#' in last_part:
-                        last_part = last_part.split('#')[-1]
-                    return SafeStringProcessor.safe_clean_label(last_part)
-                return "Entity"
-        except Exception as e:
-            logging.debug(f"Error getting class label for {class_uri}: {e}")
-            return "Entity"
-    
-    def get_property_label(self, property_uri: str) -> str:
-        """Get a clean label for a property."""
-        try:
-            prefix, local_name = self.namespace_analyzer.get_local_name(property_uri)
-            if local_name and local_name != property_uri:
-                return SafeStringProcessor.safe_clean_property(local_name)
-            else:
-                # Extract from URI
-                parts = property_uri.split('/')
-                if parts:
-                    last_part = parts[-1]
-                    if '#' in last_part:
-                        last_part = last_part.split('#')[-1]
-                    return SafeStringProcessor.safe_clean_property(last_part)
-                return "property"
-        except Exception as e:
-            logging.debug(f"Error getting property label for {property_uri}: {e}")
-            return "property"
 
 
-class StreamingRDFProcessor:
-    """Streaming RDF processor for large files."""
+class ExternalToolProcessor:
+    """Uses external RDF tools for conversion."""
     
-    def __init__(self, config: ConversionConfig):
-        self.config = config
-        self.namespace_analyzer = RobustNamespaceAnalyzer()
-        self.schema_analyzer = ProgressiveSchemaAnalyzer(self.namespace_analyzer)
-        self.resource_ids: Dict[str, str] = {}
-        self.next_id = 0
-        
-        # Error tracking
-        self.error_count = 0
-        self.processed_count = 0
+    def __init__(self):
+        self.available_tools = self._check_available_tools()
     
-    def process_file_streaming(self, file_path: str) -> Iterator[Tuple[Any, Any, Any]]:
-        """Stream process large RDF files without loading into memory."""
-        file_path = Path(file_path)
+    def _check_available_tools(self) -> Dict[str, bool]:
+        """Check which external RDF tools are available."""
+        tools = {}
         
-        # Determine format
-        format_map = {
-            '.ttl': 'turtle', '.turtle': 'turtle',
-            '.nt': 'nt', '.ntriples': 'nt',
-            '.rdf': 'xml', '.xml': 'xml',
-            '.n3': 'n3'
-        }
+        # Check for rapper (Redland)
+        try:
+            subprocess.run(['rapper', '--version'], capture_output=True, check=True)
+            tools['rapper'] = True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            tools['rapper'] = False
         
-        file_format = format_map.get(file_path.suffix.lower(), 'turtle')
-        logging.info(f"Streaming {file_path} as {file_format}")
+        # Check for rdf4j
+        try:
+            subprocess.run(['rdf4j'], capture_output=True)
+            tools['rdf4j'] = True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            tools['rdf4j'] = False
         
-        if file_format == 'nt':
-            # N-Triples can be streamed line by line
-            yield from self._stream_ntriples(file_path)
+        # Check for riot (Apache Jena)
+        try:
+            subprocess.run(['riot', '--version'], capture_output=True, check=True)
+            tools['riot'] = True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            tools['riot'] = False
+        
+        logging.info(f"Available external tools: {tools}")
+        return tools
+    
+    def convert_to_ntriples(self, input_file: str, output_file: str = None) -> str:
+        """Convert TTL to N-Triples using external tools."""
+        if not output_file:
+            output_file = Path(input_file).with_suffix('.nt')
+        
+        if self.available_tools.get('rapper'):
+            return self._convert_with_rapper(input_file, output_file)
+        elif self.available_tools.get('riot'):
+            return self._convert_with_riot(input_file, output_file)
         else:
-            # For other formats, use chunked parsing
-            yield from self._stream_other_formats(file_path, file_format)
+            raise RuntimeError("No external RDF tools available. Install rapper or riot.")
     
-    def _stream_ntriples(self, file_path: Path) -> Iterator[Tuple[Any, Any, Any]]:
-        """Stream N-Triples format line by line."""
-        chunk_triples = []
+    def _convert_with_rapper(self, input_file: str, output_file: str) -> str:
+        """Convert using rapper."""
+        logging.info(f"Converting {input_file} to N-Triples using rapper")
         
-        try:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                for line_num, line in enumerate(f, 1):
+        cmd = [
+            'rapper',
+            '-i', 'turtle',
+            '-o', 'ntriples',
+            input_file
+        ]
+        
+        with open(output_file, 'w') as f:
+            result = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE, text=True)
+        
+        if result.returncode != 0:
+            logging.error(f"Rapper conversion failed: {result.stderr}")
+            raise RuntimeError(f"Rapper conversion failed")
+        
+        logging.info(f"Conversion complete: {output_file}")
+        return output_file
+    
+    def _convert_with_riot(self, input_file: str, output_file: str) -> str:
+        """Convert using Apache Jena riot."""
+        logging.info(f"Converting {input_file} to N-Triples using riot")
+        
+        cmd = [
+            'riot',
+            '--output=NT',
+            input_file
+        ]
+        
+        with open(output_file, 'w') as f:
+            result = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE, text=True)
+        
+        if result.returncode != 0:
+            logging.error(f"Riot conversion failed: {result.stderr}")
+            raise RuntimeError(f"Riot conversion failed")
+        
+        logging.info(f"Conversion complete: {output_file}")
+        return output_file
+
+
+class ChunkBasedProcessor:
+    """Processes large files in isolated chunks to contain errors."""
+    
+    def __init__(self, chunk_size_mb: int = 100):
+        self.chunk_size_bytes = chunk_size_mb * 1024 * 1024
+        self.parser = ManualTTLParser()
+    
+    def process_file_in_chunks(self, file_path: str) -> Iterator[Tuple[str, str, str, str]]:
+        """Process file in chunks with error isolation."""
+        file_path = Path(file_path)
+        file_size = file_path.stat().st_size
+        
+        logging.info(f"Processing {file_path} ({file_size / 1024**3:.2f} GB) in chunks")
+        
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            chunk_num = 0
+            while True:
+                chunk_num += 1
+                chunk_lines = []
+                chunk_size = 0
+                
+                # Read chunk
+                while chunk_size < self.chunk_size_bytes:
                     try:
-                        line = line.strip()
-                        if not line or line.startswith('#'):
-                            continue
-                        
-                        # Parse single triple
-                        temp_graph = Graph()
-                        temp_graph.parse(data=line, format='nt')
-                        
-                        for triple in temp_graph:
-                            chunk_triples.append(triple)
-                            
-                            if len(chunk_triples) >= self.config.stream_chunk_size:
-                                for t in chunk_triples:
-                                    yield t
-                                chunk_triples = []
-                                
-                                # Memory management
-                                if line_num % self.config.cleanup_frequency == 0:
-                                    gc.collect()
-                    
+                        line = f.readline()
+                        if not line:  # EOF
+                            break
+                        chunk_lines.append(line)
+                        chunk_size += len(line.encode('utf-8'))
                     except Exception as e:
-                        self.error_count += 1
-                        if self.error_count % 1000 == 0:
-                            logging.warning(f"Parse errors so far: {self.error_count}")
-                        
-                        # Check error tolerance
-                        if self.processed_count > 0:
-                            error_rate = self.error_count / self.processed_count
-                            if error_rate > self.config.error_tolerance:
-                                raise RuntimeError(f"Error rate {error_rate:.2%} exceeds tolerance")
+                        logging.warning(f"Error reading line in chunk {chunk_num}: {e}")
+                        continue
                 
-                # Yield remaining triples
-                for t in chunk_triples:
-                    yield t
-                    
-        except Exception as e:
-            logging.error(f"Error streaming N-Triples: {e}")
-            raise
-    
-    def _stream_other_formats(self, file_path: Path, file_format: str) -> Iterator[Tuple[Any, Any, Any]]:
-        """Stream other RDF formats using chunked parsing."""
-        try:
-            # For very large files, try to split or use alternative approach
-            file_size_gb = file_path.stat().st_size / (1024**3)
-            
-            if file_size_gb > 10:  # > 10GB
-                logging.warning(f"Very large {file_format} file ({file_size_gb:.1f}GB)")
-                logging.warning("Consider converting to N-Triples for better streaming")
-            
-            # Load with progress monitoring
-            graph = Graph()
-            logging.info("Loading RDF file (this may take time for large files)...")
-            
-            # Monitor memory during parsing
-            start_memory = psutil.Process().memory_info().rss / 1024 / 1024
-            graph.parse(str(file_path), format=file_format)
-            end_memory = psutil.Process().memory_info().rss / 1024 / 1024
-            
-            logging.info(f"Loaded {len(graph):,} triples, memory used: {end_memory - start_memory:.1f}MB")
-            
-            # Stream from loaded graph
-            chunk_triples = []
-            for triple in graph:
-                chunk_triples.append(triple)
+                if not chunk_lines:
+                    break
                 
-                if len(chunk_triples) >= self.config.stream_chunk_size:
-                    for t in chunk_triples:
-                        yield t
-                    chunk_triples = []
-                    gc.collect()
-            
-            # Yield remaining
-            for t in chunk_triples:
-                yield t
+                # Process chunk
+                logging.info(f"Processing chunk {chunk_num} ({len(chunk_lines):,} lines)")
                 
-        except Exception as e:
-            logging.error(f"Error streaming {file_format}: {e}")
-            raise
-    
-    def get_resource_id(self, resource: Any) -> str:
-        """Get or create unique ID for resource."""
-        try:
-            resource_str = str(resource) if resource else ""
-            
-            if not resource_str:
-                return f"empty_{self.next_id}"
-            
-            # Handle very long resource strings
-            if len(resource_str) > self.config.max_uri_length:
-                resource_str = resource_str[:100] + f"...hash_{abs(hash(resource_str)) % 10000}"
-            
-            if resource_str not in self.resource_ids:
-                if isinstance(resource, URIRef):
-                    uri_hash = hashlib.md5(resource_str.encode()).hexdigest()[:12]
-                    self.resource_ids[resource_str] = f"uri_{uri_hash}"
-                elif isinstance(resource, BNode):
-                    self.resource_ids[resource_str] = f"bn_{self.next_id}"
-                    self.next_id += 1
-                else:
-                    gen_hash = hashlib.md5(resource_str.encode()).hexdigest()[:12]
-                    self.resource_ids[resource_str] = f"res_{gen_hash}"
-            
-            return self.resource_ids[resource_str]
-            
-        except Exception as e:
-            logging.debug(f"Error getting resource ID for {resource}: {e}")
-            fallback_id = f"error_{self.next_id}"
-            self.next_id += 1
-            return fallback_id
+                for line_num, line in enumerate(chunk_lines):
+                    try:
+                        parsed = self.parser.parse_line_safe(line)
+                        if parsed:
+                            yield parsed
+                    except Exception as e:
+                        logging.debug(f"Error in chunk {chunk_num}, line {line_num}: {e}")
+                        continue
+                
+                # Memory cleanup after each chunk
+                del chunk_lines
+                gc.collect()
 
 
-class RobustFalkorDBLoader:
-    """Robust FalkorDB loader with comprehensive error handling."""
+class SimpleFalkorDBLoader:
+    """Simplified FalkorDB loader with minimal string operations."""
     
-    def __init__(self, config: ConversionConfig, schema_analyzer: ProgressiveSchemaAnalyzer,
-                 resource_processor: StreamingRDFProcessor):
-        self.config = config
-        self.schema_analyzer = schema_analyzer
-        self.resource_processor = resource_processor
+    def __init__(self, graph_name: str = "knowledge_graph", host: str = "localhost", port: int = 6379):
+        self.graph_name = graph_name
+        self.host = host
+        self.port = port
         self.db = None
         self.graph = None
-        
-        # Batch management
-        self.node_batch: List[Dict] = []
-        self.edge_batch: List[Dict] = []
-        self.property_batch: List[Dict] = []
         
         # Statistics
         self.nodes_created = 0
         self.edges_created = 0
-        self.properties_set = 0
-        self.operations_since_commit = 0
+        
+        # Simple ID mapping
+        self.resource_to_id = {}
+        self.next_id = 0
     
     def connect(self):
-        """Connect to FalkorDB with retries."""
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                self.db = falkordb.FalkorDB(
-                    host=self.config.host,
-                    port=self.config.port,
-                    password=self.config.password
-                )
-                self.graph = self.db.select_graph(self.config.graph_name)
-                
-                # Test connection
-                self.graph.query("RETURN 1")
-                logging.info(f"Connected to FalkorDB at {self.config.host}:{self.config.port}")
-                return
-                
-            except Exception as e:
-                logging.warning(f"Connection attempt {attempt + 1} failed: {e}")
-                if attempt == max_retries - 1:
-                    raise
-                time.sleep(2 ** attempt)  # Exponential backoff
+        """Connect to FalkorDB."""
+        self.db = falkordb.FalkorDB(host=self.host, port=self.port)
+        self.graph = self.db.select_graph(self.graph_name)
+        logging.info(f"Connected to FalkorDB: {self.graph_name}")
     
-    def load_triple_safe(self, subject: Any, predicate: Any, obj: Any) -> bool:
-        """Safely load a triple with comprehensive error handling."""
+    def get_safe_id(self, resource: str) -> str:
+        """Get safe ID for resource with minimal string operations."""
         try:
-            # Validate inputs
-            if not subject or not predicate:
-                return False
+            if resource in self.resource_to_id:
+                return self.resource_to_id[resource]
             
-            # Analyze for schema
-            self.schema_analyzer.analyze_triple(subject, predicate, obj)
+            # Create simple hash-based ID
+            resource_hash = hashlib.md5(resource.encode('utf-8', errors='ignore')).hexdigest()[:12]
+            safe_id = f"n_{resource_hash}"
             
-            # Handle different triple types
-            pred_str = str(predicate)
+            self.resource_to_id[resource] = safe_id
+            return safe_id
             
-            if pred_str == str(RDF.type) or pred_str.endswith('#type'):
-                return self._handle_type_triple_safe(subject, obj)
-            elif isinstance(obj, Literal):
-                return self._handle_data_property_safe(subject, predicate, obj)
+        except Exception:
+            # Fallback to sequential ID
+            safe_id = f"n_{self.next_id}"
+            self.next_id += 1
+            self.resource_to_id[resource] = safe_id
+            return safe_id
+    
+    def load_triple_simple(self, subject: str, predicate: str, obj: str, obj_type: str):
+        """Load triple with minimal processing."""
+        try:
+            subj_id = self.get_safe_id(subject)
+            
+            # Create subject node if needed
+            self._ensure_node_exists(subj_id, subject)
+            
+            if obj_type == "literal":
+                # Add as property
+                self._add_property_safe(subj_id, predicate, obj)
             else:
-                return self._handle_object_property_safe(subject, predicate, obj)
-                
+                # Create object node and edge
+                obj_id = self.get_safe_id(obj)
+                self._ensure_node_exists(obj_id, obj)
+                self._create_edge_safe(subj_id, obj_id, predicate)
+            
         except Exception as e:
-            logging.debug(f"Error loading triple {subject} {predicate} {obj}: {e}")
-            return False
+            logging.debug(f"Error loading triple: {e}")
     
-    def _handle_type_triple_safe(self, subject: Any, type_obj: Any) -> bool:
-        """Safely handle rdf:type triples."""
+    def _ensure_node_exists(self, node_id: str, uri: str):
+        """Ensure node exists with minimal operations."""
         try:
-            node_id = self.resource_processor.get_resource_id(subject)
-            if not node_id:
-                return False
-            
-            # Get class label
-            type_str = str(type_obj) if type_obj else ""
-            if not type_str:
-                return False
-            
-            class_label = self.schema_analyzer.get_class_label(type_str)
-            
-            node_data = {
-                'id': node_id,
-                'uri': str(subject) if isinstance(subject, URIRef) else None,
-                'labels': [class_label, 'Resource'] if isinstance(subject, URIRef) else [class_label]
-            }
-            
-            self.node_batch.append(node_data)
-            self._check_and_flush_batches()
-            return True
-            
+            query = "MERGE (n {id: $id}) SET n.uri = $uri"
+            self.graph.query(query, {'id': node_id, 'uri': uri})
+            self.nodes_created += 1
         except Exception as e:
-            logging.debug(f"Error handling type triple: {e}")
-            return False
+            logging.debug(f"Error creating node: {e}")
     
-    def _handle_data_property_safe(self, subject: Any, predicate: Any, literal: Literal) -> bool:
-        """Safely handle data properties."""
+    def _add_property_safe(self, node_id: str, predicate: str, value: str):
+        """Add property safely."""
         try:
-            # Check literal size
-            literal_str = str(literal) if literal else ""
-            if len(literal_str) > self.config.max_literal_length:
-                logging.debug(f"Skipping very long literal (length: {len(literal_str)})")
-                return False
+            # Clean property name
+            prop_name = predicate.split('/')[-1].split('#')[-1]
+            prop_name = re.sub(r'[^a-zA-Z0-9_]', '_', prop_name)[:50]
             
-            node_id = self.resource_processor.get_resource_id(subject)
-            if not node_id:
-                return False
+            if not prop_name:
+                prop_name = "property"
             
-            prop_name = self.schema_analyzer.get_property_label(str(predicate))
-            prop_value = self._convert_literal_safe(literal)
-            
-            if prop_value is not None:
-                prop_data = {
-                    'node_id': node_id,
-                    'property': prop_name,
-                    'value': prop_value
-                }
-                self.property_batch.append(prop_data)
-                self._check_and_flush_batches()
-                return True
-            
-            return False
+            query = f"MATCH (n {{id: $id}}) SET n.{prop_name} = $value"
+            self.graph.query(query, {'id': node_id, 'value': value})
             
         except Exception as e:
-            logging.debug(f"Error handling data property: {e}")
-            return False
+            logging.debug(f"Error adding property: {e}")
     
-    def _handle_object_property_safe(self, subject: Any, predicate: Any, obj: Any) -> bool:
-        """Safely handle object properties."""
+    def _create_edge_safe(self, source_id: str, target_id: str, predicate: str):
+        """Create edge safely."""
         try:
-            subj_id = self.resource_processor.get_resource_id(subject)
-            obj_id = self.resource_processor.get_resource_id(obj)
+            # Clean edge type
+            edge_type = predicate.split('/')[-1].split('#')[-1]
+            edge_type = re.sub(r'[^a-zA-Z0-9_]', '_', edge_type)[:50]
             
-            if not subj_id or not obj_id:
-                return False
+            if not edge_type:
+                edge_type = "RELATED"
             
-            # Ensure both nodes exist
-            self._ensure_node_exists_safe(subject, subj_id)
-            self._ensure_node_exists_safe(obj, obj_id)
+            query = f"""
+            MATCH (a {{id: $source}}), (b {{id: $target}})
+            MERGE (a)-[r:{edge_type}]->(b)
+            """
             
-            edge_type = self.schema_analyzer.get_property_label(str(predicate))
-            edge_data = {
-                'source_id': subj_id,
-                'target_id': obj_id,
-                'type': edge_type,
-                'uri': str(predicate)
-            }
-            
-            self.edge_batch.append(edge_data)
-            self._check_and_flush_batches()
-            return True
+            self.graph.query(query, {'source': source_id, 'target': target_id})
+            self.edges_created += 1
             
         except Exception as e:
-            logging.debug(f"Error handling object property: {e}")
-            return False
-    
-    def _ensure_node_exists_safe(self, resource: Any, resource_id: str):
-        """Safely ensure node exists."""
-        try:
-            # Check if already in batch
-            if any(n['id'] == resource_id for n in self.node_batch):
-                return
-            
-            labels = ['Resource'] if isinstance(resource, URIRef) else ['BlankNode']
-            
-            node_data = {
-                'id': resource_id,
-                'uri': str(resource) if isinstance(resource, URIRef) else None,
-                'labels': labels
-            }
-            self.node_batch.append(node_data)
-            
-        except Exception as e:
-            logging.debug(f"Error ensuring node exists: {e}")
-    
-    def _convert_literal_safe(self, literal: Literal) -> Any:
-        """Safely convert literal to appropriate type."""
-        try:
-            if not literal:
-                return None
-            
-            literal_str = str(literal)
-            
-            if literal.datatype:
-                datatype_str = str(literal.datatype)
-                try:
-                    if 'integer' in datatype_str or 'int' in datatype_str:
-                        return int(literal)
-                    elif 'decimal' in datatype_str or 'double' in datatype_str or 'float' in datatype_str:
-                        return float(literal)
-                    elif 'boolean' in datatype_str:
-                        return literal_str.lower() in ('true', '1')
-                except (ValueError, TypeError):
-                    pass
-            
-            return literal_str
-            
-        except Exception as e:
-            logging.debug(f"Error converting literal: {e}")
-            return str(literal) if literal else None
-    
-    def _check_and_flush_batches(self):
-        """Check if batches need flushing."""
-        try:
-            if len(self.node_batch) >= self.config.batch_size:
-                self._flush_node_batch_safe()
-            if len(self.edge_batch) >= self.config.batch_size:
-                self._flush_edge_batch_safe()
-            if len(self.property_batch) >= self.config.batch_size:
-                self._flush_property_batch_safe()
-            
-            # Progressive commits
-            self.operations_since_commit += 1
-            if self.operations_since_commit >= self.config.commit_frequency:
-                self._commit_transaction_safe()
-                self.operations_since_commit = 0
-                
-        except Exception as e:
-            logging.warning(f"Error in batch management: {e}")
-    
-    def _flush_node_batch_safe(self):
-        """Safely flush node batch."""
-        if not self.node_batch:
-            return
-        
-        try:
-            # Group by labels
-            nodes_by_labels = defaultdict(list)
-            for node in self.node_batch:
-                labels_key = ':'.join(sorted(node['labels']))
-                nodes_by_labels[labels_key].append(node)
-            
-            for labels_key, nodes in nodes_by_labels.items():
-                try:
-                    labels = labels_key.split(':')
-                    label_clause = ':'.join(labels)
-                    
-                    query = f"""
-                    UNWIND $nodes AS nodeData
-                    MERGE (n:{label_clause} {{id: nodeData.id}})
-                    SET n.uri = nodeData.uri
-                    """
-                    
-                    self.graph.query(query, {'nodes': nodes})
-                    self.nodes_created += len(nodes)
-                    
-                except Exception as e:
-                    logging.warning(f"Batch node creation failed for {labels_key}: {e}")
-                    # Try individual creation
-                    for node in nodes:
-                        try:
-                            query = f"MERGE (n:{label_clause} {{id: $id}}) SET n.uri = $uri"
-                            self.graph.query(query, {'id': node['id'], 'uri': node['uri']})
-                            self.nodes_created += 1
-                        except Exception as e2:
-                            logging.debug(f"Individual node creation failed: {e2}")
-            
-            self.node_batch.clear()
-            
-        except Exception as e:
-            logging.error(f"Critical error in node batch flush: {e}")
-            self.node_batch.clear()  # Clear to prevent infinite retry
-    
-    def _flush_edge_batch_safe(self):
-        """Safely flush edge batch."""
-        if not self.edge_batch:
-            return
-        
-        try:
-            # Group by edge type
-            edges_by_type = defaultdict(list)
-            for edge in self.edge_batch:
-                edges_by_type[edge['type']].append(edge)
-            
-            for edge_type, edges in edges_by_type.items():
-                try:
-                    query = f"""
-                    UNWIND $edges AS edgeData
-                    MATCH (source {{id: edgeData.source_id}})
-                    MATCH (target {{id: edgeData.target_id}})
-                    MERGE (source)-[r:{edge_type}]->(target)
-                    SET r.uri = edgeData.uri
-                    """
-                    
-                    self.graph.query(query, {'edges': edges})
-                    self.edges_created += len(edges)
-                    
-                except Exception as e:
-                    logging.warning(f"Batch edge creation failed for {edge_type}: {e}")
-                    # Try without URI property
-                    try:
-                        query = f"""
-                        UNWIND $edges AS edgeData
-                        MATCH (source {{id: edgeData.source_id}})
-                        MATCH (target {{id: edgeData.target_id}})
-                        MERGE (source)-[r:{edge_type}]->(target)
-                        """
-                        self.graph.query(query, {'edges': edges})
-                        self.edges_created += len(edges)
-                    except Exception as e2:
-                        logging.debug(f"Simplified edge creation also failed: {e2}")
-            
-            self.edge_batch.clear()
-            
-        except Exception as e:
-            logging.error(f"Critical error in edge batch flush: {e}")
-            self.edge_batch.clear()
-    
-    def _flush_property_batch_safe(self):
-        """Safely flush property batch."""
-        if not self.property_batch:
-            return
-        
-        try:
-            # Group by property name
-            props_by_name = defaultdict(list)
-            for prop in self.property_batch:
-                props_by_name[prop['property']].append(prop)
-            
-            for prop_name, props in props_by_name.items():
-                try:
-                    query = f"""
-                    UNWIND $props AS propData
-                    MATCH (n {{id: propData.node_id}})
-                    SET n.{prop_name} = propData.value
-                    """
-                    
-                    self.graph.query(query, {'props': props})
-                    self.properties_set += len(props)
-                    
-                except Exception as e:
-                    logging.warning(f"Batch property setting failed for {prop_name}: {e}")
-            
-            self.property_batch.clear()
-            
-        except Exception as e:
-            logging.error(f"Critical error in property batch flush: {e}")
-            self.property_batch.clear()
-    
-    def _commit_transaction_safe(self):
-        """Safely commit transaction."""
-        try:
-            # FalkorDB auto-commits, but we can flush pending operations
-            self._flush_all_batches_safe()
-            gc.collect()  # Memory cleanup
-        except Exception as e:
-            logging.warning(f"Error in transaction commit: {e}")
-    
-    def _flush_all_batches_safe(self):
-        """Safely flush all batches."""
-        try:
-            self._flush_node_batch_safe()
-            self._flush_edge_batch_safe()
-            self._flush_property_batch_safe()
-        except Exception as e:
-            logging.error(f"Error flushing all batches: {e}")
-    
-    def finalize(self):
-        """Finalize loading and flush all remaining data."""
-        try:
-            logging.info("Finalizing data loading...")
-            self._flush_all_batches_safe()
-            logging.info(f"Loading complete: {self.nodes_created:,} nodes, {self.edges_created:,} edges, {self.properties_set:,} properties")
-        except Exception as e:
-            logging.error(f"Error in finalization: {e}")
+            logging.debug(f"Error creating edge: {e}")
 
 
-class LargeScaleRDFToFalkorDBConverter:
-    """Main converter optimized for very large RDF files."""
+class AlternativeConverter:
+    """Main converter using alternative approaches."""
     
-    def __init__(self, config: ConversionConfig):
-        self.config = config
-        self.metrics = ConversionMetrics()
-        
-        # Components
-        self.rdf_processor = StreamingRDFProcessor(config)
-        self.loader = RobustFalkorDBLoader(
-            config, 
-            self.rdf_processor.schema_analyzer,
-            self.rdf_processor
-        )
+    def __init__(self, approach: str = "manual"):
+        self.approach = approach
+        self.stats = ProcessingStats()
         
         # Setup logging
         logging.basicConfig(
@@ -948,230 +475,157 @@ class LargeScaleRDFToFalkorDBConverter:
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
                 logging.StreamHandler(),
-                logging.FileHandler('rdf_conversion.log')
+                logging.FileHandler('alternative_conversion.log')
             ]
         )
     
-    def convert_large_rdf_file(self, rdf_file_path: str) -> ConversionMetrics:
-        """Convert large RDF file with robust error handling."""
-        self.metrics.start_time = time.time()
+    def convert_with_alternative_approach(self, input_file: str, graph_name: str = "knowledge_graph") -> ProcessingStats:
+        """Convert using specified alternative approach."""
+        self.stats.start_time = time.time()
         
         try:
-            file_path = Path(rdf_file_path)
-            if not file_path.exists():
-                raise FileNotFoundError(f"RDF file not found: {file_path}")
-            
-            # Get file info
-            file_size_bytes = file_path.stat().st_size
-            self.metrics.file_size_gb = file_size_bytes / (1024**3)
-            
-            logging.info(f"Starting large-scale conversion of {file_path}")
-            logging.info(f"File size: {self.metrics.file_size_gb:.2f} GB")
-            
-            # Connect to database
-            self.loader.connect()
-            
-            # Process file with streaming
-            self._process_file_streaming(file_path)
-            
-            # Finalize
-            self.loader.finalize()
-            self._collect_final_metrics()
-            
-            self.metrics.end_time = time.time()
-            self._print_completion_summary()
-            
-            return self.metrics
-            
+            if self.approach == "manual":
+                return self._convert_with_manual_parser(input_file, graph_name)
+            elif self.approach == "external":
+                return self._convert_with_external_tools(input_file, graph_name)
+            elif self.approach == "preprocess":
+                return self._convert_with_preprocessing(input_file, graph_name)
+            elif self.approach == "chunks":
+                return self._convert_with_chunks(input_file, graph_name)
+            else:
+                raise ValueError(f"Unknown approach: {self.approach}")
+                
         except Exception as e:
             logging.error(f"Conversion failed: {e}")
-            self.metrics.end_time = time.time()
             raise
+        finally:
+            self.stats.end_time = time.time()
     
-    def _process_file_streaming(self, file_path: Path):
-        """Process file using streaming approach."""
-        logging.info("Starting streaming processing...")
+    def _convert_with_manual_parser(self, input_file: str, graph_name: str) -> ProcessingStats:
+        """Convert using manual regex-based parser."""
+        logging.info("Using manual regex-based parser approach")
+        
+        parser = ManualTTLParser()
+        loader = SimpleFalkorDBLoader(graph_name)
+        loader.connect()
+        
+        with open(input_file, 'r', encoding='utf-8', errors='ignore') as f:
+            for line_num, line in enumerate(tqdm(f, desc="Processing with manual parser"), 1):
+                self.stats.total_lines = line_num
+                
+                try:
+                    parsed = parser.parse_line_safe(line)
+                    if parsed:
+                        subject, predicate, obj, obj_type = parsed
+                        loader.load_triple_simple(subject, predicate, obj, obj_type)
+                        self.stats.processed_lines += 1
+                    else:
+                        self.stats.skipped_lines += 1
+                
+                except Exception as e:
+                    self.stats.error_lines += 1
+                    if self.stats.error_lines % 10000 == 0:
+                        logging.warning(f"Errors so far: {self.stats.error_lines}")
+                
+                # Memory management
+                if line_num % 50000 == 0:
+                    gc.collect()
+                    memory_mb = psutil.Process().memory_info().rss / 1024 / 1024
+                    self.stats.memory_peak_mb = max(self.stats.memory_peak_mb, memory_mb)
+        
+        self.stats.nodes_created = loader.nodes_created
+        self.stats.edges_created = loader.edges_created
+        
+        return self.stats
+    
+    def _convert_with_external_tools(self, input_file: str, graph_name: str) -> ProcessingStats:
+        """Convert using external RDF tools."""
+        logging.info("Using external tools approach")
+        
+        # Convert to N-Triples first
+        external_processor = ExternalToolProcessor()
+        nt_file = external_processor.convert_to_ntriples(input_file)
+        
+        # Process N-Triples
+        return self._convert_with_manual_parser(nt_file, graph_name)
+    
+    def _convert_with_preprocessing(self, input_file: str, graph_name: str) -> ProcessingStats:
+        """Convert with file preprocessing."""
+        logging.info("Using preprocessing approach")
+        
+        # Preprocess file
+        preprocessor = FilePreprocessor(input_file)
+        clean_file = preprocessor.preprocess_file()
+        
+        # Process cleaned file
+        return self._convert_with_manual_parser(clean_file, graph_name)
+    
+    def _convert_with_chunks(self, input_file: str, graph_name: str) -> ProcessingStats:
+        """Convert using chunk-based processing."""
+        logging.info("Using chunk-based processing approach")
+        
+        chunk_processor = ChunkBasedProcessor()
+        loader = SimpleFalkorDBLoader(graph_name)
+        loader.connect()
         
         processed_count = 0
-        error_count = 0
-        last_report_time = time.time()
+        for subject, predicate, obj, obj_type in chunk_processor.process_file_in_chunks(input_file):
+            try:
+                loader.load_triple_simple(subject, predicate, obj, obj_type)
+                processed_count += 1
+                
+                if processed_count % 10000 == 0:
+                    logging.info(f"Processed {processed_count:,} triples")
+                    memory_mb = psutil.Process().memory_info().rss / 1024 / 1024
+                    self.stats.memory_peak_mb = max(self.stats.memory_peak_mb, memory_mb)
+                
+            except Exception as e:
+                self.stats.error_lines += 1
         
-        try:
-            # Create progress bar based on file size estimation
-            estimated_triples = int(self.metrics.file_size_gb * 1000000)  # Rough estimate
-            
-            with tqdm(total=estimated_triples, desc="Processing triples", unit="triples") as pbar:
-                for triple in self.rdf_processor.process_file_streaming(str(file_path)):
-                    try:
-                        # Load triple
-                        if self.loader.load_triple_safe(*triple):
-                            processed_count += 1
-                        else:
-                            error_count += 1
-                        
-                        # Update progress
-                        if processed_count % self.config.progress_reporting == 0:
-                            pbar.update(self.config.progress_reporting)
-                            current_time = time.time()
-                            
-                            if current_time - last_report_time > 60:  # Report every minute
-                                self._report_progress(processed_count, error_count)
-                                last_report_time = current_time
-                        
-                        # Memory management
-                        if processed_count % self.config.cleanup_frequency == 0:
-                            self._memory_cleanup()
-                        
-                        # Check error tolerance
-                        if processed_count > 1000:  # Check after initial batch
-                            error_rate = error_count / processed_count
-                            if error_rate > self.config.error_tolerance:
-                                raise RuntimeError(f"Error rate {error_rate:.2%} exceeds tolerance")
-                    
-                    except Exception as e:
-                        error_count += 1
-                        if error_count % 10000 == 0:
-                            logging.warning(f"Processing errors: {error_count}")
-                        
-                        if processed_count > 0:
-                            error_rate = error_count / processed_count
-                            if error_rate > self.config.error_tolerance:
-                                raise RuntimeError(f"Error rate {error_rate:.2%} exceeds tolerance")
-            
-            self.metrics.processed_triples = processed_count
-            self.metrics.error_triples = error_count
-            
-            logging.info(f"Streaming processing complete: {processed_count:,} triples processed, {error_count:,} errors")
-            
-        except Exception as e:
-            logging.error(f"Error in streaming processing: {e}")
-            raise
-    
-    def _report_progress(self, processed: int, errors: int):
-        """Report processing progress."""
-        elapsed = time.time() - self.metrics.start_time
-        rate = processed / elapsed if elapsed > 0 else 0
-        error_rate = errors / processed if processed > 0 else 0
+        self.stats.processed_lines = processed_count
+        self.stats.nodes_created = loader.nodes_created
+        self.stats.edges_created = loader.edges_created
         
-        memory_mb = psutil.Process().memory_info().rss / 1024 / 1024
-        if memory_mb > self.metrics.memory_peak_mb:
-            self.metrics.memory_peak_mb = memory_mb
-        
-        logging.info(f"Progress: {processed:,} triples, {rate:.0f} triples/sec, "
-                    f"{error_rate:.3%} error rate, {memory_mb:.1f}MB memory")
-    
-    def _memory_cleanup(self):
-        """Perform memory cleanup."""
-        gc.collect()
-        
-        # Check memory usage
-        process = psutil.Process()
-        memory_mb = process.memory_info().rss / 1024 / 1024
-        
-        if memory_mb > self.metrics.memory_peak_mb:
-            self.metrics.memory_peak_mb = memory_mb
-        
-        if memory_mb > self.config.max_memory_mb:
-            logging.warning(f"Memory usage ({memory_mb:.1f}MB) exceeds threshold")
-            # Force more aggressive cleanup
-            gc.collect()
-            gc.collect()  # Double collection
-    
-    def _collect_final_metrics(self):
-        """Collect final metrics."""
-        self.metrics.nodes_created = self.loader.nodes_created
-        self.metrics.edges_created = self.loader.edges_created
-        self.metrics.properties_set = self.loader.properties_set
-        
-        # Schema metrics
-        self.metrics.discovered_classes = len(self.rdf_processor.schema_analyzer.classes)
-        self.metrics.discovered_properties = len(self.rdf_processor.schema_analyzer.properties)
-        self.metrics.namespaces_found = len(self.rdf_processor.namespace_analyzer.namespace_map)
-    
-    def _print_completion_summary(self):
-        """Print comprehensive completion summary."""
-        print("\n" + "="*80)
-        print("LARGE-SCALE RDF TO FALKORDB CONVERSION COMPLETED")
-        print("="*80)
-        
-        print(f"📁 File Information:")
-        print(f"   File size: {self.metrics.file_size_gb:.2f} GB")
-        print(f"   Processing time: {self.metrics.processing_time:.1f} seconds ({self.metrics.processing_time/60:.1f} minutes)")
-        print(f"   Peak memory: {self.metrics.memory_peak_mb:.1f} MB")
-        
-        print(f"\n🔍 Processing Results:")
-        print(f"   Triples processed: {self.metrics.processed_triples:,}")
-        print(f"   Processing errors: {self.metrics.error_triples:,}")
-        if self.metrics.processed_triples > 0:
-            error_rate = self.metrics.error_triples / self.metrics.processed_triples
-            print(f"   Error rate: {error_rate:.3%}")
-        
-        print(f"\n📊 Schema Discovery:")
-        print(f"   Namespaces found: {self.metrics.namespaces_found}")
-        print(f"   Classes discovered: {self.metrics.discovered_classes}")
-        print(f"   Properties discovered: {self.metrics.discovered_properties}")
-        
-        print(f"\n🎯 Graph Creation:")
-        print(f"   Nodes created: {self.metrics.nodes_created:,}")
-        print(f"   Edges created: {self.metrics.edges_created:,}")
-        print(f"   Properties set: {self.metrics.properties_set:,}")
-        
-        if self.metrics.processing_time > 0:
-            rate = self.metrics.processed_triples / self.metrics.processing_time
-            print(f"\n⚡ Performance:")
-            print(f"   Processing rate: {rate:.0f} triples/second")
-            print(f"   Throughput: {self.metrics.file_size_gb / (self.metrics.processing_time/3600):.2f} GB/hour")
-        
-        print("="*80)
+        return self.stats
 
 
 def main():
-    """Example usage for large-scale conversion."""
+    """Main function with multiple approach options."""
+    import argparse
     
-    # Configuration optimized for 17GB+ files
-    config = ConversionConfig(
-        stream_chunk_size=5000,         # Smaller chunks for stability
-        parse_chunk_size=500000,        # Large parse chunks for efficiency
-        max_memory_mb=6000,             # Higher memory limit
-        batch_size=500,                 # Smaller batches for stability
-        error_tolerance=0.02,           # Allow 2% error rate
-        progressive_commit=True,
-        commit_frequency=5000,
-        cleanup_frequency=2500,
-        progress_reporting=50000,
-        use_streaming_parser=True,
-        graph_name="large_knowledge_graph"
-    )
+    parser = argparse.ArgumentParser(description="Alternative RDF to FalkorDB conversion approaches")
+    parser.add_argument('input_file', help='Input TTL/RDF file')
+    parser.add_argument('--approach', choices=['manual', 'external', 'preprocess', 'chunks'], 
+                       default='manual', help='Conversion approach')
+    parser.add_argument('--graph-name', default='knowledge_graph', help='FalkorDB graph name')
     
-    # Initialize converter
-    converter = LargeScaleRDFToFalkorDBConverter(config)
+    args = parser.parse_args()
+    
+    if not Path(args.input_file).exists():
+        print(f"File not found: {args.input_file}")
+        return
+    
+    print(f"Converting {args.input_file} using {args.approach} approach")
+    print("This may take a long time for large files...")
     
     try:
-        # Convert your large TTL file
-        ttl_file_path = "your_large_file.ttl"  # Replace with your file
+        converter = AlternativeConverter(args.approach)
+        stats = converter.convert_with_alternative_approach(args.input_file, args.graph_name)
         
-        if not Path(ttl_file_path).exists():
-            print(f"Please provide a valid TTL file path. Current: {ttl_file_path}")
-            print("For a 17GB file, ensure you have:")
-            print("- At least 8GB RAM available")
-            print("- SSD storage recommended")
-            print("- Consider converting to N-Triples format first for better streaming")
-            return
+        print(f"\n✅ Conversion completed:")
+        print(f"   Processing time: {stats.processing_time:.1f} seconds")
+        print(f"   Lines processed: {stats.processed_lines:,}")
+        print(f"   Nodes created: {stats.nodes_created:,}")
+        print(f"   Edges created: {stats.edges_created:,}")
+        print(f"   Peak memory: {stats.memory_peak_mb:.1f} MB")
         
-        print(f"Starting large-scale conversion of {ttl_file_path}")
-        print("This may take several hours for a 17GB file...")
-        
-        # Perform conversion
-        metrics = converter.convert_large_rdf_file(ttl_file_path)
-        
-        print(f"\n🎉 Conversion completed successfully!")
-        print(f"Check the log file 'rdf_conversion.log' for detailed information.")
+        if stats.error_lines > 0:
+            error_rate = stats.error_lines / stats.total_lines if stats.total_lines > 0 else 0
+            print(f"   Error rate: {error_rate:.2%}")
         
     except Exception as e:
         print(f"❌ Conversion failed: {e}")
-        print("Check the log file for detailed error information.")
-        import traceback
-        traceback.print_exc()
+        print("Check alternative_conversion.log for details")
 
 
 if __name__ == "__main__":
