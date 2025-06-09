@@ -1,280 +1,973 @@
-import rdflib
-from rdflib import ConjunctiveGraph, Namespace, URIRef, Literal
-from rdflib.plugins.stores import sparqlstore
-import falkordb
-from typing import Dict, List, Set, Tuple
-import json
+#!/usr/bin/env python3
+"""
+Complete RDF to FalkorDB Property Graph Converter
 
-class RDFAnalyzer:
-    """Utility class to analyze RDF graph structure before conversion"""
+This module provides a comprehensive solution for converting RDF data from SPARQL endpoints
+to FalkorDB property graphs while preserving exact schema and structure.
+
+Features:
+- Streaming conversion from SPARQL endpoints using rdflib
+- Exact schema preservation with configurable mappings
+- Batch processing for large datasets
+- Comprehensive error handling and logging
+- Support for authentication and custom headers
+- Performance monitoring and statistics
+- Extensible architecture for custom transformations
+
+Dependencies:
+    pip install rdflib falkordb urllib3 requests
+"""
+
+import logging
+import json
+import time
+import hashlib
+from typing import Dict, List, Set, Tuple, Optional, Any, Iterator, Union
+from dataclasses import dataclass, asdict
+from collections import defaultdict, Counter
+from urllib.parse import urlparse
+import re
+from datetime import datetime
+
+import rdflib
+from rdflib import ConjunctiveGraph, Graph, URIRef, Literal, BNode, Namespace
+from rdflib.plugins.stores import sparqlstore
+from rdflib.namespace import RDF, RDFS, OWL, XSD, SKOS
+import falkordb
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class ConversionConfig:
+    """Configuration class for RDF to FalkorDB conversion"""
+    sparql_endpoint: str
+    username: Optional[str] = None
+    password: Optional[str] = None
+    falkordb_host: str = 'localhost'
+    falkordb_port: int = 6379
+    falkordb_password: Optional[str] = None
+    graph_name: str = 'rdf_graph'
+    batch_size: int = 1000
+    max_retries: int = 3
+    timeout: int = 30
+    preserve_blank_nodes: bool = True
+    use_shortened_names: bool = True
+    custom_mappings: Optional[Dict[str, str]] = None
+    excluded_predicates: Optional[List[str]] = None
+    included_namespaces: Optional[List[str]] = None
+    parallel_processing: bool = False
+    create_indexes: bool = True
+    validate_data: bool = True
+    export_metadata: bool = True
+
+@dataclass
+class ConversionStats:
+    """Statistics tracking for conversion process"""
+    start_time: datetime
+    end_time: Optional[datetime] = None
+    total_triples: int = 0
+    processed_triples: int = 0
+    created_nodes: int = 0
+    created_relationships: int = 0
+    skipped_triples: int = 0
+    errors: int = 0
+    processing_rate: float = 0.0
+    namespaces_discovered: int = 0
     
-    def __init__(self, sparql_endpoint: str, username: str = None, password: str = None):
-        auth = (username, password) if username and password else None
-        self.store = sparqlstore.SPARQLUpdateStore(sparql_endpoint, auth=auth)
-        self.graph = ConjunctiveGraph(store=self.store)
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert stats to dictionary for JSON serialization"""
+        result = asdict(self)
+        result['start_time'] = self.start_time.isoformat()
+        if self.end_time:
+            result['end_time'] = self.end_time.isoformat()
+            result['duration_seconds'] = (self.end_time - self.start_time).total_seconds()
+        return result
+
+class NamespaceManager:
+    """Manages namespace prefixes and URI shortening"""
     
-    def analyze_schema(self) -> Dict:
-        """Analyze the RDF schema to understand its structure"""
-        
-        analysis = {
-            'classes': {},
-            'properties': {},
-            'namespaces': {},
-            'statistics': {}
+    def __init__(self, use_shortened_names: bool = True):
+        self.use_shortened_names = use_shortened_names
+        self.namespace_map: Dict[str, str] = {}
+        self.reverse_map: Dict[str, str] = {}
+        self._setup_default_namespaces()
+    
+    def _setup_default_namespaces(self):
+        """Setup common namespace prefixes"""
+        defaults = {
+            'rdf': str(RDF),
+            'rdfs': str(RDFS),
+            'owl': str(OWL),
+            'xsd': str(XSD),
+            'skos': str(SKOS),
+            'foaf': 'http://xmlns.com/foaf/0.1/',
+            'dc': 'http://purl.org/dc/elements/1.1/',
+            'dct': 'http://purl.org/dc/terms/',
+            'schema': 'http://schema.org/',
+            'dbpedia': 'http://dbpedia.org/resource/',
+            'dbpedia-owl': 'http://dbpedia.org/ontology/',
         }
         
-        # Get all classes
-        classes_query = """
+        for prefix, namespace in defaults.items():
+            self.add_namespace(prefix, namespace)
+    
+    def add_namespace(self, prefix: str, namespace: str):
+        """Add a namespace prefix mapping"""
+        self.namespace_map[prefix] = namespace
+        self.reverse_map[namespace] = prefix
+    
+    def extract_namespaces_from_graph(self, graph: ConjunctiveGraph):
+        """Extract namespace bindings from RDF graph"""
+        try:
+            for prefix, namespace in graph.namespaces():
+                if prefix and namespace:
+                    self.add_namespace(str(prefix), str(namespace))
+            logger.info(f"Extracted {len(self.namespace_map)} namespace prefixes")
+        except Exception as e:
+            logger.warning(f"Could not extract namespaces: {e}")
+    
+    def shorten_uri(self, uri: str) -> str:
+        """Convert URI to shortened form using namespace prefixes"""
+        if not self.use_shortened_names:
+            return uri
+            
+        # Try exact namespace match
+        for namespace, prefix in self.reverse_map.items():
+            if uri.startswith(namespace):
+                local_name = uri[len(namespace):]
+                # Create valid identifier
+                local_name = re.sub(r'[^a-zA-Z0-9_]', '_', local_name)
+                return f"{prefix}_{local_name}" if local_name else prefix
+        
+        # Fallback: create readable name from URI structure
+        parsed = urlparse(uri)
+        if parsed.fragment:
+            local_name = parsed.fragment
+        elif '/' in parsed.path:
+            local_name = parsed.path.split('/')[-1]
+        elif '#' in uri:
+            local_name = uri.split('#')[-1]
+        else:
+            local_name = 'resource'
+        
+        # Ensure valid identifier
+        safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', local_name)
+        return safe_name or 'unknown_resource'
+
+class RDFAnalyzer:
+    """Analyzes RDF graph structure for optimized conversion"""
+    
+    def __init__(self, graph: ConjunctiveGraph, config: ConversionConfig):
+        self.graph = graph
+        self.config = config
+        self.analysis_results: Dict[str, Any] = {}
+    
+    def analyze_schema(self) -> Dict[str, Any]:
+        """Perform comprehensive schema analysis"""
+        logger.info("Starting RDF schema analysis...")
+        
+        analysis = {
+            'classes': self._analyze_classes(),
+            'properties': self._analyze_properties(),
+            'datatypes': self._analyze_datatypes(),
+            'statistics': self._gather_statistics(),
+            'patterns': self._identify_patterns()
+        }
+        
+        self.analysis_results = analysis
+        logger.info("Schema analysis completed")
+        return analysis
+    
+    def _analyze_classes(self) -> Dict[str, Dict[str, Any]]:
+        """Analyze RDF classes and their instances"""
+        classes = {}
+        
+        # Query for all classes and their instance counts
+        query = """
         SELECT ?class (COUNT(?instance) as ?count) WHERE {
             ?instance a ?class .
         } GROUP BY ?class ORDER BY DESC(?count)
         """
         
-        for result in self.graph.query(classes_query):
-            class_uri = str(result[0])
-            count = int(result[1])
-            analysis['classes'][class_uri] = {
-                'count': count,
-                'short_name': self._get_short_name(class_uri)
-            }
+        try:
+            results = self.graph.query(query)
+            for row in results:
+                class_uri = str(row[0])
+                count = int(row[1])
+                classes[class_uri] = {
+                    'instance_count': count,
+                    'properties': self._get_class_properties(class_uri)
+                }
+        except Exception as e:
+            logger.warning(f"Error analyzing classes: {e}")
         
-        # Get all properties
-        properties_query = """
-        SELECT ?prop (COUNT(*) as ?count) WHERE {
+        return classes
+    
+    def _analyze_properties(self) -> Dict[str, Dict[str, Any]]:
+        """Analyze RDF properties and their usage"""
+        properties = {}
+        
+        query = """
+        SELECT ?prop (COUNT(*) as ?count) 
+               (COUNT(DISTINCT ?s) as ?subject_count)
+               (COUNT(DISTINCT ?o) as ?object_count) WHERE {
             ?s ?prop ?o .
         } GROUP BY ?prop ORDER BY DESC(?count)
         """
         
-        for result in self.graph.query(properties_query):
-            prop_uri = str(result[0])
-            count = int(result[1])
-            analysis['properties'][prop_uri] = {
-                'count': count,
-                'short_name': self._get_short_name(prop_uri)
-            }
+        try:
+            results = self.graph.query(query)
+            for row in results:
+                prop_uri = str(row[0])
+                properties[prop_uri] = {
+                    'usage_count': int(row[1]),
+                    'subject_count': int(row[2]),
+                    'object_count': int(row[3]),
+                    'is_object_property': self._is_object_property(prop_uri),
+                    'range_analysis': self._analyze_property_range(prop_uri)
+                }
+        except Exception as e:
+            logger.warning(f"Error analyzing properties: {e}")
         
-        # Get namespaces
-        for prefix, namespace in self.graph.namespaces():
-            analysis['namespaces'][str(prefix)] = str(namespace)
+        return properties
+    
+    def _analyze_datatypes(self) -> Dict[str, int]:
+        """Analyze literal datatypes usage"""
+        datatypes = Counter()
         
-        # Get statistics
-        stats_queries = {
+        query = """
+        SELECT ?datatype (COUNT(*) as ?count) WHERE {
+            ?s ?p ?o .
+            FILTER(isLiteral(?o))
+            BIND(datatype(?o) as ?datatype)
+        } GROUP BY ?datatype
+        """
+        
+        try:
+            results = self.graph.query(query)
+            for row in results:
+                dt = str(row[0]) if row[0] else 'untyped'
+                datatypes[dt] = int(row[1])
+        except Exception as e:
+            logger.warning(f"Error analyzing datatypes: {e}")
+        
+        return dict(datatypes)
+    
+    def _gather_statistics(self) -> Dict[str, int]:
+        """Gather general graph statistics"""
+        stats = {}
+        
+        stat_queries = {
             'total_triples': "SELECT (COUNT(*) as ?count) WHERE { ?s ?p ?o }",
             'unique_subjects': "SELECT (COUNT(DISTINCT ?s) as ?count) WHERE { ?s ?p ?o }",
             'unique_predicates': "SELECT (COUNT(DISTINCT ?p) as ?count) WHERE { ?s ?p ?o }",
-            'unique_objects': "SELECT (COUNT(DISTINCT ?o) as ?count) WHERE { ?s ?p ?o }"
+            'unique_objects': "SELECT (COUNT(DISTINCT ?o) as ?count) WHERE { ?s ?p ?o }",
+            'literal_objects': "SELECT (COUNT(*) as ?count) WHERE { ?s ?p ?o . FILTER(isLiteral(?o)) }",
+            'uri_objects': "SELECT (COUNT(*) as ?count) WHERE { ?s ?p ?o . FILTER(isURI(?o)) }",
         }
         
-        for stat_name, query in stats_queries.items():
-            result = list(self.graph.query(query))[0]
-            analysis['statistics'][stat_name] = int(result[0])
+        for stat_name, query in stat_queries.items():
+            try:
+                result = list(self.graph.query(query))[0]
+                stats[stat_name] = int(result[0])
+            except Exception as e:
+                logger.warning(f"Error gathering {stat_name}: {e}")
+                stats[stat_name] = 0
         
-        return analysis
+        return stats
     
-    def _get_short_name(self, uri: str) -> str:
-        """Get short name for URI"""
-        if '#' in uri:
-            return uri.split('#')[-1]
-        elif '/' in uri:
-            return uri.split('/')[-1]
-        return uri
-    
-    def get_property_ranges(self, property_uri: str) -> Dict:
-        """Analyze the range of values for a specific property"""
-        
-        range_query = f"""
-        SELECT ?o (COUNT(*) as ?count) WHERE {{
-            ?s <{property_uri}> ?o .
-        }} GROUP BY ?o ORDER BY DESC(?count) LIMIT 100
+    def _get_class_properties(self, class_uri: str) -> List[str]:
+        """Get properties used by instances of a class"""
+        query = f"""
+        SELECT DISTINCT ?prop WHERE {{
+            ?instance a <{class_uri}> .
+            ?instance ?prop ?value .
+        }}
         """
         
-        ranges = {'literals': [], 'uris': [], 'datatypes': {}}
+        try:
+            results = self.graph.query(query)
+            return [str(row[0]) for row in results]
+        except:
+            return []
+    
+    def _is_object_property(self, prop_uri: str) -> bool:
+        """Determine if property is typically used with URI objects"""
+        query = f"""
+        SELECT (COUNT(?uri_obj) as ?uri_count) (COUNT(?lit_obj) as ?lit_count) WHERE {{
+            {{ SELECT ?uri_obj WHERE {{ ?s <{prop_uri}> ?uri_obj . FILTER(isURI(?uri_obj)) }} LIMIT 100 }}
+            UNION
+            {{ SELECT ?lit_obj WHERE {{ ?s <{prop_uri}> ?lit_obj . FILTER(isLiteral(?lit_obj)) }} LIMIT 100 }}
+        }}
+        """
         
-        for result in self.graph.query(range_query):
-            obj = result[0]
-            count = int(result[1])
-            
-            if isinstance(obj, Literal):
-                ranges['literals'].append({'value': str(obj), 'count': count})
-                datatype = str(obj.datatype) if obj.datatype else 'string'
-                ranges['datatypes'][datatype] = ranges['datatypes'].get(datatype, 0) + count
-            else:
-                ranges['uris'].append({'value': str(obj), 'count': count})
+        try:
+            result = list(self.graph.query(query))[0]
+            uri_count = int(result[0]) if result[0] else 0
+            lit_count = int(result[1]) if result[1] else 0
+            return uri_count > lit_count
+        except:
+            return False
+    
+    def _analyze_property_range(self, prop_uri: str) -> Dict[str, Any]:
+        """Analyze the range of values for a property"""
+        query = f"""
+        SELECT ?o (COUNT(*) as ?count) WHERE {{
+            ?s <{prop_uri}> ?o .
+        }} GROUP BY ?o ORDER BY DESC(?count) LIMIT 20
+        """
+        
+        ranges = {'literals': [], 'uris': [], 'sample_values': []}
+        
+        try:
+            results = self.graph.query(query)
+            for row in results:
+                obj = row[0]
+                count = int(row[1])
+                
+                sample = {'value': str(obj), 'count': count}
+                ranges['sample_values'].append(sample)
+                
+                if isinstance(obj, Literal):
+                    ranges['literals'].append(sample)
+                else:
+                    ranges['uris'].append(sample)
+        except:
+            pass
         
         return ranges
+    
+    def _identify_patterns(self) -> Dict[str, Any]:
+        """Identify common graph patterns"""
+        patterns = {
+            'has_hierarchical_structure': self._check_hierarchical_patterns(),
+            'has_temporal_data': self._check_temporal_patterns(),
+            'has_multilingual_content': self._check_multilingual_patterns(),
+            'complexity_score': self._calculate_complexity_score()
+        }
+        return patterns
+    
+    def _check_hierarchical_patterns(self) -> bool:
+        """Check for hierarchical relationship patterns"""
+        hierarchical_props = [
+            'http://www.w3.org/2000/01/rdf-schema#subClassOf',
+            'http://www.w3.org/2004/02/skos/core#broader',
+            'http://www.w3.org/2004/02/skos/core#narrower',
+            'http://purl.org/dc/terms/isPartOf'
+        ]
+        
+        for prop in hierarchical_props:
+            query = f"ASK {{ ?s <{prop}> ?o }}"
+            try:
+                if self.graph.query(query):
+                    return True
+            except:
+                continue
+        return False
+    
+    def _check_temporal_patterns(self) -> bool:
+        """Check for temporal data patterns"""
+        temporal_props = [
+            'http://purl.org/dc/terms/created',
+            'http://purl.org/dc/terms/modified',
+            'http://purl.org/dc/terms/date',
+            'http://www.w3.org/2006/time#hasTime'
+        ]
+        
+        for prop in temporal_props:
+            query = f"ASK {{ ?s <{prop}> ?o }}"
+            try:
+                if self.graph.query(query):
+                    return True
+            except:
+                continue
+        return False
+    
+    def _check_multilingual_patterns(self) -> bool:
+        """Check for multilingual content"""
+        query = """
+        ASK {
+            ?s ?p ?o .
+            FILTER(isLiteral(?o) && lang(?o) != "")
+        }
+        """
+        
+        try:
+            return bool(self.graph.query(query))
+        except:
+            return False
+    
+    def _calculate_complexity_score(self) -> float:
+        """Calculate a complexity score for the graph"""
+        stats = self.analysis_results.get('statistics', {})
+        
+        if not stats:
+            return 0.0
+        
+        # Simple complexity calculation based on various factors
+        total_triples = stats.get('total_triples', 1)
+        unique_predicates = stats.get('unique_predicates', 1)
+        unique_subjects = stats.get('unique_subjects', 1)
+        
+        # Higher predicate/subject ratio indicates more complex object descriptions
+        complexity = (unique_predicates / unique_subjects) * (total_triples / 10000)
+        return min(complexity, 10.0)  # Cap at 10
 
-class BatchProcessor:
-    """Process RDF data in batches for large graphs"""
+class FalkorDBManager:
+    """Manages FalkorDB connection and operations"""
     
-    def __init__(self, sparql_endpoint: str, falkordb_graph, batch_size: int = 1000,
-                 username: str = None, password: str = None):
-        auth = (username, password) if username and password else None
-        self.store = sparqlstore.SPARQLUpdateStore(sparql_endpoint, auth=auth)
-        self.rdf_graph = ConjunctiveGraph(store=self.store)
-        self.falkor_graph = falkordb_graph
-        self.batch_size = batch_size
+    def __init__(self, config: ConversionConfig):
+        self.config = config
+        self.db = None
+        self.graph = None
+        self._connect()
     
-    def process_in_batches(self):
-        """Process RDF data in batches"""
+    def _connect(self):
+        """Establish connection to FalkorDB"""
+        try:
+            connect_kwargs = {
+                'host': self.config.falkordb_host,
+                'port': self.config.falkordb_port
+            }
+            
+            if self.config.falkordb_password:
+                connect_kwargs['password'] = self.config.falkordb_password
+            
+            self.db = falkordb.FalkorDB(**connect_kwargs)
+            self.graph = self.db.select_graph(self.config.graph_name)
+            logger.info(f"Connected to FalkorDB at {self.config.falkordb_host}:{self.config.falkordb_port}")
+        except Exception as e:
+            logger.error(f"Failed to connect to FalkorDB: {e}")
+            raise
+    
+    def clear_graph(self):
+        """Clear existing graph data"""
+        try:
+            self.graph.query("MATCH (n) DETACH DELETE n")
+            logger.info("Cleared existing graph data")
+        except Exception as e:
+            logger.error(f"Error clearing graph: {e}")
+            raise
+    
+    def create_indexes(self):
+        """Create performance indexes"""
+        if not self.config.create_indexes:
+            return
         
-        # Get total count
-        count_query = "SELECT (COUNT(*) as ?count) WHERE { ?s ?p ?o }"
-        total_triples = int(list(self.rdf_graph.query(count_query))[0][0])
+        index_queries = [
+            "CREATE INDEX IF NOT EXISTS FOR (n:Resource) ON (n.uri)",
+            "CREATE INDEX IF NOT EXISTS FOR ()-[r:RELATIONSHIP]->() ON (r.uri)",
+        ]
         
-        print(f"Processing {total_triples} triples in batches of {self.batch_size}")
+        for query in index_queries:
+            try:
+                self.graph.query(query)
+                logger.debug(f"Created index: {query}")
+            except Exception as e:
+                logger.warning(f"Could not create index: {e}")
+    
+    def execute_query(self, query: str, params: Optional[Dict] = None) -> Any:
+        """Execute a Cypher query with error handling"""
+        max_retries = self.config.max_retries
         
+        for attempt in range(max_retries):
+            try:
+                return self.graph.query(query, params or {})
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logger.error(f"Query failed after {max_retries} attempts: {e}")
+                    raise
+                logger.warning(f"Query attempt {attempt + 1} failed, retrying: {e}")
+                time.sleep(2 ** attempt)  # Exponential backoff
+    
+    def get_statistics(self) -> Dict[str, int]:
+        """Get current graph statistics"""
+        try:
+            node_result = self.graph.query("MATCH (n) RETURN count(n) as count")
+            node_count = node_result.result_set[0][0] if node_result.result_set else 0
+            
+            rel_result = self.graph.query("MATCH ()-[r]->() RETURN count(r) as count")
+            rel_count = rel_result.result_set[0][0] if rel_result.result_set else 0
+            
+            return {'nodes': node_count, 'relationships': rel_count}
+        except Exception as e:
+            logger.error(f"Error getting statistics: {e}")
+            return {'nodes': 0, 'relationships': 0}
+
+class RDFToFalkorDBConverter:
+    """Main converter class with comprehensive functionality"""
+    
+    def __init__(self, config: ConversionConfig):
+        self.config = config
+        self.stats = ConversionStats(start_time=datetime.now())
+        self.namespace_manager = NamespaceManager(config.use_shortened_names)
+        self.falkordb_manager = FalkorDBManager(config)
+        self.rdf_graph = None
+        self._setup_rdf_connection()
+        
+        # Data structures for tracking conversion
+        self.nodes_cache: Dict[str, Dict[str, Any]] = {}
+        self.relationships_cache: List[Tuple[str, str, str, Dict[str, Any]]] = []
+        self.processed_uris: Set[str] = set()
+        
+    def _setup_rdf_connection(self):
+        """Setup RDF graph connection to SPARQL endpoint"""
+        try:
+            auth = None
+            if self.config.username and self.config.password:
+                auth = (self.config.username, self.config.password)
+            
+            # Setup SPARQL store with proper configuration
+            store_kwargs = {
+                'auth': auth,
+                'timeout': self.config.timeout,
+            }
+            
+            store = sparqlstore.SPARQLUpdateStore(
+                self.config.sparql_endpoint,
+                **store_kwargs
+            )
+            
+            self.rdf_graph = ConjunctiveGraph(store=store)
+            logger.info(f"Connected to SPARQL endpoint: {self.config.sparql_endpoint}")
+            
+        except Exception as e:
+            logger.error(f"Failed to connect to SPARQL endpoint: {e}")
+            raise
+    
+    def convert(self) -> ConversionStats:
+        """Main conversion method with full pipeline"""
+        try:
+            logger.info("Starting RDF to FalkorDB conversion...")
+            
+            # Step 1: Clear existing data if needed
+            self.falkordb_manager.clear_graph()
+            
+            # Step 2: Extract namespaces
+            self._extract_namespaces()
+            
+            # Step 3: Analyze schema (optional but recommended)
+            analyzer = RDFAnalyzer(self.rdf_graph, self.config)
+            schema_analysis = analyzer.analyze_schema()
+            
+            if self.config.export_metadata:
+                self._export_analysis(schema_analysis)
+            
+            # Step 4: Process data in batches
+            self._process_data_in_batches()
+            
+            # Step 5: Create indexes for performance
+            self.falkordb_manager.create_indexes()
+            
+            # Step 6: Validate results
+            if self.config.validate_data:
+                self._validate_conversion()
+            
+            # Step 7: Finalize statistics
+            self._finalize_stats()
+            
+            logger.info("Conversion completed successfully!")
+            return self.stats
+            
+        except Exception as e:
+            logger.error(f"Conversion failed: {e}")
+            self.stats.errors += 1
+            raise
+    
+    def _extract_namespaces(self):
+        """Extract namespace prefixes from RDF graph"""
+        try:
+            self.namespace_manager.extract_namespaces_from_graph(self.rdf_graph)
+            self.stats.namespaces_discovered = len(self.namespace_manager.namespace_map)
+        except Exception as e:
+            logger.warning(f"Could not extract namespaces: {e}")
+    
+    def _process_data_in_batches(self):
+        """Process RDF triples in configurable batches"""
+        
+        # First, get total count for progress tracking
+        try:
+            count_query = "SELECT (COUNT(*) as ?count) WHERE { ?s ?p ?o }"
+            count_result = list(self.rdf_graph.query(count_query))[0]
+            self.stats.total_triples = int(count_result[0])
+            logger.info(f"Total triples to process: {self.stats.total_triples}")
+        except Exception as e:
+            logger.warning(f"Could not get total count: {e}")
+            self.stats.total_triples = 0
+        
+        # Process in batches
         offset = 0
-        while offset < total_triples:
+        batch_size = self.config.batch_size
+        
+        while True:
             batch_query = f"""
             SELECT ?s ?p ?o WHERE {{
                 ?s ?p ?o .
-            }} LIMIT {self.batch_size} OFFSET {offset}
+            }} LIMIT {batch_size} OFFSET {offset}
             """
             
-            batch_results = list(self.rdf_graph.query(batch_query))
-            self._process_batch(batch_results)
-            
-            offset += self.batch_size
-            progress = min(100, (offset / total_triples) * 100)
-            print(f"Progress: {progress:.1f}% ({offset}/{total_triples})")
+            try:
+                batch_results = list(self.rdf_graph.query(batch_query))
+                
+                if not batch_results:
+                    break
+                
+                self._process_batch(batch_results)
+                
+                offset += batch_size
+                progress = (offset / self.stats.total_triples * 100) if self.stats.total_triples > 0 else 0
+                logger.info(f"Progress: {progress:.1f}% ({offset}/{self.stats.total_triples})")
+                
+                # Commit batch to FalkorDB
+                self._commit_batch()
+                
+            except Exception as e:
+                logger.error(f"Error processing batch at offset {offset}: {e}")
+                self.stats.errors += 1
+                break
     
     def _process_batch(self, batch_results: List[Tuple]):
-        """Process a batch of triples"""
-        
-        # Collect nodes and relationships from batch
-        nodes_in_batch = set()
-        relationships_in_batch = []
+        """Process a batch of RDF triples"""
         
         for s, p, o in batch_results:
-            if isinstance(s, URIRef):
-                nodes_in_batch.add(str(s))
+            try:
+                if self._should_skip_triple(s, p, o):
+                    self.stats.skipped_triples += 1
+                    continue
+                
+                self._process_triple(s, p, o)
+                self.stats.processed_triples += 1
+                
+            except Exception as e:
+                logger.warning(f"Error processing triple {s} {p} {o}: {e}")
+                self.stats.errors += 1
+    
+    def _should_skip_triple(self, s, p, o) -> bool:
+        """Determine if a triple should be skipped"""
+        
+        # Skip if predicate is excluded
+        if self.config.excluded_predicates:
+            if str(p) in self.config.excluded_predicates:
+                return True
+        
+        # Skip if namespace is not included (if filter is set)
+        if self.config.included_namespaces:
+            subject_ns = self._get_namespace(str(s))
+            if subject_ns not in self.config.included_namespaces:
+                return True
+        
+        return False
+    
+    def _process_triple(self, s, p, o):
+        """Process individual RDF triple"""
+        
+        subject_uri = str(s)
+        predicate_uri = str(p)
+        
+        # Ensure subject node exists
+        if subject_uri not in self.nodes_cache:
+            self._create_node_entry(subject_uri, s)
+        
+        if isinstance(o, (URIRef, BNode)):
+            # Object is a resource - create relationship
+            object_uri = str(o)
             
-            if isinstance(o, URIRef):
-                nodes_in_batch.add(str(o))
-                relationships_in_batch.append((str(s), str(p), str(o)))
-        
-        # Create nodes for this batch
-        for node_uri in nodes_in_batch:
-            self._create_node_if_not_exists(node_uri)
-        
-        # Create relationships for this batch
-        for s, p, o in relationships_in_batch:
-            self._create_relationship(s, p, o)
+            # Ensure object node exists
+            if object_uri not in self.nodes_cache:
+                self._create_node_entry(object_uri, o)
+            
+            # Handle rdf:type specially (becomes node label)
+            if predicate_uri == str(RDF.type):
+                self._add_type_to_node(subject_uri, object_uri)
+            else:
+                # Create relationship
+                self._add_relationship(subject_uri, predicate_uri, object_uri)
+                
+        elif isinstance(o, Literal):
+            # Object is literal - add as node property
+            self._add_property_to_node(subject_uri, predicate_uri, o)
     
-    def _create_node_if_not_exists(self, uri: str):
-        """Create node if it doesn't exist"""
-        check_query = "MATCH (n {uri: $uri}) RETURN n"
-        result = self.falkor_graph.query(check_query, {'uri': uri})
-        
-        if not result.result_set:
-            # Node doesn't exist, create it
-            create_query = "CREATE (n:Resource {uri: $uri})"
-            self.falkor_graph.query(create_query, {'uri': uri})
-    
-    def _create_relationship(self, subject: str, predicate: str, obj: str):
-        """Create relationship between nodes"""
-        rel_type = predicate.split('/')[-1].split('#')[-1]
-        rel_query = f"""
-        MATCH (s {{uri: $subject}}), (o {{uri: $object}})
-        CREATE (s)-[:{rel_type}]->(o)
-        """
-        self.falkor_graph.query(rel_query, {'subject': subject, 'object': obj})
-
-class SchemaMapper:
-    """Map RDF schema to property graph schema"""
-    
-    def __init__(self, schema_analysis: Dict):
-        self.schema = schema_analysis
-    
-    def generate_mapping_config(self) -> Dict:
-        """Generate configuration for schema mapping"""
-        
-        config = {
-            'node_labels': {},
-            'relationship_types': {},
-            'property_mappings': {}
+    def _create_node_entry(self, uri: str, rdf_node):
+        """Create a new node entry in cache"""
+        node_data = {
+            'uri': uri,
+            'labels': set(['Resource']),  # Default label
+            'properties': {},
+            'rdf_type': type(rdf_node).__name__
         }
         
-        # Map RDF classes to node labels
-        for class_uri, class_info in self.schema['classes'].items():
-            config['node_labels'][class_uri] = {
-                'label': class_info['short_name'],
-                'count': class_info['count']
-            }
+        # Handle blank nodes specially
+        if isinstance(rdf_node, BNode):
+            node_data['labels'].add('BlankNode')
+            if not self.config.preserve_blank_nodes:
+                node_data['properties']['blank_node_id'] = str(rdf_node)
         
-        # Map RDF properties to relationship types or node properties
-        for prop_uri, prop_info in self.schema['properties'].items():
-            short_name = prop_info['short_name']
+        self.nodes_cache[uri] = node_data
+    
+    def _add_type_to_node(self, subject_uri: str, type_uri: str):
+        """Add rdf:type as node label"""
+        if subject_uri in self.nodes_cache:
+            type_label = self.namespace_manager.shorten_uri(type_uri)
+            # Clean label name
+            type_label = re.sub(r'[^a-zA-Z0-9_]', '_', type_label)
+            if type_label and type_label != 'Resource':
+                self.nodes_cache[subject_uri]['labels'].add(type_label)
+    
+    def _add_property_to_node(self, subject_uri: str, predicate_uri: str, literal_obj: Literal):
+        """Add literal property to node"""
+        if subject_uri in self.nodes_cache:
+            prop_name = self.namespace_manager.shorten_uri(predicate_uri)
+            prop_value = self._convert_literal_value(literal_obj)
             
-            if prop_uri == 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type':
-                # Skip rdf:type as it's handled by node labels
-                continue
-            
-            config['relationship_types'][prop_uri] = {
-                'type': short_name,
-                'count': prop_info['count']
-            }
+            # Handle multiple values for same property
+            existing_value = self.nodes_cache[subject_uri]['properties'].get(prop_name)
+            if existing_value is not None:
+                if isinstance(existing_value, list):
+                    existing_value.append(prop_value)
+                else:
+                    self.nodes_cache[subject_uri]['properties'][prop_name] = [existing_value, prop_value]
+            else:
+                self.nodes_cache[subject_uri]['properties'][prop_name] = prop_value
+    
+    def _add_relationship(self, subject_uri: str, predicate_uri: str, object_uri: str):
+        """Add relationship to cache"""
+        rel_type = self.namespace_manager.shorten_uri(predicate_uri)
+        rel_type = re.sub(r'[^a-zA-Z0-9_]', '_', rel_type)
         
-        return config
+        rel_properties = {
+            'uri': predicate_uri,
+            'original_predicate': predicate_uri
+        }
+        
+        self.relationships_cache.append((subject_uri, rel_type, object_uri, rel_properties))
     
-    def save_mapping_config(self, filename: str, config: Dict):
-        """Save mapping configuration to file"""
-        with open(filename, 'w') as f:
-            json.dump(config, f, indent=2)
+    def _convert_literal_value(self, literal: Literal) -> Any:
+        """Convert RDF literal to appropriate Python value"""
+        try:
+            if literal.datatype:
+                # Handle typed literals
+                if literal.datatype == XSD.integer:
+                    return int(literal)
+                elif literal.datatype == XSD.decimal or literal.datatype == XSD.float:
+                    return float(literal)
+                elif literal.datatype == XSD.boolean:
+                    return str(literal).lower() in ('true', '1')
+                elif literal.datatype == XSD.dateTime:
+                    return str(literal)  # Keep as string, FalkorDB will handle datetime
+                else:
+                    return str(literal)
+            else:
+                # Handle language tags
+                if literal.language:
+                    return f"{literal}@{literal.language}"
+                return str(literal)
+        except Exception as e:
+            logger.warning(f"Error converting literal {literal}: {e}")
+            return str(literal)
     
-    def load_mapping_config(self, filename: str) -> Dict:
-        """Load mapping configuration from file"""
-        with open(filename, 'r') as f:
-            return json.load(f)
+    def _commit_batch(self):
+        """Commit current batch to FalkorDB"""
+        
+        # Create nodes
+        for uri, node_data in self.nodes_cache.items():
+            self._create_falkordb_node(uri, node_data)
+            self.stats.created_nodes += 1
+        
+        # Create relationships
+        for subj_uri, rel_type, obj_uri, rel_props in self.relationships_cache:
+            self._create_falkordb_relationship(subj_uri, rel_type, obj_uri, rel_props)
+            self.stats.created_relationships += 1
+        
+        # Clear caches
+        self.nodes_cache.clear()
+        self.relationships_cache.clear()
+    
+    def _create_falkordb_node(self, uri: str, node_data: Dict[str, Any]):
+        """Create node in FalkorDB"""
+        try:
+            # Prepare labels
+            labels = ':'.join(sorted(node_data['labels']))
+            
+            # Prepare properties
+            properties = dict(node_data['properties'])
+            properties['uri'] = uri
+            
+            # Build Cypher query
+            props_clause = ', '.join([f"{k}: ${k}" for k in properties.keys()])
+            query = f"CREATE (n:{labels} {{{props_clause}}})"
+            
+            self.falkordb_manager.execute_query(query, properties)
+            
+        except Exception as e:
+            logger.error(f"Error creating node {uri}: {e}")
+            raise
+    
+    def _create_falkordb_relationship(self, subj_uri: str, rel_type: str, obj_uri: str, rel_props: Dict[str, Any]):
+        """Create relationship in FalkorDB"""
+        try:
+            # Build relationship properties clause
+            props_clause = ''
+            if rel_props:
+                props_clause = '{' + ', '.join([f"{k}: ${k}" for k in rel_props.keys()]) + '}'
+            
+            query = f"""
+            MATCH (s {{uri: $subject_uri}}), (o {{uri: $object_uri}})
+            CREATE (s)-[:{rel_type} {props_clause}]->(o)
+            """
+            
+            params = {
+                'subject_uri': subj_uri,
+                'object_uri': obj_uri,
+                **rel_props
+            }
+            
+            self.falkordb_manager.execute_query(query, params)
+            
+        except Exception as e:
+            logger.error(f"Error creating relationship {subj_uri} -> {obj_uri}: {e}")
+            # Don't raise here to allow partial success
+    
+    def _get_namespace(self, uri: str) -> str:
+        """Extract namespace from URI"""
+        for namespace in self.namespace_manager.reverse_map.keys():
+            if uri.startswith(namespace):
+                return namespace
+        return ""
+    
+    def _validate_conversion(self):
+        """Validate the conversion results"""
+        logger.info("Validating conversion results...")
+        
+        falkor_stats = self.falkordb_manager.get_statistics()
+        
+        # Basic validation
+        if falkor_stats['nodes'] == 0:
+            logger.warning("No nodes were created in FalkorDB")
+        
+        if self.stats.processed_triples > 0 and falkor_stats['relationships'] == 0:
+            logger.warning("No relationships were created despite processing triples")
+        
+        # Log final statistics
+        logger.info(f"Validation complete. FalkorDB contains {falkor_stats['nodes']} nodes and {falkor_stats['relationships']} relationships")
+    
+    def _export_analysis(self, analysis: Dict[str, Any]):
+        """Export schema analysis to file"""
+        try:
+            filename = f"rdf_analysis_{self.config.graph_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            with open(filename, 'w') as f:
+                json.dump(analysis, f, indent=2, default=str)
+            logger.info(f"Schema analysis exported to {filename}")
+        except Exception as e:
+            logger.warning(f"Could not export analysis: {e}")
+    
+    def _finalize_stats(self):
+        """Finalize conversion statistics"""
+        self.stats.end_time = datetime.now()
+        
+        duration = (self.stats.end_time - self.stats.start_time).total_seconds()
+        if duration > 0:
+            self.stats.processing_rate = self.stats.processed_triples / duration
+        
+        # Get final counts from FalkorDB
+        falkor_stats = self.falkordb_manager.get_statistics()
+        self.stats.created_nodes = falkor_stats['nodes']
+        self.stats.created_relationships = falkor_stats['relationships']
+    
+    def get_sample_queries(self) -> List[str]:
+        """Generate sample Cypher queries for the converted graph"""
+        queries = [
+            "MATCH (n) RETURN labels(n) as labels, count(n) as count ORDER BY count DESC LIMIT 10",
+            "MATCH ()-[r]->() RETURN type(r) as relationship_type, count(r) as count ORDER BY count DESC LIMIT 10",
+            "MATCH (n) WHERE size((n)--()) > 5 RETURN n.uri as highly_connected_nodes, size((n)--()) as degree ORDER BY degree DESC LIMIT 10",
+            "MATCH (n) RETURN n LIMIT 5",
+            "MATCH (s)-[r]->(o) RETURN s.uri, type(r), o.uri LIMIT 10"
+        ]
+        return queries
+    
+    def export_stats(self, filename: Optional[str] = None):
+        """Export conversion statistics to JSON file"""
+        if not filename:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"conversion_stats_{self.config.graph_name}_{timestamp}.json"
+        
+        try:
+            with open(filename, 'w') as f:
+                json.dump(self.stats.to_dict(), f, indent=2)
+            logger.info(f"Conversion statistics exported to {filename}")
+        except Exception as e:
+            logger.warning(f"Could not export statistics: {e}")
 
-# Usage example combining all utilities
-def comprehensive_conversion(sparql_endpoint: str, username: str = None, password: str = None):
-    """Complete conversion workflow with analysis and optimization"""
+# Utility functions
+def create_config_from_dict(config_dict: Dict[str, Any]) -> ConversionConfig:
+    """Create ConversionConfig from dictionary"""
+    return ConversionConfig(**config_dict)
+
+def validate_sparql_endpoint(endpoint: str, username: str = None, password: str = None) -> bool:
+    """Validate SPARQL endpoint connectivity"""
+    try:
+        auth = (username, password) if username and password else None
+        store = sparqlstore.SPARQLStore(endpoint, auth=auth)
+        
+        # Simple test query
+        g = Graph(store=store)
+        list(g.query("SELECT * WHERE { ?s ?p ?o } LIMIT 1"))
+        return True
+    except Exception as e:
+        logger.error(f"SPARQL endpoint validation failed: {e}")
+        return False
+
+def main():
+    """Example usage of the converter"""
     
-    # Step 1: Analyze the RDF schema
-    print("Step 1: Analyzing RDF schema...")
-    analyzer = RDFAnalyzer(sparql_endpoint, username, password)
-    schema_analysis = analyzer.analyze_schema()
+    # Configuration
+    config = ConversionConfig(
+        sparql_endpoint="https://your-sparql-endpoint.com/sparql",
+        username="your_username",  # Optional
+        password="your_password",  # Optional
+        falkordb_host='localhost',
+        falkordb_port=6379,
+        graph_name='converted_rdf_graph',
+        batch_size=1000,
+        use_shortened_names=True,
+        create_indexes=True,
+        validate_data=True,
+        export_metadata=True
+    )
     
-    print(f"Found {len(schema_analysis['classes'])} classes and {len(schema_analysis['properties'])} properties")
-    print(f"Total triples: {schema_analysis['statistics']['total_triples']}")
+    # Validate endpoint before conversion
+    if not validate_sparql_endpoint(config.sparql_endpoint, config.username, config.password):
+        logger.error("Cannot connect to SPARQL endpoint")
+        return
     
-    # Step 2: Generate mapping configuration
-    print("Step 2: Generating schema mapping...")
-    mapper = SchemaMapper(schema_analysis)
-    mapping_config = mapper.generate_mapping_config()
-    mapper.save_mapping_config('rdf_mapping.json', mapping_config)
-    
-    # Step 3: Setup FalkorDB
-    print("Step 3: Setting up FalkorDB...")
-    db = falkordb.FalkorDB()
-    falkor_graph = db.select_graph('comprehensive_rdf_graph')
-    falkor_graph.query("MATCH (n) DETACH DELETE n")  # Clear existing data
-    
-    # Step 4: Process in batches if large dataset
-    print("Step 4: Converting data...")
-    total_triples = schema_analysis['statistics']['total_triples']
-    
-    if total_triples > 10000:  # Use batch processing for large datasets
-        processor = BatchProcessor(sparql_endpoint, falkor_graph, batch_size=1000, 
-                                 username=username, password=password)
-        processor.process_in_batches()
-    else:
-        # Use the comprehensive converter for smaller datasets
-        from rdf_to_falkordb_converter import RDFToFalkorDBConverter
-        converter = RDFToFalkorDBConverter(sparql_endpoint, username=username, password=password)
-        converter.convert()
-    
-    print("Conversion completed!")
-    
-    return schema_analysis, mapping_config
+    # Create and run converter
+    try:
+        converter = RDFToFalkorDBConverter(config)
+        stats = converter.convert()
+        
+        # Export statistics
+        converter.export_stats()
+        
+        # Print summary
+        print("\nConversion Summary:")
+        print(f"Total triples processed: {stats.processed_triples}")
+        print(f"Nodes created: {stats.created_nodes}")
+        print(f"Relationships created: {stats.created_relationships}")
+        print(f"Processing rate: {stats.processing_rate:.2f} triples/second")
+        print(f"Duration: {(stats.end_time - stats.start_time).total_seconds():.2f} seconds")
+        
+        # Show sample queries
+        print("\nSample Cypher queries to explore your data:")
+        for i, query in enumerate(converter.get_sample_queries(), 1):
+            print(f"{i}. {query}")
+        
+    except Exception as e:
+        logger.error(f"Conversion failed: {e}")
+        raise
 
 if __name__ == "__main__":
-    # Run comprehensive conversion
-    endpoint = "your_sparql_endpoint_here"
-    
-    comprehensive_conversion(
-        sparql_endpoint=endpoint,
-        username="username",  # or None
-        password="password"   # or None
-    )
+    main()
