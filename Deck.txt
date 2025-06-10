@@ -312,7 +312,6 @@ class AsyncFalkorDBManager:
                 'timeout': self.config.falkordb_timeout,  # None = infinite timeout
                 'decode_responses': True,
                 'retry_on_timeout': True,
-                'retry_on_error': [redis_async.ConnectionError, redis_async.TimeoutError],
                 'health_check_interval': 30,
             }
             
@@ -320,6 +319,12 @@ class AsyncFalkorDBManager:
                 pool_kwargs['password'] = self.config.falkordb_password
             
             self.pool = BlockingConnectionPool(**pool_kwargs)
+            
+            # Test the connection
+            test_conn = redis_async.Redis(connection_pool=self.pool)
+            await test_conn.ping()
+            await test_conn.aclose()
+            
             self.db = falkordb_async.FalkorDB(connection_pool=self.pool)
             self.graph = self.db.select_graph(self.config.graph_name)
             
@@ -362,15 +367,27 @@ class AsyncFalkorDBManager:
         for attempt in range(self.config.max_retries):
             try:
                 return await self.graph.query(query, params or {})
-            except (redis_async.ConnectionError, redis_async.TimeoutError) as e:
+            except Exception as e:
+                # Check if it's a retryable error
                 if attempt == self.config.max_retries - 1:
                     logger.error(f"Query failed after {self.config.max_retries} attempts: {e}")
                     raise
+                
+                # Log the retry attempt
                 await asyncio.sleep(2 ** attempt)  # Exponential backoff
                 logger.warning(f"Query attempt {attempt + 1} failed, retrying: {e}")
-            except Exception as e:
-                logger.error(f"Non-retryable error in query: {e}")
-                raise
+            except redis_async.ConnectionError as e:
+                if attempt == self.config.max_retries - 1:
+                    logger.error(f"Connection error after {self.config.max_retries} attempts: {e}")
+                    raise
+                await asyncio.sleep(2 ** attempt)
+                logger.warning(f"Connection error on attempt {attempt + 1}, retrying: {e}")
+            except redis_async.TimeoutError as e:
+                if attempt == self.config.max_retries - 1:
+                    logger.error(f"Timeout error after {self.config.max_retries} attempts: {e}")
+                    raise
+                await asyncio.sleep(2 ** attempt)
+                logger.warning(f"Timeout error on attempt {attempt + 1}, retrying: {e}")
     
     async def create_node_batch(self, nodes_batch: List[Tuple[str, Dict[str, Any]]]) -> int:
         """Create a batch of nodes concurrently"""
@@ -495,8 +512,12 @@ class AsyncFalkorDBManager:
     
     async def close(self):
         """Close async connections"""
-        if self.pool:
-            await self.pool.aclose()
+        try:
+            if self.pool:
+                await self.pool.aclose()
+                logger.info("Closed FalkorDB connection pool")
+        except Exception as e:
+            logger.warning(f"Error closing FalkorDB connection pool: {e}")
 
 class AsyncTripleBasedConverter:
     """Main async converter using 6-variable triple query"""
@@ -514,6 +535,19 @@ class AsyncTripleBasedConverter:
         self.semaphore = asyncio.Semaphore(config.max_concurrent_batches)
         
         self._setup_rdf_connection()
+    
+    def _execute_sparql_query(self):
+        """Execute SPARQL query synchronously (for use in executor)"""
+        try:
+            logger.info(f"Executing SPARQL query with timeout {self.config.sparql_timeout}s")
+            # Execute the query and convert to list immediately
+            query_result = self.rdf_graph.query(self.config.triples_query)
+            results = list(query_result)
+            logger.info(f"SPARQL query completed, retrieved {len(results)} triples")
+            return results
+        except Exception as e:
+            logger.error(f"SPARQL query execution failed: {e}")
+            raise
     
     def _setup_rdf_connection(self):
         """Setup RDF graph connection to SPARQL endpoint"""
@@ -585,10 +619,10 @@ class AsyncTripleBasedConverter:
             logger.info(f"Query timeout: {self.config.sparql_timeout}s")
             
             # Execute query in executor to avoid blocking event loop
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             results = await loop.run_in_executor(
                 None, 
-                lambda: list(self.rdf_graph.query(self.config.triples_query))
+                self._execute_sparql_query
             )
             
             self.stats.query_execution_time = time.time() - start_time
@@ -610,6 +644,8 @@ class AsyncTripleBasedConverter:
         total_batches = (len(results) + batch_size - 1) // batch_size
         self.stats.total_batches = total_batches
         
+        logger.info(f"Processing {len(results)} triples in {total_batches} batches of {batch_size}")
+        
         # Create batches
         batches = []
         for i in range(0, len(results), batch_size):
@@ -619,14 +655,18 @@ class AsyncTripleBasedConverter:
         # Process batches concurrently with semaphore control
         tasks = []
         for i, batch in enumerate(batches):
-            task = self._process_single_batch_async(batch, i + 1, total_batches)
+            task = asyncio.create_task(
+                self._process_single_batch_async(batch, i + 1, total_batches)
+            )
             tasks.append(task)
         
-        # Use asyncio.as_completed for processing results as they come in
+        # Process results as they complete
         completed = 0
-        async for task in asyncio.as_completed(tasks):
+        failed = 0
+        
+        for future in asyncio.as_completed(tasks):
             try:
-                await task
+                await future
                 completed += 1
                 self.stats.completed_batches = completed
                 
@@ -634,8 +674,11 @@ class AsyncTripleBasedConverter:
                     progress = (completed / total_batches) * 100
                     logger.info(f"Async batch progress: {progress:.1f}% ({completed}/{total_batches})")
             except Exception as e:
-                self.stats.failed_batches += 1
+                failed += 1
+                self.stats.failed_batches = failed
                 logger.error(f"Batch processing failed: {e}")
+        
+        logger.info(f"Batch processing completed: {completed} successful, {failed} failed")
     
     async def _process_single_batch_async(self, batch: List[Tuple], batch_num: int, total_batches: int):
         """Process a single batch of triples with semaphore control"""
@@ -731,7 +774,9 @@ class AsyncTripleBasedConverter:
         # Process node batches concurrently
         tasks = []
         for batch in node_batches:
-            task = self.falkordb_manager.create_node_batch(batch)
+            task = asyncio.create_task(
+                self.falkordb_manager.create_node_batch(batch)
+            )
             tasks.append(task)
         
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -760,7 +805,9 @@ class AsyncTripleBasedConverter:
         # Process relationship batches concurrently
         tasks = []
         for batch in rel_batches:
-            task = self.falkordb_manager.create_relationship_batch(batch)
+            task = asyncio.create_task(
+                self.falkordb_manager.create_relationship_batch(batch)
+            )
             tasks.append(task)
         
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -843,6 +890,39 @@ class AsyncTripleBasedConverter:
         ]
 
 # Utility functions
+async def test_async_setup(config: AsyncTripleConfig) -> bool:
+    """Test the async setup without running full conversion"""
+    try:
+        logger.info("Testing async setup...")
+        
+        # Test SPARQL connection
+        if not validate_sparql_endpoint(config.sparql_endpoint, config.username, config.password):
+            logger.error("SPARQL endpoint test failed")
+            return False
+        logger.info("✅ SPARQL endpoint accessible")
+        
+        # Test FalkorDB async connection
+        falkordb_manager = AsyncFalkorDBManager(config)
+        await falkordb_manager.connect()
+        
+        # Test basic operations
+        await falkordb_manager.clear_graph()
+        await falkordb_manager.execute_query_with_retry("CREATE (test:TestNode {name: 'async_test'})")
+        stats = await falkordb_manager.get_graph_stats()
+        
+        if stats['nodes'] > 0:
+            logger.info("✅ FalkorDB async operations working")
+        
+        await falkordb_manager.execute_query_with_retry("MATCH (n:TestNode) DELETE n")
+        await falkordb_manager.close()
+        
+        logger.info("✅ Async setup test completed successfully")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Async setup test failed: {e}")
+        return False
+
 def validate_sparql_endpoint(endpoint: str, username: str = None, password: str = None) -> bool:
     """Validate SPARQL endpoint connectivity"""
     try:
@@ -895,7 +975,7 @@ def create_sample_query():
     """
 
 async def main():
-    """Example async usage for large datasets"""
+    """Example async usage for large datasets with error checking"""
     
     # Sample query optimized for large datasets
     sample_query = create_sample_query()
@@ -910,11 +990,11 @@ async def main():
         falkordb_port=6379,
         graph_name='async_large_graph',
         
-        # Async optimization settings for large datasets
-        batch_size=2000,  # Larger batches for efficiency
-        max_concurrent_batches=10,  # Higher concurrency
-        connection_pool_size=30,  # More connections
-        sparql_timeout=7200,  # 2 hours for very large queries
+        # Conservative settings for testing
+        batch_size=1000,  # Start smaller for testing
+        max_concurrent_batches=5,  # Lower concurrency for testing
+        connection_pool_size=20,  # Fewer connections for testing
+        sparql_timeout=7200,  # 2 hours
         falkordb_timeout=None,  # Infinite timeout for FalkorDB operations
         
         use_shortened_uris=True,
@@ -925,12 +1005,23 @@ async def main():
     )
     
     try:
-        # Validate endpoint
+        # Step 1: Test async setup first
+        print("🔧 Testing async setup...")
+        setup_ok = await test_async_setup(config)
+        if not setup_ok:
+            print("❌ Async setup test failed. Please check your configuration.")
+            return
+        print("✅ Async setup test passed!")
+        
+        # Step 2: Validate endpoint
+        print("🔍 Validating SPARQL endpoint...")
         if not validate_sparql_endpoint(config.sparql_endpoint, config.username, config.password):
             logger.error("Cannot connect to SPARQL endpoint")
             return
+        print("✅ SPARQL endpoint validated!")
         
-        # Run async conversion
+        # Step 3: Run async conversion
+        print("🚀 Starting async conversion...")
         converter = AsyncTripleBasedConverter(config)
         stats = await converter.convert()
         
@@ -965,6 +1056,8 @@ async def main():
         
     except Exception as e:
         logger.error(f"Async conversion failed: {e}")
+        import traceback
+        traceback.print_exc()
         raise
 
 if __name__ == "__main__":
