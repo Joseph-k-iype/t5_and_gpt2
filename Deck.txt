@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
 """
-Triple-Based RDF to FalkorDB Property Graph Converter
+Async Triple-Based RDF to FalkorDB Property Graph Converter
 
 This module converts RDF data to FalkorDB property graphs using a single SPARQL query
-that returns enriched triples with subject/object class information.
+with asyncio for handling large datasets without timeout issues.
 
 Query Format: SELECT ?subject ?subjectClass ?predicate ?predicateClass ?object ?objectClass
 
 Features:
-- Single query approach with 6-variable triples
-- Automatic node vs relationship detection based on object type
-- Class-based node labeling
-- Predicate-based relationship typing
-- Streaming conversion with batching
+- Async processing with falkordb.asyncio and redis.asyncio
+- Very long timeouts for large datasets
+- Concurrent batch processing
+- Connection pooling for optimal performance
+- Semaphore-based rate limiting
 
 Dependencies:
-    pip install rdflib falkordb urllib3 requests
+    pip install rdflib falkordb urllib3 requests asyncio
 """
 
 import logging
 import json
 import time
+import asyncio
 from typing import Dict, List, Set, Tuple, Optional, Any, Union
 from dataclasses import dataclass, asdict
 from collections import defaultdict, Counter
@@ -32,7 +33,11 @@ import rdflib
 from rdflib import ConjunctiveGraph, Graph, URIRef, Literal, BNode
 from rdflib.plugins.stores import sparqlstore
 from rdflib.namespace import RDF, RDFS, OWL, XSD
-import falkordb
+
+# Async imports
+import falkordb.asyncio as falkordb_async
+import redis.asyncio as redis_async
+from redis.asyncio import BlockingConnectionPool
 
 # Configure logging
 logging.basicConfig(
@@ -42,8 +47,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 @dataclass
-class TripleConfig:
-    """Configuration for triple-based RDF conversion"""
+class AsyncTripleConfig:
+    """Configuration for async triple-based RDF conversion"""
     # The main SPARQL query with 6 variables
     triples_query: str
     sparql_endpoint: str
@@ -56,10 +61,13 @@ class TripleConfig:
     falkordb_password: Optional[str] = None
     graph_name: str = 'rdf_graph'
     
-    # Processing settings
+    # Async processing settings
     batch_size: int = 1000
+    max_concurrent_batches: int = 5  # Control concurrency
+    connection_pool_size: int = 20
+    sparql_timeout: int = 3600  # 1 hour for large queries
+    falkordb_timeout: Optional[int] = None  # Infinite timeout for FalkorDB operations
     max_retries: int = 3
-    timeout: int = 30
     
     # Transformation settings
     use_shortened_uris: bool = True
@@ -69,15 +77,15 @@ class TripleConfig:
     
     # Filtering
     exclude_rdf_type_properties: bool = True
-    literal_properties_only: Set[str] = None  # If set, only these predicates become properties
+    literal_properties_only: Set[str] = None
     
     # Monitoring
     export_stats: bool = True
     validate_conversion: bool = True
 
 @dataclass
-class ConversionStats:
-    """Statistics tracking for conversion process"""
+class AsyncConversionStats:
+    """Statistics tracking for async conversion process"""
     start_time: datetime
     end_time: Optional[datetime] = None
     
@@ -87,8 +95,13 @@ class ConversionStats:
     
     # Processing stats
     processed_triples: int = 0
-    property_triples: int = 0  # literal objects
-    relationship_triples: int = 0  # URI objects
+    property_triples: int = 0
+    relationship_triples: int = 0
+    
+    # Batch processing stats
+    total_batches: int = 0
+    completed_batches: int = 0
+    failed_batches: int = 0
     
     # Created entities
     unique_subjects: int = 0
@@ -181,11 +194,8 @@ class URIProcessor:
     
     def _clean_identifier(self, name: str) -> str:
         """Clean string to be valid identifier"""
-        # Replace non-alphanumeric characters with underscores
         clean_name = re.sub(r'[^a-zA-Z0-9_]', '_', name)
-        # Remove leading/trailing underscores
         clean_name = clean_name.strip('_')
-        # Ensure it starts with letter or underscore
         if clean_name and clean_name[0].isdigit():
             clean_name = f"_{clean_name}"
         return clean_name or 'unknown'
@@ -205,20 +215,22 @@ class URIProcessor:
         
         return self._clean_identifier(local_name)
 
-class NodeManager:
-    """Manages node creation and properties"""
+class AsyncNodeManager:
+    """Manages node creation and properties with async operations"""
     
-    def __init__(self, uri_processor: URIProcessor, config: TripleConfig):
+    def __init__(self, uri_processor: URIProcessor, config: AsyncTripleConfig):
         self.uri_processor = uri_processor
         self.config = config
         self.nodes: Dict[str, Dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
     
-    def ensure_node_exists(self, uri: str, class_uri: Optional[str] = None):
+    async def ensure_node_exists(self, uri: str, class_uri: Optional[str] = None):
         """Ensure a node exists with appropriate labeling"""
-        if uri not in self.nodes:
-            self._create_node(uri, class_uri)
+        async with self._lock:
+            if uri not in self.nodes:
+                await self._create_node(uri, class_uri)
     
-    def _create_node(self, uri: str, class_uri: Optional[str] = None):
+    async def _create_node(self, uri: str, class_uri: Optional[str] = None):
         """Create a new node entry"""
         labels = {self.config.default_node_label}
         
@@ -245,75 +257,90 @@ class NodeManager:
         
         self.nodes[uri] = node_data
     
-    def add_property(self, subject_uri: str, predicate_uri: str, literal_value: Any):
+    async def add_property(self, subject_uri: str, predicate_uri: str, literal_value: Any):
         """Add a property to a node"""
-        if subject_uri not in self.nodes:
-            logger.warning(f"Node {subject_uri} not found when adding property")
-            return
-        
-        # Skip rdf:type if configured to do so
-        if (self.config.exclude_rdf_type_properties and 
-            predicate_uri == str(RDF.type)):
-            return
-        
-        prop_name = self.uri_processor.process_uri(predicate_uri)
-        
-        # Handle multiple values for the same property
-        properties = self.nodes[subject_uri]['properties']
-        if prop_name in properties:
-            existing = properties[prop_name]
-            if isinstance(existing, list):
-                existing.append(literal_value)
+        async with self._lock:
+            if subject_uri not in self.nodes:
+                logger.warning(f"Node {subject_uri} not found when adding property")
+                return
+            
+            # Skip rdf:type if configured to do so
+            if (self.config.exclude_rdf_type_properties and 
+                predicate_uri == str(RDF.type)):
+                return
+            
+            prop_name = self.uri_processor.process_uri(predicate_uri)
+            
+            # Handle multiple values for the same property
+            properties = self.nodes[subject_uri]['properties']
+            if prop_name in properties:
+                existing = properties[prop_name]
+                if isinstance(existing, list):
+                    existing.append(literal_value)
+                else:
+                    properties[prop_name] = [existing, literal_value]
             else:
-                properties[prop_name] = [existing, literal_value]
-        else:
-            properties[prop_name] = literal_value
+                properties[prop_name] = literal_value
     
-    def get_nodes(self) -> Dict[str, Dict[str, Any]]:
+    async def get_nodes(self) -> Dict[str, Dict[str, Any]]:
         """Get all nodes"""
-        return self.nodes
+        async with self._lock:
+            return self.nodes.copy()
     
-    def clear(self):
+    async def clear(self):
         """Clear all nodes"""
-        self.nodes.clear()
+        async with self._lock:
+            self.nodes.clear()
 
-class FalkorDBManager:
-    """Manages FalkorDB connection and operations"""
+class AsyncFalkorDBManager:
+    """Manages async FalkorDB connection and operations"""
     
-    def __init__(self, config: TripleConfig):
+    def __init__(self, config: AsyncTripleConfig):
         self.config = config
+        self.pool = None
         self.db = None
         self.graph = None
-        self._connect()
     
-    def _connect(self):
-        """Establish connection to FalkorDB"""
+    async def connect(self):
+        """Establish async connection to FalkorDB"""
         try:
-            connect_kwargs = {
+            # Create Redis connection pool with very long timeout
+            pool_kwargs = {
                 'host': self.config.falkordb_host,
-                'port': self.config.falkordb_port
+                'port': self.config.falkordb_port,
+                'max_connections': self.config.connection_pool_size,
+                'timeout': self.config.falkordb_timeout,  # None = infinite timeout
+                'decode_responses': True,
+                'retry_on_timeout': True,
+                'retry_on_error': [redis_async.ConnectionError, redis_async.TimeoutError],
+                'health_check_interval': 30,
             }
             
             if self.config.falkordb_password:
-                connect_kwargs['password'] = self.config.falkordb_password
+                pool_kwargs['password'] = self.config.falkordb_password
             
-            self.db = falkordb.FalkorDB(**connect_kwargs)
+            self.pool = BlockingConnectionPool(**pool_kwargs)
+            self.db = falkordb_async.FalkorDB(connection_pool=self.pool)
             self.graph = self.db.select_graph(self.config.graph_name)
-            logger.info(f"Connected to FalkorDB at {self.config.falkordb_host}:{self.config.falkordb_port}")
+            
+            logger.info(f"Connected to FalkorDB async at {self.config.falkordb_host}:{self.config.falkordb_port}")
+            logger.info(f"Connection pool size: {self.config.connection_pool_size}")
+            logger.info(f"Timeout setting: {self.config.falkordb_timeout}")
+            
         except Exception as e:
-            logger.error(f"Failed to connect to FalkorDB: {e}")
+            logger.error(f"Failed to connect to FalkorDB async: {e}")
             raise
     
-    def clear_graph(self):
+    async def clear_graph(self):
         """Clear existing graph data"""
         try:
-            self.graph.query("MATCH (n) DETACH DELETE n")
+            await self.graph.query("MATCH (n) DETACH DELETE n")
             logger.info("Cleared existing graph data")
         except Exception as e:
             logger.error(f"Error clearing graph: {e}")
             raise
     
-    def create_indexes(self):
+    async def create_indexes(self):
         """Create performance indexes"""
         if not self.config.create_indexes:
             return
@@ -325,27 +352,46 @@ class FalkorDBManager:
         
         for query in index_queries:
             try:
-                self.graph.query(query)
+                await self.graph.query(query)
                 logger.debug(f"Created index: {query}")
             except Exception as e:
                 logger.warning(f"Could not create index '{query}': {e}")
     
-    def execute_query(self, query: str, params: Optional[Dict] = None) -> Any:
-        """Execute a Cypher query with error handling"""
-        max_retries = self.config.max_retries
-        
-        for attempt in range(max_retries):
+    async def execute_query_with_retry(self, query: str, params: Optional[Dict] = None) -> Any:
+        """Execute a Cypher query with async retry logic"""
+        for attempt in range(self.config.max_retries):
             try:
-                return self.graph.query(query, params or {})
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    logger.error(f"Query failed after {max_retries} attempts: {e}")
+                return await self.graph.query(query, params or {})
+            except (redis_async.ConnectionError, redis_async.TimeoutError) as e:
+                if attempt == self.config.max_retries - 1:
+                    logger.error(f"Query failed after {self.config.max_retries} attempts: {e}")
                     raise
+                await asyncio.sleep(2 ** attempt)  # Exponential backoff
                 logger.warning(f"Query attempt {attempt + 1} failed, retrying: {e}")
-                time.sleep(2 ** attempt)
+            except Exception as e:
+                logger.error(f"Non-retryable error in query: {e}")
+                raise
     
-    def create_node(self, uri: str, node_data: Dict[str, Any]) -> bool:
-        """Create a node in FalkorDB"""
+    async def create_node_batch(self, nodes_batch: List[Tuple[str, Dict[str, Any]]]) -> int:
+        """Create a batch of nodes concurrently"""
+        tasks = []
+        for uri, node_data in nodes_batch:
+            task = self._create_single_node(uri, node_data)
+            tasks.append(task)
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        success_count = 0
+        for result in results:
+            if not isinstance(result, Exception):
+                success_count += 1
+            else:
+                logger.warning(f"Node creation failed: {result}")
+        
+        return success_count
+    
+    async def _create_single_node(self, uri: str, node_data: Dict[str, Any]) -> bool:
+        """Create a single node in FalkorDB"""
         try:
             # Prepare labels
             labels = [self.config.default_node_label if not label else label 
@@ -359,10 +405,10 @@ class FalkorDBManager:
             if properties:
                 props_clause = ', '.join([f"{k}: ${k}" for k in properties.keys()])
                 query = f"CREATE (n:{labels_str} {{{props_clause}}})"
-                self.execute_query(query, properties)
+                await self.execute_query_with_retry(query, properties)
             else:
                 query = f"CREATE (n:{labels_str})"
-                self.execute_query(query)
+                await self.execute_query_with_retry(query)
             
             return True
             
@@ -370,11 +416,28 @@ class FalkorDBManager:
             logger.error(f"Error creating node {uri}: {e}")
             return False
     
-    def create_relationship(self, subject_uri: str, predicate_uri: str, object_uri: str) -> bool:
-        """Create a relationship in FalkorDB"""
+    async def create_relationship_batch(self, relationships_batch: List[Tuple[str, str, str]]) -> int:
+        """Create a batch of relationships concurrently"""
+        tasks = []
+        for subject_uri, predicate_uri, object_uri in relationships_batch:
+            task = self._create_single_relationship(subject_uri, predicate_uri, object_uri)
+            tasks.append(task)
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        success_count = 0
+        for result in results:
+            if not isinstance(result, Exception):
+                success_count += 1
+            else:
+                logger.warning(f"Relationship creation failed: {result}")
+        
+        return success_count
+    
+    async def _create_single_relationship(self, subject_uri: str, predicate_uri: str, object_uri: str) -> bool:
+        """Create a single relationship in FalkorDB"""
         try:
             # Process predicate for relationship type
-            from urllib.parse import urlparse
             parsed = urlparse(predicate_uri)
             if parsed.fragment:
                 rel_type = parsed.fragment
@@ -409,40 +472,46 @@ class FalkorDBManager:
                 **rel_props
             }
             
-            self.execute_query(query, params)
+            await self.execute_query_with_retry(query, params)
             return True
             
         except Exception as e:
             logger.error(f"Error creating relationship {subject_uri} -> {object_uri}: {e}")
             return False
     
-    def get_graph_stats(self) -> Dict[str, int]:
+    async def get_graph_stats(self) -> Dict[str, int]:
         """Get current graph statistics"""
         try:
-            node_result = self.graph.query("MATCH (n) RETURN count(n) as count")
+            node_result = await self.graph.query("MATCH (n) RETURN count(n) as count")
             node_count = node_result.result_set[0][0] if node_result.result_set else 0
             
-            rel_result = self.graph.query("MATCH ()-[r]->() RETURN count(r) as count")
+            rel_result = await self.graph.query("MATCH ()-[r]->() RETURN count(r) as count")
             rel_count = rel_result.result_set[0][0] if rel_result.result_set else 0
             
             return {'nodes': node_count, 'relationships': rel_count}
         except Exception as e:
             logger.error(f"Error getting statistics: {e}")
             return {'nodes': 0, 'relationships': 0}
-
-class TripleBasedConverter:
-    """Main converter using 6-variable triple query"""
     
-    def __init__(self, config: TripleConfig):
+    async def close(self):
+        """Close async connections"""
+        if self.pool:
+            await self.pool.aclose()
+
+class AsyncTripleBasedConverter:
+    """Main async converter using 6-variable triple query"""
+    
+    def __init__(self, config: AsyncTripleConfig):
         self.config = config
-        self.stats = ConversionStats(start_time=datetime.now())
+        self.stats = AsyncConversionStats(start_time=datetime.now())
         self.uri_processor = URIProcessor(config.use_shortened_uris)
-        self.node_manager = NodeManager(self.uri_processor, config)
-        self.falkordb_manager = FalkorDBManager(config)
+        self.node_manager = AsyncNodeManager(self.uri_processor, config)
+        self.falkordb_manager = AsyncFalkorDBManager(config)
         self.rdf_graph = None
         
         # Processing state
         self.relationships_to_create: List[Tuple[str, str, str]] = []
+        self.semaphore = asyncio.Semaphore(config.max_concurrent_batches)
         
         self._setup_rdf_connection()
     
@@ -456,92 +525,137 @@ class TripleBasedConverter:
             store = sparqlstore.SPARQLUpdateStore(
                 self.config.sparql_endpoint,
                 auth=auth,
-                timeout=self.config.timeout
+                timeout=self.config.sparql_timeout
             )
             
             self.rdf_graph = ConjunctiveGraph(store=store)
             logger.info(f"Connected to SPARQL endpoint: {self.config.sparql_endpoint}")
+            logger.info(f"SPARQL timeout: {self.config.sparql_timeout}s")
             
         except Exception as e:
             logger.error(f"Failed to connect to SPARQL endpoint: {e}")
             raise
     
-    def convert(self) -> ConversionStats:
-        """Main conversion method"""
+    async def convert(self) -> AsyncConversionStats:
+        """Main async conversion method"""
         try:
-            logger.info("Starting triple-based RDF to FalkorDB conversion...")
+            logger.info("Starting async triple-based RDF to FalkorDB conversion...")
+            
+            # Connect to FalkorDB
+            await self.falkordb_manager.connect()
             
             # Clear existing data
-            self.falkordb_manager.clear_graph()
+            await self.falkordb_manager.clear_graph()
             
             # Execute the main query and process results
-            self._execute_and_process_query()
+            await self._execute_and_process_query()
             
-            # Create nodes in FalkorDB
-            self._create_nodes_in_falkordb()
+            # Create nodes in FalkorDB using async batching
+            await self._create_nodes_in_falkordb_async()
             
-            # Create relationships in FalkorDB
-            self._create_relationships_in_falkordb()
+            # Create relationships in FalkorDB using async batching
+            await self._create_relationships_in_falkordb_async()
             
             # Create indexes
-            self.falkordb_manager.create_indexes()
+            await self.falkordb_manager.create_indexes()
             
             # Validate if requested
             if self.config.validate_conversion:
-                self._validate_conversion()
+                await self._validate_conversion()
             
             # Finalize statistics
-            self._finalize_stats()
+            await self._finalize_stats()
             
-            logger.info("Conversion completed successfully!")
+            logger.info("Async conversion completed successfully!")
             return self.stats
             
         except Exception as e:
-            logger.error(f"Conversion failed: {e}")
+            logger.error(f"Async conversion failed: {e}")
             raise
+        finally:
+            # Always close connections
+            await self.falkordb_manager.close()
     
-    def _execute_and_process_query(self):
+    async def _execute_and_process_query(self):
         """Execute the main SPARQL query and process results"""
         start_time = time.time()
         
         try:
-            logger.info("Executing triples query...")
-            results = list(self.rdf_graph.query(self.config.triples_query))
+            logger.info("Executing triples query with extended timeout...")
+            logger.info(f"Query timeout: {self.config.sparql_timeout}s")
+            
+            # Execute query in executor to avoid blocking event loop
+            loop = asyncio.get_event_loop()
+            results = await loop.run_in_executor(
+                None, 
+                lambda: list(self.rdf_graph.query(self.config.triples_query))
+            )
             
             self.stats.query_execution_time = time.time() - start_time
             self.stats.total_triples_retrieved = len(results)
             
-            logger.info(f"Retrieved {len(results)} triples, processing in batches...")
+            logger.info(f"Retrieved {len(results)} triples in {self.stats.query_execution_time:.2f}s")
+            logger.info("Processing triples in async batches...")
             
-            # Process in batches
-            batch_size = self.config.batch_size
-            for i in range(0, len(results), batch_size):
-                batch = results[i:i+batch_size]
-                self._process_triple_batch(batch)
-                
-                progress = (i + len(batch)) / len(results) * 100
-                logger.info(f"Processing progress: {progress:.1f}%")
+            # Process in async batches
+            await self._process_triples_in_batches(results)
             
         except Exception as e:
             logger.error(f"Error executing/processing query: {e}")
             raise
     
-    def _process_triple_batch(self, batch: List[Tuple]):
-        """Process a batch of 6-variable triples"""
-        for triple in batch:
+    async def _process_triples_in_batches(self, results: List[Tuple]):
+        """Process triples in async batches with concurrency control"""
+        batch_size = self.config.batch_size
+        total_batches = (len(results) + batch_size - 1) // batch_size
+        self.stats.total_batches = total_batches
+        
+        # Create batches
+        batches = []
+        for i in range(0, len(results), batch_size):
+            batch = results[i:i+batch_size]
+            batches.append(batch)
+        
+        # Process batches concurrently with semaphore control
+        tasks = []
+        for i, batch in enumerate(batches):
+            task = self._process_single_batch_async(batch, i + 1, total_batches)
+            tasks.append(task)
+        
+        # Use asyncio.as_completed for processing results as they come in
+        completed = 0
+        async for task in asyncio.as_completed(tasks):
             try:
-                if len(triple) >= 6:
-                    subject, subject_class, predicate, predicate_class, obj, object_class = triple[:6]
-                    self._process_single_triple(subject, subject_class, predicate, predicate_class, obj, object_class)
-                    self.stats.processed_triples += 1
-                else:
-                    logger.warning(f"Invalid triple format (expected 6 variables): {triple}")
+                await task
+                completed += 1
+                self.stats.completed_batches = completed
+                
+                if completed % 10 == 0:  # Log every 10 completed batches
+                    progress = (completed / total_batches) * 100
+                    logger.info(f"Async batch progress: {progress:.1f}% ({completed}/{total_batches})")
             except Exception as e:
-                logger.warning(f"Error processing triple {triple}: {e}")
-                self.stats.processing_errors += 1
+                self.stats.failed_batches += 1
+                logger.error(f"Batch processing failed: {e}")
     
-    def _process_single_triple(self, subject, subject_class, predicate, predicate_class, obj, object_class):
-        """Process a single 6-variable triple"""
+    async def _process_single_batch_async(self, batch: List[Tuple], batch_num: int, total_batches: int):
+        """Process a single batch of triples with semaphore control"""
+        async with self.semaphore:
+            try:
+                for triple in batch:
+                    if len(triple) >= 6:
+                        subject, subject_class, predicate, predicate_class, obj, object_class = triple[:6]
+                        await self._process_single_triple_async(subject, subject_class, predicate, predicate_class, obj, object_class)
+                        self.stats.processed_triples += 1
+                    else:
+                        logger.warning(f"Invalid triple format in batch {batch_num}: {triple}")
+                        
+            except Exception as e:
+                logger.error(f"Error processing batch {batch_num}: {e}")
+                self.stats.processing_errors += 1
+                raise
+    
+    async def _process_single_triple_async(self, subject, subject_class, predicate, predicate_class, obj, object_class):
+        """Process a single 6-variable triple asynchronously"""
         subject_uri = str(subject)
         predicate_uri = str(predicate)
         
@@ -551,13 +665,13 @@ class TripleBasedConverter:
             self.stats.subject_classes.add(str(subject_class))
         
         # Ensure subject node exists
-        self.node_manager.ensure_node_exists(subject_uri, str(subject_class) if subject_class else None)
+        await self.node_manager.ensure_node_exists(subject_uri, str(subject_class) if subject_class else None)
         
         # Determine if this creates a property or relationship
         if isinstance(obj, Literal):
             # Object is literal -> add as property
             literal_value = self._convert_literal_value(obj)
-            self.node_manager.add_property(subject_uri, predicate_uri, literal_value)
+            await self.node_manager.add_property(subject_uri, predicate_uri, literal_value)
             self.stats.property_triples += 1
             
         elif isinstance(obj, (URIRef, BNode)):
@@ -569,7 +683,7 @@ class TripleBasedConverter:
                 self.stats.object_classes.add(str(object_class))
             
             # Ensure object node exists
-            self.node_manager.ensure_node_exists(object_uri, str(object_class) if object_class else None)
+            await self.node_manager.ensure_node_exists(object_uri, str(object_class) if object_class else None)
             
             # Queue relationship for creation
             self.relationships_to_create.append((subject_uri, predicate_uri, object_uri))
@@ -588,11 +702,10 @@ class TripleBasedConverter:
                 elif literal.datatype == XSD.boolean:
                     return str(literal).lower() in ('true', '1')
                 elif literal.datatype in (XSD.dateTime, XSD.date, XSD.time):
-                    return str(literal)  # Keep as string for FalkorDB
+                    return str(literal)
                 else:
                     return str(literal)
             else:
-                # Handle language tags
                 if literal.language:
                     return f"{literal}@{literal.language}"
                 return str(literal)
@@ -600,35 +713,72 @@ class TripleBasedConverter:
             logger.warning(f"Error converting literal {literal}: {e}")
             return str(literal)
     
-    def _create_nodes_in_falkordb(self):
-        """Create all nodes in FalkorDB"""
-        nodes = self.node_manager.get_nodes()
-        logger.info(f"Creating {len(nodes)} nodes in FalkorDB...")
+    async def _create_nodes_in_falkordb_async(self):
+        """Create all nodes in FalkorDB using async batching"""
+        nodes = await self.node_manager.get_nodes()
+        logger.info(f"Creating {len(nodes)} nodes in FalkorDB using async batching...")
         
-        created_count = 0
-        for uri, node_data in nodes.items():
-            if self.falkordb_manager.create_node(uri, node_data):
-                created_count += 1
+        # Convert to list of tuples for batching
+        nodes_list = list(nodes.items())
+        batch_size = self.config.batch_size
         
-        self.stats.unique_subjects = len(nodes)
-        logger.info(f"Successfully created {created_count} nodes")
+        # Create node batches
+        node_batches = []
+        for i in range(0, len(nodes_list), batch_size):
+            batch = nodes_list[i:i+batch_size]
+            node_batches.append(batch)
+        
+        # Process node batches concurrently
+        tasks = []
+        for batch in node_batches:
+            task = self.falkordb_manager.create_node_batch(batch)
+            tasks.append(task)
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        total_created = 0
+        for result in results:
+            if isinstance(result, int):
+                total_created += result
+            else:
+                logger.error(f"Node batch creation failed: {result}")
+        
+        logger.info(f"Successfully created {total_created} nodes using async processing")
     
-    def _create_relationships_in_falkordb(self):
-        """Create all relationships in FalkorDB"""
-        logger.info(f"Creating {len(self.relationships_to_create)} relationships in FalkorDB...")
+    async def _create_relationships_in_falkordb_async(self):
+        """Create all relationships in FalkorDB using async batching"""
+        logger.info(f"Creating {len(self.relationships_to_create)} relationships in FalkorDB using async batching...")
         
-        created_count = 0
-        for subject_uri, predicate_uri, object_uri in self.relationships_to_create:
-            if self.falkordb_manager.create_relationship(subject_uri, predicate_uri, object_uri):
-                created_count += 1
+        batch_size = self.config.batch_size
         
-        logger.info(f"Successfully created {created_count} relationships")
+        # Create relationship batches
+        rel_batches = []
+        for i in range(0, len(self.relationships_to_create), batch_size):
+            batch = self.relationships_to_create[i:i+batch_size]
+            rel_batches.append(batch)
+        
+        # Process relationship batches concurrently
+        tasks = []
+        for batch in rel_batches:
+            task = self.falkordb_manager.create_relationship_batch(batch)
+            tasks.append(task)
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        total_created = 0
+        for result in results:
+            if isinstance(result, int):
+                total_created += result
+            else:
+                logger.error(f"Relationship batch creation failed: {result}")
+        
+        logger.info(f"Successfully created {total_created} relationships using async processing")
     
-    def _validate_conversion(self):
+    async def _validate_conversion(self):
         """Validate the conversion results"""
-        logger.info("Validating conversion results...")
+        logger.info("Validating async conversion results...")
         
-        falkor_stats = self.falkordb_manager.get_graph_stats()
+        falkor_stats = await self.falkordb_manager.get_graph_stats()
         
         if falkor_stats['nodes'] == 0:
             logger.warning("No nodes were created in FalkorDB")
@@ -638,17 +788,17 @@ class TripleBasedConverter:
         
         logger.info(f"Validation complete: {falkor_stats['nodes']} nodes, {falkor_stats['relationships']} relationships")
     
-    def _finalize_stats(self):
+    async def _finalize_stats(self):
         """Finalize conversion statistics"""
         self.stats.end_time = datetime.now()
         
         # Get final counts from FalkorDB
-        falkor_stats = self.falkordb_manager.get_graph_stats()
+        falkor_stats = await self.falkordb_manager.get_graph_stats()
         self.stats.created_nodes = falkor_stats['nodes']
         self.stats.created_relationships = falkor_stats['relationships']
         
         # Calculate unique entities
-        nodes = self.node_manager.get_nodes()
+        nodes = await self.node_manager.get_nodes()
         self.stats.unique_subjects = len(nodes)
         
         # Count unique objects from relationships
@@ -658,18 +808,27 @@ class TripleBasedConverter:
         self.stats.unique_objects = len(unique_objects)
         
         if self.config.export_stats:
-            self.export_stats()
+            await self._export_stats()
     
-    def export_stats(self, filename: Optional[str] = None):
+    async def _export_stats(self, filename: Optional[str] = None):
         """Export conversion statistics"""
         if not filename:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"conversion_stats_{self.config.graph_name}_{timestamp}.json"
+            filename = f"async_conversion_stats_{self.config.graph_name}_{timestamp}.json"
         
         try:
+            stats_data = self.stats.to_dict()
+            stats_data['config'] = {
+                'batch_size': self.config.batch_size,
+                'max_concurrent_batches': self.config.max_concurrent_batches,
+                'connection_pool_size': self.config.connection_pool_size,
+                'sparql_timeout': self.config.sparql_timeout,
+                'falkordb_timeout': self.config.falkordb_timeout
+            }
+            
             with open(filename, 'w') as f:
-                json.dump(self.stats.to_dict(), f, indent=2)
-            logger.info(f"Statistics exported to {filename}")
+                json.dump(stats_data, f, indent=2)
+            logger.info(f"Async statistics exported to {filename}")
         except Exception as e:
             logger.warning(f"Could not export statistics: {e}")
     
@@ -684,18 +843,6 @@ class TripleBasedConverter:
         ]
 
 # Utility functions
-def list_available_rdf_terms():
-    """List available terms in common RDF namespaces for debugging"""
-    print("Available RDF namespace terms:")
-    for attr in dir(RDF):
-        if not attr.startswith('_'):
-            print(f"  RDF.{attr}")
-    
-    print("\nAvailable RDFS namespace terms:")
-    for attr in dir(RDFS):
-        if not attr.startswith('_'):
-            print(f"  RDFS.{attr}")
-
 def validate_sparql_endpoint(endpoint: str, username: str = None, password: str = None) -> bool:
     """Validate SPARQL endpoint connectivity"""
     try:
@@ -712,7 +859,7 @@ def validate_sparql_endpoint(endpoint: str, username: str = None, password: str 
 def create_sample_query():
     """Create a sample 6-variable SPARQL query"""
     return """
-    # Sample 6-variable triple query
+    # Sample 6-variable triple query optimized for large datasets
     PREFIX foaf: <http://xmlns.com/foaf/0.1/>
     PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
     
@@ -736,7 +883,7 @@ def create_sample_query():
         # Example filters (customize as needed)
         FILTER(?subject != ?object)  # Avoid self-loops
         
-        # Optional: Filter by specific types
+        # Optional: Filter by specific types for performance
         FILTER(?subjectClass IN (foaf:Person, <http://schema.org/Organization>))
         
         # Include relevant predicates
@@ -744,16 +891,16 @@ def create_sample_query():
             foaf:name, foaf:knows, foaf:mbox, rdfs:label
         ))
     }
-    LIMIT 10000
+    # Note: Remove LIMIT for full dataset conversion
     """
 
-def main():
-    """Example usage"""
+async def main():
+    """Example async usage for large datasets"""
     
-    # Sample query
+    # Sample query optimized for large datasets
     sample_query = create_sample_query()
     
-    config = TripleConfig(
+    config = AsyncTripleConfig(
         triples_query=sample_query,
         sparql_endpoint="https://dbpedia.org/sparql",
         username=None,
@@ -761,9 +908,15 @@ def main():
         
         falkordb_host='localhost',
         falkordb_port=6379,
-        graph_name='triple_based_graph',
+        graph_name='async_large_graph',
         
-        batch_size=1000,
+        # Async optimization settings for large datasets
+        batch_size=2000,  # Larger batches for efficiency
+        max_concurrent_batches=10,  # Higher concurrency
+        connection_pool_size=30,  # More connections
+        sparql_timeout=7200,  # 2 hours for very large queries
+        falkordb_timeout=None,  # Infinite timeout for FalkorDB operations
+        
         use_shortened_uris=True,
         preserve_uri_properties=True,
         create_indexes=True,
@@ -777,17 +930,19 @@ def main():
             logger.error("Cannot connect to SPARQL endpoint")
             return
         
-        # Run conversion
-        converter = TripleBasedConverter(config)
-        stats = converter.convert()
+        # Run async conversion
+        converter = AsyncTripleBasedConverter(config)
+        stats = await converter.convert()
         
         # Print results
-        print("\n" + "="*60)
-        print("TRIPLE-BASED CONVERSION COMPLETED")
-        print("="*60)
+        print("\n" + "="*70)
+        print("ASYNC TRIPLE-BASED CONVERSION COMPLETED")
+        print("="*70)
         print(f"Total triples retrieved: {stats.total_triples_retrieved}")
         print(f"Property triples (literals): {stats.property_triples}")
         print(f"Relationship triples (URIs): {stats.relationship_triples}")
+        print(f"Processed batches: {stats.completed_batches}/{stats.total_batches}")
+        print(f"Failed batches: {stats.failed_batches}")
         print(f"Unique subjects: {stats.unique_subjects}")
         print(f"Unique objects: {stats.unique_objects}")
         print(f"Nodes created: {stats.created_nodes}")
@@ -799,16 +954,19 @@ def main():
         
         if stats.end_time:
             duration = (stats.end_time - stats.start_time).total_seconds()
-            print(f"\nTotal duration: {duration:.2f} seconds")
-            print(f"Query execution: {stats.query_execution_time:.2f} seconds")
+            print(f"\nPerformance:")
+            print(f"  Query execution: {stats.query_execution_time:.2f}s")
+            print(f"  Total duration: {duration:.2f}s")
+            print(f"  Processing rate: {stats.processed_triples/duration:.1f} triples/second")
         
         print("\nSample Cypher queries to explore your data:")
         for i, query in enumerate(converter.get_sample_queries(), 1):
             print(f"{i}. {query}")
         
     except Exception as e:
-        logger.error(f"Conversion failed: {e}")
+        logger.error(f"Async conversion failed: {e}")
         raise
 
 if __name__ == "__main__":
-    main()
+    # Run the async main function
+    asyncio.run(main())
