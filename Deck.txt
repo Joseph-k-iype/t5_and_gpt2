@@ -93,7 +93,7 @@ class OptimizedAsyncTripleConfig:
     default_node_label: str = 'Resource'  # Must be valid Cypher identifier
     
     # Memory and performance optimizations
-    exclude_rdf_type_properties: bool = True
+    exclude_rdf_type_properties: bool = False  # Keep RDF types to preserve structure
     validate_conversion: bool = False      # Skip validation for speed
     export_stats: bool = True
     progress_update_interval: int = 50     # Log progress every N batches
@@ -277,32 +277,40 @@ class AsyncNodeManager:
                 await self._create_node(uri, class_uri)
     
     async def _create_node(self, uri: str, class_uri: Optional[str] = None):
-        """Create a new node entry"""
-        labels = {self.config.default_node_label}
+        """Create a new node entry with proper RDF class as primary label"""
+        labels = set()
+        primary_label = None
         
-        # Add class-based label if available
+        # Use the actual RDF class as the primary label
         if class_uri:
             class_label = self.uri_processor.process_uri(class_uri)
-            labels.add(class_label)
+            clean_class_label = self._clean_label_name(class_label)
+            labels.add(clean_class_label)
+            primary_label = clean_class_label
+        else:
+            # Only fall back to default if no class is specified
+            primary_label = self._clean_label_name(self.config.default_node_label)
+            labels.add(primary_label)
         
-        # Handle blank nodes
+        # Handle blank nodes - add as additional label
         if uri.startswith('_:'):
             labels.add('BlankNode')
         
         node_data = {
             'labels': labels,
+            'primary_label': primary_label,  # Store the main label to use in queries
             'properties': {}
         }
         
-        # Add URI properties if requested
-        if self.config.preserve_uri_properties:
-            node_data['properties']['uri'] = uri
-        else:
-            # Always add URI for lookup purposes
-            node_data['properties']['uri'] = uri
+        # Always add URI for lookup purposes
+        node_data['properties']['uri'] = uri
         
         # Add processed identifier for easier querying
         node_data['properties']['id'] = self.uri_processor.process_uri(uri)
+        
+        # Add original class URI if preserving URIs
+        if self.config.preserve_uri_properties and class_uri:
+            node_data['properties']['rdf_type'] = class_uri
         
         self.nodes[uri] = node_data
     
@@ -458,15 +466,16 @@ class OptimizedAsyncFalkorDBManager:
                 logger.warning(f"Query attempt {attempt + 1} failed, retrying: {e}")
     
     async def create_node_batch(self, nodes_batch: List[Tuple[str, Dict[str, Any]]]) -> int:
-        """FIXED: Create a batch of nodes with proper label handling for FalkorDB"""
+        """FIXED: Create nodes with their actual RDF class labels, not generic 'Resource'"""
         if not nodes_batch:
             return 0
         
         use_merge = self.config.handle_duplicates and self.config.append_to_existing_graph
         
         try:
-            # Prepare data for UNWIND with simpler property handling and valid labels
-            nodes_data = []
+            # Group nodes by their primary label for efficient batch creation
+            nodes_by_label = defaultdict(list)
+            
             for uri, node_data in nodes_batch:
                 # Simplify properties to basic types only
                 properties = {}
@@ -474,50 +483,56 @@ class OptimizedAsyncFalkorDBManager:
                     if isinstance(value, (str, int, float, bool)):
                         properties[key] = value
                     else:
-                        properties[key] = str(value)  # Convert complex types to strings
+                        properties[key] = str(value)
                 
-                # Get and validate the primary label
-                labels = list(node_data['labels'])
-                primary_label = labels[0] if labels else self.config.default_node_label
+                # Use the actual primary label from RDF class
+                primary_label = node_data.get('primary_label', self._clean_label_name(self.config.default_node_label))
                 
-                # Ensure label is valid for Cypher
-                clean_label = self._clean_label_name(primary_label)
-                
-                nodes_data.append({
+                nodes_by_label[primary_label].append({
                     'uri': uri,
-                    'properties': properties,
-                    'label': clean_label
+                    'properties': properties
                 })
             
-            if use_merge:
-                # Use MERGE to handle existing nodes with proper label syntax
-                query = f"""
-                UNWIND $nodes_data AS node_data
-                MERGE (n:{self._clean_label_name(self.config.default_node_label)} {{uri: node_data.uri}})
-                SET n += node_data.properties
-                RETURN count(n) as total_processed
-                """
-            else:
-                # Use CREATE for new graphs with proper label syntax
-                query = f"""
-                UNWIND $nodes_data AS node_data
-                CREATE (n:{self._clean_label_name(self.config.default_node_label)})
-                SET n += node_data.properties
-                RETURN count(n) as total_created
-                """
+            total_created = 0
             
-            result = await self.execute_query_with_retry(query, {'nodes_data': nodes_data})
-            return result.result_set[0][0] if result.result_set else len(nodes_batch)
+            # Create nodes grouped by label for better performance
+            for label, nodes_data in nodes_by_label.items():
+                logger.info(f"Creating {len(nodes_data)} nodes with label '{label}'")
+                
+                if use_merge:
+                    # Use MERGE with the actual class label
+                    query = f"""
+                    UNWIND $nodes_data AS node_data
+                    MERGE (n:{label} {{uri: node_data.uri}})
+                    SET n += node_data.properties
+                    RETURN count(n) as total_processed
+                    """
+                else:
+                    # Use CREATE with the actual class label
+                    query = f"""
+                    UNWIND $nodes_data AS node_data
+                    CREATE (n:{label})
+                    SET n += node_data.properties
+                    RETURN count(n) as total_created
+                    """
+                
+                result = await self.execute_query_with_retry(query, {'nodes_data': nodes_data})
+                batch_created = result.result_set[0][0] if result.result_set else len(nodes_data)
+                total_created += batch_created
+                
+                logger.info(f"✅ Created {batch_created} nodes with label '{label}'")
+            
+            return total_created
                 
         except Exception as e:
             logger.error(f"Batch node creation failed: {e}")
             if "expected label" in str(e).lower():
-                logger.error(f"❌ Label syntax error in batch creation. Check node labels and default_node_label: '{self.config.default_node_label}'")
+                logger.error(f"❌ Label syntax error in batch creation. Check node labels")
             # Fallback to individual creation
             return await self._create_nodes_individual_fallback(nodes_batch, use_merge)
     
     async def _create_nodes_individual_fallback(self, nodes_batch: List[Tuple[str, Dict[str, Any]]], use_merge: bool = False) -> int:
-        """FIXED: Fallback to create nodes individually with proper labels"""
+        """FIXED: Fallback to create nodes individually with their actual RDF class labels"""
         created_count = 0
         
         for uri, node_data in nodes_batch:
@@ -530,19 +545,17 @@ class OptimizedAsyncFalkorDBManager:
                     else:
                         properties[key] = str(value)
                 
-                # Get and clean the primary label
-                labels = list(node_data['labels'])
-                primary_label = labels[0] if labels else self.config.default_node_label
-                clean_label = self._clean_label_name(primary_label)
+                # Use the actual primary label from RDF class
+                primary_label = node_data.get('primary_label', self._clean_label_name(self.config.default_node_label))
                 
                 if use_merge:
                     query = f"""
-                    MERGE (n:{clean_label} {{uri: $uri}})
+                    MERGE (n:{primary_label} {{uri: $uri}})
                     SET n += $properties
                     """
                 else:
                     query = f"""
-                    CREATE (n:{clean_label})
+                    CREATE (n:{primary_label})
                     SET n += $properties
                     """
                 
@@ -555,7 +568,7 @@ class OptimizedAsyncFalkorDBManager:
             except Exception as e:
                 logger.warning(f"Failed to create individual node {uri}: {e}")
                 if "expected label" in str(e).lower():
-                    logger.error(f"❌ Label syntax error for node {uri}. Label: '{clean_label}'. Original labels: {list(node_data['labels'])}")
+                    logger.error(f"❌ Label syntax error for node {uri}. Label: '{primary_label}'. Available labels: {list(node_data.get('labels', []))}")
                 continue
         
         return created_count
@@ -766,34 +779,50 @@ class OptimizedAsyncFalkorDBManager:
         return total_created
     
     async def create_indexes(self):
-        """FIXED: Create indexes with proper FalkorDB syntax - requires labels"""
+        """FIXED: Create indexes for all discovered RDF class labels"""
         if not self.config.create_indexes:
             return
         
-        logger.info("Creating performance indexes...")
+        logger.info("Creating performance indexes for discovered RDF classes...")
         
-        # Clean and validate the default label
-        clean_default_label = self._clean_label_name(self.config.default_node_label)
+        # Get all unique labels from the created nodes
+        nodes = await self.node_manager.get_nodes()
+        label_counts = Counter()
         
-        # FalkorDB requires labels in index creation - cannot create generic indexes
-        index_queries = []
-        if clean_default_label and clean_default_label != 'n':
-            # Only create index for the specific label we're using
-            index_queries.append(f"CREATE INDEX FOR (n:{clean_default_label}) ON (n.uri)")
-            logger.info(f"Will create index for label: {clean_default_label}")
-        else:
-            logger.warning("Cannot create index - invalid default node label")
+        for node_data in nodes.values():
+            primary_label = node_data.get('primary_label')
+            if primary_label:
+                label_counts[primary_label] += 1
+        
+        if not label_counts:
+            logger.warning("No nodes with labels found - skipping index creation")
             return
         
-        for query in index_queries:
+        # Create indexes for the most common labels (top 10)
+        top_labels = label_counts.most_common(10)
+        logger.info(f"Creating indexes for top {len(top_labels)} RDF classes:")
+        
+        for label, count in top_labels:
+            logger.info(f"  - {label}: {count:,} nodes")
             try:
+                query = f"CREATE INDEX FOR (n:{label}) ON (n.uri)"
                 await self.execute_query_with_retry(query)
-                logger.info(f"✅ Created index: {query}")
+                logger.info(f"✅ Created index for label '{label}'")
             except Exception as e:
-                logger.warning(f"Could not create index '{query}': {e}")
+                logger.warning(f"Could not create index for label '{label}': {e}")
                 if "expected label" in str(e).lower():
-                    logger.error(f"❌ Label syntax error in index creation. Check default_node_label: '{self.config.default_node_label}'")
+                    logger.error(f"❌ Label syntax error for label: '{label}'")
                 # Index creation failures are not critical, continue
+        
+        # Also create a general index if we have a fallback default label
+        clean_default_label = self._clean_label_name(self.config.default_node_label)
+        if clean_default_label not in [label for label, _ in top_labels]:
+            try:
+                query = f"CREATE INDEX FOR (n:{clean_default_label}) ON (n.uri)"
+                await self.execute_query_with_retry(query)
+                logger.info(f"✅ Created fallback index for label '{clean_default_label}'")
+            except Exception as e:
+                logger.warning(f"Could not create fallback index: {e}")
     
     async def get_graph_stats(self) -> Dict[str, int]:
         """Get current graph statistics"""
@@ -1253,6 +1282,18 @@ class OptimizedAsyncTripleBasedConverter:
         duration = (self.stats.end_time - self.stats.start_time).total_seconds()
         
         logger.info("=" * 80)
+        
+        # Show discovered RDF classes for verification
+        if len(self.stats.subject_classes.union(self.stats.object_classes)) > 0:
+            all_classes = self.stats.subject_classes.union(self.stats.object_classes)
+            sample_classes = sorted(list(all_classes))[:10]  # Show top 10
+            logger.info(f"🏷️  Discovered RDF Classes (sample):")
+            for rdf_class in sample_classes:
+                clean_label = self.uri_processor.process_uri(rdf_class)
+                logger.info(f"   {rdf_class} → :{clean_label}")
+            if len(all_classes) > 10:
+                logger.info(f"   ... and {len(all_classes) - 10} more classes")
+            logger.info("")
         if self.stats.append_mode:
             logger.info("🎯 INCREMENTAL LOADING SUMMARY")
         else:
@@ -1273,6 +1314,8 @@ class OptimizedAsyncTripleBasedConverter:
         logger.info(f"   Total triples: {self.stats.total_triples_retrieved:,}")
         logger.info(f"   Property triples: {self.stats.property_triples:,}")
         logger.info(f"   Relationship triples: {self.stats.relationship_triples:,}")
+        logger.info(f"   RDF Classes discovered: {len(self.stats.subject_classes.union(self.stats.object_classes))}")
+        logger.info(f"   Predicates used: {len(self.stats.predicates_used)}")
         logger.info(f"")
         
         if not self.stats.append_mode or self.stats.graph_was_cleared:
@@ -1350,16 +1393,18 @@ class OptimizedAsyncTripleBasedConverter:
             logger.warning(f"Could not export statistics: {e}")
     
     def get_sample_queries(self) -> List[str]:
-        """Generate sample Cypher queries for the converted graph"""
+        """Generate sample Cypher queries for the converted RDF graph"""
         return [
-            "MATCH (n) RETURN labels(n) as node_labels, count(n) as count ORDER BY count DESC LIMIT 10",
-            "MATCH ()-[r]->() RETURN type(r) as relationship_type, count(r) as count ORDER BY count DESC LIMIT 10",
-            "MATCH (n) RETURN n.id, n.uri LIMIT 5",
-            "MATCH (s)-[r]->(o) RETURN s.id, type(r), o.id LIMIT 10",
-            "MATCH (n) RETURN n.id, size((n)--()) as degree ORDER BY degree DESC LIMIT 10",
+            "MATCH (n) RETURN labels(n) as rdf_classes, count(n) as count ORDER BY count DESC LIMIT 10",
+            "MATCH ()-[r]->() RETURN type(r) as rdf_predicates, count(r) as count ORDER BY count DESC LIMIT 10",
+            "MATCH (n) WHERE n.rdf_type IS NOT NULL RETURN n.rdf_type, count(n) as count ORDER BY count DESC LIMIT 10",
+            "MATCH (n) RETURN n.id, n.uri, labels(n) LIMIT 5",
+            "MATCH (s)-[r]->(o) RETURN labels(s), type(r), labels(o) LIMIT 10",
+            "MATCH (n) RETURN labels(n) as class, size((n)--()) as degree ORDER BY degree DESC LIMIT 10",
             "MATCH (n) RETURN count(n) as total_nodes",
             "MATCH ()-[r]->() RETURN count(r) as total_relationships",
-            "MATCH (n) WHERE exists(n.uri) RETURN count(n) as nodes_with_uri"
+            "CALL db.labels() YIELD label RETURN label as discovered_rdf_classes",
+            "CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType as rdf_predicates"
         ]
 
 # Utility functions
