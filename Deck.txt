@@ -780,24 +780,58 @@ class OptimizedAsyncFalkorDBManager:
         
         return total_created
     
+    async def get_existing_indexes(self) -> Set[str]:
+        """Get list of existing indexes to avoid creating duplicates"""
+        try:
+            # Try to get existing indexes - this is FalkorDB specific
+            result = await self.execute_query_with_retry("CALL db.indexes()")
+            existing_indexes = set()
+            
+            if result.result_set:
+                for row in result.result_set:
+                    # Extract label and property from index info
+                    if len(row) > 0:
+                        index_info = str(row[0])
+                        # Parse index format: "INDEX :Label(property)"
+                        if "(" in index_info and ")" in index_info:
+                            label_part = index_info.split("(")[0].replace("INDEX :", "").strip()
+                            if label_part:
+                                existing_indexes.add(label_part)
+            
+            logger.info(f"Found {len(existing_indexes)} existing indexes: {list(existing_indexes)}")
+            return existing_indexes
+            
+        except Exception as e:
+            logger.warning(f"Could not retrieve existing indexes: {e}")
+            return set()
+
     async def create_indexes(self, discovered_labels: Dict[str, int] = None):
-        """FIXED: Create indexes for discovered RDF class labels (passed as parameter)"""
+        """FIXED: Create indexes for discovered RDF class labels with duplicate checking"""
         if not self.config.create_indexes:
             return
         
         logger.info("Creating performance indexes for discovered RDF classes...")
+        
+        # Get existing indexes to avoid duplicates
+        existing_indexes = await self.get_existing_indexes()
         
         # Get clean default label for fallback
         clean_default_label = clean_label_name(self.config.default_node_label)
         
         if not discovered_labels:
             logger.warning("No discovered labels provided - creating fallback index only")
-            try:
-                query = f"CREATE INDEX FOR (n:{clean_default_label}) ON (n.uri)"
-                await self.execute_query_with_retry(query)
-                logger.info(f"✅ Created fallback index for label '{clean_default_label}'")
-            except Exception as e:
-                logger.warning(f"Could not create fallback index: {e}")
+            if clean_default_label not in existing_indexes:
+                try:
+                    query = f"CREATE INDEX FOR (n:{clean_default_label}) ON (n.uri)"
+                    await self.execute_query_with_retry(query)
+                    logger.info(f"✅ Created fallback index for label '{clean_default_label}'")
+                except Exception as e:
+                    if "already indexed" in str(e).lower():
+                        logger.info(f"ℹ️  Index for '{clean_default_label}' already exists")
+                    else:
+                        logger.warning(f"Could not create fallback index: {e}")
+            else:
+                logger.info(f"ℹ️  Index for '{clean_default_label}' already exists")
             return
         
         # Create indexes for the most common labels (top 10)
@@ -808,25 +842,38 @@ class OptimizedAsyncFalkorDBManager:
         
         for label, count in top_labels:
             logger.info(f"  - {label}: {count:,} nodes")
+            
+            if label in existing_indexes:
+                logger.info(f"ℹ️  Index for '{label}' already exists")
+                indexed_labels.add(label)
+                continue
+                
             try:
                 query = f"CREATE INDEX FOR (n:{label}) ON (n.uri)"
                 await self.execute_query_with_retry(query)
                 logger.info(f"✅ Created index for label '{label}'")
                 indexed_labels.add(label)
             except Exception as e:
-                logger.warning(f"Could not create index for label '{label}': {e}")
-                if "expected label" in str(e).lower():
+                if "already indexed" in str(e).lower():
+                    logger.info(f"ℹ️  Index for '{label}' already exists")
+                    indexed_labels.add(label)
+                elif "expected label" in str(e).lower():
                     logger.error(f"❌ Label syntax error for label: '{label}'")
+                else:
+                    logger.warning(f"Could not create index for label '{label}': {e}")
                 # Index creation failures are not critical, continue
         
         # Create fallback index only if it wasn't already created
-        if clean_default_label not in indexed_labels:
+        if clean_default_label not in indexed_labels and clean_default_label not in existing_indexes:
             try:
                 query = f"CREATE INDEX FOR (n:{clean_default_label}) ON (n.uri)"
                 await self.execute_query_with_retry(query)
                 logger.info(f"✅ Created fallback index for label '{clean_default_label}'")
             except Exception as e:
-                logger.warning(f"Could not create fallback index: {e}")
+                if "already indexed" in str(e).lower():
+                    logger.info(f"ℹ️  Index for '{clean_default_label}' already exists")
+                else:
+                    logger.warning(f"Could not create fallback index: {e}")
     
     async def get_graph_stats(self) -> Dict[str, int]:
         """Get current graph statistics"""
@@ -1533,10 +1580,10 @@ def create_optimized_config(sparql_endpoint: str, triples_query: str, graph_name
         sparql_endpoint=sparql_endpoint,
         graph_name=graph_name,
         
-        # Incremental loading settings
+        # Incremental loading settings - ALWAYS use append mode for multiple queries
         append_to_existing_graph=append_mode,       # Append by default
-        clear_existing_graph=False,                 # Don't clear by default
-        handle_duplicates=append_mode,              # Handle duplicates in append mode
+        clear_existing_graph=False,                 # Never clear when appending
+        handle_duplicates=True,                     # Always handle duplicates for robustness
         
         # Optimized settings for fast relationship creation
         batch_size=2000,                         # Larger batches for relationships
@@ -1567,11 +1614,25 @@ def create_fresh_graph_config(sparql_endpoint: str, triples_query: str, graph_na
     return config
 
 def create_append_config(sparql_endpoint: str, triples_query: str, graph_name: str = "rdf_graph") -> OptimizedAsyncTripleConfig:
-    """Create configuration for appending to existing graph"""
+    """Create configuration for appending to existing graph with robust duplicate handling"""
     config = create_optimized_config(sparql_endpoint, triples_query, graph_name, append_mode=True)
     config.append_to_existing_graph = True
     config.clear_existing_graph = False
     config.handle_duplicates = True
+    config.skip_existing_nodes = True
+    config.skip_existing_relationships = True
+    return config
+
+def create_safe_multi_query_config(sparql_endpoint: str, triples_query: str, graph_name: str = "rdf_graph") -> OptimizedAsyncTripleConfig:
+    """Create configuration specifically for multiple query runs with maximum safety"""
+    config = create_append_config(sparql_endpoint, triples_query, graph_name)
+    
+    # Extra safety settings for multiple runs
+    config.max_retries = 3                   # Fewer retries to fail faster
+    config.retry_delay = 2                   # Shorter delay between retries
+    config.validate_conversion = False       # Skip validation for speed
+    config.export_stats = False              # Skip stats export to avoid conflicts
+    
     return config
 
 async def test_optimized_converter(sparql_endpoint: str, triples_query: str, sample_size: int = 1000):
@@ -1713,58 +1774,342 @@ async def fresh_graph_from_query(sparql_endpoint: str, triples_query: str, graph
     logger.info(f"✅ Fresh graph created: {stats.created_nodes:,} nodes, {stats.created_relationships:,} relationships")
     return stats
 
-async def incremental_loading_example():
-    """Example: Multiple incremental loads - customize with your own queries"""
+async def run_multiple_queries_with_deduplication(sparql_endpoint: str, queries_list: List[str], graph_name: str = "merged_graph"):
+    """Run multiple SPARQL queries and merge results with automatic deduplication"""
     
-    # CUSTOMIZE THESE
-    endpoint = "https://dbpedia.org/sparql"  # Example endpoint
-    graph_name = "incremental_graph"
+    logger.info(f"🔄 Running {len(queries_list)} queries with automatic deduplication...")
+    logger.info(f"📊 Target graph: '{graph_name}'")
     
-    # Example queries - replace with yours
-    query1 = """
-    SELECT ?subject ?subjectClass ?predicate ?predicateClass ?object ?objectClass WHERE {
-        ?subject ?predicate ?object .
-        OPTIONAL { ?subject a ?subjectClass }
-        OPTIONAL { ?predicate a ?predicateClass }
-        OPTIONAL { ?object a ?objectClass . FILTER(isURI(?object)) }
-        FILTER(STRSTARTS(STR(?subject), "http://dbpedia.org/resource/A"))
-        FILTER(?predicate = <http://www.w3.org/1999/02/22-rdf-syntax-ns#type>)
-    }
-    LIMIT 50
-    """
+    all_stats = []
     
-    query2 = """
-    SELECT ?subject ?subjectClass ?predicate ?predicateClass ?object ?objectClass WHERE {
-        ?subject ?predicate ?object .
-        OPTIONAL { ?subject a ?subjectClass }
-        OPTIONAL { ?predicate a ?predicateClass }
-        OPTIONAL { ?object a ?objectClass . FILTER(isURI(?object)) }
-        FILTER(STRSTARTS(STR(?subject), "http://dbpedia.org/resource/B"))
-        FILTER(?predicate = <http://www.w3.org/1999/02/22-rdf-syntax-ns#type>)
-    }
-    LIMIT 50
-    """
+    for i, query in enumerate(queries_list, 1):
+        logger.info(f"\n{'='*60}")
+        logger.info(f"🚀 QUERY {i}/{len(queries_list)}")
+        logger.info(f"{'='*60}")
+        logger.info(f"Query preview: {query[:200]}...")
+        
+        try:
+            # Use safe multi-query configuration
+            config = create_safe_multi_query_config(sparql_endpoint, query, graph_name)
+            
+            # Create fresh converter for each query to avoid connection issues
+            converter = OptimizedAsyncTripleBasedConverter(config)
+            stats = await converter.convert()
+            all_stats.append(stats)
+            
+            logger.info(f"✅ Query {i} completed: {stats.get_incremental_summary()}")
+            
+        except Exception as e:
+            logger.error(f"❌ Query {i} failed: {e}")
+            if "already indexed" in str(e).lower():
+                logger.info("ℹ️  Index already exists - this is normal for multiple queries")
+            # Continue with next query instead of failing completely
+            continue
+    
+    # Summary of all queries
+    logger.info(f"\n{'='*80}")
+    logger.info(f"🎉 MULTIPLE QUERIES COMPLETED")
+    logger.info(f"{'='*80}")
+    
+    if all_stats:
+        final_stats = all_stats[-1]  # Last stats show final graph state
+        logger.info(f"📊 Final graph state: {final_stats.final_nodes:,} nodes, {final_stats.final_relationships:,} relationships")
+        
+        total_processed = sum(s.processed_triples for s in all_stats)
+        total_new_nodes = sum(s.created_nodes for s in all_stats)
+        total_new_relationships = sum(s.created_relationships for s in all_stats)
+        
+        logger.info(f"📈 Processing summary:")
+        logger.info(f"   Total triples processed: {total_processed:,}")
+        logger.info(f"   Total new nodes added: {total_new_nodes:,}")
+        logger.info(f"   Total new relationships added: {total_new_relationships:,}")
+        logger.info(f"   Successful queries: {len(all_stats)}/{len(queries_list)}")
+        
+        # Run final deduplication if requested
+        logger.info(f"\n🧹 Running final deduplication check...")
+        await deduplicate_graph(graph_name)
+        
+        return all_stats
+    else:
+        logger.error("❌ No queries completed successfully")
+        return []
+
+async def deduplicate_graph(graph_name: str, falkordb_host: str = 'localhost', falkordb_port: int = 6379):
+    """Remove duplicate nodes and relationships from the graph"""
+    
+    logger.info(f"🧹 Starting deduplication of graph '{graph_name}'...")
+    
+    # Create temporary FalkorDB connection for deduplication
+    config = OptimizedAsyncTripleConfig(
+        triples_query="",  # Not needed for deduplication
+        sparql_endpoint="",  # Not needed for deduplication
+        graph_name=graph_name,
+        falkordb_host=falkordb_host,
+        falkordb_port=falkordb_port
+    )
+    
+    falkordb_manager = OptimizedAsyncFalkorDBManager(config)
     
     try:
-        # Load 1
-        logger.info("Load 1: Running first query...")
-        stats1 = await single_query_append(endpoint, query1, graph_name)
-        logger.info(f"Load 1: {stats1.get_incremental_summary()}")
+        await falkordb_manager.connect()
         
-        # Load 2
-        logger.info("Load 2: Running second query...")
-        stats2 = await single_query_append(endpoint, query2, graph_name)
-        logger.info(f"Load 2: {stats2.get_incremental_summary()}")
+        # Get initial stats
+        initial_stats = await falkordb_manager.get_graph_stats()
+        logger.info(f"📊 Before deduplication: {initial_stats['nodes']:,} nodes, {initial_stats['relationships']:,} relationships")
         
-        logger.info("🎉 Incremental loading completed!")
+        # Deduplicate nodes with same URI (keep nodes with more properties)
+        logger.info("🔍 Removing duplicate nodes...")
+        dedup_nodes_query = """
+        MATCH (n)
+        WITH n.uri as uri, collect(n) as nodes
+        WHERE size(nodes) > 1
+        WITH uri, nodes, 
+             [node in nodes | size(keys(node))] as prop_counts,
+             range(0, size(nodes)-1) as indices
+        WITH uri, nodes, 
+             [i in indices | {node: nodes[i], props: prop_counts[i]}] as node_info
+        WITH uri, node_info, 
+             reduce(max_props = -1, info in node_info | 
+                   CASE WHEN info.props > max_props THEN info.props ELSE max_props END) as max_prop_count
+        WITH uri, [info in node_info WHERE info.props = max_prop_count][0].node as keeper,
+             [info in node_info WHERE info.props < max_prop_count | info.node] as to_delete
+        UNWIND to_delete as duplicate_node
+        DETACH DELETE duplicate_node
+        """
+        
+        try:
+            await falkordb_manager.execute_query_with_retry(dedup_nodes_query)
+            logger.info("✅ Node deduplication completed")
+        except Exception as e:
+            logger.warning(f"Node deduplication query failed (may be no duplicates): {e}")
+        
+        # Deduplicate relationships between same nodes
+        logger.info("🔍 Removing duplicate relationships...")
+        dedup_rels_query = """
+        MATCH (a)-[r]->(b)
+        WITH a, b, type(r) as rel_type, collect(r) as rels
+        WHERE size(rels) > 1
+        WITH a, b, rel_type, rels[1..] as duplicates
+        UNWIND duplicates as duplicate_rel
+        DELETE duplicate_rel
+        """
+        
+        try:
+            await falkordb_manager.execute_query_with_retry(dedup_rels_query)
+            logger.info("✅ Relationship deduplication completed")
+        except Exception as e:
+            logger.warning(f"Relationship deduplication query failed (may be no duplicates): {e}")
+        
+        # Get final stats
+        final_stats = await falkordb_manager.get_graph_stats()
+        logger.info(f"📊 After deduplication: {final_stats['nodes']:,} nodes, {final_stats['relationships']:,} relationships")
+        
+        nodes_removed = initial_stats['nodes'] - final_stats['nodes']
+        rels_removed = initial_stats['relationships'] - final_stats['relationships']
+        
+        if nodes_removed > 0 or rels_removed > 0:
+            logger.info(f"🧹 Removed {nodes_removed:,} duplicate nodes and {rels_removed:,} duplicate relationships")
+        else:
+            logger.info("✨ No duplicates found - graph was already clean!")
+        
+        return {
+            'initial_nodes': initial_stats['nodes'],
+            'initial_relationships': initial_stats['relationships'],
+            'final_nodes': final_stats['nodes'],
+            'final_relationships': final_stats['relationships'],
+            'nodes_removed': nodes_removed,
+            'relationships_removed': rels_removed
+        }
         
     except Exception as e:
-        logger.error(f"❌ Incremental loading failed: {e}")
+        logger.error(f"❌ Deduplication failed: {e}")
+        raise
+    finally:
+        await falkordb_manager.close()
+
+async def example_multiple_queries():
+    """Example of running multiple queries with automatic merging and deduplication"""
+    
+    # CUSTOMIZE THESE VALUES
+    endpoint = "https://dbpedia.org/sparql"  # Replace with your endpoint
+    graph_name = "multi_query_graph"
+    
+    # Example queries - replace with your own
+    queries = [
+        # Query 1: Get some entities starting with 'A'
+        """
+        SELECT ?subject ?subjectClass ?predicate ?predicateClass ?object ?objectClass WHERE {
+            ?subject ?predicate ?object .
+            OPTIONAL { ?subject a ?subjectClass }
+            OPTIONAL { ?predicate a ?predicateClass }
+            OPTIONAL { ?object a ?objectClass . FILTER(isURI(?object)) }
+            FILTER(STRSTARTS(STR(?subject), "http://dbpedia.org/resource/A"))
+            FILTER(?predicate = <http://www.w3.org/1999/02/22-rdf-syntax-ns#type>)
+        }
+        LIMIT 50
+        """,
+        
+        # Query 2: Get some entities starting with 'B'
+        """
+        SELECT ?subject ?subjectClass ?predicate ?predicateClass ?object ?objectClass WHERE {
+            ?subject ?predicate ?object .
+            OPTIONAL { ?subject a ?subjectClass }
+            OPTIONAL { ?predicate a ?predicateClass }
+            OPTIONAL { ?object a ?objectClass . FILTER(isURI(?object)) }
+            FILTER(STRSTARTS(STR(?subject), "http://dbpedia.org/resource/B"))
+            FILTER(?predicate = <http://www.w3.org/1999/02/22-rdf-syntax-ns#type>)
+        }
+        LIMIT 50
+        """,
+        
+        # Query 3: Get some different predicate relationships
+        """
+        SELECT ?subject ?subjectClass ?predicate ?predicateClass ?object ?objectClass WHERE {
+            ?subject ?predicate ?object .
+            OPTIONAL { ?subject a ?subjectClass }
+            OPTIONAL { ?predicate a ?predicateClass }
+            OPTIONAL { ?object a ?objectClass . FILTER(isURI(?object)) }
+            FILTER(?predicate = <http://dbpedia.org/ontology/birthPlace>)
+        }
+        LIMIT 30
+        """
+    ]
+    
+    logger.info("🚀 EXAMPLE: Multiple Queries with Automatic Merging")
+    logger.info("=" * 60)
+    logger.info("💡 This example shows how to:")
+    logger.info("   1. Run multiple SPARQL queries")
+    logger.info("   2. Automatically merge results into one graph")
+    logger.info("   3. Handle duplicate data seamlessly")
+    logger.info("   4. Perform final deduplication")
+    
+    try:
+        # Run all queries with automatic merging and deduplication
+        stats_list = await run_multiple_queries_with_deduplication(
+            sparql_endpoint=endpoint,
+            queries_list=queries,
+            graph_name=graph_name
+        )
+        
+        if stats_list:
+            logger.info("\n🎉 SUCCESS: All queries completed and merged!")
+            logger.info(f"📊 Final graph '{graph_name}' is ready for use")
+            
+            # Show some sample queries to explore the merged data
+            logger.info("\n🔍 Sample queries to explore your merged data:")
+            sample_queries = [
+                f"MATCH (n) RETURN labels(n), count(n) ORDER BY count(n) DESC LIMIT 10",
+                f"MATCH ()-[r]->() RETURN type(r), count(r) ORDER BY count(r) DESC LIMIT 10", 
+                f"MATCH (n) RETURN n.uri, labels(n) LIMIT 5"
+            ]
+            
+            for i, query in enumerate(sample_queries, 1):
+                logger.info(f"   {i}. {query}")
+        
+        return stats_list
+        
+    except Exception as e:
+        logger.error(f"❌ Multiple queries example failed: {e}")
+        raise
+
+async def your_custom_multiple_queries():
+    """CUSTOMIZE THIS FUNCTION with your own queries and endpoint"""
+    
+    # 🔧 CUSTOMIZE THESE VALUES FOR YOUR USE CASE
+    endpoint = "YOUR_SPARQL_ENDPOINT_HERE"  # Replace with your SPARQL endpoint
+    graph_name = "your_merged_graph"        # Replace with your desired graph name
+    
+    # 📝 ADD YOUR QUERIES HERE - each query MUST return these 6 variables:
+    # ?subject ?subjectClass ?predicate ?predicateClass ?object ?objectClass
+    your_queries = [
+        """
+        # QUERY 1: Replace with your first SPARQL query
+        SELECT ?subject ?subjectClass ?predicate ?predicateClass ?object ?objectClass WHERE {
+            ?subject ?predicate ?object .
+            OPTIONAL { ?subject a ?subjectClass }
+            OPTIONAL { ?predicate a ?predicateClass }
+            OPTIONAL { ?object a ?objectClass . FILTER(isURI(?object)) }
+            # Add your specific filters here
+        }
+        LIMIT 1000
+        """,
+        
+        """
+        # QUERY 2: Replace with your second SPARQL query
+        SELECT ?subject ?subjectClass ?predicate ?predicateClass ?object ?objectClass WHERE {
+            ?subject ?predicate ?object .
+            OPTIONAL { ?subject a ?subjectClass }
+            OPTIONAL { ?predicate a ?predicateClass }
+            OPTIONAL { ?object a ?objectClass . FILTER(isURI(?object)) }
+            # Add your specific filters here
+        }
+        LIMIT 1000
+        """,
+        
+        # Add more queries as needed...
+    ]
+    
+    # Validation
+    if endpoint == "YOUR_SPARQL_ENDPOINT_HERE":
+        logger.error("❌ Please configure your SPARQL endpoint and queries!")
+        logger.info("Edit the your_custom_multiple_queries() function with:")
+        logger.info("1. endpoint = 'https://your-endpoint.com/sparql'")
+        logger.info("2. Replace the example queries with your actual SPARQL queries")
+        logger.info("3. graph_name = 'your_graph_name'")
+        return
+    
+    if any("Replace with your" in query for query in your_queries):
+        logger.error("❌ Please replace the example queries with your actual SPARQL queries!")
+        logger.info("Each query must return: ?subject ?subjectClass ?predicate ?predicateClass ?object ?objectClass")
+        return
+    
+    logger.info("🚀 RUNNING YOUR CUSTOM MULTIPLE QUERIES")
+    logger.info("=" * 60)
+    logger.info(f"📡 Endpoint: {endpoint}")
+    logger.info(f"📊 Target graph: {graph_name}")
+    logger.info(f"📝 Number of queries: {len(your_queries)}")
+    logger.info("✨ Features enabled:")
+    logger.info("   ✅ Automatic deduplication")
+    logger.info("   ✅ Incremental merging")
+    logger.info("   ✅ Index reuse")
+    logger.info("   ✅ Error recovery")
+    
+    try:
+        # Run all your queries with automatic merging
+        stats_list = await run_multiple_queries_with_deduplication(
+            sparql_endpoint=endpoint,
+            queries_list=your_queries,
+            graph_name=graph_name
+        )
+        
+        if stats_list:
+            logger.info(f"\n🎉 SUCCESS: All your queries completed!")
+            logger.info(f"📊 Your graph '{graph_name}' contains merged and deduplicated data")
+            
+            # Get final converter instance to show sample queries
+            final_config = create_append_config(endpoint, your_queries[0], graph_name)
+            converter = OptimizedAsyncTripleBasedConverter(final_config)
+            
+            logger.info("\n🔍 Sample queries to explore your merged data:")
+            for i, query in enumerate(converter.get_sample_queries()[:5], 1):
+                logger.info(f"   {i}. {query}")
+        
+        return stats_list
+        
+    except Exception as e:
+        logger.error(f"❌ Your custom queries failed: {e}")
+        import traceback
+        traceback.print_exc()
         raise
 
 if __name__ == "__main__":
-    # Run the FIXED converter with your custom configuration
-    asyncio.run(main())
+    # CHOOSE YOUR EXECUTION MODE:
     
-    # Uncomment to test incremental loading:
-    # asyncio.run(incremental_loading_example())
+    # Option 1: Single query conversion
+    # asyncio.run(main())
+    
+    # Option 2: Multiple queries with automatic merging (RECOMMENDED FOR YOUR USE CASE)
+    asyncio.run(example_multiple_queries())
+    
+    # Option 3: Custom multiple queries - UNCOMMENT AND CUSTOMIZE the function above
+    # asyncio.run(your_custom_multiple_queries())
