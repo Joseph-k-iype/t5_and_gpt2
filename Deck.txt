@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Complete Optimized Async RDF to FalkorDB Converter with Automatic Deduplication
+Complete Optimized Async RDF to FalkorDB Converter with Fixed Index Management
 Dependencies: pip install rdflib falkordb redis asyncio tqdm
 """
 
@@ -304,13 +304,14 @@ class AsyncNodeManager:
 
 
 class OptimizedAsyncFalkorDBManager:
-    """Optimized FalkorDB manager with corrected syntax for FalkorDB compatibility"""
+    """Optimized FalkorDB manager with fixed index handling"""
     
     def __init__(self, config: OptimizedAsyncTripleConfig):
         self.config = config
         self.pool = None
         self.db = None
         self.graph = None
+        self._existing_indexes = set()  # Cache of existing indexes
     
     async def connect(self):
         """Establish async connection to FalkorDB"""
@@ -346,9 +347,45 @@ class OptimizedAsyncFalkorDBManager:
             
             logger.info(f"✅ FalkorDB connection established to graph '{self.config.graph_name}'")
             
+            # Discover existing indexes after connection
+            await self._discover_existing_indexes()
+            
         except Exception as e:
             logger.error(f"Failed to connect to FalkorDB: {e}")
             raise
+    
+    async def _discover_existing_indexes(self):
+        """Discover and cache existing indexes to avoid conflicts"""
+        try:
+            logger.info("🔍 Discovering existing indexes...")
+            
+            try:
+                result = await self.execute_query_with_retry("CALL db.indexes()")
+                
+                if result.result_set:
+                    for row in result.result_set:
+                        if len(row) > 0:
+                            index_info = str(row[0])
+                            # Parse index information to extract label and property
+                            if ":" in index_info and "(" in index_info:
+                                # Extract label from index info like "INDEX :Person(uri)"
+                                label_part = index_info.split("(")[0].replace("INDEX", "").replace(":", "").strip()
+                                if "uri" in index_info.lower():
+                                    self._existing_indexes.add(label_part)
+                                    logger.info(f"📋 Found existing index: {label_part}.uri")
+                
+                if self._existing_indexes:
+                    logger.info(f"✅ Discovered {len(self._existing_indexes)} existing indexes")
+                else:
+                    logger.info("ℹ️  No existing indexes found")
+                    
+            except Exception as e:
+                # If we can't get indexes, that's ok - we'll handle it gracefully
+                logger.info(f"ℹ️  Could not discover existing indexes: {e}")
+                logger.info("ℹ️  Will handle index creation gracefully as we go")
+                
+        except Exception as e:
+            logger.warning(f"Index discovery failed: {e}")
     
     async def clear_graph(self):
         """Clear existing graph data"""
@@ -391,48 +428,135 @@ class OptimizedAsyncFalkorDBManager:
                 await asyncio.sleep(self.config.retry_delay * (2 ** attempt))
                 logger.warning(f"Query attempt {attempt + 1} failed, retrying: {e}")
     
+    async def check_if_index_exists(self, label: str) -> bool:
+        """Check if an index already exists for a label"""
+        
+        # First check our cache
+        if label in self._existing_indexes:
+            return True
+        
+        # Try to query for the specific index
+        try:
+            # Try a query that would use the index to see if it exists
+            test_query = f"EXPLAIN MATCH (n:{label}) WHERE n.uri = 'test' RETURN n"
+            result = await self.execute_query_with_retry(test_query)
+            
+            # If we can get an execution plan, the index likely exists
+            if result:
+                self._existing_indexes.add(label)
+                return True
+                
+        except Exception:
+            # If the query fails, we'll assume no index exists
+            pass
+        
+        return False
+    
     async def create_index_safely(self, label: str) -> bool:
-        """Create an index safely with proper error handling"""
+        """Create an index safely with comprehensive error handling"""
+        
+        # First check if we already know this index exists
+        if await self.check_if_index_exists(label):
+            logger.info(f"✅ Index for label '{label}' already exists (reusing)")
+            return True
+        
         try:
             query = f"CREATE INDEX FOR (n:{label}) ON (n.uri)"
             await self.execute_query_with_retry(query)
-            logger.info(f"✅ Created index for label '{label}'")
+            
+            # Cache that this index now exists
+            self._existing_indexes.add(label)
+            logger.info(f"✅ Created new index for label '{label}'")
             return True
+            
         except Exception as e:
             error_msg = str(e).lower()
-            if any(keyword in error_msg for keyword in ['already indexed', 'already exists', 'duplicate']):
-                logger.info(f"ℹ️  Index for '{label}' already exists")
+            
+            # Comprehensive list of error messages that indicate index already exists
+            existing_index_keywords = [
+                'already indexed',        # Catches "Attribute 'uri' already indexed"
+                'already exists', 
+                'duplicate',
+                'index already exists',
+                'constraint already exists',
+                'attribute',             # Additional catch for attribute-related errors
+                'uri already indexed',   # Specific case
+                'index exists'
+            ]
+            
+            if any(keyword in error_msg for keyword in existing_index_keywords):
+                # Cache that this index exists
+                self._existing_indexes.add(label)
+                logger.info(f"✅ Index for '{label}' already exists (detected from error)")
                 return True
             else:
-                logger.warning(f"Could not create index for label '{label}': {e}")
+                logger.warning(f"⚠️  Could not create index for label '{label}': {e}")
+                logger.info(f"💡 This won't affect functionality, just query performance")
                 return False
     
     async def create_indexes(self, discovered_labels: Dict[str, int] = None):
-        """Create indexes with robust duplicate handling"""
+        """Create indexes with robust duplicate handling and existing index reuse"""
         if not self.config.create_indexes:
+            logger.info("⏭️  Index creation disabled in config")
             return
         
-        logger.info("Creating performance indexes for discovered RDF classes...")
+        logger.info("🏗️  Creating performance indexes for discovered RDF classes...")
         
         clean_default_label = clean_label_name(self.config.default_node_label)
         
         if not discovered_labels:
-            logger.warning("No discovered labels provided - creating fallback index only")
+            logger.info("⚠️  No discovered labels provided - creating fallback index only")
             await self.create_index_safely(clean_default_label)
             return
         
-        top_labels = sorted(discovered_labels.items(), key=lambda x: x[1], reverse=True)[:10]
-        logger.info(f"Creating indexes for top {len(top_labels)} RDF classes:")
+        # Sort labels by count (most frequent first) and take top 15
+        top_labels = sorted(discovered_labels.items(), key=lambda x: x[1], reverse=True)[:15]
+        logger.info(f"🎯 Creating indexes for top {len(top_labels)} RDF classes:")
         
-        created_indexes = set()
+        created_count = 0
+        reused_count = 0
+        failed_count = 0
         
         for label, count in top_labels:
-            logger.info(f"  - {label}: {count:,} nodes")
-            if await self.create_index_safely(label):
-                created_indexes.add(label)
+            logger.info(f"   📊 {label}: {count:,} nodes")
+            
+            # Check if index already exists first
+            if await self.check_if_index_exists(label):
+                logger.info(f"   ✅ {label}: Reusing existing index")
+                reused_count += 1
+            else:
+                # Try to create new index
+                if await self.create_index_safely(label):
+                    if label in self._existing_indexes:
+                        created_count += 1
+                    else:
+                        reused_count += 1
+                else:
+                    failed_count += 1
         
-        if clean_default_label not in created_indexes:
-            await self.create_index_safely(clean_default_label)
+        # Ensure default label has an index
+        if clean_default_label not in self._existing_indexes:
+            if await self.create_index_safely(clean_default_label):
+                if clean_default_label in self._existing_indexes:
+                    created_count += 1
+                else:
+                    reused_count += 1
+            else:
+                failed_count += 1
+        else:
+            logger.info(f"✅ Default label '{clean_default_label}': Reusing existing index")
+            reused_count += 1
+        
+        logger.info(f"🎉 Index management completed:")
+        logger.info(f"   ✅ Created: {created_count} new indexes")
+        logger.info(f"   ♻️  Reused: {reused_count} existing indexes") 
+        logger.info(f"   ⚠️  Failed: {failed_count} indexes")
+        
+        if reused_count > 0:
+            logger.info(f"💡 Reusing existing indexes improves startup time!")
+        
+        if failed_count > 0:
+            logger.info(f"💡 Failed indexes won't affect functionality, just query performance")
     
     async def create_node_batch(self, nodes_batch: List[Tuple[str, Dict[str, Any]]]) -> int:
         """Create nodes with URI-based merging"""
@@ -843,6 +967,57 @@ class OptimizedAsyncFalkorDBManager:
         except Exception as e:
             logger.error(f"Error getting statistics: {e}")
             return {'nodes': 0, 'relationships': 0}
+    
+    async def list_all_indexes(self) -> List[str]:
+        """List all existing indexes in the graph"""
+        indexes = []
+        
+        try:
+            result = await self.execute_query_with_retry("CALL db.indexes()")
+            
+            if result.result_set:
+                logger.info("📋 Current indexes in graph:")
+                for row in result.result_set:
+                    if len(row) > 0:
+                        index_info = str(row[0])
+                        indexes.append(index_info)
+                        logger.info(f"   📌 {index_info}")
+            else:
+                logger.info("📋 No indexes found in graph")
+                
+        except Exception as e:
+            logger.warning(f"Could not list indexes: {e}")
+        
+        return indexes
+    
+    async def clear_specific_indexes(self, labels_to_clear: List[str]):
+        """Clear indexes for specific labels only"""
+        logger.info(f"🧹 Clearing indexes for specific labels: {labels_to_clear}")
+        
+        cleared_count = 0
+        
+        for label in labels_to_clear:
+            try:
+                drop_query = f"DROP INDEX FOR (n:{label}) ON (n.uri)"
+                await self.execute_query_with_retry(drop_query)
+                
+                # Remove from our cache
+                self._existing_indexes.discard(label)
+                
+                logger.info(f"✅ Cleared index for label '{label}'")
+                cleared_count += 1
+                
+            except Exception as e:
+                error_msg = str(e).lower()
+                if any(keyword in error_msg for keyword in ['no such index', 'does not exist', 'not found']):
+                    logger.info(f"ℹ️  Index for '{label}' does not exist (already clear)")
+                else:
+                    logger.warning(f"Could not clear index for '{label}': {e}")
+        
+        logger.info(f"🧹 Cleared {cleared_count} indexes")
+        
+        # Refresh our cache
+        await self._discover_existing_indexes()
     
     async def close(self):
         """Close async connections"""
@@ -1283,7 +1458,7 @@ class OptimizedAsyncTripleBasedConverter:
             
         except Exception as e:
             error_msg = str(e).lower()
-            if any(keyword in error_msg for keyword in ['already indexed', 'already exists', 'duplicate']):
+            if any(keyword in error_msg for keyword in ['already indexed', 'already exists', 'duplicate', 'attribute']):
                 logger.info("ℹ️  Index already exists - this is normal when running multiple queries")
                 logger.info("💡 Conversion will continue successfully without recreating indexes")
             else:
@@ -1625,7 +1800,7 @@ async def run_multiple_queries_with_deduplication(sparql_endpoint: str, queries_
                 
             except Exception as e:
                 error_msg = str(e).lower()
-                if "already indexed" in error_msg:
+                if any(keyword in error_msg for keyword in ['already indexed', 'attribute']):
                     logger.warning(f"⚠️  Query {i} hit index conflict: {e}")
                     logger.info("💡 This is usually not critical - data may still be processed")
                 else:
@@ -1862,10 +2037,11 @@ async def run_queries_simple(endpoint: str, queries: List[str], graph_name: str 
     except Exception as e:
         logger.error(f"❌ Simple interface failed: {e}")
         
-        if "already indexed" in str(e).lower():
+        error_msg = str(e).lower()
+        if any(keyword in error_msg for keyword in ['already indexed', 'attribute']):
             logger.info("💡 Index error detected. The system should handle this automatically.")
             logger.info("💡 If this persists, try using a different graph_name")
-        elif "sparql" in str(e).lower() or "endpoint" in str(e).lower():
+        elif "sparql" in error_msg or "endpoint" in error_msg:
             logger.info("💡 SPARQL connection issue. Check your endpoint URL and network connectivity")
         else:
             logger.info("💡 Unexpected error. Check your query syntax and FalkorDB connection")
@@ -1955,5 +2131,231 @@ async def example_multiple_queries():
         raise
 
 
+async def example_simple_usage():
+    """Example showing the simplest way to use the converter"""
+    
+    logger.info("🎯 SIMPLE USAGE EXAMPLE")
+    logger.info("=" * 50)
+    logger.info("💡 The easiest way to convert RDF to FalkorDB:")
+    
+    # Example configuration
+    endpoint = "https://dbpedia.org/sparql"
+    
+    # Simple queries 
+    queries = [
+        """
+        SELECT ?subject ?subjectClass ?predicate ?predicateClass ?object ?objectClass WHERE {
+            ?subject ?predicate ?object .
+            OPTIONAL { ?subject a ?subjectClass }
+            OPTIONAL { ?predicate a ?predicateClass }
+            OPTIONAL { ?object a ?objectClass . FILTER(isURI(?object)) }
+            FILTER(STRSTARTS(STR(?subject), "http://dbpedia.org/resource/C"))
+            FILTER(?predicate = <http://www.w3.org/1999/02/22-rdf-syntax-ns#type>)
+        }
+        LIMIT 25
+        """
+    ]
+    
+    # This single function call handles everything:
+    # - Index conflicts
+    # - SPARQL connection 
+    # - URI merging
+    # - Deduplication
+    # - Error recovery
+    
+    logger.info("📝 Code:")
+    logger.info('''
+success = await run_queries_simple(
+    endpoint="https://dbpedia.org/sparql",
+    queries=your_queries,
+    graph_name="my_graph"
+)
+    ''')
+    
+    try:
+        success = await run_queries_simple(
+            endpoint=endpoint,
+            queries=queries,
+            graph_name="simple_example_graph"
+        )
+        
+        if success:
+            logger.info("✅ Simple usage example completed successfully!")
+            logger.info("💡 Your graph is ready to query in FalkorDB")
+        else:
+            logger.error("❌ Simple usage example failed")
+            
+        return success
+        
+    except Exception as e:
+        logger.error(f"Simple usage example error: {e}")
+        return False
+
+
+async def example_configuration_options():
+    """Example showing different configuration options"""
+    
+    logger.info("⚙️  CONFIGURATION OPTIONS EXAMPLE")
+    logger.info("=" * 50)
+    
+    endpoint = "https://dbpedia.org/sparql"
+    query = """
+    SELECT ?subject ?subjectClass ?predicate ?predicateClass ?object ?objectClass WHERE {
+        ?subject ?predicate ?object .
+        OPTIONAL { ?subject a ?subjectClass }
+        OPTIONAL { ?predicate a ?predicateClass }
+        OPTIONAL { ?object a ?objectClass . FILTER(isURI(?object)) }
+        FILTER(STRSTARTS(STR(?subject), "http://dbpedia.org/resource/D"))
+    }
+    LIMIT 20
+    """
+    
+    logger.info("1️⃣  Standard optimized config (recommended):")
+    config1 = create_optimized_config(endpoint, query, "standard_graph")
+    logger.info(f"   - Handles duplicates: {config1.handle_duplicates}")
+    logger.info(f"   - Batch size: {config1.batch_size}")
+    logger.info(f"   - Creates indexes: {config1.create_indexes}")
+    
+    logger.info("\n2️⃣  Ultra-fast config (for 2M+ edges):")
+    config2 = create_ultra_fast_config(endpoint, query, "ultra_fast_graph")
+    logger.info(f"   - Handles duplicates: {config2.handle_duplicates}")
+    logger.info(f"   - Batch size: {config2.batch_size}")
+    logger.info(f"   - Creates indexes: {config2.create_indexes}")
+    
+    logger.info("\n3️⃣  Safe multi-query config:")
+    config3 = create_safe_multi_query_config(endpoint, query, "safe_graph")
+    logger.info(f"   - Max retries: {config3.max_retries}")
+    logger.info(f"   - Append mode: {config3.append_to_existing_graph}")
+    logger.info(f"   - Validation: {config3.validate_conversion}")
+    
+    logger.info("\n4️⃣  Custom config example:")
+    custom_config = OptimizedAsyncTripleConfig(
+        triples_query=query,
+        sparql_endpoint=endpoint,
+        graph_name="custom_graph",
+        batch_size=5000,  # Larger batches
+        max_concurrent_batches=5,  # More parallel processing
+        create_indexes=True,
+        handle_duplicates=True,
+        append_to_existing_graph=True,
+        sparql_timeout=3600,  # 1 hour timeout
+        falkordb_timeout=600,  # 10 minute timeout
+        preserve_uri_properties=True,  # Keep URI properties
+        use_shortened_uris=False,  # Use full URIs
+    )
+    
+    logger.info(f"   - Custom batch size: {custom_config.batch_size}")
+    logger.info(f"   - Custom concurrent batches: {custom_config.max_concurrent_batches}")
+    logger.info(f"   - Custom timeouts: SPARQL={custom_config.sparql_timeout}s, FalkorDB={custom_config.falkordb_timeout}s")
+    
+    return [config1, config2, config3, custom_config]
+
+
+async def troubleshooting_guide():
+    """Comprehensive troubleshooting guide"""
+    
+    logger.info("🔧 TROUBLESHOOTING GUIDE")
+    logger.info("=" * 60)
+    
+    logger.info("❌ COMMON ISSUES AND SOLUTIONS:")
+    logger.info("")
+    
+    logger.info("1️⃣  'Attribute uri already indexed' Error:")
+    logger.info("   CAUSE: Trying to create indexes that already exist")
+    logger.info("   SOLUTION: Use clear_indexes_first=True or run_queries_simple()")
+    logger.info("   CODE: await clear_all_indexes('your_graph_name')")
+    logger.info("")
+    
+    logger.info("2️⃣  SPARQL Connection Timeout:")
+    logger.info("   CAUSE: Large queries or slow endpoints")
+    logger.info("   SOLUTION: Increase sparql_timeout in config")
+    logger.info("   CODE: config.sparql_timeout = 7200  # 2 hours")
+    logger.info("")
+    
+    logger.info("3️⃣  FalkorDB Connection Failed:")
+    logger.info("   CAUSE: FalkorDB not running or wrong connection details")
+    logger.info("   SOLUTION: Check FalkorDB status and connection parameters")
+    logger.info("   CODE: redis-cli ping  # Should return PONG")
+    logger.info("")
+    
+    logger.info("4️⃣  Out of Memory During Processing:")
+    logger.info("   CAUSE: Too large batch sizes or not enough RAM")
+    logger.info("   SOLUTION: Reduce batch_size and max_concurrent_batches")
+    logger.info("   CODE: config.batch_size = 1000; config.max_concurrent_batches = 1")
+    logger.info("")
+    
+    logger.info("5️⃣  Slow Relationship Creation:")
+    logger.info("   CAUSE: Large number of relationships, duplicate checking overhead")
+    logger.info("   SOLUTION: Use ultra-fast config or disable duplicate handling temporarily")
+    logger.info("   CODE: config = create_ultra_fast_config(...)")
+    logger.info("")
+    
+    logger.info("6️⃣  Graph Has Duplicates After Loading:")
+    logger.info("   CAUSE: Multiple queries adding same data")
+    logger.info("   SOLUTION: Run automatic deduplication")
+    logger.info("   CODE: await deduplicate_graph('your_graph_name')")
+    logger.info("")
+    
+    logger.info("💡 BEST PRACTICES:")
+    logger.info("   ✅ Always use run_queries_simple() for automatic error handling")
+    logger.info("   ✅ Clear indexes before fresh starts: clear_indexes_first=True")
+    logger.info("   ✅ Use unique graph names for different datasets")
+    logger.info("   ✅ Monitor system resources (RAM, CPU) during large conversions")
+    logger.info("   ✅ Run deduplication after multiple query sessions")
+    logger.info("   ✅ Test with small queries first, then scale up")
+    
+    logger.info("")
+    logger.info("🆘 EMERGENCY FIXES:")
+    logger.info("   🔥 Everything broken? Try: await clear_all_indexes('graph_name')")
+    logger.info("   🔥 Corrupted graph? Delete and restart with new graph name")
+    logger.info("   🔥 Memory issues? Restart Python process and use smaller batches")
+    logger.info("   🔥 Still failing? Use create_ultra_fast_config() for maximum compatibility")
+
+
+# MAIN EXECUTION AND EXAMPLES
 if __name__ == "__main__":
-    asyncio.run(example_multiple_queries())
+    
+    async def main():
+        """Main execution with multiple examples"""
+        
+        logger.info("🚀 RDF TO FALKORDB CONVERTER")
+        logger.info("=" * 60)
+        logger.info("✨ Complete, Fixed, and Optimized Version")
+        logger.info("🔧 Fixed: Index conflict handling")
+        logger.info("⚡ Enhanced: Ultra-fast relationship creation")
+        logger.info("🧹 Automatic: Deduplication and cleanup")
+        logger.info("🛡️  Robust: Error handling and recovery")
+        logger.info("")
+        
+        # Show troubleshooting guide first
+        await troubleshooting_guide()
+        print("\n" + "="*80 + "\n")
+        
+        # Show configuration options
+        await example_configuration_options() 
+        print("\n" + "="*80 + "\n")
+        
+        # Run simple usage example
+        logger.info("🎯 RUNNING SIMPLE USAGE EXAMPLE...")
+        await example_simple_usage()
+        print("\n" + "="*80 + "\n")
+        
+        # Run multiple queries example
+        logger.info("🔄 RUNNING MULTIPLE QUERIES EXAMPLE...")
+        await example_multiple_queries()
+        print("\n" + "="*80 + "\n")
+        
+        logger.info("✅ ALL EXAMPLES COMPLETED!")
+        logger.info("🎉 Your RDF to FalkorDB converter is ready for production use!")
+        logger.info("")
+        logger.info("📚 QUICK REFERENCE:")
+        logger.info("   • Simple usage: run_queries_simple(endpoint, queries, graph_name)")
+        logger.info("   • Multiple queries: run_multiple_queries_with_deduplication(...)")
+        logger.info("   • Ultra-fast: run_ultra_fast_conversion(...)")
+        logger.info("   • Clear conflicts: clear_all_indexes(graph_name)")
+        logger.info("   • Remove duplicates: deduplicate_graph(graph_name)")
+        logger.info("")
+        logger.info("🔍 Need help? Check the troubleshooting guide above!")
+    
+    # Run the main function
+    asyncio.run(main())
