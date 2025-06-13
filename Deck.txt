@@ -1,2344 +1,748 @@
 #!/usr/bin/env python3
 """
-Complete Fixed RDF to FalkorDB Converter - Updated for Latest FalkorDB
-Key fixes:
-1. Proper GRAPH.EXPLAIN syntax: GRAPH.EXPLAIN key query
-2. Correct error handling for "Attribute uri is already indexed"
-3. Updated for latest FalkorDB API and ResponseError handling
-4. Better index management and discovery
+FalkorDB CSV to Knowledge Graph Converter with OpenAI Embeddings
+A streamlined tool for creating knowledge graphs from CSV data with OpenAI vector embeddings.
+
+Features:
+- OpenAI embeddings (text-embedding-3-large, text-embedding-3-small)
+- Data quality validation and analysis
+- User-defined relationships only
+- FalkorDB vector indexing
+- Performance optimizations
+
+Usage:
+    python enhanced_graph_converter.py <graph_name> <csv_directory_path> <config_file_path>
 """
 
-import logging
+import os
+import sys
 import json
 import time
+import logging
+import argparse
 import asyncio
-from typing import Dict, List, Set, Tuple, Optional, Any
-from dataclasses import dataclass, asdict
-from collections import defaultdict, Counter
-from urllib.parse import urlparse
-import re
+import aiohttp
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
+from dataclasses import dataclass
 
-import rdflib
-from rdflib import ConjunctiveGraph, URIRef, Literal, BNode
-from rdflib.plugins.stores import sparqlstore
-from rdflib.namespace import RDF, RDFS, OWL, XSD
+import pandas as pd
+import numpy as np
+from openai import OpenAI
 
-import falkordb.asyncio as falkordb_async
-import redis.asyncio as redis_async
-from redis.asyncio import BlockingConnectionPool
-from redis.exceptions import ResponseError  # Import the correct exception type
+try:
+    from falkordb import FalkorDB
+    import redis
+except ImportError:
+    print("Error: FalkorDB and redis packages not found. Install with: pip install falkordb redis")
+    sys.exit(1)
 
-from tqdm.asyncio import tqdm
-from tqdm import tqdm as tqdm_sync
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('graph_converter.log'),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
-
-def clean_label_name(label: str) -> str:
-    """Clean label name to ensure valid Cypher identifier"""
-    if not label:
-        return 'Resource'
-    
-    clean_label = re.sub(r'[^a-zA-Z0-9_]', '_', label)
-    
-    if clean_label and clean_label[0].isdigit():
-        clean_label = f"_{clean_label}"
-    
-    if not clean_label:
-        clean_label = 'Resource'
-    elif len(clean_label) > 50:
-        clean_label = clean_label[:50]
-    
-    return clean_label
-
-
 @dataclass
-class OptimizedAsyncTripleConfig:
-    """Configuration for async triple-based RDF conversion"""
-    triples_query: str
-    sparql_endpoint: str
-    username: Optional[str] = None
-    password: Optional[str] = None
-    
-    falkordb_host: str = 'localhost'
-    falkordb_port: int = 6379
-    falkordb_password: Optional[str] = None
-    graph_name: str = 'rdf_graph'
-    
-    append_to_existing_graph: bool = True
-    clear_existing_graph: bool = False
-    handle_duplicates: bool = True
-    skip_existing_nodes: bool = True
-    skip_existing_relationships: bool = True
-    
-    batch_size: int = 2000
-    max_concurrent_batches: int = 3
-    connection_pool_size: int = 10
-    sparql_timeout: int = 7200
-    falkordb_timeout: Optional[int] = 300
-    max_retries: int = 5
-    retry_delay: int = 3
-    
-    preserve_uri_properties: bool = False
-    disable_relationship_properties: bool = True
-    group_relationships_by_type: bool = True
-    use_bulk_relationship_creation: bool = True
-    
-    use_shortened_uris: bool = True
-    create_indexes: bool = True
-    default_node_label: str = 'Resource'
-    
-    exclude_rdf_type_properties: bool = False
-    validate_conversion: bool = False
-    export_stats: bool = True
-    progress_update_interval: int = 50
+class DataQualityConfig:
+    """Configuration for data quality validation."""
+    enabled: bool = True
+    max_null_percentage: float = 0.5
+    duplicate_detection: bool = True
+    outlier_detection: bool = True
+    data_profiling: bool = True
 
-
-@dataclass
-class AsyncConversionStats:
-    """Statistics tracking for async conversion process"""
-    start_time: datetime
-    end_time: Optional[datetime] = None
+class DataQualityAnalyzer:
+    """Analyzes and validates data quality."""
     
-    query_execution_time: float = 0.0
-    total_triples_retrieved: int = 0
-    processed_triples: int = 0
-    property_triples: int = 0
-    relationship_triples: int = 0
+    def __init__(self, config: DataQualityConfig):
+        self.config = config
     
-    total_batches: int = 0
-    completed_batches: int = 0
-    failed_batches: int = 0
-    
-    initial_nodes: int = 0
-    initial_relationships: int = 0
-    unique_subjects: int = 0
-    unique_objects: int = 0
-    created_nodes: int = 0
-    created_relationships: int = 0
-    skipped_nodes: int = 0
-    skipped_relationships: int = 0
-    final_nodes: int = 0
-    final_relationships: int = 0
-    
-    relationship_creation_time: float = 0.0
-    node_creation_time: float = 0.0
-    relationship_creation_rate: float = 0.0
-    
-    subject_classes: Set[str] = None
-    object_classes: Set[str] = None
-    predicates_used: Set[str] = None
-    relationship_types_count: Dict[str, int] = None
-    
-    append_mode: bool = False
-    graph_was_cleared: bool = False
-    processing_errors: int = 0
-    
-    def __post_init__(self):
-        if self.subject_classes is None:
-            self.subject_classes = set()
-        if self.object_classes is None:
-            self.object_classes = set()
-        if self.predicates_used is None:
-            self.predicates_used = set()
-        if self.relationship_types_count is None:
-            self.relationship_types_count = {}
-    
-    def get_incremental_summary(self) -> str:
-        """Get a summary of incremental changes"""
-        if self.append_mode:
-            return (f"Added {self.created_nodes:,} nodes and {self.created_relationships:,} relationships. "
-                   f"Graph now has {self.final_nodes:,} nodes and {self.final_relationships:,} relationships total.")
-        else:
-            return (f"Created {self.created_nodes:,} nodes and {self.created_relationships:,} relationships "
-                   f"in new graph.")
-
-
-class URIProcessor:
-    """Handles URI processing and identifier creation"""
-    
-    def __init__(self, use_shortened_uris: bool = True):
-        self.use_shortened_uris = use_shortened_uris
-        self.namespace_map: Dict[str, str] = {}
-        self.uri_cache: Dict[str, str] = {}
-        self._setup_common_namespaces()
-    
-    def _setup_common_namespaces(self):
-        """Setup common namespace mappings"""
-        common_namespaces = {
-            'http://www.w3.org/1999/02/22-rdf-syntax-ns#': 'rdf',
-            'http://www.w3.org/2000/01/rdf-schema#': 'rdfs',
-            'http://www.w3.org/2002/07/owl#': 'owl',
-            'http://www.w3.org/2001/XMLSchema#': 'xsd',
-            'http://xmlns.com/foaf/0.1/': 'foaf',
-            'http://purl.org/dc/elements/1.1/': 'dc',
-            'http://purl.org/dc/terms/': 'dct',
-            'http://schema.org/': 'schema',
-            'http://dbpedia.org/resource/': 'dbr',
-            'http://dbpedia.org/ontology/': 'dbo',
-            'http://www.w3.org/2004/02/skos/core#': 'skos',
+    def analyze_dataframe(self, df: pd.DataFrame) -> Dict:
+        """Analyze data quality of a DataFrame."""
+        report = {
+            'total_rows': len(df),
+            'total_columns': len(df.columns),
+            'null_percentages': {},
+            'duplicate_rows': 0,
+            'data_types': {},
+            'outliers': {},
+            'quality_score': 0.0
         }
         
-        for namespace, prefix in common_namespaces.items():
-            self.namespace_map[namespace] = prefix
+        if not self.config.enabled:
+            return report
+        
+        # Calculate null percentages
+        for col in df.columns:
+            null_pct = df[col].isnull().sum() / len(df) if len(df) > 0 else 0
+            report['null_percentages'][col] = null_pct
+        
+        # Check for duplicates
+        if self.config.duplicate_detection:
+            report['duplicate_rows'] = df.duplicated().sum()
+        
+        # Data type analysis
+        for col in df.columns:
+            report['data_types'][col] = str(df[col].dtype)
+        
+        # Outlier detection for numeric columns
+        if self.config.outlier_detection:
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            for col in numeric_cols:
+                if len(df[col].dropna()) > 0:
+                    Q1 = df[col].quantile(0.25)
+                    Q3 = df[col].quantile(0.75)
+                    IQR = Q3 - Q1
+                    if IQR > 0:
+                        outliers = df[(df[col] < (Q1 - 1.5 * IQR)) | (df[col] > (Q3 + 1.5 * IQR))]
+                        report['outliers'][col] = len(outliers)
+                    else:
+                        report['outliers'][col] = 0
+        
+        # Calculate overall quality score
+        avg_null_pct = np.mean(list(report['null_percentages'].values())) if report['null_percentages'] else 0
+        duplicate_pct = report['duplicate_rows'] / len(df) if len(df) > 0 else 0
+        
+        quality_score = max(0, 1.0 - avg_null_pct - duplicate_pct)
+        report['quality_score'] = quality_score
+        
+        return report
+
+class OpenAIEmbeddingProvider:
+    """OpenAI embedding provider supporting text-embedding-3-large and text-embedding-3-small."""
     
-    def process_uri(self, uri_str: str) -> str:
-        """Process URI for use as identifier or label"""
-        if not self.use_shortened_uris:
-            return self._clean_identifier(uri_str)
+    def __init__(self, model_name: str, api_key: str, dimensions: Optional[int] = None, batch_size: int = 100):
+        self.model_name = model_name
+        self.batch_size = batch_size
+        self.client = OpenAI(api_key=api_key)
         
-        if uri_str in self.uri_cache:
-            return self.uri_cache[uri_str]
-        
-        for namespace, prefix in self.namespace_map.items():
-            if uri_str.startswith(namespace):
-                local_name = uri_str[len(namespace):]
-                local_name = self._clean_identifier(local_name)
-                result = f"{prefix}_{local_name}" if local_name else prefix
-                self.uri_cache[uri_str] = result
-                return result
-        
-        result = self._extract_local_name(uri_str)
-        self.uri_cache[uri_str] = result
-        return result
-    
-    def _clean_identifier(self, name: str) -> str:
-        """Clean string to be valid identifier"""
-        clean_name = re.sub(r'[^a-zA-Z0-9_]', '_', name)
-        clean_name = clean_name.strip('_')
-        if clean_name and clean_name[0].isdigit():
-            clean_name = f"_{clean_name}"
-        return clean_name or 'unknown'
-    
-    def _extract_local_name(self, uri: str) -> str:
-        """Extract local name from URI"""
-        parsed = urlparse(uri)
-        
-        if parsed.fragment:
-            local_name = parsed.fragment
-        elif '/' in parsed.path:
-            local_name = parsed.path.split('/')[-1]
-        elif '#' in uri:
-            local_name = uri.split('#')[-1]
+        # Set default dimensions based on model
+        if dimensions:
+            self.dimensions = dimensions
+        elif 'text-embedding-3-large' in model_name:
+            self.dimensions = 3072
+        elif 'text-embedding-3-small' in model_name:
+            self.dimensions = 1536
         else:
-            local_name = uri.split('/')[-1] if '/' in uri else uri
-        
-        return self._clean_identifier(local_name)
-
-
-class AsyncNodeManager:
-    """Manages node creation and properties with async operations"""
+            self.dimensions = 1536
     
-    def __init__(self, uri_processor: URIProcessor, config: OptimizedAsyncTripleConfig):
-        self.uri_processor = uri_processor
-        self.config = config
-        self.nodes: Dict[str, Dict[str, Any]] = {}
-        self._lock = asyncio.Lock()
-    
-    async def ensure_node_exists(self, uri: str, class_uri: Optional[str] = None):
-        """Ensure a node exists with appropriate labeling"""
-        async with self._lock:
-            if uri not in self.nodes:
-                await self._create_node(uri, class_uri)
-    
-    async def _create_node(self, uri: str, class_uri: Optional[str] = None):
-        """Create a new node entry with proper RDF class as primary label"""
-        labels = set()
-        primary_label = None
+    def embed_texts(self, texts: List[str]) -> List[List[float]]:
+        """Generate embeddings for multiple texts using OpenAI API."""
+        embeddings = []
         
-        if class_uri:
-            class_label = self.uri_processor.process_uri(class_uri)
-            clean_class_label = clean_label_name(class_label)
-            labels.add(clean_class_label)
-            primary_label = clean_class_label
-        else:
-            primary_label = clean_label_name(self.config.default_node_label)
-            labels.add(primary_label)
-        
-        if uri.startswith('_:'):
-            labels.add('BlankNode')
-        
-        node_data = {
-            'labels': labels,
-            'primary_label': primary_label,
-            'properties': {}
-        }
-        
-        node_data['properties']['uri'] = uri
-        node_data['properties']['id'] = self.uri_processor.process_uri(uri)
-        
-        if self.config.preserve_uri_properties and class_uri:
-            node_data['properties']['rdf_type'] = class_uri
-        
-        self.nodes[uri] = node_data
-    
-    async def add_property(self, subject_uri: str, predicate_uri: str, literal_value: Any):
-        """Add a property to a node"""
-        async with self._lock:
-            if subject_uri not in self.nodes:
-                logger.warning(f"Node {subject_uri} not found when adding property")
-                return
+        # Process in batches
+        for i in range(0, len(texts), self.batch_size):
+            batch = texts[i:i + self.batch_size]
             
-            if (self.config.exclude_rdf_type_properties and 
-                predicate_uri == str(RDF.type)):
-                return
-            
-            prop_name = self.uri_processor.process_uri(predicate_uri)
-            
-            properties = self.nodes[subject_uri]['properties']
-            if prop_name in properties:
-                existing = properties[prop_name]
-                if isinstance(existing, list):
-                    existing.append(literal_value)
-                else:
-                    properties[prop_name] = [existing, literal_value]
-            else:
-                properties[prop_name] = literal_value
+            try:
+                response = self.client.embeddings.create(
+                    input=batch,
+                    model=self.model_name,
+                    dimensions=self.dimensions
+                )
+                
+                batch_embeddings = [data.embedding for data in response.data]
+                embeddings.extend(batch_embeddings)
+                
+                logger.debug(f"Generated embeddings for batch {i//self.batch_size + 1}")
+                
+            except Exception as e:
+                logger.error(f"Error generating OpenAI embeddings for batch {i//self.batch_size + 1}: {e}")
+                # Return zero vectors for failed batches
+                embeddings.extend([[0.0] * self.dimensions] * len(batch))
+        
+        return embeddings
     
-    async def get_nodes(self) -> Dict[str, Dict[str, Any]]:
-        """Get all nodes"""
-        async with self._lock:
-            return self.nodes.copy()
-    
-    async def clear(self):
-        """Clear all nodes"""
-        async with self._lock:
-            self.nodes.clear()
+    def embed_text(self, text: str) -> List[float]:
+        """Generate embedding for a single text."""
+        try:
+            response = self.client.embeddings.create(
+                input=[text],
+                model=self.model_name,
+                dimensions=self.dimensions
+            )
+            return response.data[0].embedding
+        except Exception as e:
+            logger.error(f"Error generating OpenAI embedding: {e}")
+            return [0.0] * self.dimensions
 
-
-class FixedAsyncFalkorDBManager:
-    """Fixed FalkorDB manager with proper error handling for latest FalkorDB version"""
+class GraphConverter:
+    """Main class for converting CSV data to FalkorDB graph database with OpenAI embeddings."""
     
-    def __init__(self, config: OptimizedAsyncTripleConfig):
-        self.config = config
-        self.pool = None
+    def __init__(self, graph_name: str, csv_path: str, config_path: str):
+        """Initialize the GraphConverter with configuration."""
+        self.graph_name = graph_name
+        self.csv_path = Path(csv_path)
+        self.config_path = Path(config_path)
+        self.config = self._load_config()
+        
+        # Initialize components
         self.db = None
         self.graph = None
-        self._existing_indexes = set()  # Cache of existing indexes
+        self.redis_client = None
+        self.embedding_provider = None
+        self.data_quality_analyzer = DataQualityAnalyzer(
+            DataQualityConfig(**self.config.get('data_quality', {}))
+        )
+        
+        # Statistics tracking
+        self.stats = {
+            'nodes_created': 0,
+            'relationships_created': 0,
+            'embeddings_created': 0,
+            'vector_indexes_created': 0,
+            'indexes_created': 0,
+            'constraints_created': 0,
+            'processing_time': 0,
+            'files_processed': 0,
+            'data_quality_reports': {},
+            'errors': []
+        }
+        
+        self._setup_database()
+        self._setup_embedding_provider()
     
-    async def connect(self):
-        """Establish async connection to FalkorDB"""
+    def _load_config(self) -> Dict:
+        """Load and validate configuration."""
         try:
-            clean_default_label = clean_label_name(self.config.default_node_label)
-            if clean_default_label != self.config.default_node_label:
-                logger.warning(f"Default label '{self.config.default_node_label}' will be cleaned to '{clean_default_label}'")
+            with open(self.config_path, 'r') as f:
+                config = json.load(f)
             
-            pool_kwargs = {
-                'host': self.config.falkordb_host,
-                'port': self.config.falkordb_port,
-                'max_connections': self.config.connection_pool_size,
-                'decode_responses': True,
-                'retry_on_timeout': True,
-                'health_check_interval': 30,
-                'socket_connect_timeout': 30,
+            # Add default configurations if not present
+            if 'embedding' not in config:
+                config['embedding'] = {
+                    'enabled': False,
+                    'model_name': 'text-embedding-3-small'
+                }
+            
+            if 'data_quality' not in config:
+                config['data_quality'] = {
+                    'enabled': True,
+                    'max_null_percentage': 0.5,
+                    'duplicate_detection': True,
+                    'outlier_detection': True,
+                    'data_profiling': True
+                }
+            
+            logger.info(f"Configuration loaded from {self.config_path}")
+            return config
+            
+        except Exception as e:
+            logger.error(f"Error loading config: {e}")
+            raise
+    
+    def _setup_database(self):
+        """Initialize FalkorDB connection."""
+        try:
+            db_config = self.config.get('database', {})
+            
+            connection_params = {
+                'host': db_config.get('host', 'localhost'),
+                'port': db_config.get('port', 6379)
             }
             
-            if self.config.falkordb_timeout:
-                pool_kwargs['timeout'] = self.config.falkordb_timeout
+            if db_config.get('password'):
+                connection_params['password'] = db_config.get('password')
             
-            if self.config.falkordb_password:
-                pool_kwargs['password'] = self.config.falkordb_password
+            self.db = FalkorDB(**connection_params)
+            self.graph = self.db.select_graph(self.graph_name)
+            self.redis_client = redis.Redis(**connection_params, decode_responses=True)
             
-            self.pool = BlockingConnectionPool(**pool_kwargs)
-            
-            test_conn = redis_async.Redis(connection_pool=self.pool)
-            await test_conn.ping()
-            await test_conn.aclose()
-            
-            self.db = falkordb_async.FalkorDB(connection_pool=self.pool)
-            self.graph = self.db.select_graph(self.config.graph_name)
-            
-            logger.info(f"✅ FalkorDB connection established to graph '{self.config.graph_name}'")
-            
-            # Discover existing indexes after connection
-            await self._discover_existing_indexes()
+            logger.info(f"Connected to FalkorDB: {self.graph_name}")
             
         except Exception as e:
-            logger.error(f"Failed to connect to FalkorDB: {e}")
+            logger.error(f"Database connection error: {e}")
             raise
     
-    async def _discover_existing_indexes(self):
-        """Discover and cache existing indexes using proper FalkorDB commands"""
-        try:
-            logger.info("🔍 Discovering existing indexes...")
-            
-            try:
-                # Use the correct FalkorDB command for listing indexes
-                result = await self.execute_query_with_retry("CALL db.indexes()")
-                
-                if result.result_set:
-                    for row in result.result_set:
-                        if len(row) > 0:
-                            index_info = str(row[0])
-                            # Parse index information to extract label and property
-                            # Format is usually like "INDEX :Label(property)"
-                            if ":" in index_info and "(" in index_info:
-                                label_part = index_info.split("(")[0].replace("INDEX", "").replace(":", "").strip()
-                                if "uri" in index_info.lower():
-                                    self._existing_indexes.add(label_part)
-                                    logger.info(f"📋 Found existing index: {label_part}.uri")
-                
-                if self._existing_indexes:
-                    logger.info(f"✅ Discovered {len(self._existing_indexes)} existing URI indexes")
-                else:
-                    logger.info("ℹ️  No existing URI indexes found")
-                    
-            except Exception as e:
-                # If we can't get indexes, that's ok - we'll handle it gracefully
-                logger.info(f"ℹ️  Could not discover existing indexes: {e}")
-                logger.info("ℹ️  Will handle index creation gracefully as we go")
-                
-        except Exception as e:
-            logger.warning(f"Index discovery failed: {e}")
-    
-    async def clear_graph(self):
-        """Clear existing graph data"""
-        try:
-            await self.graph.query("MATCH (n) DETACH DELETE n")
-            logger.info("🗑️  Cleared existing graph data")
-        except Exception as e:
-            logger.error(f"Error clearing graph: {e}")
-            raise
-    
-    async def get_initial_graph_stats(self) -> Dict[str, int]:
-        """Get initial graph statistics before processing"""
-        try:
-            node_result = await self.graph.query("MATCH (n) RETURN count(n) as count")
-            node_count = node_result.result_set[0][0] if node_result.result_set else 0
-            
-            rel_result = await self.graph.query("MATCH ()-[r]->() RETURN count(r) as count")
-            rel_count = rel_result.result_set[0][0] if rel_result.result_set else 0
-            
-            if node_count > 0 or rel_count > 0:
-                logger.info(f"📊 Existing graph: {node_count:,} nodes, {rel_count:,} relationships")
-            else:
-                logger.info("📊 Starting with empty graph")
-            
-            return {'nodes': node_count, 'relationships': rel_count}
-        except Exception as e:
-            logger.error(f"Error getting initial statistics: {e}")
-            return {'nodes': 0, 'relationships': 0}
-    
-    async def execute_query_with_retry(self, query: str, params: Optional[Dict] = None) -> Any:
-        """Execute a Cypher query with async retry logic"""
-        for attempt in range(self.config.max_retries):
-            try:
-                return await self.graph.query(query, params or {})
-            except Exception as e:
-                if attempt == self.config.max_retries - 1:
-                    logger.error(f"Query failed after {self.config.max_retries} attempts: {e}")
-                    raise
-                
-                await asyncio.sleep(self.config.retry_delay * (2 ** attempt))
-                logger.warning(f"Query attempt {attempt + 1} failed, retrying: {e}")
-    
-    async def check_if_index_exists_properly(self, label: str) -> bool:
-        """Check if an index exists using proper FalkorDB GRAPH.EXPLAIN syntax"""
+    def _setup_embedding_provider(self):
+        """Initialize OpenAI embedding provider."""
+        embedding_config = self.config.get('embedding', {})
         
-        # First check our cache
-        if label in self._existing_indexes:
-            return True
+        if not embedding_config.get('enabled', False):
+            logger.info("Embedding support disabled")
+            return
         
         try:
-            # Use the CORRECT FalkorDB syntax: GRAPH.EXPLAIN key query (not GRAPH.QUERY key EXPLAIN query)
-            # We need to use the Redis client directly for GRAPH.EXPLAIN
-            redis_client = redis_async.Redis(connection_pool=self.pool)
+            api_key = embedding_config.get('api_key')
+            if not api_key:
+                api_key = os.getenv('OPENAI_API_KEY')
             
-            # Test query that would use the index
-            test_query = f"MATCH (n:{label}) WHERE n.uri = 'test' RETURN n"
+            if not api_key:
+                raise ValueError("OpenAI API key not provided in config or environment")
             
-            # Use GRAPH.EXPLAIN with correct syntax
-            explain_result = await redis_client.execute_command(
-                "GRAPH.EXPLAIN", self.config.graph_name, test_query
+            self.embedding_provider = OpenAIEmbeddingProvider(
+                model_name=embedding_config.get('model_name', 'text-embedding-3-small'),
+                api_key=api_key,
+                dimensions=embedding_config.get('dimensions'),
+                batch_size=embedding_config.get('batch_size', 100)
             )
             
-            await redis_client.aclose()
+            logger.info(f"Initialized OpenAI embedding provider with model: {embedding_config.get('model_name')}")
             
-            # Check if the explain output mentions index scan
-            if explain_result and isinstance(explain_result, list):
-                explain_text = ' '.join(str(item) for item in explain_result)
-                if 'Index Scan' in explain_text or 'index' in explain_text.lower():
-                    self._existing_indexes.add(label)
-                    return True
-                    
         except Exception as e:
-            # If explain fails, we'll assume no index exists
-            logger.debug(f"Index check failed for {label}: {e}")
-        
-        return False
+            logger.error(f"Error setting up OpenAI embedding provider: {e}")
+            self.embedding_provider = None
     
-    async def create_index_safely_fixed(self, label: str) -> bool:
-        """Create an index safely with FIXED error handling for FalkorDB ResponseError"""
-        
-        # First check if we already know this index exists
-        if await self.check_if_index_exists_properly(label):
-            logger.info(f"✅ Index for label '{label}' already exists (reusing)")
-            return True
-        
+    def _create_indexes_and_constraints(self):
+        """Create indexes, constraints, and vector indexes."""
         try:
-            query = f"CREATE INDEX FOR (n:{label}) ON (n.uri)"
-            await self.execute_query_with_retry(query)
-            
-            # Cache that this index now exists
-            self._existing_indexes.add(label)
-            logger.info(f"✅ Created new index for label '{label}'")
-            return True
-            
-        except ResponseError as e:
-            # This is the CORRECT exception type for FalkorDB
-            error_msg = str(e).lower()
-            
-            # FIXED: Updated error message patterns based on actual FalkorDB responses
-            existing_index_keywords = [
-                'already indexed',        # The exact error message from FalkorDB
-                'attribute uri is already indexed',  # Full error message
-                'already exists', 
-                'duplicate',
-                'index already exists',
-                'constraint already exists',
-                'attribute',             # Catches "Attribute 'uri' already indexed"
-                'uri already indexed',   # Specific case
-                'index exists'
-            ]
-            
-            if any(keyword in error_msg for keyword in existing_index_keywords):
-                # Cache that this index exists
-                self._existing_indexes.add(label)
-                logger.info(f"✅ Index for '{label}' already exists (detected from ResponseError)")
-                return True
-            else:
-                logger.warning(f"⚠️  Could not create index for label '{label}': {e}")
-                logger.info(f"💡 This won't affect functionality, just query performance")
-                return False
+            # Create traditional indexes
+            indexes = self.config.get('indexes', [])
+            for index_config in indexes:
+                label = index_config['label']
+                properties = index_config['properties']
                 
-        except Exception as e:
-            # Handle other exception types
-            error_msg = str(e).lower()
-            
-            if any(keyword in error_msg for keyword in ['already indexed', 'attribute', 'duplicate']):
-                self._existing_indexes.add(label)
-                logger.info(f"✅ Index for '{label}' already exists (detected from general exception)")
-                return True
-            else:
-                logger.warning(f"⚠️  Could not create index for label '{label}': {e}")
-                logger.info(f"💡 This won't affect functionality, just query performance")
-                return False
-    
-    async def create_indexes(self, discovered_labels: Dict[str, int] = None):
-        """Create indexes with FIXED error handling and existing index reuse"""
-        if not self.config.create_indexes:
-            logger.info("⏭️  Index creation disabled in config")
-            return
-        
-        logger.info("🏗️  Creating performance indexes for discovered RDF classes...")
-        
-        clean_default_label = clean_label_name(self.config.default_node_label)
-        
-        if not discovered_labels:
-            logger.info("⚠️  No discovered labels provided - creating fallback index only")
-            await self.create_index_safely_fixed(clean_default_label)
-            return
-        
-        # Sort labels by count (most frequent first) and take top 15
-        top_labels = sorted(discovered_labels.items(), key=lambda x: x[1], reverse=True)[:15]
-        logger.info(f"🎯 Creating indexes for top {len(top_labels)} RDF classes:")
-        
-        created_count = 0
-        reused_count = 0
-        failed_count = 0
-        
-        for label, count in top_labels:
-            logger.info(f"   📊 {label}: {count:,} nodes")
-            
-            # Check if index already exists first
-            if await self.check_if_index_exists_properly(label):
-                logger.info(f"   ✅ {label}: Reusing existing index")
-                reused_count += 1
-            else:
-                # Try to create new index
-                if await self.create_index_safely_fixed(label):
-                    if label in self._existing_indexes:
-                        created_count += 1
-                    else:
-                        reused_count += 1
-                else:
-                    failed_count += 1
-        
-        # Ensure default label has an index
-        if clean_default_label not in self._existing_indexes:
-            if await self.create_index_safely_fixed(clean_default_label):
-                if clean_default_label in self._existing_indexes:
-                    created_count += 1
-                else:
-                    reused_count += 1
-            else:
-                failed_count += 1
-        else:
-            logger.info(f"✅ Default label '{clean_default_label}': Reusing existing index")
-            reused_count += 1
-        
-        logger.info(f"🎉 Index management completed:")
-        logger.info(f"   ✅ Created: {created_count} new indexes")
-        logger.info(f"   ♻️  Reused: {reused_count} existing indexes") 
-        logger.info(f"   ⚠️  Failed: {failed_count} indexes")
-        
-        if reused_count > 0:
-            logger.info(f"💡 Reusing existing indexes improves startup time!")
-        
-        if failed_count > 0:
-            logger.info(f"💡 Failed indexes won't affect functionality, just query performance")
-    
-    async def create_node_batch(self, nodes_batch: List[Tuple[str, Dict[str, Any]]]) -> int:
-        """Create nodes with URI-based merging"""
-        if not nodes_batch:
-            return 0
-        
-        use_merge = self.config.handle_duplicates and self.config.append_to_existing_graph
-        
-        try:
-            nodes_by_label = defaultdict(list)
-            
-            for uri, node_data in nodes_batch:
-                properties = {}
-                for key, value in node_data['properties'].items():
-                    if isinstance(value, (str, int, float, bool)):
-                        properties[key] = value
-                    else:
-                        properties[key] = str(value)
-                
-                primary_label = node_data.get('primary_label', clean_label_name(self.config.default_node_label))
-                
-                nodes_by_label[primary_label].append({
-                    'uri': uri,
-                    'properties': properties
-                })
-            
-            total_created = 0
-            
-            for label, nodes_data in nodes_by_label.items():
-                if use_merge:
-                    query = f"""
-                    UNWIND $nodes_data AS node_data
-                    MERGE (n:{label} {{uri: node_data.uri}})
-                    SET n += node_data.properties
-                    RETURN count(n) as total_processed
-                    """
-                else:
-                    query = f"""
-                    UNWIND $nodes_data AS node_data
-                    CREATE (n:{label})
-                    SET n += node_data.properties
-                    RETURN count(n) as total_created
-                    """
-                
-                result = await self.execute_query_with_retry(query, {'nodes_data': nodes_data})
-                batch_processed = result.result_set[0][0] if result.result_set else len(nodes_data)
-                total_created += batch_processed
-            
-            return total_created
-                
-        except Exception as e:
-            logger.error(f"Batch node creation failed: {e}")
-            return await self._create_nodes_individual_fallback(nodes_batch, use_merge)
-    
-    async def _create_nodes_individual_fallback(self, nodes_batch: List[Tuple[str, Dict[str, Any]]], use_merge: bool = False) -> int:
-        """Fallback to create nodes individually"""
-        created_count = 0
-        
-        for uri, node_data in nodes_batch:
-            try:
-                properties = {}
-                for key, value in node_data['properties'].items():
-                    if isinstance(value, (str, int, float, bool)):
-                        properties[key] = value
-                    else:
-                        properties[key] = str(value)
-                
-                primary_label = node_data.get('primary_label', clean_label_name(self.config.default_node_label))
-                
-                if use_merge:
-                    query = f"""
-                    MERGE (n:{primary_label} {{uri: $uri}})
-                    SET n += $properties
-                    """
-                else:
-                    query = f"""
-                    CREATE (n:{primary_label})
-                    SET n += $properties
-                    """
-                
-                await self.execute_query_with_retry(query, {
-                    'uri': uri,
-                    'properties': properties
-                })
-                created_count += 1
-                
-            except Exception as e:
-                logger.warning(f"Failed to create individual node {uri}: {e}")
-                continue
-        
-        return created_count
-    
-    async def create_relationships_ultra_fast(self, relationships_by_type: Dict[str, List[Tuple[str, str, str]]]) -> int:
-        """Ultra-fast relationship creation optimized for 2M+ edges"""
-        if not relationships_by_type:
-            return 0
-        
-        total_relationships = sum(len(rels) for rels in relationships_by_type.values())
-        logger.info(f"🚀 Creating {total_relationships:,} relationships using ultra-fast approach")
-        
-        start_time = time.time()
-        total_created = 0
-        
-        if self.config.handle_duplicates:
-            logger.info("⚡ Using MERGE strategy (handles duplicates)")
-            semaphore = asyncio.Semaphore(1)
-            
-            async def create_relationships_for_type(rel_type: str, relationships: List[Tuple[str, str, str]]):
-                async with semaphore:
-                    return await self._create_relationships_bulk_by_type(rel_type, relationships)
-            
-            tasks = []
-            for rel_type, relationships in relationships_by_type.items():
-                task = asyncio.create_task(create_relationships_for_type(rel_type, relationships))
-                tasks.append(task)
-            
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            for i, result in enumerate(results):
-                if isinstance(result, int):
-                    total_created += result
-                else:
-                    rel_type = list(relationships_by_type.keys())[i]
-                    logger.error(f"Failed to create relationships for type {rel_type}: {result}")
-        else:
-            logger.info("🚄 Using CREATE strategy (maximum speed)")
-            total_created = await self._create_relationships_mega_fast(relationships_by_type)
-        
-        duration = time.time() - start_time
-        rate = total_created / duration if duration > 0 else 0
-        
-        logger.info(f"🎉 Relationship creation completed:")
-        logger.info(f"  Created: {total_created:,} relationships")
-        logger.info(f"  Time: {duration:.2f} seconds ({duration/60:.1f} minutes)")
-        logger.info(f"  Rate: {rate:.1f} relationships/second")
-        
-        return total_created
-    
-    async def _create_relationships_mega_fast(self, relationships_by_type: Dict[str, List[Tuple[str, str, str]]]) -> int:
-        """MEGA-FAST: Process all relationships with tqdm progress bars"""
-        
-        all_relationships = []
-        for rel_type, relationships in relationships_by_type.items():
-            for subject_uri, predicate_uri, object_uri in relationships:
-                all_relationships.append((subject_uri, predicate_uri, object_uri, rel_type))
-        
-        logger.info(f"🚄 MEGA-FAST MODE: Processing {len(all_relationships):,} relationships")
-        
-        mega_batch_size = min(100000, max(50000, len(all_relationships) // 20))
-        logger.info(f"📦 Using mega-batch size: {mega_batch_size:,} relationships per batch")
-        
-        total_created = 0
-        total_batches = (len(all_relationships) + mega_batch_size - 1) // mega_batch_size
-        
-        with tqdm_sync(total=total_batches, desc="🚄 Creating mega-batches", 
-                      unit="mega-batch", ncols=100, colour="red") as pbar:
-            
-            for i in range(0, len(all_relationships), mega_batch_size):
-                batch = all_relationships[i:i+mega_batch_size]
-                batch_num = (i // mega_batch_size) + 1
-                
-                pbar.set_description(f"🚄 Mega-batch {batch_num}/{total_batches}")
-                
-                try:
-                    created = await self._execute_mega_batch_query(batch)
-                    total_created += created
-                    
-                    pbar.update(1)
-                    pbar.set_postfix({
-                        'edges': f"{total_created:,}",
-                        'batch_size': f"{len(batch):,}"
-                    })
-                    
-                except Exception as e:
-                    logger.error(f"Mega-batch {batch_num} failed: {e}")
-                    created = await self._fallback_mega_batch(batch)
-                    total_created += created
-                    
-                    pbar.update(1)
-                    pbar.set_postfix({
-                        'edges': f"{total_created:,}",
-                        'status': 'fallback'
-                    })
-        
-        return total_created
-    
-    async def _create_relationships_bulk_by_type(self, rel_type: str, relationships: List[Tuple[str, str, str]]) -> int:
-        """Create all relationships of a specific type with tqdm progress bar"""
-        if not relationships:
-            return 0
-        
-        logger.info(f"Creating {len(relationships):,} relationships of type '{rel_type}'")
-        
-        if len(relationships) > 500000:
-            batch_size = self.config.batch_size * 10
-        elif len(relationships) > 100000:
-            batch_size = self.config.batch_size * 5
-        elif len(relationships) > 10000:
-            batch_size = self.config.batch_size * 2
-        else:
-            batch_size = self.config.batch_size
-        
-        logger.info(f"📦 Using adaptive batch size: {batch_size:,} relationships per batch")
-        
-        total_created = 0
-        total_batches = (len(relationships) + batch_size - 1) // batch_size
-        
-        batches = []
-        for i in range(0, len(relationships), batch_size):
-            batch = relationships[i:i+batch_size]
-            batches.append(batch)
-        
-        with tqdm_sync(total=len(batches), desc=f"⚡ Creating {rel_type}", 
-                      unit="batch", ncols=100, colour="yellow") as pbar:
-            
-            for batch_idx, batch in enumerate(batches):
-                batch_num = batch_idx + 1
-                
-                try:
-                    created = await self._execute_relationship_batch_query(rel_type, batch)
-                    total_created += created
-                    
-                    pbar.update(1)
-                    pbar.set_postfix({
-                        'edges': f"{total_created:,}",
-                        'batch': f"{batch_num}/{total_batches}"
-                    })
-                    
-                except Exception as e:
-                    logger.error(f"Failed to create relationship batch for {rel_type}: {e}")
-                    created = await self._create_relationships_smaller_batches(rel_type, batch)
-                    total_created += created
-                    
-                    pbar.update(1)
-                    pbar.set_postfix({
-                        'edges': f"{total_created:,}",
-                        'status': 'fallback',
-                        'batch': f"{batch_num}/{total_batches}"
-                    })
-        
-        logger.info(f"✅ Completed {rel_type}: {total_created:,} relationships created")
-        return total_created
-    
-    async def _execute_mega_batch_query(self, batch: List[Tuple[str, str, str, str]]) -> int:
-        """Execute a mega-batch of relationships with optimized Cypher"""
-        
-        grouped_batch = defaultdict(list)
-        for subject_uri, predicate_uri, object_uri, rel_type in batch:
-            grouped_batch[rel_type].append({
-                'subject_uri': subject_uri,
-                'object_uri': object_uri
-            })
-        
-        total_created = 0
-        
-        for rel_type, rel_data in grouped_batch.items():
-            clean_rel_type = self._clean_relationship_type(rel_type)
-            
-            query = f"""
-            UNWIND $batch_data AS rel
-            MATCH (s {{uri: rel.subject_uri}})
-            MATCH (o {{uri: rel.object_uri}})
-            CREATE (s)-[:{clean_rel_type}]->(o)
-            """
-            
-            await self.execute_query_with_retry(query, {'batch_data': rel_data})
-            total_created += len(rel_data)
-        
-        return total_created
-    
-    async def _fallback_mega_batch(self, batch: List[Tuple[str, str, str, str]]) -> int:
-        """Fallback for failed mega-batches: process in smaller chunks"""
-        fallback_batch_size = 10000
-        total_created = 0
-        
-        for i in range(0, len(batch), fallback_batch_size):
-            small_batch = batch[i:i+fallback_batch_size]
-            try:
-                created = await self._execute_mega_batch_query(small_batch)
-                total_created += created
-            except Exception as e:
-                logger.warning(f"Fallback batch failed: {e}")
-                continue
-        
-        return total_created
-    
-    async def _execute_relationship_batch_query(self, rel_type: str, batch: List[Tuple[str, str, str]]) -> int:
-        """Execute optimized batch relationship creation with URI-based merging"""
-        batch_data = []
-        for subject_uri, predicate_uri, object_uri in batch:
-            rel_data = {
-                'subject_uri': subject_uri,
-                'object_uri': object_uri
-            }
-            if not self.config.disable_relationship_properties and self.config.preserve_uri_properties:
-                rel_data['predicate_uri'] = predicate_uri
-            batch_data.append(rel_data)
-        
-        clean_rel_type = self._clean_relationship_type(rel_type)
-        use_merge = self.config.handle_duplicates and self.config.append_to_existing_graph
-        
-        if use_merge:
-            if not self.config.disable_relationship_properties and self.config.preserve_uri_properties:
-                query = f"""
-                UNWIND $batch_data AS rel
-                MATCH (s {{uri: rel.subject_uri}})
-                MATCH (o {{uri: rel.object_uri}})
-                MERGE (s)-[r:{clean_rel_type}]->(o)
-                SET r.predicate_uri = rel.predicate_uri
-                """
-            else:
-                query = f"""
-                UNWIND $batch_data AS rel
-                MATCH (s {{uri: rel.subject_uri}})
-                MATCH (o {{uri: rel.object_uri}})
-                MERGE (s)-[:{clean_rel_type}]->(o)
-                """
-        else:
-            if not self.config.disable_relationship_properties and self.config.preserve_uri_properties:
-                query = f"""
-                UNWIND $batch_data AS rel
-                MATCH (s {{uri: rel.subject_uri}})
-                MATCH (o {{uri: rel.object_uri}})
-                CREATE (s)-[r:{clean_rel_type}]->(o)
-                SET r.predicate_uri = rel.predicate_uri
-                """
-            else:
-                query = f"""
-                UNWIND $batch_data AS rel
-                MATCH (s {{uri: rel.subject_uri}})
-                MATCH (o {{uri: rel.object_uri}})
-                CREATE (s)-[:{clean_rel_type}]->(o)
-                """
-        
-        await self.execute_query_with_retry(query, {'batch_data': batch_data})
-        return len(batch)
-    
-    def _clean_relationship_type(self, rel_type: str) -> str:
-        """Clean relationship type to ensure valid Cypher identifier"""
-        clean_type = re.sub(r'[^a-zA-Z0-9_]', '_', rel_type)
-        
-        if clean_type and clean_type[0].isdigit():
-            clean_type = f"_{clean_type}"
-        
-        if not clean_type:
-            clean_type = 'RELATED_TO'
-        elif len(clean_type) > 50:
-            clean_type = clean_type[:50]
-        
-        return clean_type
-    
-    async def _create_relationships_smaller_batches(self, rel_type: str, relationships: List[Tuple[str, str, str]]) -> int:
-        """Fallback: create relationships in much smaller batches"""
-        batch_size = 100
-        total_created = 0
-        clean_rel_type = self._clean_relationship_type(rel_type)
-        
-        for i in range(0, len(relationships), batch_size):
-            batch = relationships[i:i+batch_size]
-            try:
-                batch_data = []
-                for subject_uri, predicate_uri, object_uri in batch:
-                    batch_data.append({
-                        'subject_uri': subject_uri,
-                        'object_uri': object_uri
-                    })
-                
-                query = f"""
-                UNWIND $batch_data AS rel
-                MATCH (s {{uri: rel.subject_uri}})
-                MATCH (o {{uri: rel.object_uri}})
-                CREATE (s)-[:{clean_rel_type}]->(o)
-                """
-                
-                await self.execute_query_with_retry(query, {'batch_data': batch_data})
-                total_created += len(batch)
-                
-            except Exception as e:
-                logger.warning(f"Small batch failed for {rel_type}: {e}")
-                for subject_uri, predicate_uri, object_uri in batch:
+                for prop in properties:
                     try:
-                        query = """
-                        MATCH (s {uri: $subject_uri})
-                        MATCH (o {uri: $object_uri})
-                        CREATE (s)-[:RELATED_TO]->(o)
-                        """
-                        await self.execute_query_with_retry(query, {
-                            'subject_uri': subject_uri,
-                            'object_uri': object_uri
-                        })
-                        total_created += 1
-                    except Exception:
-                        continue
-        
-        return total_created
-    
-    async def get_graph_stats(self) -> Dict[str, int]:
-        """Get current graph statistics"""
-        try:
-            node_result = await self.graph.query("MATCH (n) RETURN count(n) as count")
-            node_count = node_result.result_set[0][0] if node_result.result_set else 0
+                        query = f"CREATE INDEX FOR (n:{label}) ON (n.{prop})"
+                        self.graph.query(query)
+                        self.stats['indexes_created'] += 1
+                        logger.info(f"Created index on {label}.{prop}")
+                    except Exception as e:
+                        error_msg = str(e).lower()
+                        if "already indexed" in error_msg or "already exists" in error_msg:
+                            logger.debug(f"Index already exists for {label}.{prop}")
+                        else:
+                            logger.warning(f"Index creation failed for {label}.{prop}: {e}")
             
-            rel_result = await self.graph.query("MATCH ()-[r]->() RETURN count(r) as count")
-            rel_count = rel_result.result_set[0][0] if rel_result.result_set else 0
-            
-            return {'nodes': node_count, 'relationships': rel_count}
-        except Exception as e:
-            logger.error(f"Error getting statistics: {e}")
-            return {'nodes': 0, 'relationships': 0}
-    
-    async def close(self):
-        """Close async connections"""
-        try:
-            if self.pool:
-                await self.pool.aclose()
-                logger.info("Closed FalkorDB connection pool")
-        except Exception as e:
-            logger.warning(f"Error closing FalkorDB connection pool: {e}")
-
-
-class FixedAsyncTripleBasedConverter:
-    """Main async converter with FIXED error handling for latest FalkorDB"""
-    
-    def __init__(self, config: OptimizedAsyncTripleConfig):
-        self.config = config
-        self.stats = AsyncConversionStats(start_time=datetime.now())
-        self.uri_processor = URIProcessor(config.use_shortened_uris)
-        self.node_manager = AsyncNodeManager(self.uri_processor, config)
-        self.falkordb_manager = FixedAsyncFalkorDBManager(config)  # Use FIXED manager
-        self.rdf_graph = None
-        
-        self.relationships_by_type: Dict[str, List[Tuple[str, str, str]]] = defaultdict(list)
-        self.total_relationships = 0
-        self.semaphore = asyncio.Semaphore(config.max_concurrent_batches)
-    
-    def _reset_conversion_state(self):
-        """Reset converter state for fresh conversion"""
-        logger.info("🔄 Resetting converter state for fresh conversion...")
-        
-        self.stats = AsyncConversionStats(start_time=datetime.now())
-        self.relationships_by_type.clear()
-        self.total_relationships = 0
-        
-        logger.info("✅ Converter state reset complete")
-    
-    def _setup_fresh_rdf_connection(self):
-        """Setup a fresh RDF graph connection to SPARQL endpoint"""
-        try:
-            if hasattr(self, 'rdf_graph') and self.rdf_graph is not None:
+            # Create constraints
+            constraints = self.config.get('constraints', [])
+            for constraint_config in constraints:
+                label = constraint_config['label']
+                property_name = constraint_config['property']
+                constraint_type = constraint_config.get('type', 'UNIQUE')
+                
                 try:
-                    if hasattr(self.rdf_graph.store, 'close'):
-                        self.rdf_graph.store.close()
-                except:
-                    pass
+                    if constraint_type == 'UNIQUE':
+                        result = self.redis_client.execute_command(
+                            'GRAPH.CONSTRAINT', 'CREATE', 
+                            self.graph_name, 
+                            'UNIQUE', 'NODE', label, 
+                            'PROPERTIES', '1', property_name
+                        )
+                        self.stats['constraints_created'] += 1
+                        logger.info(f"Created unique constraint on {label}.{property_name}")
+                        
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    if "already exists" in error_msg or "pending" in error_msg:
+                        logger.debug(f"Constraint already exists for {label}.{property_name}")
+                    else:
+                        logger.warning(f"Constraint creation failed for {label}.{property_name}: {e}")
             
-            auth = None
-            if self.config.username and self.config.password:
-                auth = (self.config.username, self.config.password)
-            
-            store = sparqlstore.SPARQLUpdateStore(
-                self.config.sparql_endpoint,
-                auth=auth,
-                timeout=self.config.sparql_timeout
-            )
-            
-            self.rdf_graph = ConjunctiveGraph(store=store)
-            logger.info(f"✅ Fresh SPARQL connection established to: {self.config.sparql_endpoint}")
-            
-            test_query = "SELECT (COUNT(*) as ?count) WHERE { ?s ?p ?o } LIMIT 1"
-            try:
-                list(self.rdf_graph.query(test_query))
-                logger.info("✅ SPARQL connection test successful")
-            except Exception as test_error:
-                logger.warning(f"⚠️  SPARQL connection test failed: {test_error}")
-            
+            # Create vector indexes if embedding provider is available
+            if self.embedding_provider:
+                self._create_vector_indexes()
+                        
         except Exception as e:
-            logger.error(f"Failed to connect to SPARQL endpoint: {e}")
-            raise
+            logger.error(f"Error creating indexes/constraints: {e}")
     
-    def _cleanup_rdf_connection(self):
-        """Clean up RDF connection resources"""
-        try:
-            if hasattr(self, 'rdf_graph') and self.rdf_graph is not None:
-                if hasattr(self.rdf_graph.store, 'close'):
-                    self.rdf_graph.store.close()
-                    logger.info("🧹 Cleaned up SPARQL connection")
-                self.rdf_graph = None
-        except Exception as e:
-            logger.warning(f"Error cleaning up SPARQL connection: {e}")
-    
-    def _execute_sparql_query_with_retry(self):
-        """Execute SPARQL query with connection retry logic"""
-        max_attempts = 3
+    def _create_vector_indexes(self):
+        """Create vector indexes for embeddings."""
+        vector_fields = self.config.get('embedding', {}).get('vector_fields', [])
         
-        for attempt in range(max_attempts):
+        for field_config in vector_fields:
             try:
-                if attempt == 0:
-                    logger.info("Setting up initial SPARQL connection...")
-                else:
-                    logger.info(f"SPARQL query attempt {attempt + 1}/{max_attempts} - setting up fresh connection...")
+                entity_pattern = field_config['entity_pattern']
+                attribute = field_config['attribute']
                 
-                self._setup_fresh_rdf_connection()
+                options = {
+                    'dimension': self.embedding_provider.dimensions,
+                    'similarityFunction': field_config.get('similarityFunction', 'cosine'),
+                    'M': field_config.get('M', 16),
+                    'efConstruction': field_config.get('efConstruction', 200),
+                    'efRuntime': field_config.get('efRuntime', 10)
+                }
                 
-                if self.rdf_graph is None:
-                    raise Exception("Failed to establish SPARQL connection - rdf_graph is None")
+                # Build options string properly
+                options_str = ", ".join([f"{k}: {v}" if isinstance(v, (int, float)) else f"{k}: '{v}'" for k, v in options.items()])
                 
-                logger.info(f"Executing SPARQL query with timeout {self.config.sparql_timeout}s")
-                logger.info(f"Query preview: {self.config.triples_query[:200]}...")
+                query = f"CREATE VECTOR INDEX FOR {entity_pattern} ON ({attribute}) OPTIONS {{{options_str}}}"
                 
-                start_time = time.time()
-                query_result = self.rdf_graph.query(self.config.triples_query)
-                results = list(query_result)
-                execution_time = time.time() - start_time
-                
-                logger.info(f"✅ SPARQL query completed in {execution_time:.2f}s, retrieved {len(results)} triples")
-                return results
+                self.graph.query(query)
+                self.stats['vector_indexes_created'] += 1
+                logger.info(f"Created vector index: {entity_pattern} ON {attribute}")
                 
             except Exception as e:
-                logger.error(f"SPARQL query attempt {attempt + 1} failed: {e}")
-                
-                if attempt < max_attempts - 1:
-                    self._cleanup_rdf_connection()
-                    retry_wait = 5 * (attempt + 1)
-                    logger.info(f"Retrying in {retry_wait} seconds...")
-                    time.sleep(retry_wait)
+                error_msg = str(e).lower()
+                if "already exists" in error_msg:
+                    logger.debug(f"Vector index already exists: {entity_pattern}")
                 else:
-                    logger.error(f"❌ SPARQL query failed after {max_attempts} attempts")
-                    raise
-        
-        raise Exception("SPARQL query failed - should not reach here")
+                    logger.error(f"Error creating vector index: {e}")
     
-    async def convert(self) -> AsyncConversionStats:
-        """Main async conversion method with FIXED error handling"""
+    def _generate_embeddings_for_text_fields(self, df: pd.DataFrame, text_fields: List[str]) -> Dict[str, List[List[float]]]:
+        """Generate embeddings for specified text fields."""
+        if not self.embedding_provider:
+            return {}
+        
+        embeddings = {}
+        
+        for field in text_fields:
+            if field not in df.columns:
+                logger.warning(f"Field '{field}' not found in DataFrame columns")
+                continue
+            
+            texts = df[field].fillna('').astype(str).tolist()
+            
+            try:
+                field_embeddings = self.embedding_provider.embed_texts(texts)
+                embeddings[field] = field_embeddings
+                self.stats['embeddings_created'] += len(field_embeddings)
+                logger.info(f"Generated {len(field_embeddings)} embeddings for field: {field}")
+                
+            except Exception as e:
+                logger.error(f"Error generating embeddings for field {field}: {e}")
+                embeddings[field] = [[0.0] * self.embedding_provider.dimensions] * len(texts)
+        
+        return embeddings
+    
+    def _process_nodes(self, file_config: Dict) -> int:
+        """Process nodes with embeddings."""
+        csv_file = self.csv_path / file_config['file']
+        
+        if not csv_file.exists():
+            logger.error(f"CSV file not found: {csv_file}")
+            return 0
+        
         try:
-            self._reset_conversion_state()
-            self.stats.append_mode = self.config.append_to_existing_graph
+            df = pd.read_csv(csv_file)
+            logger.info(f"Processing {len(df)} rows from {csv_file}")
             
-            if self.config.append_to_existing_graph:
-                logger.info("📈 Starting incremental RDF to FalkorDB conversion (append mode)...")
-            else:
-                logger.info("🚀 Starting fresh RDF to FalkorDB conversion...")
+            # Data quality analysis
+            quality_report = self.data_quality_analyzer.analyze_dataframe(df)
+            self.stats['data_quality_reports'][file_config['file']] = quality_report
+            logger.info(f"Data quality score for {csv_file.name}: {quality_report['quality_score']:.2f}")
             
-            await self.falkordb_manager.connect()
+            # Generate embeddings if configured
+            embeddings = {}
+            embedding_fields = file_config.get('embedding_fields', [])
+            if embedding_fields and self.embedding_provider:
+                embeddings = self._generate_embeddings_for_text_fields(df, embedding_fields)
             
-            initial_stats = await self.falkordb_manager.get_initial_graph_stats()
-            self.stats.initial_nodes = initial_stats['nodes']
-            self.stats.initial_relationships = initial_stats['relationships']
+            node_label = file_config['node_label']
+            field_mappings = file_config['field_mappings']
+            batch_size = file_config.get('batch_size', 1000)
             
-            if self.config.clear_existing_graph:
-                logger.info("🗑️  Clearing existing graph as requested...")
-                await self.falkordb_manager.clear_graph()
-                self.stats.graph_was_cleared = True
-                self.stats.initial_nodes = 0
-                self.stats.initial_relationships = 0
-            elif not self.config.append_to_existing_graph:
-                logger.info("🗑️  Clearing graph for fresh conversion...")
-                await self.falkordb_manager.clear_graph()
-                self.stats.graph_was_cleared = True
-                self.stats.initial_nodes = 0
-                self.stats.initial_relationships = 0
+            nodes_created = 0
             
-            await self.node_manager.clear()
+            # Process in batches
+            for i in range(0, len(df), batch_size):
+                batch = df.iloc[i:i + batch_size]
+                
+                create_statements = []
+                for idx, (_, row) in enumerate(batch.iterrows()):
+                    actual_idx = i + idx
+                    
+                    # Build basic properties
+                    properties = self._build_cypher_properties(row, field_mappings)
+                    
+                    # Add embeddings as vector properties
+                    for field, field_embeddings in embeddings.items():
+                        if actual_idx < len(field_embeddings):
+                            embedding = field_embeddings[actual_idx]
+                            vector_field_name = f"{field}_embedding"
+                            vector_str = f"vecf32({json.dumps(embedding)})"
+                            # Remove closing brace and add vector property
+                            if properties.endswith('}'):
+                                if properties == '{}':
+                                    properties = f"{{{vector_field_name}: {vector_str}}}"
+                                else:
+                                    properties = properties[:-1] + f", {vector_field_name}: {vector_str}" + "}"
+                    
+                    create_statements.append(f"CREATE (n{nodes_created}:{node_label} {properties})")
+                    nodes_created += 1
+                
+                # Execute batch
+                if create_statements:
+                    query = " ".join(create_statements)
+                    try:
+                        self.graph.query(query)
+                        logger.debug(f"Created batch of {len(create_statements)} {node_label} nodes")
+                    except Exception as e:
+                        logger.error(f"Error creating batch of {node_label} nodes: {e}")
+                        self.stats['errors'].append(f"Node creation error in {csv_file}: {e}")
             
-            await self._execute_and_process_query()
-            
-            node_start = time.time()
-            await self._create_nodes_in_falkordb_async()
-            self.stats.node_creation_time = time.time() - node_start
-            
-            rel_start = time.time()
-            await self._create_relationships_ultra_fast()
-            self.stats.relationship_creation_time = time.time() - rel_start
-            
-            if self.stats.relationship_creation_time > 0:
-                self.stats.relationship_creation_rate = self.stats.created_relationships / self.stats.relationship_creation_time
-            
-            await self._create_indexes_with_discovered_labels()
-            
-            if self.config.validate_conversion:
-                await self._validate_conversion()
-            
-            await self._finalize_stats()
-            
-            if self.config.append_to_existing_graph:
-                logger.info("✅ Incremental conversion completed successfully!")
-                logger.info(f"📊 {self.stats.get_incremental_summary()}")
-            else:
-                logger.info("✅ Fresh conversion completed successfully!")
-            
-            return self.stats
+            logger.info(f"Created {nodes_created} {node_label} nodes from {csv_file.name}")
+            return nodes_created
             
         except Exception as e:
-            logger.error(f"❌ Conversion failed: {e}")
-            raise
-        finally:
-            self._cleanup_rdf_connection()
-            await self.falkordb_manager.close()
+            logger.error(f"Error processing nodes from {csv_file}: {e}")
+            self.stats['errors'].append(f"Node processing error {csv_file}: {e}")
+            return 0
     
-    async def _execute_and_process_query(self):
-        """Execute the main SPARQL query and process results"""
+    def _build_cypher_properties(self, row: pd.Series, field_mappings: Dict) -> str:
+        """Build Cypher property string from pandas row."""
+        properties = []
+        
+        for csv_field, graph_field in field_mappings.items():
+            if csv_field in row.index:
+                value = self._sanitize_value(row[csv_field])
+                if value is not None:
+                    if isinstance(value, str):
+                        properties.append(f"{graph_field}: '{value}'")
+                    else:
+                        properties.append(f"{graph_field}: {value}")
+        
+        return "{" + ", ".join(properties) + "}"
+    
+    def _sanitize_value(self, value: Any) -> Any:
+        """Sanitize and convert values for Cypher queries."""
+        if pd.isna(value) or value is None:
+            return None
+        
+        if isinstance(value, str):
+            # Escape single quotes and handle special characters
+            return value.replace("'", "\\'").replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r')
+        
+        if isinstance(value, (int, float)):
+            return value
+        
+        if isinstance(value, bool):
+            return str(value).lower()
+        
+        # Convert other types to string
+        return str(value).replace("'", "\\'").replace('"', '\\"')
+    
+    def _process_relationships(self, file_config: Dict) -> int:
+        """Process relationships from CSV file."""
+        csv_file = self.csv_path / file_config['file']
+        
+        if not csv_file.exists():
+            logger.error(f"CSV file not found: {csv_file}")
+            return 0
+        
+        try:
+            df = pd.read_csv(csv_file)
+            logger.info(f"Processing {len(df)} relationships from {csv_file}")
+            
+            relationships_created = 0
+            batch_size = file_config.get('batch_size', 1000)
+            
+            for i in range(0, len(df), batch_size):
+                batch = df.iloc[i:i + batch_size]
+                
+                for idx, row in batch.iterrows():
+                    rel_config = file_config['relationship']
+                    
+                    # Check if foreign key values are not null before creating relationship
+                    source_key = row[rel_config['source']['csv_field']]
+                    target_key = row[rel_config['target']['csv_field']]
+                    
+                    if pd.isna(source_key) or pd.isna(target_key) or source_key is None or target_key is None:
+                        logger.debug(f"Skipping relationship due to null key: source={source_key}, target={target_key}")
+                        continue
+                    
+                    # Build MATCH clauses for source and target nodes
+                    source_match = self._build_match_clause(row, rel_config['source'], "source")
+                    target_match = self._build_match_clause(row, rel_config['target'], "target")
+                    
+                    # Build relationship properties
+                    rel_properties = ""
+                    if 'properties' in rel_config:
+                        props = self._build_cypher_properties(row, rel_config['properties'])
+                        if props != "{}":
+                            rel_properties = f" {props}"
+                    
+                    # Create relationship query
+                    rel_type = rel_config['type']
+                    query = f"""
+                    MATCH {source_match}
+                    MATCH {target_match}
+                    MERGE (source)-[r:{rel_type}{rel_properties}]->(target)
+                    """
+                    
+                    try:
+                        result = self.graph.query(query)
+                        relationships_created += 1
+                    except Exception as e:
+                        logger.warning(f"Error creating relationship: {e}")
+                        self.stats['errors'].append(f"Relationship creation error: {e}")
+            
+            logger.info(f"Created {relationships_created} relationships from {csv_file.name}")
+            return relationships_created
+            
+        except Exception as e:
+            logger.error(f"Error processing relationships from {csv_file}: {e}")
+            self.stats['errors'].append(f"Relationship processing error {csv_file}: {e}")
+            return 0
+    
+    def _build_match_clause(self, row: pd.Series, node_config: Dict, var_name: str = "n") -> str:
+        """Build MATCH clause for finding nodes in relationships."""
+        label = node_config['label']
+        key_field = node_config['key_field']
+        csv_field = node_config['csv_field']
+        
+        key_value = self._sanitize_value(row[csv_field])
+        
+        if isinstance(key_value, str):
+            return f"({var_name}:{label} {{{key_field}: '{key_value}'}})"
+        else:
+            return f"({var_name}:{label} {{{key_field}: {key_value}}})"
+    
+    def _generate_profile_report(self) -> Dict:
+        """Generate comprehensive profiling report."""
+        try:
+            # Get graph statistics
+            node_count_query = "MATCH (n) RETURN count(n) as node_count"
+            relationship_count_query = "MATCH ()-[r]->() RETURN count(r) as rel_count"
+            
+            node_result = self.graph.query(node_count_query)
+            rel_result = self.graph.query(relationship_count_query)
+            
+            total_nodes = node_result.result_set[0][0] if node_result.result_set else 0
+            total_relationships = rel_result.result_set[0][0] if rel_result.result_set else 0
+            
+            # Get node type distribution
+            node_types_query = "MATCH (n) RETURN labels(n) as label, count(n) as count ORDER BY count DESC"
+            node_types_result = self.graph.query(node_types_query)
+            
+            node_distribution = {}
+            for row in node_types_result.result_set:
+                label = row[0][0] if row[0] else 'Unknown'
+                count = row[1]
+                node_distribution[label] = count
+            
+            # Get relationship type distribution
+            rel_types_query = "MATCH ()-[r]->() RETURN type(r) as rel_type, count(r) as count ORDER BY count DESC"
+            rel_types_result = self.graph.query(rel_types_query)
+            
+            rel_distribution = {}
+            for row in rel_types_result.result_set:
+                rel_type = row[0]
+                count = row[1]
+                rel_distribution[rel_type] = count
+            
+            # Embedding analytics
+            embedding_analytics = {}
+            if self.embedding_provider:
+                embedding_analytics = {
+                    'total_embeddings': self.stats['embeddings_created'],
+                    'vector_dimensions': self.embedding_provider.dimensions,
+                    'model_name': self.embedding_provider.model_name,
+                    'vector_indexes': self.stats['vector_indexes_created']
+                }
+            
+            profile_report = {
+                'summary': {
+                    'total_nodes': total_nodes,
+                    'total_relationships': total_relationships,
+                    'graph_density': total_relationships / (total_nodes * (total_nodes - 1)) if total_nodes > 1 else 0,
+                    'processing_time_seconds': self.stats['processing_time'],
+                    'files_processed': self.stats['files_processed']
+                },
+                'distributions': {
+                    'nodes': node_distribution,
+                    'relationships': rel_distribution
+                },
+                'embeddings': embedding_analytics,
+                'data_quality': self.stats['data_quality_reports'],
+                'performance_stats': self.stats,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            return profile_report
+            
+        except Exception as e:
+            logger.error(f"Error generating profile report: {e}")
+            return {'error': str(e), 'timestamp': datetime.now().isoformat()}
+    
+    def convert(self):
+        """Main conversion process."""
         start_time = time.time()
         
         try:
-            logger.info("📊 Executing triples query with fresh connection...")
+            logger.info("Starting CSV to FalkorDB conversion with OpenAI embeddings...")
             
-            loop = asyncio.get_running_loop()
-            results = await loop.run_in_executor(None, self._execute_sparql_query_with_retry)
+            # Create indexes, constraints, and vector indexes
+            self._create_indexes_and_constraints()
             
-            self.stats.query_execution_time = time.time() - start_time
-            self.stats.total_triples_retrieved = len(results)
+            # Process node files
+            node_files = self.config.get('node_files', [])
+            for file_config in node_files:
+                nodes_created = self._process_nodes(file_config)
+                self.stats['nodes_created'] += nodes_created
+                self.stats['files_processed'] += 1
             
-            logger.info(f"📈 Retrieved {len(results):,} triples in {self.stats.query_execution_time:.2f}s")
-            logger.info("⚡ Processing triples in optimized async batches...")
+            # Process relationship files
+            relationship_files = self.config.get('relationship_files', [])
+            for file_config in relationship_files:
+                relationships_created = self._process_relationships(file_config)
+                self.stats['relationships_created'] += relationships_created
+                self.stats['files_processed'] += 1
             
-            await self._process_triples_in_batches(results)
+            # Calculate processing time
+            self.stats['processing_time'] = time.time() - start_time
+            
+            # Generate profile report
+            profile_report = self._generate_profile_report()
+            
+            # Save profile report
+            profile_path = f"{self.graph_name}_profile_report.json"
+            with open(profile_path, 'w') as f:
+                json.dump(profile_report, f, indent=2)
+            
+            logger.info("Conversion completed successfully!")
+            logger.info(f"Profile report saved to: {profile_path}")
+            logger.info(f"Total nodes created: {self.stats['nodes_created']}")
+            logger.info(f"Total relationships created: {self.stats['relationships_created']}")
+            logger.info(f"Total embeddings created: {self.stats['embeddings_created']}")
+            logger.info(f"Vector indexes created: {self.stats['vector_indexes_created']}")
+            logger.info(f"Processing time: {self.stats['processing_time']:.2f} seconds")
+            
+            if self.stats['errors']:
+                logger.warning(f"Encountered {len(self.stats['errors'])} errors during processing")
+                for error in self.stats['errors']:
+                    logger.warning(f"Error: {error}")
             
         except Exception as e:
-            logger.error(f"Error executing/processing query: {e}")
+            logger.error(f"Conversion failed: {e}")
             raise
         finally:
-            self._cleanup_rdf_connection()
-    
-    async def _process_triples_in_batches(self, results: List[Tuple]):
-        """Process triples in async batches with tqdm progress bar"""
-        batch_size = self.config.batch_size
-        total_batches = (len(results) + batch_size - 1) // batch_size
-        self.stats.total_batches = total_batches
-        
-        logger.info(f"🔄 Processing {len(results):,} triples in {total_batches} batches of {batch_size}")
-        
-        batches = []
-        for i in range(0, len(results), batch_size):
-            batch = results[i:i+batch_size]
-            batches.append(batch)
-        
-        tasks = []
-        for i, batch in enumerate(batches):
-            task = asyncio.create_task(
-                self._process_single_batch_async(batch, i + 1, total_batches)
-            )
-            tasks.append(task)
-        
-        completed = 0
-        failed = 0
-        
-        with tqdm_sync(total=len(tasks), desc="🔄 Processing triple batches", 
-                      unit="batch", ncols=100, colour="blue") as pbar:
-            
-            for future in asyncio.as_completed(tasks):
-                try:
-                    await future
-                    completed += 1
-                    self.stats.completed_batches = completed
-                    pbar.update(1)
-                    pbar.set_postfix({
-                        'completed': f"{completed}/{total_batches}",
-                        'triples': f"{self.stats.processed_triples:,}"
-                    })
-                    
-                except Exception as e:
-                    failed += 1
-                    self.stats.failed_batches = failed
-                    pbar.update(1)
-                    pbar.set_postfix({
-                        'completed': f"{completed}/{total_batches}",
-                        'failed': failed,
-                        'triples': f"{self.stats.processed_triples:,}"
-                    })
-                    logger.error(f"Batch processing failed: {e}")
-        
-        logger.info(f"✅ Batch processing completed: {completed} successful, {failed} failed")
-    
-    async def _process_single_batch_async(self, batch: List[Tuple], batch_num: int, total_batches: int):
-        """Process a single batch of triples with semaphore control"""
-        async with self.semaphore:
-            try:
-                for triple in batch:
-                    if len(triple) >= 6:
-                        subject, subject_class, predicate, predicate_class, obj, object_class = triple[:6]
-                        await self._process_single_triple_async(subject, subject_class, predicate, predicate_class, obj, object_class)
-                        self.stats.processed_triples += 1
-                    else:
-                        logger.warning(f"Invalid triple format in batch {batch_num}: {triple}")
-                        
-            except Exception as e:
-                logger.error(f"Error processing batch {batch_num}: {e}")
-                self.stats.processing_errors += 1
-                raise
-    
-    async def _process_single_triple_async(self, subject, subject_class, predicate, predicate_class, obj, object_class):
-        """Process a single 6-variable triple asynchronously"""
-        subject_uri = str(subject)
-        predicate_uri = str(predicate)
-        
-        self.stats.predicates_used.add(predicate_uri)
-        if subject_class:
-            self.stats.subject_classes.add(str(subject_class))
-        
-        await self.node_manager.ensure_node_exists(subject_uri, str(subject_class) if subject_class else None)
-        
-        if isinstance(obj, Literal):
-            literal_value = self._convert_literal_value(obj)
-            await self.node_manager.add_property(subject_uri, predicate_uri, literal_value)
-            self.stats.property_triples += 1
-            
-        elif isinstance(obj, (URIRef, BNode)):
-            object_uri = str(obj)
-            
-            if object_class:
-                self.stats.object_classes.add(str(object_class))
-            
-            await self.node_manager.ensure_node_exists(object_uri, str(object_class) if object_class else None)
-            
-            rel_type = self._get_relationship_type(predicate_uri)
-            self.relationships_by_type[rel_type].append((subject_uri, predicate_uri, object_uri))
-            self.total_relationships += 1
-            self.stats.relationship_triples += 1
-            
-            self.stats.relationship_types_count[rel_type] = self.stats.relationship_types_count.get(rel_type, 0) + 1
-    
-    def _convert_literal_value(self, literal: Literal) -> Any:
-        """Convert RDF literal to appropriate Python value"""
-        try:
-            if literal.datatype:
-                if literal.datatype == XSD.integer:
-                    return int(literal)
-                elif literal.datatype in (XSD.decimal, XSD.float, XSD.double):
-                    return float(literal)
-                elif literal.datatype == XSD.boolean:
-                    return str(literal).lower() in ('true', '1')
-                else:
-                    return str(literal)
-            else:
-                if literal.language:
-                    return f"{literal}@{literal.language}"
-                return str(literal)
-        except Exception as e:
-            logger.warning(f"Error converting literal {literal}: {e}")
-            return str(literal)
-    
-    def _get_relationship_type(self, predicate_uri: str) -> str:
-        """Extract and clean relationship type from predicate URI"""
-        parsed = urlparse(predicate_uri)
-        if parsed.fragment:
-            rel_type = parsed.fragment
-        else:
-            rel_type = predicate_uri.split('/')[-1] if '/' in predicate_uri else predicate_uri
-        
-        rel_type = re.sub(r'[^a-zA-Z0-9_]', '_', rel_type)
-        
-        if not rel_type or rel_type.isdigit():
-            rel_type = 'RELATED_TO'
-        elif rel_type[0].isdigit():
-            rel_type = f"_{rel_type}"
-        
-        if len(rel_type) > 50:
-            rel_type = rel_type[:50]
-        
-        return rel_type
-    
-    async def _create_nodes_in_falkordb_async(self):
-        """Create all nodes in FalkorDB with tqdm progress bar"""
-        nodes = await self.node_manager.get_nodes()
-        logger.info(f"🏗️  Creating {len(nodes):,} nodes in FalkorDB...")
-        
-        if not nodes:
-            logger.warning("No nodes to create")
-            return
-        
-        nodes_list = list(nodes.items())
-        batch_size = self.config.batch_size
-        
-        node_batches = []
-        for i in range(0, len(nodes_list), batch_size):
-            batch = nodes_list[i:i+batch_size]
-            node_batches.append(batch)
-        
-        tasks = []
-        for batch in node_batches:
-            task = asyncio.create_task(
-                self.falkordb_manager.create_node_batch(batch)
-            )
-            tasks.append(task)
-        
-        total_created = 0
-        
-        with tqdm_sync(total=len(tasks), desc="🏗️  Creating node batches", 
-                      unit="batch", ncols=100, colour="green") as pbar:
-            
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            for result in results:
-                if isinstance(result, int):
-                    total_created += result
-                    pbar.update(1)
-                    pbar.set_postfix({
-                        'nodes_created': f"{total_created:,}"
-                    })
-                else:
-                    pbar.update(1)
-                    pbar.set_postfix({
-                        'nodes_created': f"{total_created:,}",
-                        'errors': "Some failed"
-                    })
-                    logger.error(f"Node batch creation failed: {result}")
-        
-        logger.info(f"✅ Successfully created {total_created:,} nodes")
-        self.stats.created_nodes = total_created
-    
-    async def _create_relationships_ultra_fast(self):
-        """Create all relationships using ultra-fast optimized approach"""
-        if not self.relationships_by_type:
-            logger.info("No relationships to create")
-            return
-        
-        logger.info(f"⚡ Creating {self.total_relationships:,} relationships using ultra-fast approach...")
-        
-        logger.info("📊 Relationship type distribution:")
-        for rel_type, count in sorted(self.stats.relationship_types_count.items(), key=lambda x: x[1], reverse=True)[:10]:
-            logger.info(f"  {rel_type}: {count:,} relationships")
-        
-        created_count = await self.falkordb_manager.create_relationships_ultra_fast(self.relationships_by_type)
-        self.stats.created_relationships = created_count
-        
-        logger.info(f"✅ Successfully created {created_count:,} relationships")
-    
-    async def _create_indexes_with_discovered_labels(self):
-        """Collect discovered labels and create indexes for them with FIXED error handling"""
-        try:
-            nodes = await self.node_manager.get_nodes()
-            label_counts = Counter()
-            
-            for node_data in nodes.values():
-                primary_label = node_data.get('primary_label')
-                if primary_label:
-                    label_counts[primary_label] += 1
-            
-            if not label_counts:
-                logger.warning("No nodes with labels found - creating fallback indexes only")
-                await self.falkordb_manager.create_indexes()
-                return
-            
-            logger.info(f"Discovered {len(label_counts)} RDF class labels from {sum(label_counts.values()):,} nodes")
-            
-            discovered_labels = dict(label_counts)
-            await self.falkordb_manager.create_indexes(discovered_labels)
-            
-        except ResponseError as e:
-            # FIXED: Handle the correct FalkorDB exception type
-            error_msg = str(e).lower()
-            if any(keyword in error_msg for keyword in ['already indexed', 'attribute', 'duplicate']):
-                logger.info("ℹ️  Index already exists - this is normal when running multiple queries")
-                logger.info("💡 Conversion will continue successfully without recreating indexes")
-            else:
-                logger.warning(f"Index creation failed but conversion will continue: {e}")
-                logger.info("💡 Tip: Indexes improve query performance but are not required for functionality")
-        except Exception as e:
-            error_msg = str(e).lower()
-            if any(keyword in error_msg for keyword in ['already indexed', 'attribute', 'duplicate']):
-                logger.info("ℹ️  Index already exists - this is normal when running multiple queries")
-                logger.info("💡 Conversion will continue successfully without recreating indexes")
-            else:
-                logger.warning(f"Index creation failed but conversion will continue: {e}")
-                logger.info("💡 Tip: Indexes improve query performance but are not required for functionality")
-    
-    async def _validate_conversion(self):
-        """Validate the conversion results"""
-        logger.info("🔍 Validating conversion results...")
-        
-        falkor_stats = await self.falkordb_manager.get_graph_stats()
-        
-        if falkor_stats['nodes'] == 0:
-            logger.warning("⚠️  No nodes were created in FalkorDB")
-        
-        if self.stats.relationship_triples > 0 and falkor_stats['relationships'] == 0:
-            logger.warning("⚠️  No relationships were created despite processing relationship triples")
-        
-        logger.info(f"✅ Validation complete: {falkor_stats['nodes']:,} nodes, {falkor_stats['relationships']:,} relationships")
-    
-    async def _finalize_stats(self):
-        """Finalize conversion statistics"""
-        self.stats.end_time = datetime.now()
-        
-        final_falkor_stats = await self.falkordb_manager.get_graph_stats()
-        self.stats.final_nodes = final_falkor_stats['nodes']
-        self.stats.final_relationships = final_falkor_stats['relationships']
-        
-        if self.config.append_to_existing_graph and not self.stats.graph_was_cleared:
-            actual_nodes_created = self.stats.final_nodes - self.stats.initial_nodes
-            actual_rels_created = self.stats.final_relationships - self.stats.initial_relationships
-            
-            if actual_nodes_created >= 0:
-                self.stats.created_nodes = actual_nodes_created
-            if actual_rels_created >= 0:
-                self.stats.created_relationships = actual_rels_created
-                
-            nodes_processed = len(await self.node_manager.get_nodes())
-            self.stats.skipped_nodes = max(0, nodes_processed - actual_nodes_created)
-            self.stats.skipped_relationships = max(0, self.total_relationships - actual_rels_created)
-        else:
-            self.stats.created_nodes = self.stats.final_nodes
-            self.stats.created_relationships = self.stats.final_relationships
-        
-        nodes = await self.node_manager.get_nodes()
-        self.stats.unique_subjects = len(nodes)
-        
-        unique_objects = set()
-        for rel_list in self.relationships_by_type.values():
-            for _, _, obj_uri in rel_list:
-                unique_objects.add(obj_uri)
-        self.stats.unique_objects = len(unique_objects)
+            if self.db:
+                self.db.close()
+            if self.redis_client:
+                self.redis_client.close()
 
 
-# CONFIGURATION FUNCTIONS WITH FIXED MANAGER
-
-def create_optimized_config_fixed(sparql_endpoint: str, triples_query: str, graph_name: str = "rdf_graph", 
-                          append_mode: bool = True) -> OptimizedAsyncTripleConfig:
-    """Create an optimized configuration for the FIXED converter"""
-    
-    return OptimizedAsyncTripleConfig(
-        triples_query=triples_query,
-        sparql_endpoint=sparql_endpoint,
-        graph_name=graph_name,
-        append_to_existing_graph=append_mode,
-        clear_existing_graph=False,
-        handle_duplicates=True,
-        batch_size=2000,
-        max_concurrent_batches=3,
-        connection_pool_size=10,
-        sparql_timeout=7200,
-        falkordb_timeout=300,
-        preserve_uri_properties=False,
-        disable_relationship_properties=True,
-        group_relationships_by_type=True,
-        use_bulk_relationship_creation=True,
-        use_shortened_uris=True,
-        create_indexes=True,
-        validate_conversion=False,
-        export_stats=True,
-        progress_update_interval=25,
-    )
-
-
-async def clear_all_indexes_fixed(graph_name: str, falkordb_host: str = 'localhost', falkordb_port: int = 6379):
-    """Clear all indexes from a graph using FIXED error handling"""
-    
-    logger.info(f"🧹 Clearing all indexes from graph '{graph_name}'...")
-    
-    config = OptimizedAsyncTripleConfig(
-        triples_query="",
-        sparql_endpoint="",
-        graph_name=graph_name,
-        falkordb_host=falkordb_host,
-        falkordb_port=falkordb_port
+def main():
+    """Main entry point for the script."""
+    parser = argparse.ArgumentParser(
+        description="Convert CSV files to FalkorDB graph database with OpenAI embeddings",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    python graph_converter.py ecommerce_graph ./csv_files ./config.json
+    python graph_converter.py social_network /path/to/csvs /path/to/config.json
+        """
     )
     
-    falkordb_manager = FixedAsyncFalkorDBManager(config)  # Use FIXED manager
+    parser.add_argument('graph_name', help='Name of the graph to create in FalkorDB')
+    parser.add_argument('csv_path', help='Path to directory containing CSV files')
+    parser.add_argument('config_path', help='Path to configuration JSON file')
+    
+    args = parser.parse_args()
+    
+    # Validate arguments
+    if not os.path.exists(args.csv_path):
+        print(f"Error: CSV directory not found: {args.csv_path}")
+        sys.exit(1)
+    
+    if not os.path.exists(args.config_path):
+        print(f"Error: Configuration file not found: {args.config_path}")
+        sys.exit(1)
     
     try:
-        await falkordb_manager.connect()
-        
-        try:
-            result = await falkordb_manager.execute_query_with_retry("CALL db.indexes()")
-            if result.result_set:
-                for row in result.result_set:
-                    if len(row) > 0:
-                        index_info = str(row[0])
-                        if ":" in index_info and "(" in index_info:
-                            label_part = index_info.split("(")[0].replace("INDEX", "").replace(":", "").strip()
-                            if label_part:
-                                try:
-                                    drop_query = f"DROP INDEX FOR (n:{label_part}) ON (n.uri)"
-                                    await falkordb_manager.execute_query_with_retry(drop_query)
-                                    logger.info(f"✅ Dropped index for label '{label_part}'")
-                                except Exception as e:
-                                    logger.debug(f"Could not drop index for {label_part}: {e}")
-        except Exception as e:
-            logger.info(f"Index clearing completed with some errors (this is normal): {e}")
-        
-        logger.info("✅ Index clearing completed")
+        converter = GraphConverter(args.graph_name, args.csv_path, args.config_path)
+        converter.convert()
+        print(f"Successfully converted CSV data to FalkorDB graph: {args.graph_name}")
         
     except Exception as e:
-        logger.warning(f"Index clearing failed: {e}")
-    finally:
-        await falkordb_manager.close()
-
-
-async def run_queries_simple_fixed(endpoint: str, queries: List[str], graph_name: str = "my_graph") -> bool:
-    """
-    FIXED Simple interface: Run multiple queries with all error handling built-in
-    
-    This function handles ALL potential issues automatically including the latest FalkorDB errors:
-    - FIXED: "Attribute uri is already indexed" error handling
-    - FIXED: Proper GRAPH.EXPLAIN syntax usage
-    - FIXED: ResponseError exception handling
-    - Index conflicts
-    - SPARQL connection errors
-    - URI merging
-    - Deduplication
-    - Error recovery
-    """
-    
-    logger.info("🚀 STARTING FIXED SIMPLE MULTI-QUERY INTERFACE")
-    logger.info("=" * 60)
-    logger.info("✨ FIXED features enabled:")
-    logger.info("   ✅ FIXED: 'Attribute uri already indexed' error handling")
-    logger.info("   ✅ FIXED: Proper GRAPH.EXPLAIN syntax (GRAPH.EXPLAIN key query)")
-    logger.info("   ✅ FIXED: ResponseError exception handling")
-    logger.info("   ✅ Index conflict prevention")
-    logger.info("   ✅ URI-based node merging") 
-    logger.info("   ✅ Duplicate relationship prevention")
-    logger.info("   ✅ Error recovery (failed queries don't stop others)")
-    logger.info("   ✅ Final deduplication cleanup")
-    
-    try:
-        # Clear indexes first to prevent conflicts
-        await clear_all_indexes_fixed(graph_name)
-        
-        all_stats = []
-        
-        with tqdm_sync(total=len(queries), desc="🚀 Processing queries", 
-                      unit="query", ncols=100, colour="cyan") as query_pbar:
-            
-            for i, query in enumerate(queries, 1):
-                query_pbar.set_description(f"🚀 Query {i}/{len(queries)}")
-                logger.info(f"\n{'='*60}")
-                logger.info(f"🚀 FIXED QUERY {i}/{len(queries)}")
-                logger.info(f"{'='*60}")
-                logger.info(f"Query preview: {query[:200]}...")
-                
-                try:
-                    config = create_optimized_config_fixed(endpoint, query, graph_name, append_mode=True)
-                    converter = FixedAsyncTripleBasedConverter(config)  # Use FIXED converter
-                    stats = await converter.convert()
-                    all_stats.append(stats)
-                    
-                    query_pbar.update(1)
-                    query_pbar.set_postfix({
-                        'completed': f"{len(all_stats)}/{len(queries)}",
-                        'total_edges': f"{sum(s.created_relationships for s in all_stats):,}"
-                    })
-                    
-                    logger.info(f"✅ Query {i} completed: {stats.get_incremental_summary()}")
-                    
-                except ResponseError as e:
-                    # FIXED: Handle FalkorDB ResponseError specifically
-                    error_msg = str(e).lower()
-                    if any(keyword in error_msg for keyword in ['already indexed', 'attribute']):
-                        logger.warning(f"⚠️  Query {i} hit index conflict (FIXED handling): {e}")
-                        logger.info("💡 This is handled gracefully - data may still be processed")
-                    else:
-                        logger.error(f"❌ Query {i} failed with ResponseError: {e}")
-                    
-                    query_pbar.update(1)
-                    query_pbar.set_postfix({
-                        'completed': f"{len(all_stats)}/{len(queries)}",
-                        'failed': f"{i - len(all_stats)}"
-                    })
-                    continue
-                    
-                except Exception as e:
-                    error_msg = str(e).lower()
-                    if any(keyword in error_msg for keyword in ['already indexed', 'attribute']):
-                        logger.warning(f"⚠️  Query {i} hit index conflict: {e}")
-                        logger.info("💡 This is usually not critical - data may still be processed")
-                    else:
-                        logger.error(f"❌ Query {i} failed: {e}")
-                    
-                    query_pbar.update(1)
-                    query_pbar.set_postfix({
-                        'completed': f"{len(all_stats)}/{len(queries)}",
-                        'failed': f"{i - len(all_stats)}"
-                    })
-                    continue
-        
-        success = len(all_stats) > 0
-        
-        if success:
-            final_stats = all_stats[-1]
-            logger.info("\n🎉 FIXED SIMPLE INTERFACE: SUCCESS!")
-            logger.info(f"📊 Your graph '{graph_name}' has {final_stats.final_nodes:,} nodes and {final_stats.final_relationships:,} relationships")
-            logger.info(f"✅ {len(all_stats)}/{len(queries)} queries completed successfully")
-            
-            logger.info("\n🔍 To explore your data, connect to FalkorDB and run:")
-            logger.info(f"   MATCH (n) RETURN labels(n), count(n) ORDER BY count(n) DESC LIMIT 10")
-            logger.info(f"   MATCH ()-[r]->() RETURN type(r), count(r) ORDER BY count(r) DESC LIMIT 10")
-            
-        else:
-            logger.error("\n❌ FIXED SIMPLE INTERFACE: All queries failed")
-            logger.info("💡 Check your SPARQL endpoint and query syntax")
-            
-        return success
-        
-    except Exception as e:
-        logger.error(f"❌ Fixed simple interface failed: {e}")
-        
-        error_msg = str(e).lower()
-        if any(keyword in error_msg for keyword in ['already indexed', 'attribute']):
-            logger.info("💡 Index error detected. The FIXED system should handle this automatically.")
-            logger.info("💡 If this persists, try using a different graph_name")
-        elif "sparql" in error_msg or "endpoint" in error_msg:
-            logger.info("💡 SPARQL connection issue. Check your endpoint URL and network connectivity")
-        else:
-            logger.info("💡 Unexpected error. Check your query syntax and FalkorDB connection")
-        
-        return False
-
-
-async def deduplicate_graph_fixed(graph_name: str, falkordb_host: str = 'localhost', falkordb_port: int = 6379):
-    """FIXED: Automatic deduplication with proper error handling"""
-    
-    logger.info(f"🧹 Starting FIXED automatic deduplication of graph '{graph_name}'...")
-    logger.info("✨ This ensures your final graph has no duplicates!")
-    
-    config = OptimizedAsyncTripleConfig(
-        triples_query="",
-        sparql_endpoint="",
-        graph_name=graph_name,
-        falkordb_host=falkordb_host,
-        falkordb_port=falkordb_port
-    )
-    
-    falkordb_manager = FixedAsyncFalkorDBManager(config)  # Use FIXED manager
-    
-    try:
-        await falkordb_manager.connect()
-        
-        initial_stats = await falkordb_manager.get_graph_stats()
-        logger.info(f"📊 Before deduplication: {initial_stats['nodes']:,} nodes, {initial_stats['relationships']:,} relationships")
-        
-        dedup_steps = [
-            ("🔍 Scanning for duplicate nodes", "duplicate node detection"),
-            ("🧹 Removing duplicate nodes", "node deduplication"),
-            ("🔍 Scanning for duplicate relationships", "duplicate relationship detection"),
-            ("🧹 Removing duplicate relationships", "relationship deduplication"),
-            ("📊 Finalizing cleanup", "cleanup finalization")
-        ]
-        
-        with tqdm_sync(total=len(dedup_steps), desc="🧹 Deduplicating graph", 
-                      unit="step", ncols=100, colour="magenta") as pbar:
-            
-            pbar.set_description(dedup_steps[0][0])
-            pbar.update(1)
-            
-            pbar.set_description(dedup_steps[1][0])
-            dedup_nodes_query = """
-            MATCH (n)
-            WITH n.uri as uri, collect(n) as nodes
-            WHERE size(nodes) > 1
-            WITH uri, nodes, 
-                 [node in nodes | size(keys(node))] as prop_counts,
-                 range(0, size(nodes)-1) as indices
-            WITH uri, nodes, 
-                 [i in indices | {node: nodes[i], props: prop_counts[i]}] as node_info
-            WITH uri, node_info, 
-                 reduce(max_props = -1, info in node_info | 
-                       CASE WHEN info.props > max_props THEN info.props ELSE max_props END) as max_prop_count
-            WITH uri, [info in node_info WHERE info.props = max_prop_count][0].node as keeper,
-                 [info in node_info WHERE info.props < max_prop_count | info.node] as to_delete
-            UNWIND to_delete as duplicate_node
-            DETACH DELETE duplicate_node
-            """
-            
-            try:
-                await falkordb_manager.execute_query_with_retry(dedup_nodes_query)
-                logger.info("✅ Node deduplication completed")
-            except Exception as e:
-                logger.warning(f"Node deduplication query failed (may be no duplicates): {e}")
-            
-            pbar.update(1)
-            
-            pbar.set_description(dedup_steps[2][0])
-            pbar.update(1)
-            
-            pbar.set_description(dedup_steps[3][0])
-            dedup_rels_query = """
-            MATCH (a)-[r]->(b)
-            WITH a, b, type(r) as rel_type, collect(r) as rels
-            WHERE size(rels) > 1
-            WITH a, b, rel_type, rels[1..] as duplicates
-            UNWIND duplicates as duplicate_rel
-            DELETE duplicate_rel
-            """
-            
-            try:
-                await falkordb_manager.execute_query_with_retry(dedup_rels_query)
-                logger.info("✅ Relationship deduplication completed")
-            except Exception as e:
-                logger.warning(f"Relationship deduplication query failed (may be no duplicates): {e}")
-            
-            pbar.update(1)
-            
-            pbar.set_description(dedup_steps[4][0])
-            final_stats = await falkordb_manager.get_graph_stats()
-            pbar.update(1)
-        
-        logger.info(f"📊 After deduplication: {final_stats['nodes']:,} nodes, {final_stats['relationships']:,} relationships")
-        
-        nodes_removed = initial_stats['nodes'] - final_stats['nodes']
-        rels_removed = initial_stats['relationships'] - final_stats['relationships']
-        
-        if nodes_removed > 0 or rels_removed > 0:
-            logger.info(f"🧹 DEDUPLICATION RESULTS:")
-            logger.info(f"   ✅ Removed {nodes_removed:,} duplicate nodes")
-            logger.info(f"   ✅ Removed {rels_removed:,} duplicate relationships")
-            logger.info(f"   ✨ Your graph is now completely deduplicated!")
-        else:
-            logger.info("✨ No duplicates found - your graph was already perfectly clean!")
-        
-        return {
-            'initial_nodes': initial_stats['nodes'],
-            'initial_relationships': initial_stats['relationships'],
-            'final_nodes': final_stats['nodes'],
-            'final_relationships': final_stats['relationships'],
-            'nodes_removed': nodes_removed,
-            'relationships_removed': rels_removed
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Deduplication failed: {e}")
-        raise
-    finally:
-        await falkordb_manager.close()
-
-
-async def run_multiple_queries_with_deduplication_fixed(sparql_endpoint: str, queries_list: List[str], 
-                                                graph_name: str = "merged_graph", clear_indexes_first: bool = False):
-    """
-    FIXED: Run multiple queries with automatic deduplication and progress tracking
-    
-    Automatic deduplication: After all queries complete, the system will:
-       1. Merge duplicate nodes (same URI) 
-       2. Remove duplicate relationships
-       3. Ensure your final graph is completely clean
-    """
-    
-    if clear_indexes_first:
-        logger.info("🧹 Clearing existing indexes to avoid conflicts...")
-        await clear_all_indexes_fixed(graph_name)
-    
-    logger.info(f"🔄 Running {len(queries_list)} queries with FIXED automatic deduplication...")
-    logger.info(f"📊 Target graph: '{graph_name}'")
-    logger.info("✨ AUTOMATIC DEDUPLICATION will run after all queries complete!")
-    
-    all_stats = []
-    
-    with tqdm_sync(total=len(queries_list), desc="🚀 Processing queries", 
-                  unit="query", ncols=100, colour="cyan") as query_pbar:
-        
-        for i, query in enumerate(queries_list, 1):
-            query_pbar.set_description(f"🚀 Query {i}/{len(queries_list)}")
-            logger.info(f"\n{'='*60}")
-            logger.info(f"🚀 FIXED QUERY {i}/{len(queries_list)}")
-            logger.info(f"{'='*60}")
-            logger.info(f"Query preview: {query[:200]}...")
-            
-            try:
-                config = create_optimized_config_fixed(sparql_endpoint, query, graph_name)
-                config.append_to_existing_graph = True
-                config.clear_existing_graph = False
-                config.handle_duplicates = True
-                
-                converter = FixedAsyncTripleBasedConverter(config)  # Use FIXED converter
-                stats = await converter.convert()
-                all_stats.append(stats)
-                
-                query_pbar.update(1)
-                query_pbar.set_postfix({
-                    'completed': f"{len(all_stats)}/{len(queries_list)}",
-                    'total_edges': f"{sum(s.created_relationships for s in all_stats):,}"
-                })
-                
-                logger.info(f"✅ Query {i} completed: {stats.get_incremental_summary()}")
-                
-            except ResponseError as e:
-                # FIXED: Handle FalkorDB ResponseError specifically
-                error_msg = str(e).lower()
-                if any(keyword in error_msg for keyword in ['already indexed', 'attribute']):
-                    logger.warning(f"⚠️  Query {i} hit index conflict (FIXED handling): {e}")
-                    logger.info("💡 This is handled gracefully - data may still be processed")
-                else:
-                    logger.error(f"❌ Query {i} failed with ResponseError: {e}")
-                
-                query_pbar.update(1)
-                query_pbar.set_postfix({
-                    'completed': f"{len(all_stats)}/{len(queries_list)}",
-                    'failed': f"{i - len(all_stats)}"
-                })
-                continue
-                
-            except Exception as e:
-                error_msg = str(e).lower()
-                if any(keyword in error_msg for keyword in ['already indexed', 'attribute']):
-                    logger.warning(f"⚠️  Query {i} hit index conflict: {e}")
-                    logger.info("💡 This is usually not critical - data may still be processed")
-                else:
-                    logger.error(f"❌ Query {i} failed: {e}")
-                
-                query_pbar.update(1)
-                query_pbar.set_postfix({
-                    'completed': f"{len(all_stats)}/{len(queries_list)}",
-                    'failed': f"{i - len(all_stats)}"
-                })
-                continue
-    
-    logger.info(f"\n{'='*80}")
-    logger.info(f"🎉 ALL QUERIES COMPLETED")
-    logger.info(f"{'='*80}")
-    
-    if all_stats:
-        final_stats = all_stats[-1]
-        logger.info(f"📊 Pre-deduplication: {final_stats.final_nodes:,} nodes, {final_stats.final_relationships:,} relationships")
-        
-        total_processed = sum(s.processed_triples for s in all_stats)
-        total_new_nodes = sum(s.created_nodes for s in all_stats)
-        total_new_relationships = sum(s.created_relationships for s in all_stats)
-        
-        logger.info(f"📈 Processing summary:")
-        logger.info(f"   Total triples processed: {total_processed:,}")
-        logger.info(f"   Total new nodes added: {total_new_nodes:,}")
-        logger.info(f"   Total new relationships added: {total_new_relationships:,}")
-        logger.info(f"   Successful queries: {len(all_stats)}/{len(queries_list)}")
-        
-        logger.info(f"\n{'='*80}")
-        logger.info(f"✨ AUTOMATIC DEDUPLICATION STARTING")
-        logger.info(f"{'='*80}")
-        logger.info("🔄 Running final deduplication to ensure a perfectly clean graph...")
-        
-        dedup_results = await deduplicate_graph_fixed(graph_name)  # Use FIXED deduplication
-        
-        logger.info(f"\n{'='*80}")
-        logger.info(f"✨ DEDUPLICATION COMPLETED")
-        logger.info(f"{'='*80}")
-        logger.info(f"📊 Final clean graph: {dedup_results['final_nodes']:,} nodes, {dedup_results['final_relationships']:,} relationships")
-        
-        if dedup_results['nodes_removed'] > 0 or dedup_results['relationships_removed'] > 0:
-            logger.info(f"🧹 Cleaned up {dedup_results['nodes_removed']:,} duplicate nodes and {dedup_results['relationships_removed']:,} duplicate relationships")
-        else:
-            logger.info("✨ Graph was already perfectly clean - no duplicates found!")
-        
-        return all_stats
-    else:
-        logger.error("❌ No queries completed successfully")
-        return []
-
-
-async def run_ultra_fast_conversion_fixed(sparql_endpoint: str, queries_list: List[str], 
-                                 graph_name: str = "ultra_fast_graph") -> List[AsyncConversionStats]:
-    """
-    FIXED: Ultra-fast mode with automatic deduplication and proper error handling
-    
-    This mode sacrifices some safety features for maximum performance:
-    - Uses massive batch sizes (50K-100K edges per batch)
-    - Skips duplicate checking during load (for maximum speed)
-    - Minimal indexing during load (creates indexes after)
-    - Single-threaded processing for stability with large batches
-    
-    FIXED: Automatic deduplication still runs comprehensive deduplication at the end!
-    
-    Best for: Clean data with 2M+ edges where speed is critical
-    """
-    
-    logger.info("🚄 FIXED ULTRA-FAST MODE: Optimized for 2M+ edges")
-    logger.info("=" * 60)
-    logger.info("⚡ FIXED ultra-fast optimizations enabled:")
-    logger.info("   🚄 Mega-batch processing (50K-100K edges/batch)")
-    logger.info("   ⚡ CREATE-only mode during load (maximum speed)")
-    logger.info("   🎯 Single-threaded for stability")
-    logger.info("   📊 Minimal overhead during processing")
-    logger.info("   🏗️  Indexes created after loading")
-    logger.info("   ✨ AUTOMATIC DEDUPLICATION at the end")
-    logger.info("   🔧 FIXED: Proper error handling for FalkorDB")
-    
-    all_stats = []
-    
-    with tqdm_sync(total=len(queries_list), desc="🚄 Ultra-fast queries", 
-                  unit="query", ncols=100, colour="red") as query_pbar:
-        
-        for i, query in enumerate(queries_list, 1):
-            query_pbar.set_description(f"🚄 Ultra-fast query {i}/{len(queries_list)}")
-            logger.info(f"\n{'='*60}")
-            logger.info(f"🚄 FIXED ULTRA-FAST QUERY {i}/{len(queries_list)}")
-            logger.info(f"{'='*60}")
-            logger.info(f"Query preview: {query[:200]}...")
-            
-            try:
-                # Create ultra-fast config
-                config = create_optimized_config_fixed(sparql_endpoint, query, graph_name)
-                config.append_to_existing_graph = True
-                config.clear_existing_graph = False
-                config.handle_duplicates = False  # Skip for speed
-                config.batch_size = 50000
-                config.max_concurrent_batches = 1
-                config.create_indexes = False  # Create after loading
-                
-                converter = FixedAsyncTripleBasedConverter(config)  # Use FIXED converter
-                stats = await converter.convert()
-                all_stats.append(stats)
-                
-                query_pbar.update(1)
-                query_pbar.set_postfix({
-                    'completed': f"{len(all_stats)}/{len(queries_list)}",
-                    'total_edges': f"{sum(s.created_relationships for s in all_stats):,}",
-                    'rate': f"{stats.relationship_creation_rate:.0f}/s" if stats.relationship_creation_rate > 0 else "N/A"
-                })
-                
-                logger.info(f"🚄 Ultra-fast query {i} completed: {stats.get_incremental_summary()}")
-                
-                if stats.relationship_creation_rate > 0:
-                    logger.info(f"⚡ Edge creation rate: {stats.relationship_creation_rate:.0f} relationships/second")
-                
-            except ResponseError as e:
-                # FIXED: Handle FalkorDB ResponseError specifically
-                error_msg = str(e).lower()
-                if any(keyword in error_msg for keyword in ['already indexed', 'attribute']):
-                    logger.warning(f"⚠️  Ultra-fast query {i} hit index conflict (FIXED handling): {e}")
-                    logger.info("💡 This is handled gracefully in ultra-fast mode")
-                else:
-                    logger.error(f"❌ Ultra-fast query {i} failed with ResponseError: {e}")
-                
-                query_pbar.update(1)
-                query_pbar.set_postfix({
-                    'completed': f"{len(all_stats)}/{len(queries_list)}",
-                    'failed': f"{i - len(all_stats)}"
-                })
-                continue
-                
-            except Exception as e:
-                logger.error(f"❌ Ultra-fast query {i} failed: {e}")
-                query_pbar.update(1)
-                query_pbar.set_postfix({
-                    'completed': f"{len(all_stats)}/{len(queries_list)}",
-                    'failed': f"{i - len(all_stats)}"
-                })
-                continue
-    
-    if all_stats:
-        logger.info("\n🏗️  Creating indexes after ultra-fast loading...")
-        try:
-            final_config = create_optimized_config_fixed(sparql_endpoint, queries_list[0], graph_name)
-            final_config.create_indexes = True
-            
-            falkordb_manager = FixedAsyncFalkorDBManager(final_config)  # Use FIXED manager
-            await falkordb_manager.connect()
-            
-            final_stats = await falkordb_manager.get_graph_stats()
-            logger.info(f"📊 Pre-deduplication: {final_stats['nodes']:,} nodes, {final_stats['relationships']:,} relationships")
-            
-            await falkordb_manager.create_index_safely_fixed("Resource")
-            await falkordb_manager.close()
-            logger.info("✅ Post-loading indexing completed")
-            
-        except Exception as e:
-            logger.warning(f"Post-loading indexing failed: {e}")
-    
-    if all_stats:
-        logger.info(f"\n{'='*80}")
-        logger.info(f"✨ AUTOMATIC DEDUPLICATION STARTING")
-        logger.info(f"{'='*80}")
-        logger.info("🔄 Running comprehensive deduplication on ultra-fast loaded data...")
-        
-        dedup_results = await deduplicate_graph_fixed(graph_name)  # Use FIXED deduplication
-        
-        logger.info(f"\n{'='*80}")
-        logger.info(f"✨ ULTRA-FAST + DEDUPLICATION COMPLETED")
-        logger.info(f"{'='*80}")
-    
-    logger.info(f"\n{'='*80}")
-    logger.info(f"🚄 FIXED ULTRA-FAST MODE COMPLETED")
-    logger.info(f"{'='*80}")
-    
-    if all_stats:
-        total_edges = sum(s.created_relationships for s in all_stats)
-        total_time = sum((s.end_time - s.start_time).total_seconds() for s in all_stats if s.end_time)
-        
-        logger.info(f"📊 Ultra-fast results:")
-        logger.info(f"   Total edges created: {total_edges:,}")
-        logger.info(f"   Total processing time: {total_time:.1f} seconds ({total_time/60:.1f} minutes)")
-        logger.info(f"   Overall edge rate: {total_edges/total_time:.0f} edges/second")
-        logger.info(f"   Successful queries: {len(all_stats)}/{len(queries_list)}")
-        
-        if 'dedup_results' in locals():
-            logger.info(f"   Final clean graph: {dedup_results['final_nodes']:,} nodes, {dedup_results['final_relationships']:,} relationships")
-            if dedup_results['nodes_removed'] > 0 or dedup_results['relationships_removed'] > 0:
-                logger.info(f"   Removed duplicates: {dedup_results['nodes_removed']:,} nodes, {dedup_results['relationships_removed']:,} relationships")
-            else:
-                logger.info(f"   ✨ No duplicates found - data was perfectly clean!")
-        
-        edge_rate = total_edges / total_time if total_time > 0 else 0
-        if edge_rate > 10000:
-            logger.info("🚀 OUTSTANDING: Ultra-high-speed edge processing (>10K edges/sec)")
-        elif edge_rate > 5000:
-            logger.info("🎉 EXCELLENT: High-speed edge processing (>5K edges/sec)")
-        elif edge_rate > 2000:
-            logger.info("✅ GOOD: Fast edge processing (>2K edges/sec)")
-        else:
-            logger.info("⚠️  MODERATE: Consider optimizing system resources")
-        
-        return all_stats
-    else:
-        logger.error("❌ No ultra-fast queries completed successfully")
-        return []
-
-
-async def example_multiple_queries_fixed():
-    """FIXED: Example of running multiple queries with automatic merging and deduplication"""
-    
-    endpoint = "https://dbpedia.org/sparql"
-    graph_name = "fixed_multi_query_graph"
-    
-    queries = [
-        """
-        SELECT ?subject ?subjectClass ?predicate ?predicateClass ?object ?objectClass WHERE {
-            ?subject ?predicate ?object .
-            OPTIONAL { ?subject a ?subjectClass }
-            OPTIONAL { ?predicate a ?predicateClass }
-            OPTIONAL { ?object a ?objectClass . FILTER(isURI(?object)) }
-            FILTER(STRSTARTS(STR(?subject), "http://dbpedia.org/resource/G"))
-            FILTER(?predicate = <http://www.w3.org/1999/02/22-rdf-syntax-ns#type>)
-        }
-        LIMIT 50
-        """,
-        
-        """
-        SELECT ?subject ?subjectClass ?predicate ?predicateClass ?object ?objectClass WHERE {
-            ?subject ?predicate ?object .
-            OPTIONAL { ?subject a ?subjectClass }
-            OPTIONAL { ?predicate a ?predicateClass }
-            OPTIONAL { ?object a ?objectClass . FILTER(isURI(?object)) }
-            FILTER(STRSTARTS(STR(?subject), "http://dbpedia.org/resource/H"))
-            FILTER(?predicate = <http://www.w3.org/1999/02/22-rdf-syntax-ns#type>)
-        }
-        LIMIT 50
-        """,
-        
-        """
-        SELECT ?subject ?subjectClass ?predicate ?predicateClass ?object ?objectClass WHERE {
-            ?subject ?predicate ?object .
-            OPTIONAL { ?subject a ?subjectClass }
-            OPTIONAL { ?predicate a ?predicateClass }
-            OPTIONAL { ?object a ?objectClass . FILTER(isURI(?object)) }
-            FILTER(?predicate = <http://dbpedia.org/ontology/birthPlace>)
-        }
-        LIMIT 30
-        """
-    ]
-    
-    logger.info("🚀 FIXED EXAMPLE: Multiple Queries with Automatic Merging")
-    logger.info("=" * 60)
-    logger.info("💡 This FIXED example shows how to:")
-    logger.info("   1. Run multiple SPARQL queries with FIXED error handling")
-    logger.info("   2. Automatically merge results into one graph")
-    logger.info("   3. Handle duplicate data seamlessly")
-    logger.info("   4. Perform final deduplication")
-    logger.info("   5. Handle index conflicts gracefully with FIXED ResponseError handling")
-    
-    try:
-        stats_list = await run_multiple_queries_with_deduplication_fixed(
-            sparql_endpoint=endpoint,
-            queries_list=queries,
-            graph_name=graph_name,
-            clear_indexes_first=True
-        )
-        
-        if stats_list:
-            logger.info("\n🎉 FIXED SUCCESS: All queries completed and merged!")
-            logger.info(f"📊 Final graph '{graph_name}' is ready for use")
-            
-            logger.info("\n🔍 Sample queries to explore your merged data:")
-            sample_queries = [
-                f"MATCH (n) RETURN labels(n), count(n) ORDER BY count(n) DESC LIMIT 10",
-                f"MATCH ()-[r]->() RETURN type(r), count(r) ORDER BY count(r) DESC LIMIT 10", 
-                f"MATCH (n) RETURN n.uri, labels(n) LIMIT 5"
-            ]
-            
-            for i, query in enumerate(sample_queries, 1):
-                logger.info(f"   {i}. {query}")
-        
-        return stats_list
-        
-    except Exception as e:
-        logger.error(f"❌ FIXED multiple queries example failed: {e}")
-        logger.info("💡 If you're getting index errors, the FIXED version should handle them automatically")
-        raise
-
-
-async def example_fixed_usage():
-    """Example showing the FIXED converter with proper error handling"""
-    
-    logger.info("🎯 FIXED USAGE EXAMPLE")
-    logger.info("=" * 50)
-    logger.info("💡 The FIXED version handles FalkorDB errors properly:")
-    logger.info("   ✅ FIXED: 'Attribute uri already indexed' error")
-    logger.info("   ✅ FIXED: Proper GRAPH.EXPLAIN syntax")
-    logger.info("   ✅ FIXED: ResponseError exception handling")
-    
-    # Example configuration
-    endpoint = "https://dbpedia.org/sparql"
-    
-    # Simple queries 
-    queries = [
-        """
-        SELECT ?subject ?subjectClass ?predicate ?predicateClass ?object ?objectClass WHERE {
-            ?subject ?predicate ?object .
-            OPTIONAL { ?subject a ?subjectClass }
-            OPTIONAL { ?predicate a ?predicateClass }
-            OPTIONAL { ?object a ?objectClass . FILTER(isURI(?object)) }
-            FILTER(STRSTARTS(STR(?subject), "http://dbpedia.org/resource/F"))
-            FILTER(?predicate = <http://www.w3.org/1999/02/22-rdf-syntax-ns#type>)
-        }
-        LIMIT 25
-        """
-    ]
-    
-    logger.info("📝 FIXED Code:")
-    logger.info('''
-success = await run_queries_simple_fixed(
-    endpoint="https://dbpedia.org/sparql",
-    queries=your_queries,
-    graph_name="my_graph"
-)
-    ''')
-    
-    try:
-        success = await run_queries_simple_fixed(
-            endpoint=endpoint,
-            queries=queries,
-            graph_name="fixed_example_graph"
-        )
-        
-        if success:
-            logger.info("✅ FIXED usage example completed successfully!")
-            logger.info("💡 Your graph is ready to query in FalkorDB with no index errors!")
-        else:
-            logger.error("❌ FIXED usage example failed")
-            
-        return success
-        
-    except Exception as e:
-        logger.error(f"Fixed usage example error: {e}")
-        return False
-
-
-# MAIN EXECUTION
-if __name__ == "__main__":
-    
-    async def main():
-        """Main execution with FIXED examples"""
-        
-        logger.info("🚀 FIXED RDF TO FALKORDB CONVERTER")
-        logger.info("=" * 60)
-        logger.info("✨ Complete, Fixed, and Optimized Version for Latest FalkorDB")
-        logger.info("🔧 FIXED: 'Attribute uri already indexed' error handling")
-        logger.info("🔧 FIXED: Proper GRAPH.EXPLAIN syntax (GRAPH.EXPLAIN key query)")
-        logger.info("🔧 FIXED: ResponseError exception handling")
-        logger.info("⚡ Enhanced: Ultra-fast relationship creation")
-        logger.info("🧹 Automatic: Deduplication and cleanup")
-        logger.info("🛡️  Robust: Error handling and recovery")
-        logger.info("")
-        
-        # Run fixed usage example
-        logger.info("🎯 RUNNING FIXED USAGE EXAMPLE...")
-        await example_fixed_usage()
-        print("\n" + "="*80 + "\n")
-        
-        # Run multiple queries example with FIXED error handling
-        logger.info("🔄 RUNNING FIXED MULTIPLE QUERIES EXAMPLE...")
-        await example_multiple_queries_fixed()
-        print("\n" + "="*80 + "\n")
-        
-        logger.info("✅ ALL FIXED EXAMPLES COMPLETED!")
-        logger.info("🎉 Your FIXED RDF to FalkorDB converter is ready for production use!")
-        logger.info("")
-        logger.info("📚 QUICK REFERENCE (FIXED FUNCTIONS):")
-        logger.info("   • Simple usage: run_queries_simple_fixed(endpoint, queries, graph_name)")
-        logger.info("   • Multiple queries: run_multiple_queries_with_deduplication_fixed(...)")
-        logger.info("   • Ultra-fast: run_ultra_fast_conversion_fixed(...)")
-        logger.info("   • Clear conflicts: clear_all_indexes_fixed(graph_name)")
-        logger.info("   • Deduplication: deduplicate_graph_fixed(graph_name)")
-        logger.info("   • FIXED converter: FixedAsyncTripleBasedConverter(config)")
-        logger.info("   • FIXED manager: FixedAsyncFalkorDBManager(config)")
-        logger.info("")
-        logger.info("🔧 KEY FIXES:")
-        logger.info("   • Proper ResponseError handling for 'Attribute uri already indexed'")
-        logger.info("   • Correct GRAPH.EXPLAIN syntax: GRAPH.EXPLAIN key query")
-        logger.info("   • Enhanced error message matching")
-        logger.info("   • Better index existence checking")
-        logger.info("   • FIXED multi-query support with error recovery")
-        logger.info("")
-        logger.info("🔍 Need help? All error handling is now properly fixed!")
-        logger.info("")
-        logger.info("🚀 AVAILABLE FIXED FUNCTIONS:")
-        logger.info("   1. run_queries_simple_fixed() - Simplest usage")
-        logger.info("   2. run_multiple_queries_with_deduplication_fixed() - Multi-query with dedup")
-        logger.info("   3. run_ultra_fast_conversion_fixed() - Ultra-fast for 2M+ edges")
-        logger.info("   4. deduplicate_graph_fixed() - Manual deduplication")
-        logger.info("   5. clear_all_indexes_fixed() - Index conflict resolution")
-    
-    # Run the main function
-    asyncio.run(main())
-
-
-# =============================================================================
-# QUICK REFERENCE: ALL FIXED FUNCTIONS
-# =============================================================================
-
-"""
-🚀 COMPLETE FIXED RDF TO FALKORDB CONVERTER
-
-✅ ALL ERRORS FIXED:
-   - "Attribute uri already indexed" error ✅
-   - GRAPH.EXPLAIN syntax error ✅  
-   - ResponseError handling ✅
-   - Index conflict resolution ✅
-
-📚 AVAILABLE FUNCTIONS:
-
-1. SIMPLE USAGE (RECOMMENDED):
-   success = await run_queries_simple_fixed(
-       endpoint="https://your-endpoint.com/sparql",
-       queries=your_queries_list,
-       graph_name="my_graph"
-   )
-
-2. MULTIPLE QUERIES WITH DEDUPLICATION:
-   stats = await run_multiple_queries_with_deduplication_fixed(
-       sparql_endpoint=endpoint,
-       queries_list=queries,
-       graph_name="merged_graph",
-       clear_indexes_first=True
-   )
-
-3. ULTRA-FAST MODE (2M+ EDGES):
-   stats = await run_ultra_fast_conversion_fixed(
-       sparql_endpoint=endpoint,
-       queries_list=queries,
-       graph_name="ultra_fast_graph"
-   )
-
-4. MANUAL DEDUPLICATION:
-   results = await deduplicate_graph_fixed("my_graph")
-
-5. CLEAR INDEX CONFLICTS:
-   await clear_all_indexes_fixed("my_graph")
-
-6. MANUAL CONVERTER USAGE:
-   config = create_optimized_config_fixed(endpoint, query, graph_name)
-   converter = FixedAsyncTripleBasedConverter(config)
-   stats = await converter.convert()
-
-🔧 KEY FIXES APPLIED:
-   ✅ ResponseError exception handling
-   ✅ GRAPH.EXPLAIN k
+        print(f"Conversion failed: {e}")
+        sys.exit(1)
