@@ -1,44 +1,520 @@
-import re
+import os
+import logging
+from typing import List, Dict, Any, Optional, TypedDict, Annotated
+from dataclasses import dataclass
+import asyncio
+from enum import Enum
 
-# Compile regex patterns once for better performance
-WHITESPACE_PATTERN = re.compile(r'\s+')
-CONTROL_CHAR_PATTERN = re.compile(r'[\x00-\x1f\x7f-\x9f\ufffd]')
-LINE_ENDING_PATTERN = re.compile(r'\r\n|\r|\n')
+# Core imports
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.tools import BaseTool, tool
+from langchain_core.prompts import PromptTemplate
+from langchain_core.pydantic_v1 import BaseModel, Field
+from langchain_community.graphs import FalkorDBGraph
+from langchain_community.chains import FalkorDBQAChain
 
-def ultra_clean_text(text: Any) -> str:
-    """
-    Ultra-robust text cleaning using regex for maximum performance.
-    Best for high-volume text processing.
-    """
-    if pd.isna(text) or text is None:
-        return ""
+# LangGraph imports
+from langgraph.prebuilt import create_react_agent
+from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.prebuilt.tool_node import ToolNode
+
+# FalkorDB imports
+from falkordb import FalkorDB
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Configuration
+class Config:
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    FALKORDB_HOST = os.getenv("FALKORDB_HOST", "localhost")
+    FALKORDB_PORT = int(os.getenv("FALKORDB_PORT", 6379))
+    GRAPH_NAME = os.getenv("GRAPH_NAME", "knowledge_graph")
+
+# State management for LangGraph
+class GraphRAGState(TypedDict):
+    messages: Annotated[List[Any], "Chat messages"]
+    original_query: str
+    decomposed_queries: List[str]
+    query_route: str  # "vector" or "graph" or "hybrid"
+    vector_results: List[Dict]
+    graph_results: List[Dict]
+    reasoning_context: str
+    final_answer: str
+
+# Query routing model
+class QueryRoute(BaseModel):
+    """Route a user query to the most relevant approach."""
+    route: str = Field(description="Route: 'vector', 'graph', or 'hybrid'")
+    reasoning: str = Field(description="Reasoning for the routing decision")
+
+# Decomposed query model
+class DecomposedQuery(BaseModel):
+    """Decomposed sub-queries from a complex query."""
+    sub_queries: List[str] = Field(description="List of sub-queries")
+    reasoning: str = Field(description="Reasoning for decomposition")
+
+# Multi-query generator
+class MultiQueryGenerator:
+    def __init__(self, llm):
+        self.llm = llm
+        self.decomposition_prompt = PromptTemplate(
+            template="""You are an expert at breaking down complex queries into simpler sub-queries.
+            Your task is to decompose the following query into multiple focused sub-queries that can be answered independently.
+            
+            Original Query: {query}
+            
+            Guidelines:
+            1. If the query is simple, keep it as is
+            2. For complex queries, break them into 2-5 sub-queries
+            3. Each sub-query should be self-contained
+            4. Focus on entities, relationships, and key concepts
+            
+            Examples:
+            Query: "What are the connections between Company A and Company B through their executives?"
+            Sub-queries: [
+                "Who are the executives of Company A?",
+                "Who are the executives of Company B?", 
+                "What connections exist between these executive groups?"
+            ]
+            
+            Query: "Find research papers about AI safety published after 2020"
+            Sub-queries: ["Find research papers about AI safety published after 2020"]
+            
+            Decompose the query:""",
+            input_variables=["query"]
+        )
     
+    async def decompose_query(self, query: str) -> DecomposedQuery:
+        """Decompose a complex query into sub-queries."""
+        try:
+            prompt = self.decomposition_prompt.format(query=query)
+            response = await self.llm.ainvoke([HumanMessage(content=prompt)])
+            
+            # Parse the response to extract sub-queries
+            # In a production system, you'd use structured output
+            lines = response.content.strip().split('\n')
+            sub_queries = []
+            
+            for line in lines:
+                line = line.strip()
+                if line and not line.startswith(('Query:', 'Sub-queries:', 'Examples:')):
+                    # Clean up the sub-query
+                    if line.startswith('"') and line.endswith('"'):
+                        line = line[1:-1]
+                    if line.startswith(('- ', '* ', '1. ', '2. ', '3. ', '4. ', '5. ')):
+                        line = line[2:] if line.startswith(('- ', '* ')) else line[3:]
+                    if line:
+                        sub_queries.append(line)
+            
+            return DecomposedQuery(
+                sub_queries=sub_queries if sub_queries else [query],
+                reasoning=f"Decomposed into {len(sub_queries)} sub-queries"
+            )
+        except Exception as e:
+            logger.error(f"Error in query decomposition: {e}")
+            return DecomposedQuery(sub_queries=[query], reasoning="Used original query due to error")
+
+# Query router
+class QueryRouter:
+    def __init__(self, llm):
+        self.llm = llm
+        self.routing_prompt = PromptTemplate(
+            template="""You are an expert query router for a GraphRAG system.
+            Your task is to determine the best approach for answering a query.
+            
+            Routes available:
+            - "vector": For semantic similarity searches, concept matching, general knowledge
+            - "graph": For relationship-based queries, entity connections, structural analysis
+            - "hybrid": For complex queries requiring both semantic and structural analysis
+            
+            Query: {query}
+            
+            Consider:
+            1. Does the query ask about relationships between entities? → graph
+            2. Does the query need semantic understanding of concepts? → vector  
+            3. Does the query require both relationship analysis AND semantic understanding? → hybrid
+            4. Is the query about finding similar concepts or documents? → vector
+            5. Is the query about connections, paths, or network analysis? → graph
+            
+            Route the query and explain your reasoning:""",
+            input_variables=["query"]
+        )
+    
+    async def route_query(self, query: str) -> QueryRoute:
+        """Route a query to the appropriate processing path."""
+        try:
+            prompt = self.routing_prompt.format(query=query)
+            response = await self.llm.ainvoke([HumanMessage(content=prompt)])
+            
+            content = response.content.lower()
+            
+            # Simple routing logic based on response content
+            if "hybrid" in content:
+                route = "hybrid"
+            elif "graph" in content and "vector" not in content:
+                route = "graph"
+            elif "vector" in content and "graph" not in content:
+                route = "vector"
+            else:
+                # Default to hybrid for complex cases
+                route = "hybrid"
+            
+            return QueryRoute(route=route, reasoning=response.content)
+        except Exception as e:
+            logger.error(f"Error in query routing: {e}")
+            return QueryRoute(route="hybrid", reasoning="Defaulted to hybrid due to error")
+
+# FalkorDB tools for React agent
+@tool
+async def falkordb_cypher_query(query: str) -> str:
+    """Execute a Cypher query against the FalkorDB graph database.
+    
+    Args:
+        query: Cypher query string to execute
+        
+    Returns:
+        Query results as a formatted string
+    """
     try:
-        # Convert to string first
-        if not isinstance(text, str):
-            text = str(text)
+        db = FalkorDB(host=Config.FALKORDB_HOST, port=Config.FALKORDB_PORT)
+        graph = db.select_graph(Config.GRAPH_NAME)
+        result = graph.query(query)
         
-        # Replace line endings with spaces (most specific first)
-        text = LINE_ENDING_PATTERN.sub(' ', text)
-        
-        # Replace non-breaking spaces
-        text = text.replace('\xa0', ' ')
-        
-        # Remove control characters and replacement characters
-        text = CONTROL_CHAR_PATTERN.sub('', text)
-        
-        # Encode and decode with error handling
-        text = text.encode('utf-8', errors='ignore').decode('utf-8', errors='ignore')
-        
-        # Normalize whitespace efficiently
-        text = WHITESPACE_PATTERN.sub(' ', text).strip()
-        
-        # Truncate if too long (for database field limits)
-        if len(text) > 10000:
-            text = text[:9997] + "..."
-        
-        return text
-        
+        # Format results
+        if result.result_set:
+            formatted_results = []
+            for record in result.result_set:
+                formatted_results.append(str(record))
+            return f"Query executed successfully. Results: {formatted_results[:10]}"  # Limit results
+        else:
+            return "Query executed successfully but returned no results."
+            
     except Exception as e:
-        logger.warning(f"Text cleaning error: {e}, returning empty string")
-        return ""
+        return f"Error executing Cypher query: {str(e)}"
+
+@tool
+async def falkordb_vector_search(query: str, limit: int = 5) -> str:
+    """Perform vector similarity search on graph nodes.
+    
+    Args:
+        query: Search query for semantic similarity
+        limit: Maximum number of results to return
+        
+    Returns:
+        Search results as a formatted string
+    """
+    try:
+        # Note: This is a simplified example. In practice, you'd use FalkorDB's vector index
+        cypher_query = f"""
+        CALL db.idx.fulltext.queryNodes('entity_index', '{query}') 
+        YIELD node, score 
+        RETURN node.name, node.description, score 
+        LIMIT {limit}
+        """
+        return await falkordb_cypher_query(cypher_query)
+    except Exception as e:
+        return f"Error in vector search: {str(e)}"
+
+@tool
+async def falkordb_relationship_analysis(entity: str, depth: int = 2) -> str:
+    """Analyze relationships for a given entity up to specified depth.
+    
+    Args:
+        entity: Name of the entity to analyze
+        depth: Maximum relationship depth to explore
+        
+    Returns:
+        Relationship analysis results
+    """
+    try:
+        cypher_query = f"""
+        MATCH (e {{name: '{entity}'}})-[r*1..{depth}]->(connected)
+        RETURN e.name, type(r[0]) as relationship_type, connected.name, length(r) as depth
+        LIMIT 20
+        """
+        return await falkordb_cypher_query(cypher_query)
+    except Exception as e:
+        return f"Error in relationship analysis: {str(e)}"
+
+# Main GraphRAG Search Engine
+class GraphRAGSearchEngine:
+    def __init__(self):
+        # Initialize o3-mini with reasoning capabilities
+        self.reasoning_llm = ChatOpenAI(
+            model="o3-mini",
+            temperature=0.1,
+            model_kwargs={
+                "reasoning_effort": "medium",  # low, medium, high
+            }
+        )
+        
+        # Standard LLM for other tasks
+        self.standard_llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0.1
+        )
+        
+        # Initialize components
+        self.query_generator = MultiQueryGenerator(self.standard_llm)
+        self.query_router = QueryRouter(self.standard_llm)
+        
+        # Initialize FalkorDB connection
+        self.falkordb_graph = FalkorDBGraph(
+            host=Config.FALKORDB_HOST,
+            port=Config.FALKORDB_PORT,
+            database=Config.GRAPH_NAME
+        )
+        
+        # Initialize tools
+        self.tools = [
+            falkordb_cypher_query,
+            falkordb_vector_search, 
+            falkordb_relationship_analysis
+        ]
+        
+        # Create React agent with reasoning model
+        self.react_agent = create_react_agent(
+            model=self.reasoning_llm,
+            tools=self.tools,
+            state_modifier="You are a GraphRAG search expert. Use the available tools to thoroughly analyze queries and provide comprehensive answers based on graph data."
+        )
+        
+        # Initialize memory for stateful conversations
+        self.memory = MemorySaver()
+        
+        # Build the main workflow graph
+        self.workflow = self._build_workflow()
+    
+    def _build_workflow(self) -> StateGraph:
+        """Build the LangGraph workflow for GraphRAG processing."""
+        
+        # Define the workflow graph
+        workflow = StateGraph(GraphRAGState)
+        
+        # Add nodes
+        workflow.add_node("decompose_query", self._decompose_query_node)
+        workflow.add_node("route_query", self._route_query_node)  
+        workflow.add_node("vector_search", self._vector_search_node)
+        workflow.add_node("graph_search", self._graph_search_node)
+        workflow.add_node("hybrid_search", self._hybrid_search_node)
+        workflow.add_node("reasoning_synthesis", self._reasoning_synthesis_node)
+        
+        # Define the flow
+        workflow.add_edge(START, "decompose_query")
+        workflow.add_edge("decompose_query", "route_query")
+        
+        # Conditional routing based on query type
+        workflow.add_conditional_edges(
+            "route_query",
+            self._route_decision,
+            {
+                "vector": "vector_search",
+                "graph": "graph_search", 
+                "hybrid": "hybrid_search"
+            }
+        )
+        
+        # All paths lead to reasoning synthesis
+        workflow.add_edge("vector_search", "reasoning_synthesis")
+        workflow.add_edge("graph_search", "reasoning_synthesis")
+        workflow.add_edge("hybrid_search", "reasoning_synthesis")
+        workflow.add_edge("reasoning_synthesis", END)
+        
+        return workflow.compile(checkpointer=self.memory)
+    
+    async def _decompose_query_node(self, state: GraphRAGState) -> GraphRAGState:
+        """Decompose the query into sub-queries."""
+        query = state.get("original_query", "")
+        if not query and state.get("messages"):
+            query = state["messages"][-1].content
+        
+        decomposed = await self.query_generator.decompose_query(query)
+        
+        state["original_query"] = query
+        state["decomposed_queries"] = decomposed.sub_queries
+        
+        logger.info(f"Decomposed query into: {decomposed.sub_queries}")
+        return state
+    
+    async def _route_query_node(self, state: GraphRAGState) -> GraphRAGState:
+        """Route the query to appropriate processing path."""
+        query = state["original_query"]
+        route_result = await self.query_router.route_query(query)
+        
+        state["query_route"] = route_result.route
+        logger.info(f"Routed query to: {route_result.route}")
+        return state
+    
+    def _route_decision(self, state: GraphRAGState) -> str:
+        """Decision function for routing."""
+        return state.get("query_route", "hybrid")
+    
+    async def _vector_search_node(self, state: GraphRAGState) -> GraphRAGState:
+        """Execute vector-based search."""
+        results = []
+        for sub_query in state["decomposed_queries"]:
+            # Use the vector search tool
+            result = await falkordb_vector_search(sub_query, limit=5)
+            results.append({"query": sub_query, "results": result})
+        
+        state["vector_results"] = results
+        logger.info(f"Vector search completed for {len(results)} sub-queries")
+        return state
+    
+    async def _graph_search_node(self, state: GraphRAGState) -> GraphRAGState:
+        """Execute graph-based search."""
+        results = []
+        for sub_query in state["decomposed_queries"]:
+            # Use the React agent for complex graph reasoning
+            response = await self.react_agent.ainvoke(
+                {"messages": [HumanMessage(content=f"Analyze this query using graph relationships: {sub_query}")]},
+                config={"configurable": {"thread_id": "graph_search"}}
+            )
+            
+            results.append({
+                "query": sub_query, 
+                "results": response["messages"][-1].content
+            })
+        
+        state["graph_results"] = results
+        logger.info(f"Graph search completed for {len(results)} sub-queries")
+        return state
+    
+    async def _hybrid_search_node(self, state: GraphRAGState) -> GraphRAGState:
+        """Execute hybrid vector + graph search."""
+        # Execute both vector and graph searches
+        await self._vector_search_node(state)
+        await self._graph_search_node(state)
+        
+        logger.info("Hybrid search completed")
+        return state
+    
+    async def _reasoning_synthesis_node(self, state: GraphRAGState) -> GraphRAGState:
+        """Synthesize final answer using o3-mini reasoning."""
+        
+        # Prepare context for reasoning
+        context_parts = []
+        
+        if state.get("vector_results"):
+            context_parts.append("Vector Search Results:")
+            for result in state["vector_results"]:
+                context_parts.append(f"Query: {result['query']}")
+                context_parts.append(f"Results: {result['results']}")
+        
+        if state.get("graph_results"):
+            context_parts.append("\nGraph Search Results:")
+            for result in state["graph_results"]:
+                context_parts.append(f"Query: {result['query']}")
+                context_parts.append(f"Results: {result['results']}")
+        
+        context = "\n".join(context_parts)
+        
+        # Use o3-mini for final reasoning and synthesis
+        reasoning_prompt = f"""
+        You are an expert analyst synthesizing information from a GraphRAG search.
+        
+        Original Query: {state['original_query']}
+        Sub-queries: {state['decomposed_queries']}
+        Search Route: {state['query_route']}
+        
+        Available Context:
+        {context}
+        
+        Instructions:
+        1. Analyze all the retrieved information carefully
+        2. Identify key patterns, relationships, and insights
+        3. Synthesize a comprehensive answer to the original query
+        4. Ensure accuracy and cite specific evidence from the search results
+        5. If information is incomplete, clearly state limitations
+        
+        Provide a thorough, well-reasoned response:
+        """
+        
+        response = await self.reasoning_llm.ainvoke([HumanMessage(content=reasoning_prompt)])
+        
+        state["final_answer"] = response.content
+        state["reasoning_context"] = context
+        
+        logger.info("Reasoning synthesis completed")
+        return state
+    
+    async def search(self, query: str, thread_id: Optional[str] = None) -> Dict[str, Any]:
+        """Execute a search query through the GraphRAG pipeline."""
+        if not thread_id:
+            thread_id = f"search_{hash(query)}"
+        
+        # Initialize state
+        initial_state = GraphRAGState(
+            messages=[HumanMessage(content=query)],
+            original_query=query,
+            decomposed_queries=[],
+            query_route="",
+            vector_results=[],
+            graph_results=[],
+            reasoning_context="",
+            final_answer=""
+        )
+        
+        # Execute the workflow
+        config = {"configurable": {"thread_id": thread_id}}
+        final_state = await self.workflow.ainvoke(initial_state, config=config)
+        
+        return {
+            "query": query,
+            "decomposed_queries": final_state["decomposed_queries"],
+            "route": final_state["query_route"],
+            "answer": final_state["final_answer"],
+            "context": final_state["reasoning_context"],
+            "vector_results": final_state.get("vector_results", []),
+            "graph_results": final_state.get("graph_results", [])
+        }
+
+# Usage example and main function
+async def main():
+    """Example usage of the GraphRAG Search Engine."""
+    
+    # Initialize the search engine
+    search_engine = GraphRAGSearchEngine()
+    
+    # Example queries
+    example_queries = [
+        "What are the connections between Apple and Microsoft through their partnerships?",
+        "Find research papers about machine learning published in 2023",
+        "Who are the key executives in the technology industry and how are they connected?",
+        "What are the main themes in recent AI safety research?"
+    ]
+    
+    print("GraphRAG Search Engine Initialized!")
+    print("=" * 50)
+    
+    for query in example_queries:
+        print(f"\nQuery: {query}")
+        print("-" * 40)
+        
+        try:
+            result = await search_engine.search(query)
+            
+            print(f"Route: {result['route']}")
+            print(f"Sub-queries: {result['decomposed_queries']}")
+            print(f"Answer: {result['answer'][:500]}...")  # Truncated for display
+            print("-" * 40)
+            
+        except Exception as e:
+            print(f"Error processing query: {e}")
+            continue
+    
+    print("\nSearch engine demo completed!")
+
+if __name__ == "__main__":
+    # Set up environment variables first
+    os.environ["OPENAI_API_KEY"] = "your-openai-api-key"
+    os.environ["FALKORDB_HOST"] = "localhost"
+    os.environ["FALKORDB_PORT"] = "6379"
+    os.environ["GRAPH_NAME"] = "knowledge_graph"
+    
+    # Run the example
+    asyncio.run(main())
