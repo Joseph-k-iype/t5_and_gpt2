@@ -90,6 +90,10 @@ class Config:
     EMBEDDING_DIMENSIONS = 3072
     REASONING_EFFORT = "high"
     
+    # Token management to prevent data loss
+    MAX_TOKENS_PER_REQUEST = 50000  # Conservative limit for o3-mini
+    OVERLAP_TOKENS = 500  # Overlap between chunks to maintain context
+    
     # HNSW & Quantization configurations
     # Using int8_hnsw for 75% memory reduction with minimal accuracy loss
     VECTOR_INDEX_TYPE = "int8_hnsw"  # Auto scalar quantization
@@ -155,7 +159,26 @@ class CrossDocumentLink(BaseModel):
     created_at: datetime = Field(default_factory=datetime.now)
 
 
-class AgentMemory(BaseModel):
+class RawDocument(BaseModel):
+    """Raw extracted document for data loss prevention"""
+    raw_id: str = Field(description="Unique raw document identifier")
+    file_path: str = Field(description="Original file path")
+    document_type: str = Field(description="GDPR or UK_GDPR")
+    raw_text: str = Field(description="Complete extracted text")
+    page_count: int = Field(description="Number of pages in PDF")
+    character_count: int = Field(description="Total characters extracted")
+    extraction_metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+class ProcessingValidation(BaseModel):
+    """Validation results for processing completeness"""
+    total_input_chars: int
+    total_processed_chars: int
+    coverage_percentage: float
+    missing_sections: List[str] = Field(default_factory=list)
+    validation_passed: bool
+    notes: str = ""
     """Long-term memory structure for agents"""
     memory_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     agent_name: str
@@ -170,12 +193,14 @@ class AgentMemory(BaseModel):
 class ProcessingState(TypedDict):
     """State for the processing workflow"""
     messages: Annotated[Sequence[BaseMessage], "The conversation messages"]
+    raw_documents: List[RawDocument]
     full_articles: List[FullArticle]
     documents: List[DocumentChunk]
     current_chunk: Optional[DocumentChunk]
     cross_links: List[CrossDocumentLink]
     processing_stage: str
     agent_memories: List[AgentMemory]
+    validation_results: List[ProcessingValidation]
     elasticsearch_client: Optional[Any]
 
 
@@ -315,6 +340,28 @@ class ElasticsearchManager:
             }
         }
         
+        # Raw documents index (for data loss prevention)
+        raw_docs_mapping = {
+            "settings": {
+                "index": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0,
+                }
+            },
+            "mappings": {
+                "properties": {
+                    "raw_id": {"type": "keyword"},
+                    "file_path": {"type": "keyword"},
+                    "document_type": {"type": "keyword"},
+                    "raw_text": {"type": "text", "analyzer": "standard"},
+                    "page_count": {"type": "integer"},
+                    "character_count": {"type": "integer"},
+                    "extraction_metadata": {"type": "object"},
+                    "created_at": {"type": "date"}
+                }
+            }
+        }
+        
         # Agent memories index with semantic search capabilities
         memories_mapping = {
             "settings": {
@@ -338,6 +385,7 @@ class ElasticsearchManager:
         
         # Create indices with advanced configurations
         indices = {
+            "gdpr_raw_docs": raw_docs_mapping,
             "gdpr_articles": articles_mapping,
             "gdpr_chunks": chunks_mapping,
             "gdpr_links": links_mapping,
@@ -354,6 +402,22 @@ class ElasticsearchManager:
                 logger.info(f"HNSW config verified for {index_name}: {Config.VECTOR_INDEX_TYPE}")
             else:
                 logger.info(f"Index already exists: {index_name}")
+    
+    def index_raw_document(self, raw_doc: RawDocument) -> bool:
+        """Index raw extracted document for data loss prevention"""
+        try:
+            doc = raw_doc.model_dump()
+            doc["created_at"] = raw_doc.created_at.isoformat()
+            
+            response = self.client.index(
+                index="gdpr_raw_docs",
+                id=raw_doc.raw_id,
+                body=doc
+            )
+            return response["result"] in ["created", "updated"]
+        except Exception as e:
+            logger.error(f"Error indexing raw document {raw_doc.raw_id}: {e}")
+            raise
     
     def index_article(self, article: FullArticle) -> bool:
         """Index a full article"""
@@ -589,12 +653,63 @@ class ElasticsearchManager:
             logger.error(f"Error getting related chunks for {chunk_id}: {e}")
             raise
     
+    def validate_processing_completeness(self, raw_doc: RawDocument, 
+                                        articles: List[FullArticle], 
+                                        chunks: List[DocumentChunk]) -> ProcessingValidation:
+        """Validate that processing captured all content without data loss"""
+        try:
+            total_input_chars = len(raw_doc.raw_text)
+            
+            # Calculate total processed characters
+            article_chars = sum(len(article.full_content) for article in articles)
+            chunk_chars = sum(len(chunk.content) for chunk in chunks)
+            
+            # Use the higher of article or chunk content (avoid double counting)
+            total_processed_chars = max(article_chars, chunk_chars)
+            
+            coverage_percentage = (total_processed_chars / total_input_chars) * 100 if total_input_chars > 0 else 0
+            
+            # Define acceptable coverage threshold
+            ACCEPTABLE_COVERAGE = 85.0  # 85% coverage is acceptable due to formatting, headers, footers
+            validation_passed = coverage_percentage >= ACCEPTABLE_COVERAGE
+            
+            missing_sections = []
+            notes = f"Processed {total_processed_chars:,} chars out of {total_input_chars:,} chars"
+            
+            if not validation_passed:
+                notes += f" - Coverage below threshold ({ACCEPTABLE_COVERAGE}%)"
+                # Simple heuristic to identify potential missing sections
+                if len(articles) == 0:
+                    missing_sections.append("No articles identified")
+                if len(chunks) < 5:
+                    missing_sections.append("Very few chunks created")
+            
+            return ProcessingValidation(
+                total_input_chars=total_input_chars,
+                total_processed_chars=total_processed_chars,
+                coverage_percentage=coverage_percentage,
+                missing_sections=missing_sections,
+                validation_passed=validation_passed,
+                notes=notes
+            )
+            
+        except Exception as e:
+            logger.error(f"Error validating processing completeness: {e}")
+            return ProcessingValidation(
+                total_input_chars=0,
+                total_processed_chars=0,
+                coverage_percentage=0.0,
+                missing_sections=["Validation failed"],
+                validation_passed=False,
+                notes=f"Validation error: {e}"
+            )
+    
     def get_index_stats(self) -> Dict[str, Any]:
         """Get comprehensive index statistics including HNSW performance metrics"""
         try:
             stats = {}
             
-            for index_name in ["gdpr_articles", "gdpr_chunks", "gdpr_links", "agent_memories"]:
+            for index_name in ["gdpr_raw_docs", "gdpr_articles", "gdpr_chunks", "gdpr_links", "agent_memories"]:
                 if self.client.indices.exists(index=index_name):
                     # Basic index stats
                     index_stats = self.client.indices.stats(index=index_name)
@@ -603,8 +718,11 @@ class ElasticsearchManager:
                         "documents": index_stats["indices"][index_name]["total"]["docs"]["count"],
                         "size_bytes": index_stats["indices"][index_name]["total"]["store"]["size_in_bytes"],
                         "segments": index_stats["indices"][index_name]["total"]["segments"]["count"],
-                        "vector_size_estimate": self._estimate_vector_memory_usage(index_name),
                     }
+                    
+                    # Add vector memory estimation for indices with embeddings
+                    if index_name in ["gdpr_articles", "gdpr_chunks"]:
+                        stats[index_name]["vector_size_estimate"] = self._estimate_vector_memory_usage(index_name)
             
             return stats
             
@@ -792,8 +910,52 @@ class DocumentProcessingAgent:
         self.es_manager = es_manager
         self.name = "DocumentProcessor"
     
-    def _extract_text_from_pdf(self, file_path: str) -> str:
-        """Extract text from PDF file using modern PyMuPDF 1.26+"""
+    def _estimate_token_count(self, text: str) -> int:
+        """Estimate token count for text (rough approximation)"""
+        # Rough estimation: 1 token ≈ 4 characters for English text
+        return len(text) // 4
+    
+    def _split_large_text(self, text: str, max_tokens: int) -> List[str]:
+        """Split large text into smaller chunks to handle token limits"""
+        estimated_tokens = self._estimate_token_count(text)
+        
+        if estimated_tokens <= max_tokens:
+            return [text]
+        
+        # Calculate approximate character limit per chunk
+        chars_per_token = 4
+        max_chars = max_tokens * chars_per_token
+        overlap_chars = Config.OVERLAP_TOKENS * chars_per_token
+        
+        chunks = []
+        start = 0
+        
+        while start < len(text):
+            # Find a good breaking point (end of sentence/paragraph)
+            end = start + max_chars
+            
+            if end >= len(text):
+                chunks.append(text[start:])
+                break
+            
+            # Look for sentence ending within the last 1000 chars
+            search_start = max(start + max_chars - 1000, start)
+            
+            # Find the last sentence ending
+            for delimiter in ['\n\n', '. ', '.\n', '! ', '?\n']:
+                last_delimiter = text.rfind(delimiter, search_start, end)
+                if last_delimiter != -1:
+                    end = last_delimiter + len(delimiter)
+                    break
+            
+            chunks.append(text[start:end])
+            start = max(start + 1, end - overlap_chars)  # Add overlap
+        
+        return chunks
+    
+    def _extract_text_from_pdf(self, file_path: str) -> Tuple[str, Dict[str, Any]]:
+    def _extract_text_from_pdf(self, file_path: str) -> Tuple[str, Dict[str, Any]]:
+        """Extract text from PDF file using modern PyMuPDF 1.26+ and return metadata"""
         try:
             # Modern PyMuPDF syntax - more robust than legacy fitz
             doc = pymupdf.open(file_path)
@@ -803,25 +965,40 @@ class DocumentProcessingAgent:
                 doc.close()
                 raise ValueError(f"PDF {file_path} is password protected. Please provide an unencrypted version.")
             
-            # Check if document has pages
+            # Extract metadata
             page_count = doc.page_count
+            metadata = {
+                "page_count": page_count,
+                "title": doc.metadata.get("title", ""),
+                "author": doc.metadata.get("author", ""),
+                "subject": doc.metadata.get("subject", ""),
+                "creator": doc.metadata.get("creator", ""),
+                "producer": doc.metadata.get("producer", ""),
+                "creation_date": doc.metadata.get("creationDate", ""),
+                "modification_date": doc.metadata.get("modDate", ""),
+            }
+            
             if page_count == 0:
                 doc.close()
                 raise ValueError(f"PDF {file_path} contains no pages")
             
             text = ""
             extracted_pages = 0
+            page_texts = []  # Store individual page texts for validation
             
             # Modern iteration over pages
             for page in doc:
                 try:
                     page_text = page.get_text()  # UTF-8 encoded text
+                    page_texts.append(page_text)
+                    
                     if page_text.strip():  # Only add non-empty pages
                         text += page_text
                         text += "\n\n"  # Add page separation
                         extracted_pages += 1
                 except Exception as page_error:
                     logger.warning(f"Error extracting text from page {page.number + 1} in {file_path}: {page_error}")
+                    page_texts.append("")  # Placeholder for failed page
                     continue
             
             doc.close()
@@ -829,8 +1006,19 @@ class DocumentProcessingAgent:
             if extracted_pages == 0:
                 raise ValueError(f"No text could be extracted from PDF {file_path}")
             
+            # Add extraction statistics to metadata
+            metadata.update({
+                "extracted_pages": extracted_pages,
+                "failed_pages": page_count - extracted_pages,
+                "character_count": len(text),
+                "estimated_tokens": self._estimate_token_count(text),
+                "page_texts_count": len([p for p in page_texts if p.strip()])
+            })
+            
             logger.info(f"Successfully extracted text from {extracted_pages}/{page_count} pages in {file_path}")
-            return text.strip()
+            logger.info(f"Extracted {len(text):,} characters (~{self._estimate_token_count(text):,} tokens)")
+            
+            return text.strip(), metadata
             
         except Exception as e:
             logger.error(f"Error extracting text from PDF {file_path}: {e}")
@@ -858,17 +1046,17 @@ class DocumentProcessingAgent:
         # Default based on filename
         return "GDPR" if "gdpr" in filename else "UK_GDPR"
     
-    async def process_document(self, file_path: str, document_type: str = None) -> Tuple[List[FullArticle], List[DocumentChunk]]:
-        """Process a PDF document and create both full articles and chunks"""
+    async def process_document(self, file_path: str, document_type: str = None) -> Tuple[RawDocument, List[FullArticle], List[DocumentChunk], ProcessingValidation]:
+        """Process a PDF document with complete data loss prevention"""
         try:
             # Check if file exists
             if not os.path.exists(file_path):
                 logger.error(f"File not found: {file_path}")
                 raise FileNotFoundError(f"Document file not found: {file_path}")
             
-            # Extract text from PDF
+            # Extract text from PDF with metadata
             logger.info(f"Extracting text from PDF: {file_path}")
-            content = self._extract_text_from_pdf(file_path)
+            content, extraction_metadata = self._extract_text_from_pdf(file_path)
             
             if not content.strip():
                 logger.error(f"No text extracted from PDF: {file_path}")
@@ -879,153 +1067,225 @@ class DocumentProcessingAgent:
                 document_type = self._determine_document_type(file_path, content)
                 logger.info(f"Determined document type: {document_type} for {file_path}")
             
+            # Store raw document for data loss prevention
+            raw_doc = RawDocument(
+                raw_id=str(uuid.uuid4()),
+                file_path=file_path,
+                document_type=document_type,
+                raw_text=content,
+                page_count=extraction_metadata["page_count"],
+                character_count=len(content),
+                extraction_metadata=extraction_metadata
+            )
+            
+            # Index raw document immediately
+            self.es_manager.index_raw_document(raw_doc)
+            logger.info(f"Stored raw document: {len(content):,} characters")
+            
+            # Handle large documents by splitting if necessary
+            estimated_tokens = self._estimate_token_count(content)
+            if estimated_tokens > Config.MAX_TOKENS_PER_REQUEST:
+                logger.warning(f"Large document detected ({estimated_tokens:,} tokens). Processing in chunks.")
+                return await self._process_large_document(raw_doc, content, document_type)
+            
             logger.info(f"Processing {document_type} document: {file_path} ({len(content)} characters)")
             
-            # First pass: Use o3-mini to identify full articles
-            article_system_prompt = """
-            You are an expert in GDPR documentation. Identify complete articles in the document.
-            Each article should contain the full text including all sub-sections, clauses, and paragraphs.
+            # Process in single pass for smaller documents
+            articles, chunks = await self._process_document_content(content, document_type)
             
-            Return a JSON array with the following structure:
-            {
-                "articles": [
-                    {
-                        "chapter_number": "string",
-                        "article_number": "string",
-                        "title": "string",
-                        "full_content": "complete article text including all subsections",
-                        "key_concepts": ["concept1", "concept2", ...]
-                    }
-                ]
-            }
-            """
+            # Validate processing completeness
+            validation = self.es_manager.validate_processing_completeness(raw_doc, articles, chunks)
             
-            article_messages = [
-                {"role": "user", "content": f"Document type: {document_type}\n\nDocument content:\n{content}"}
-            ]
+            if not validation.validation_passed:
+                logger.warning(f"Processing validation failed: {validation.notes}")
+                logger.warning(f"Missing sections: {validation.missing_sections}")
+            else:
+                logger.info(f"Processing validation passed: {validation.coverage_percentage:.1f}% coverage")
             
-            article_response = await self.openai_manager.reasoning_completion(article_messages, article_system_prompt)
-            
-            # Second pass: Use o3-mini to create detailed chunks within each article
-            chunk_system_prompt = """
-            You are an expert in GDPR documentation. Break down each article into meaningful chunks 
-            (paragraphs, clauses, sub-articles) while preserving the legal structure.
-            
-            For each chunk, identify:
-            - Parent article information
-            - Specific section/clause details
-            - Main content
-            - Key legal concepts
-            
-            Return a JSON array of chunks with the following structure:
-            {
-                "chunks": [
-                    {
-                        "parent_article_number": "string",
-                        "chapter_number": "string",
-                        "article_number": "string or null",
-                        "title": "string",
-                        "content": "string"
-                    }
-                ]
-            }
-            """
-            
-            chunk_messages = [
-                {"role": "user", "content": f"Document type: {document_type}\n\nDocument content:\n{content}"}
-            ]
-            
-            chunk_response = await self.openai_manager.reasoning_completion(chunk_messages, chunk_system_prompt)
-            
-            # Parse responses
-            try:
-                articles_data = json.loads(article_response)["articles"]
-                chunks_data = json.loads(chunk_response)["chunks"]
-            except (json.JSONDecodeError, KeyError) as e:
-                logger.error(f"Failed to parse AI responses: {e}")
-                raise ValueError(f"AI response parsing failed for {document_type}")
-            
-            # Create FullArticle objects
-            full_articles = []
-            for article_data in articles_data:
-                article_id = str(uuid.uuid4())
-                
-                # Create full article embedding
-                full_text = f"{article_data.get('title', '')} {article_data.get('full_content', '')}"
-                full_embedding = await self.openai_manager.create_embedding(full_text)
-                
-                article = FullArticle(
-                    article_id=article_id,
-                    document_type=document_type,
-                    chapter_number=article_data.get("chapter_number", ""),
-                    article_number=article_data.get("article_number", ""),
-                    title=article_data.get("title", ""),
-                    full_content=article_data.get("full_content", ""),
-                    full_article_embedding=full_embedding,
-                    chunk_ids=[],  # Will be populated below
-                    key_concepts=article_data.get("key_concepts", [])
-                )
-                
-                full_articles.append(article)
-                # Index in Elasticsearch
-                self.es_manager.index_article(article)
-            
-            # Create DocumentChunk objects and link to articles
-            chunks = []
-            article_chunk_map = {}  # Maps article_number to chunk_ids
-            
-            for chunk_data in chunks_data:
-                chunk_id = str(uuid.uuid4())
-                
-                # Find parent article
-                parent_article = None
-                parent_article_number = chunk_data.get("parent_article_number") or chunk_data.get("article_number")
-                
-                for article in full_articles:
-                    if article.article_number == parent_article_number:
-                        parent_article = article
-                        break
-                
-                # Create chunk embedding
-                embedding_text = f"{chunk_data.get('title', '')} {chunk_data.get('content', '')}"
-                chunk_embedding = await self.openai_manager.create_embedding(embedding_text)
-                
-                chunk = DocumentChunk(
-                    chunk_id=chunk_id,
-                    parent_article_id=parent_article.article_id if parent_article else None,
-                    document_type=document_type,
-                    chapter_number=chunk_data.get("chapter_number", ""),
-                    article_number=chunk_data.get("article_number"),
-                    title=chunk_data.get("title", ""),
-                    content=chunk_data.get("content", ""),
-                    chunk_embedding=chunk_embedding,
-                    processed_by_agent=self.name
-                )
-                
-                chunks.append(chunk)
-                
-                # Index in Elasticsearch
-                self.es_manager.index_chunk(chunk)
-                
-                # Update parent article's chunk_ids
-                if parent_article:
-                    if parent_article.article_number not in article_chunk_map:
-                        article_chunk_map[parent_article.article_number] = []
-                    article_chunk_map[parent_article.article_number].append(chunk_id)
-            
-            # Update articles with their chunk IDs
-            for article in full_articles:
-                if article.article_number in article_chunk_map:
-                    article.chunk_ids = article_chunk_map[article.article_number]
-                    # Re-index with updated chunk_ids
-                    self.es_manager.index_article(article)
-            
-            logger.info(f"Processed {len(full_articles)} articles and {len(chunks)} chunks for {document_type}")
-            return full_articles, chunks
+            return raw_doc, articles, chunks, validation
             
         except Exception as e:
             logger.error(f"Error processing document {file_path}: {e}")
             raise
+    
+    async def _process_large_document(self, raw_doc: RawDocument, content: str, document_type: str) -> Tuple[RawDocument, List[FullArticle], List[DocumentChunk], ProcessingValidation]:
+        """Process large documents by splitting into manageable chunks"""
+        text_chunks = self._split_large_text(content, Config.MAX_TOKENS_PER_REQUEST)
+        logger.info(f"Split large document into {len(text_chunks)} chunks for processing")
+        
+        all_articles = []
+        all_chunks = []
+        
+        for i, text_chunk in enumerate(text_chunks):
+            logger.info(f"Processing chunk {i+1}/{len(text_chunks)} ({len(text_chunk):,} chars)")
+            
+            try:
+                chunk_articles, chunk_chunks = await self._process_document_content(text_chunk, document_type)
+                all_articles.extend(chunk_articles)
+                all_chunks.extend(chunk_chunks)
+            except Exception as e:
+                logger.error(f"Error processing chunk {i+1}: {e}")
+                # Continue with other chunks even if one fails
+                continue
+        
+        # Validate overall processing
+        validation = self.es_manager.validate_processing_completeness(raw_doc, all_articles, all_chunks)
+        
+        logger.info(f"Large document processing complete: {len(all_articles)} articles, {len(all_chunks)} chunks")
+        
+        return raw_doc, all_articles, all_chunks, validation
+    
+    async def _process_document_content(self, content: str, document_type: str) -> Tuple[List[FullArticle], List[DocumentChunk]]:
+        """Process a PDF document and create both full articles and chunks"""
+    async def _process_document_content(self, content: str, document_type: str) -> Tuple[List[FullArticle], List[DocumentChunk]]:
+        """Process document content with AI and create articles and chunks"""
+        # First pass: Use o3-mini to identify full articles
+        article_system_prompt = """
+        You are an expert in GDPR documentation. Identify complete articles in the document.
+        Each article should contain the full text including all sub-sections, clauses, and paragraphs.
+        
+        IMPORTANT: Process ALL content provided. Do not skip any sections.
+        
+        Return a JSON array with the following structure:
+        {
+            "articles": [
+                {
+                    "chapter_number": "string",
+                    "article_number": "string",
+                    "title": "string",
+                    "full_content": "complete article text including all subsections",
+                    "key_concepts": ["concept1", "concept2", ...]
+                }
+            ]
+        }
+        """
+        
+        article_messages = [
+            {"role": "user", "content": f"Document type: {document_type}\n\nDocument content:\n{content}"}
+        ]
+        
+        article_response = await self.openai_manager.reasoning_completion(article_messages, article_system_prompt)
+        
+        # Second pass: Use o3-mini to create detailed chunks within each article
+        chunk_system_prompt = """
+        You are an expert in GDPR documentation. Break down each article into meaningful chunks 
+        (paragraphs, clauses, sub-articles) while preserving the legal structure.
+        
+        IMPORTANT: Process ALL content provided. Ensure complete coverage of the input text.
+        
+        For each chunk, identify:
+        - Parent article information
+        - Specific section/clause details
+        - Main content
+        - Key legal concepts
+        
+        Return a JSON array of chunks with the following structure:
+        {
+            "chunks": [
+                {
+                    "parent_article_number": "string",
+                    "chapter_number": "string",
+                    "article_number": "string or null",
+                    "title": "string",
+                    "content": "string"
+                }
+            ]
+        }
+        """
+        
+        chunk_messages = [
+            {"role": "user", "content": f"Document type: {document_type}\n\nDocument content:\n{content}"}
+        ]
+        
+        chunk_response = await self.openai_manager.reasoning_completion(chunk_messages, chunk_system_prompt)
+        
+        # Parse responses
+        try:
+            articles_data = json.loads(article_response)["articles"]
+            chunks_data = json.loads(chunk_response)["chunks"]
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.error(f"Failed to parse AI responses: {e}")
+            logger.error(f"Article response: {article_response[:500]}...")
+            logger.error(f"Chunk response: {chunk_response[:500]}...")
+            raise ValueError(f"AI response parsing failed for {document_type}")
+        
+        # Create FullArticle objects
+        full_articles = []
+        for article_data in articles_data:
+            article_id = str(uuid.uuid4())
+            
+            # Create full article embedding
+            full_text = f"{article_data.get('title', '')} {article_data.get('full_content', '')}"
+            full_embedding = await self.openai_manager.create_embedding(full_text)
+            
+            article = FullArticle(
+                article_id=article_id,
+                document_type=document_type,
+                chapter_number=article_data.get("chapter_number", ""),
+                article_number=article_data.get("article_number", ""),
+                title=article_data.get("title", ""),
+                full_content=article_data.get("full_content", ""),
+                full_article_embedding=full_embedding,
+                chunk_ids=[],  # Will be populated below
+                key_concepts=article_data.get("key_concepts", [])
+            )
+            
+            full_articles.append(article)
+            # Index in Elasticsearch
+            self.es_manager.index_article(article)
+        
+        # Create DocumentChunk objects and link to articles
+        chunks = []
+        article_chunk_map = {}  # Maps article_number to chunk_ids
+        
+        for chunk_data in chunks_data:
+            chunk_id = str(uuid.uuid4())
+            
+            # Find parent article
+            parent_article = None
+            parent_article_number = chunk_data.get("parent_article_number") or chunk_data.get("article_number")
+            
+            for article in full_articles:
+                if article.article_number == parent_article_number:
+                    parent_article = article
+                    break
+            
+            # Create chunk embedding
+            embedding_text = f"{chunk_data.get('title', '')} {chunk_data.get('content', '')}"
+            chunk_embedding = await self.openai_manager.create_embedding(embedding_text)
+            
+            chunk = DocumentChunk(
+                chunk_id=chunk_id,
+                parent_article_id=parent_article.article_id if parent_article else None,
+                document_type=document_type,
+                chapter_number=chunk_data.get("chapter_number", ""),
+                article_number=chunk_data.get("article_number"),
+                title=chunk_data.get("title", ""),
+                content=chunk_data.get("content", ""),
+                chunk_embedding=chunk_embedding,
+                processed_by_agent=self.name
+            )
+            
+            chunks.append(chunk)
+            
+            # Index in Elasticsearch
+            self.es_manager.index_chunk(chunk)
+            
+            # Update parent article's chunk_ids
+            if parent_article:
+                if parent_article.article_number not in article_chunk_map:
+                    article_chunk_map[parent_article.article_number] = []
+                article_chunk_map[parent_article.article_number].append(chunk_id)
+        
+        # Update articles with their chunk IDs
+        for article in full_articles:
+            if article.article_number in article_chunk_map:
+                article.chunk_ids = article_chunk_map[article.article_number]
+                # Re-index with updated chunk_ids
+                self.es_manager.index_article(article)
+        
+        logger.info(f"Created {len(full_articles)} articles and {len(chunks)} chunks")
+        return full_articles, chunks
 
 
 # Cross-Reference Agent
@@ -1356,7 +1616,7 @@ async def store_agent_memory(agent_name: str, memory_type: str, content: Dict,
 
 # Main workflow nodes
 async def document_processing_node(state: ProcessingState) -> ProcessingState:
-    """Process all PDF documents from the data directory"""
+    """Process all PDF documents from the data directory with data loss prevention"""
     logger.info("Starting document processing...")
     
     openai_manager = OpenAIManager()
@@ -1364,8 +1624,10 @@ async def document_processing_node(state: ProcessingState) -> ProcessingState:
     
     processor = DocumentProcessingAgent(openai_manager, es_manager)
     
+    all_raw_docs = []
     all_articles = []
     all_chunks = []
+    all_validations = []
     
     # Check if data directory exists
     data_dir = "data"
@@ -1388,13 +1650,25 @@ async def document_processing_node(state: ProcessingState) -> ProcessingState:
         try:
             logger.info(f"Processing PDF: {pdf_file}")
             
-            # Process document (document type will be auto-determined)
-            articles, chunks = await processor.process_document(pdf_file)
+            # Process document with full data loss prevention
+            raw_doc, articles, chunks, validation = await processor.process_document(pdf_file)
             
+            all_raw_docs.append(raw_doc)
             all_articles.extend(articles)
             all_chunks.extend(chunks)
+            all_validations.append(validation)
             
-            logger.info(f"Successfully processed {pdf_file}: {len(articles)} articles, {len(chunks)} chunks")
+            # Log processing results
+            logger.info(f"Successfully processed {pdf_file}:")
+            logger.info(f"  - Raw document: {raw_doc.character_count:,} chars")
+            logger.info(f"  - Articles: {len(articles)}")
+            logger.info(f"  - Chunks: {len(chunks)}")
+            logger.info(f"  - Validation: {validation.coverage_percentage:.1f}% coverage ({'PASSED' if validation.validation_passed else 'FAILED'})")
+            
+            if not validation.validation_passed:
+                logger.warning(f"  - Issues: {validation.notes}")
+                if validation.missing_sections:
+                    logger.warning(f"  - Missing: {', '.join(validation.missing_sections)}")
             
         except Exception as e:
             logger.error(f"Failed to process {pdf_file}: {e}")
@@ -1404,11 +1678,23 @@ async def document_processing_node(state: ProcessingState) -> ProcessingState:
     if not all_articles and not all_chunks:
         raise ValueError("No documents were successfully processed. Please check your PDF files and try again.")
     
+    # Calculate overall statistics
+    total_chars = sum(raw_doc.character_count for raw_doc in all_raw_docs)
+    passed_validations = sum(1 for v in all_validations if v.validation_passed)
+    avg_coverage = sum(v.coverage_percentage for v in all_validations) / len(all_validations) if all_validations else 0
+    
+    state["raw_documents"] = all_raw_docs
     state["full_articles"] = all_articles
     state["documents"] = all_chunks
+    state["validation_results"] = all_validations
     state["processing_stage"] = "cross_referencing"
     
-    logger.info(f"Document processing completed: {len(all_articles)} total articles, {len(all_chunks)} total chunks")
+    logger.info(f"Document processing completed:")
+    logger.info(f"  - {len(all_raw_docs)} raw documents ({total_chars:,} total chars)")
+    logger.info(f"  - {len(all_articles)} total articles")
+    logger.info(f"  - {len(all_chunks)} total chunks")
+    logger.info(f"  - {passed_validations}/{len(all_validations)} validations passed")
+    logger.info(f"  - {avg_coverage:.1f}% average coverage")
     
     return state
 
