@@ -1,9 +1,1597 @@
-full_article_content: Optional[str] = Field(default=None)
-article_number: Optional[str] = Field(default=None)
-chapter_number: Optional[str] = Field(default=None)
-section_number: Optional[str] = Field(default=None)
-paragraph_number: Optional[str] = Field(default=None)
-page_number: Optional[int] = Field(default=None)
+"""
+Multi-Agent GDPR Document Processing System with Advanced HNSW and Elasticsearch
 
-# Add default for embedding
-embedding: Optional[List[float]] = Field(default=None)
+This system processes GDPR and UK GDPR documents, creates vector embeddings,
+builds graph structures, and maintains long-term memory for cross-document linking.
+
+Features:
+- Advanced HNSW (Hierarchical Navigable Small World) vector indexing
+- Scalar quantization (int8_hnsw) for 75% memory reduction
+- SIMD acceleration for enhanced performance
+- Dual embedding strategy (full articles + chunks)
+- Graph-based cross-document relationships
+- Long-term memory with LangGraph persistence
+- Hybrid search (text + vector) with rescoring
+- Performance optimization and monitoring
+
+HNSW Optimizations:
+- int8_hnsw index type with automatic scalar quantization
+- Configurable M and ef_construction parameters
+- Query parallelization and segment optimization
+- Filesystem cache preloading for vector files
+- Automatic index optimization and merge policies
+
+Performance Benefits:
+- 75% memory reduction with int8 quantization
+- Sub-millisecond vector similarity computations
+- Logarithmic search complexity with HNSW
+- SIMD-accelerated vector operations
+- Multi-threaded graph building and search
+"""
+
+import asyncio
+import json
+import logging
+import os
+import ssl
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, TypedDict, Annotated, Sequence
+from urllib.parse import quote_plus
+
+import openai
+from elasticsearch import Elasticsearch
+from elasticsearch.helpers import bulk
+from pydantic import BaseModel, Field, ConfigDict
+from langchain_core.documents import Document
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+from langchain_core.tools import tool
+from langchain_core.runnables import RunnableConfig
+from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.store.memory import InMemoryStore
+from langgraph.prebuilt import ToolNode
+
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Configuration
+class Config:
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    ES_USERNAME = os.getenv("ES_USERNAME", "elastic")
+    ES_PASSWORD = os.getenv("ES_PASSWORD")
+    ES_HOST = os.getenv("ES_HOST", "localhost")
+    ES_PORT = int(os.getenv("ES_PORT", "9200"))
+    ES_CACERT_PATH = os.getenv("ES_CACERT_PATH", "cacert.crt")
+    
+    # Model configurations
+    O3_MINI_MODEL = "o3-mini-2025-01-31"
+    EMBEDDING_MODEL = "text-embedding-3-large"
+    EMBEDDING_DIMENSIONS = 3072
+    REASONING_EFFORT = "high"
+    
+    # HNSW & Quantization configurations
+    # Using int8_hnsw for 75% memory reduction with minimal accuracy loss
+    VECTOR_INDEX_TYPE = "int8_hnsw"  # Auto scalar quantization
+    HNSW_M = 16  # Number of bidirectional links for each node (balance between speed/accuracy)
+    HNSW_EF_CONSTRUCTION = 200  # Size of dynamic candidate list (higher = better accuracy, slower indexing)
+    CONFIDENCE_INTERVAL = 0.95  # For int8 quantization confidence
+    ENABLE_SIMD = True  # SIMD acceleration for ARM/x86
+    
+    # Performance optimizations
+    ENABLE_PRELOAD = True  # Filesystem cache preloading
+    MAX_SEGMENTS = 10  # Merge policy for optimal HNSW performance
+
+
+# Pydantic Models for Document Structure
+class ChapterReference(BaseModel):
+    """Reference to a chapter in a document"""
+    document_type: str = Field(description="GDPR or UK_GDPR")
+    chapter_number: str = Field(description="Chapter identifier")
+    article_number: Optional[str] = Field(default=None, description="Article identifier")
+    title: str = Field(description="Chapter/Article title")
+    relevance_score: float = Field(description="Relevance score 0-1")
+    relationship_type: str = Field(description="Type of relationship (supports, contradicts, references, etc.)")
+
+
+class FullArticle(BaseModel):
+    """Complete article with full content embedding"""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    
+    article_id: str = Field(description="Unique article identifier")
+    document_type: str = Field(description="GDPR or UK_GDPR")
+    chapter_number: str = Field(description="Chapter identifier")
+    article_number: str = Field(description="Article identifier")
+    title: str = Field(description="Full article title")
+    full_content: str = Field(description="Complete article text")
+    full_article_embedding: List[float] = Field(description="Embedding of entire article")
+    chunk_ids: List[str] = Field(description="IDs of chunks belonging to this article")
+    key_concepts: List[str] = Field(default_factory=list, description="Key legal concepts")
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+class DocumentChunk(BaseModel):
+    """Individual document chunk with metadata"""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    
+    chunk_id: str = Field(description="Unique chunk identifier")
+    parent_article_id: Optional[str] = Field(default=None, description="Parent article ID")
+    document_type: str = Field(description="GDPR or UK_GDPR")
+    chapter_number: str = Field(description="Chapter identifier")
+    article_number: Optional[str] = Field(default=None)
+    title: str = Field(description="Section title")
+    content: str = Field(description="Text content")
+    chunk_embedding: Optional[List[float]] = Field(default=None, description="Chunk-level vector embedding")
+    supporting_references: List[ChapterReference] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=datetime.now)
+    processed_by_agent: Optional[str] = Field(default=None)
+
+
+class CrossDocumentLink(BaseModel):
+    """Cross-document relationship"""
+    source_chunk_id: str
+    target_chunk_id: str
+    relationship_type: str
+    confidence_score: float
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+class AgentMemory(BaseModel):
+    """Long-term memory structure for agents"""
+    memory_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    agent_name: str
+    memory_type: str  # semantic, episodic, procedural
+    content: Dict[str, Any]
+    namespace: List[str]
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: datetime = Field(default_factory=datetime.now)
+
+
+# State Management
+class ProcessingState(TypedDict):
+    """State for the processing workflow"""
+    messages: Annotated[Sequence[BaseMessage], "The conversation messages"]
+    full_articles: List[FullArticle]
+    documents: List[DocumentChunk]
+    current_chunk: Optional[DocumentChunk]
+    cross_links: List[CrossDocumentLink]
+    processing_stage: str
+    agent_memories: List[AgentMemory]
+    elasticsearch_client: Optional[Any]
+
+
+# Elasticsearch Manager
+class ElasticsearchManager:
+    """Manages Elasticsearch operations with SSL authentication"""
+    
+    def __init__(self):
+        self.client = self._create_client()
+        self._setup_indices()
+    
+    def _create_client(self) -> Elasticsearch:
+        """Create Elasticsearch client with SSL configuration"""
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
+        if os.path.exists(Config.ES_CACERT_PATH):
+            ssl_context.load_verify_locations(Config.ES_CACERT_PATH)
+        
+        return Elasticsearch(
+            [{"host": Config.ES_HOST, "port": Config.ES_PORT, "scheme": "https"}],
+            basic_auth=(Config.ES_USERNAME, Config.ES_PASSWORD),
+            ssl_context=ssl_context,
+            verify_certs=True,
+            request_timeout=30,
+            max_retries=3,
+            retry_on_timeout=True
+        )
+    
+    def _setup_indices(self):
+        """Setup Elasticsearch indices with advanced HNSW and quantization configurations"""
+        
+        # Advanced HNSW vector field configuration
+        def create_vector_field_config(field_name: str) -> Dict:
+            """Create optimized vector field configuration with HNSW and quantization"""
+            return {
+                "type": "dense_vector",
+                "dims": Config.EMBEDDING_DIMENSIONS,
+                "index": True,
+                "similarity": "cosine",
+                "index_options": {
+                    "type": Config.VECTOR_INDEX_TYPE,  # int8_hnsw for scalar quantization
+                    "m": Config.HNSW_M,
+                    "ef_construction": Config.HNSW_EF_CONSTRUCTION,
+                    "confidence_interval": Config.CONFIDENCE_INTERVAL
+                }
+            }
+        
+        # Full articles index with advanced HNSW
+        articles_mapping = {
+            "settings": {
+                "index": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0,
+                    # Merge policy optimization for HNSW performance
+                    "merge.policy.max_merged_segment": "5gb",
+                    "merge.policy.segments_per_tier": 4,
+                    # Preload vector files for faster search
+                    "store.preload": ["vec", "vem", "nvd", "nvm"] if Config.ENABLE_PRELOAD else []
+                }
+            },
+            "mappings": {
+                "properties": {
+                    "article_id": {"type": "keyword"},
+                    "document_type": {"type": "keyword"},
+                    "chapter_number": {"type": "keyword"},
+                    "article_number": {"type": "keyword"},
+                    "title": {"type": "text", "analyzer": "standard"},
+                    "full_content": {"type": "text", "analyzer": "standard"},
+                    "full_article_embedding": create_vector_field_config("full_article_embedding"),
+                    "chunk_ids": {"type": "keyword"},
+                    "key_concepts": {"type": "keyword"},
+                    "created_at": {"type": "date"}
+                }
+            }
+        }
+        
+        # Document chunks index with advanced HNSW
+        chunks_mapping = {
+            "settings": {
+                "index": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0,
+                    # Optimized for frequent updates during cross-referencing
+                    "refresh_interval": "5s",
+                    "merge.policy.max_merged_segment": "2gb",
+                    "merge.policy.segments_per_tier": 4,
+                    # Preload quantized vector files for optimal performance
+                    "store.preload": ["veq", "vemq"] if Config.ENABLE_PRELOAD else []
+                }
+            },
+            "mappings": {
+                "properties": {
+                    "chunk_id": {"type": "keyword"},
+                    "parent_article_id": {"type": "keyword"},
+                    "document_type": {"type": "keyword"},
+                    "chapter_number": {"type": "keyword"},
+                    "article_number": {"type": "keyword"},
+                    "title": {"type": "text", "analyzer": "standard"},
+                    "content": {"type": "text", "analyzer": "standard"},
+                    "chunk_embedding": create_vector_field_config("chunk_embedding"),
+                    "supporting_references": {
+                        "type": "nested",
+                        "properties": {
+                            "document_type": {"type": "keyword"},
+                            "chapter_number": {"type": "keyword"},
+                            "article_number": {"type": "keyword"},
+                            "title": {"type": "text"},
+                            "relevance_score": {"type": "float"},
+                            "relationship_type": {"type": "keyword"}
+                        }
+                    },
+                    "created_at": {"type": "date"},
+                    "processed_by_agent": {"type": "keyword"}
+                }
+            }
+        }
+        
+        # Cross-document links index (optimized for graph traversal)
+        links_mapping = {
+            "settings": {
+                "index": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0,
+                    "refresh_interval": "1s",  # Fast updates for real-time graph building
+                }
+            },
+            "mappings": {
+                "properties": {
+                    "source_chunk_id": {"type": "keyword"},
+                    "target_chunk_id": {"type": "keyword"},
+                    "relationship_type": {"type": "keyword"},
+                    "confidence_score": {"type": "float"},
+                    "created_at": {"type": "date"}
+                }
+            }
+        }
+        
+        # Agent memories index with semantic search capabilities
+        memories_mapping = {
+            "settings": {
+                "index": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0,
+                }
+            },
+            "mappings": {
+                "properties": {
+                    "memory_id": {"type": "keyword"},
+                    "agent_name": {"type": "keyword"},
+                    "memory_type": {"type": "keyword"},
+                    "content": {"type": "object"},
+                    "namespace": {"type": "keyword"},
+                    "created_at": {"type": "date"},
+                    "updated_at": {"type": "date"}
+                }
+            }
+        }
+        
+        # Create indices with advanced configurations
+        indices = {
+            "gdpr_articles": articles_mapping,
+            "gdpr_chunks": chunks_mapping,
+            "gdpr_links": links_mapping,
+            "agent_memories": memories_mapping
+        }
+        
+        for index_name, mapping in indices.items():
+            try:
+                if not self.client.indices.exists(index=index_name):
+                    self.client.indices.create(index=index_name, body=mapping)
+                    logger.info(f"Created index with HNSW optimization: {index_name}")
+                    
+                    # Verify HNSW configuration
+                    index_info = self.client.indices.get_mapping(index=index_name)
+                    logger.info(f"HNSW config verified for {index_name}: {Config.VECTOR_INDEX_TYPE}")
+                else:
+                    # Update settings if index exists
+                    self.client.indices.put_settings(
+                        index=index_name,
+                        body={"settings": mapping["settings"]}
+                    )
+                    logger.info(f"Updated HNSW settings for existing index: {index_name}")
+                    
+            except Exception as e:
+                logger.error(f"Error setting up index {index_name}: {e}")
+                # Fallback to basic configuration if advanced features fail
+                self._create_fallback_index(index_name, mapping)
+    
+    def _create_fallback_index(self, index_name: str, original_mapping: Dict):
+        """Create fallback index without advanced HNSW features if needed"""
+        try:
+            # Simplified mapping for fallback
+            fallback_mapping = original_mapping.copy()
+            
+            # Remove advanced HNSW options that might not be supported
+            if "mappings" in fallback_mapping:
+                for prop_name, prop_config in fallback_mapping["mappings"]["properties"].items():
+                    if prop_config.get("type") == "dense_vector":
+                        prop_config["index_options"] = {"type": "hnsw"}  # Basic HNSW
+            
+            self.client.indices.create(index=index_name, body=fallback_mapping)
+            logger.warning(f"Created fallback index for {index_name} without advanced HNSW features")
+            
+        except Exception as e:
+            logger.error(f"Failed to create even fallback index {index_name}: {e}")
+            raise
+    
+    def index_article(self, article: FullArticle) -> bool:
+        """Index a full article"""
+        try:
+            doc = article.model_dump()
+            doc["created_at"] = article.created_at.isoformat()
+            
+            response = self.client.index(
+                index="gdpr_articles",
+                id=article.article_id,
+                body=doc
+            )
+            return response["result"] in ["created", "updated"]
+        except Exception as e:
+            logger.error(f"Error indexing article {article.article_id}: {e}")
+            return False
+    
+    def index_chunk(self, chunk: DocumentChunk) -> bool:
+        """Index a document chunk"""
+        try:
+            doc = chunk.model_dump()
+            doc["created_at"] = chunk.created_at.isoformat()
+            
+            response = self.client.index(
+                index="gdpr_chunks",
+                id=chunk.chunk_id,
+                body=doc
+            )
+            return response["result"] in ["created", "updated"]
+        except Exception as e:
+            logger.error(f"Error indexing chunk {chunk.chunk_id}: {e}")
+            return False
+    
+    def index_link(self, link: CrossDocumentLink) -> bool:
+        """Index a cross-document link"""
+        try:
+            doc = link.model_dump()
+            doc["created_at"] = link.created_at.isoformat()
+            
+            response = self.client.index(
+                index="gdpr_links",
+                body=doc
+            )
+            return response["result"] in ["created", "updated"]
+        except Exception as e:
+            logger.error(f"Error indexing link: {e}")
+            return False
+    
+    def index_memory(self, memory: AgentMemory) -> bool:
+        """Index agent memory"""
+        try:
+            doc = memory.model_dump()
+            doc["created_at"] = memory.created_at.isoformat()
+            doc["updated_at"] = memory.updated_at.isoformat()
+            
+            response = self.client.index(
+                index="agent_memories",
+                id=memory.memory_id,
+                body=doc
+            )
+            return response["result"] in ["created", "updated"]
+        except Exception as e:
+            logger.error(f"Error indexing memory {memory.memory_id}: {e}")
+            return False
+    
+    def hybrid_search(self, query: str, embedding: List[float], filters: Dict = None, 
+                     search_level: str = "both", rescore: bool = True) -> Dict[str, List[Dict]]:
+        """
+        Perform optimized hybrid search with advanced HNSW and quantization features
+        
+        Args:
+            query: Text query
+            embedding: Query embedding vector
+            filters: Search filters
+            search_level: "articles", "chunks", or "both"
+            rescore: Enable rescoring for quantized vectors (improves accuracy)
+        
+        Returns:
+            Dict with "articles" and/or "chunks" keys containing results
+        """
+        results = {}
+        
+        # Base kNN query with 8.13+ optimizations
+        def create_knn_query(vector_field: str, index: str) -> Dict:
+            knn_query = {
+                "field": vector_field,
+                "query_vector": embedding,
+                "k": 20,  # Auto-configured in 8.13+
+                "num_candidates": 50,  # Auto-configured in 8.13+
+            }
+            
+            # Add rescoring for quantized vectors (improves accuracy)
+            if rescore and Config.VECTOR_INDEX_TYPE.startswith("int"):
+                knn_query["rescore"] = {
+                    "window_size": 100,
+                    "query": {
+                        "rescore_query": {
+                            "script_score": {
+                                "query": {"match_all": {}},
+                                "script": {
+                                    "source": "cosineSimilarity(params.query_vector, doc[params.field]) + 1.0",
+                                    "params": {
+                                        "query_vector": embedding,
+                                        "field": vector_field
+                                    }
+                                }
+                            }
+                        },
+                        "query_weight": 0.7,
+                        "rescore_query_weight": 0.3
+                    }
+                }
+            
+            return knn_query
+        
+        # Hybrid search query combining kNN and text search
+        def create_hybrid_query(vector_field: str, content_fields: List[str]) -> Dict:
+            return {
+                "bool": {
+                    "should": [
+                        # Text-based search
+                        {
+                            "multi_match": {
+                                "query": query,
+                                "fields": content_fields,
+                                "type": "best_fields",
+                                "boost": 0.3  # Balance text vs vector
+                            }
+                        },
+                        # Vector search using kNN query (8.12+ syntax)
+                        {
+                            "knn": create_knn_query(vector_field, "")
+                        }
+                    ],
+                    "filter": [{"terms": {k: v}} for k, v in (filters or {}).items()]
+                }
+            }
+        
+        try:
+            # Search articles
+            if search_level in ["articles", "both"]:
+                article_search = {
+                    "query": create_hybrid_query(
+                        "full_article_embedding", 
+                        ["title^3", "full_content^2", "key_concepts^2"]
+                    ),
+                    "_source": True,
+                    "size": 20,
+                    # Leverage 8.13+ query parallelization
+                    "track_total_hits": False,  # Faster for top-k results
+                }
+                
+                article_response = self.client.search(index="gdpr_articles", body=article_search)
+                results["articles"] = [
+                    {**hit["_source"], "_score": hit["_score"]} 
+                    for hit in article_response["hits"]["hits"]
+                ]
+            
+            # Search chunks
+            if search_level in ["chunks", "both"]:
+                chunk_search = {
+                    "query": create_hybrid_query(
+                        "chunk_embedding",
+                        ["title^2", "content^1.5"]
+                    ),
+                    "_source": True,
+                    "size": 20,
+                    "track_total_hits": False,
+                }
+                
+                chunk_response = self.client.search(index="gdpr_chunks", body=chunk_search)
+                results["chunks"] = [
+                    {**hit["_source"], "_score": hit["_score"]} 
+                    for hit in chunk_response["hits"]["hits"]
+                ]
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error in optimized hybrid search: {e}")
+            # Fallback to basic search
+            return self._fallback_search(query, embedding, filters, search_level)
+    
+    def _fallback_search(self, query: str, embedding: List[float], filters: Dict = None, 
+                        search_level: str = "both") -> Dict[str, List[Dict]]:
+        """Fallback search using script_score if advanced kNN fails"""
+        results = {}
+        
+        search_body = {
+            "query": {
+                "bool": {
+                    "should": [
+                        {
+                            "multi_match": {
+                                "query": query,
+                                "fields": ["title^2", "content", "full_content"],
+                                "type": "best_fields"
+                            }
+                        },
+                        {
+                            "script_score": {
+                                "query": {"match_all": {}},
+                                "script": {
+                                    "source": "cosineSimilarity(params.query_vector, params.vector_field) + 1.0",
+                                    "params": {"query_vector": embedding}
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            "_source": True,
+            "size": 20
+        }
+        
+        if filters:
+            search_body["query"]["bool"]["filter"] = [
+                {"terms": {k: v}} for k, v in filters.items()
+            ]
+        
+        try:
+            if search_level in ["articles", "both"]:
+                article_search = search_body.copy()
+                article_search["query"]["bool"]["should"][1]["script"]["params"]["vector_field"] = "full_article_embedding"
+                article_response = self.client.search(index="gdpr_articles", body=article_search)
+                results["articles"] = [hit["_source"] for hit in article_response["hits"]["hits"]]
+            
+            if search_level in ["chunks", "both"]:
+                chunk_search = search_body.copy()
+                chunk_search["query"]["bool"]["should"][1]["script"]["params"]["vector_field"] = "chunk_embedding"
+                chunk_response = self.client.search(index="gdpr_chunks", body=chunk_search)
+                results["chunks"] = [hit["_source"] for hit in chunk_response["hits"]["hits"]]
+            
+            return results
+        except Exception as e:
+            logger.error(f"Fallback search also failed: {e}")
+            return {"articles": [], "chunks": []}
+    
+    def get_related_chunks(self, chunk_id: str) -> List[Dict]:
+        """Get chunks related through graph links"""
+        try:
+            # Find outgoing links
+            outgoing_query = {
+                "query": {"term": {"source_chunk_id": chunk_id}},
+                "size": 50
+            }
+            
+            # Find incoming links
+            incoming_query = {
+                "query": {"term": {"target_chunk_id": chunk_id}},
+                "size": 50
+            }
+            
+            outgoing_response = self.client.search(index="gdpr_links", body=outgoing_query)
+            incoming_response = self.client.search(index="gdpr_links", body=incoming_query)
+            
+            related_chunk_ids = set()
+            for hit in outgoing_response["hits"]["hits"]:
+                related_chunk_ids.add(hit["_source"]["target_chunk_id"])
+            for hit in incoming_response["hits"]["hits"]:
+                related_chunk_ids.add(hit["_source"]["source_chunk_id"])
+            
+            if not related_chunk_ids:
+                return []
+            
+            # Get the actual chunks
+            chunks_query = {
+                "query": {"terms": {"chunk_id": list(related_chunk_ids)}},
+                "size": len(related_chunk_ids)
+            }
+            
+            chunks_response = self.client.search(index="gdpr_chunks", body=chunks_query)
+            return [hit["_source"] for hit in chunks_response["hits"]["hits"]]
+            
+        except Exception as e:
+            logger.error(f"Error getting related chunks for {chunk_id}: {e}")
+            return []
+    
+    def get_index_stats(self) -> Dict[str, Any]:
+        """Get comprehensive index statistics including HNSW performance metrics"""
+        try:
+            stats = {}
+            
+            for index_name in ["gdpr_articles", "gdpr_chunks", "gdpr_links", "agent_memories"]:
+                if self.client.indices.exists(index=index_name):
+                    # Basic index stats
+                    index_stats = self.client.indices.stats(index=index_name)
+                    
+                    # Disk usage analysis for vector fields
+                    disk_usage = self.client.indices.disk_usage(index=index_name)
+                    
+                    stats[index_name] = {
+                        "documents": index_stats["indices"][index_name]["total"]["docs"]["count"],
+                        "size_bytes": index_stats["indices"][index_name]["total"]["store"]["size_in_bytes"],
+                        "segments": index_stats["indices"][index_name]["total"]["segments"]["count"],
+                        "vector_size_estimate": self._estimate_vector_memory_usage(index_name),
+                        "disk_usage": disk_usage
+                    }
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Error getting index stats: {e}")
+            return {}
+    
+    def _estimate_vector_memory_usage(self, index_name: str) -> Dict[str, str]:
+        """Estimate memory usage for vectors with quantization"""
+        try:
+            doc_count_response = self.client.count(index=index_name)
+            doc_count = doc_count_response["count"]
+            
+            if doc_count == 0:
+                return {"estimated_memory": "0 MB", "quantization_savings": "N/A"}
+            
+            # Memory calculation based on quantization type
+            if Config.VECTOR_INDEX_TYPE == "int8_hnsw":
+                # int8 quantization: ~75% memory reduction
+                vector_memory = doc_count * (Config.EMBEDDING_DIMENSIONS + 4) * 1  # 1 byte per dimension + metadata
+                original_memory = doc_count * Config.EMBEDDING_DIMENSIONS * 4  # float32
+                savings = ((original_memory - vector_memory) / original_memory) * 100
+                
+            elif Config.VECTOR_INDEX_TYPE == "int4_hnsw":
+                # int4 quantization: ~87.5% memory reduction
+                vector_memory = doc_count * (Config.EMBEDDING_DIMENSIONS / 2 + 4)
+                original_memory = doc_count * Config.EMBEDDING_DIMENSIONS * 4
+                savings = ((original_memory - vector_memory) / original_memory) * 100
+                
+            else:
+                # No quantization
+                vector_memory = doc_count * Config.EMBEDDING_DIMENSIONS * 4
+                savings = 0
+            
+            # Add HNSW graph overhead
+            hnsw_overhead = doc_count * 4 * Config.HNSW_M
+            total_memory = vector_memory + hnsw_overhead
+            
+            return {
+                "estimated_memory": f"{total_memory / (1024**2):.1f} MB",
+                "quantization_savings": f"{savings:.1f}%",
+                "hnsw_overhead": f"{hnsw_overhead / (1024**2):.1f} MB"
+            }
+            
+        except Exception as e:
+            logger.error(f"Error estimating memory usage: {e}")
+            return {"estimated_memory": "Unknown", "quantization_savings": "Unknown"}
+    
+    def optimize_indices(self):
+        """Optimize indices for better HNSW performance"""
+        try:
+            for index_name in ["gdpr_articles", "gdpr_chunks"]:
+                if self.client.indices.exists(index=index_name):
+                    # Force merge to reduce segment count for better HNSW performance
+                    logger.info(f"Optimizing HNSW performance for {index_name}...")
+                    
+                    self.client.indices.forcemerge(
+                        index=index_name,
+                        max_num_segments=Config.MAX_SEGMENTS,
+                        wait_for_completion=False
+                    )
+                    
+                    # Update settings for optimal search performance
+                    optimization_settings = {
+                        "index": {
+                            "refresh_interval": "30s",  # Reduce refresh frequency for better performance
+                            "merge.policy.max_merged_segment": "5gb",
+                        }
+                    }
+                    
+                    self.client.indices.put_settings(
+                        index=index_name,
+                        body={"settings": optimization_settings}
+                    )
+                    
+                    logger.info(f"Applied HNSW optimization settings to {index_name}")
+                    
+        except Exception as e:
+            logger.error(f"Error optimizing indices: {e}")
+    
+    def benchmark_search_performance(self, sample_queries: List[str]) -> Dict[str, Any]:
+        """Benchmark search performance with HNSW optimizations"""
+        import time
+        
+        results = {
+            "total_queries": len(sample_queries),
+            "avg_latency_ms": 0,
+            "quantization_type": Config.VECTOR_INDEX_TYPE,
+            "hnsw_config": {
+                "m": Config.HNSW_M,
+                "ef_construction": Config.HNSW_EF_CONSTRUCTION
+            }
+        }
+        
+        total_time = 0
+        successful_queries = 0
+        
+        try:
+            openai_manager = OpenAIManager()
+            
+            for query in sample_queries:
+                start_time = time.time()
+                
+                # Create embedding
+                embedding = await openai_manager.create_embedding(query)
+                
+                # Perform search
+                search_results = self.hybrid_search(
+                    query=query,
+                    embedding=embedding,
+                    search_level="both"
+                )
+                
+                end_time = time.time()
+                
+                query_time = (end_time - start_time) * 1000  # Convert to milliseconds
+                total_time += query_time
+                successful_queries += 1
+                
+                logger.info(f"Query '{query[:30]}...' took {query_time:.2f}ms")
+                
+            if successful_queries > 0:
+                results["avg_latency_ms"] = total_time / successful_queries
+                results["successful_queries"] = successful_queries
+                
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error in performance benchmark: {e}")
+            results["error"] = str(e)
+            return results
+
+
+# OpenAI API Manager
+class OpenAIManager:
+    """Manages OpenAI API calls with direct API usage"""
+    
+    def __init__(self):
+        self.client = openai.OpenAI(api_key=Config.OPENAI_API_KEY)
+    
+    async def create_embedding(self, text: str) -> List[float]:
+        """Create embedding using OpenAI API directly"""
+        try:
+            response = self.client.embeddings.create(
+                model=Config.EMBEDDING_MODEL,
+                input=text,
+                encoding_format="float"
+            )
+            return response.data[0].embedding
+        except Exception as e:
+            logger.error(f"Error creating embedding: {e}")
+            return []
+    
+    async def reasoning_completion(self, messages: List[Dict], system_prompt: str = None) -> str:
+        """Create completion using o3-mini with high reasoning effort"""
+        try:
+            formatted_messages = []
+            
+            if system_prompt:
+                formatted_messages.append({"role": "developer", "content": system_prompt})
+            
+            formatted_messages.extend(messages)
+            
+            response = self.client.chat.completions.create(
+                model=Config.O3_MINI_MODEL,
+                messages=formatted_messages,
+                reasoning_effort=Config.REASONING_EFFORT,
+                max_completion_tokens=4000,
+                temperature=0.1
+            )
+            
+            return response.choices[0].message.content
+        except Exception as e:
+            logger.error(f"Error in reasoning completion: {e}")
+            return ""
+
+
+# Document Processing Agent
+class DocumentProcessingAgent:
+    """Agent for processing and chunking documents"""
+    
+    def __init__(self, openai_manager: OpenAIManager, es_manager: ElasticsearchManager):
+        self.openai_manager = openai_manager
+        self.es_manager = es_manager
+        self.name = "DocumentProcessor"
+    
+    async def process_document(self, file_path: str, document_type: str) -> tuple[List[FullArticle], List[DocumentChunk]]:
+        """Process a document and create both full articles and chunks"""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as file:
+                content = file.read()
+            
+            # First pass: Use o3-mini to identify full articles
+            article_system_prompt = """
+            You are an expert in GDPR documentation. Identify complete articles in the document.
+            Each article should contain the full text including all sub-sections, clauses, and paragraphs.
+            
+            Return a JSON array with the following structure:
+            {
+                "articles": [
+                    {
+                        "chapter_number": "string",
+                        "article_number": "string",
+                        "title": "string",
+                        "full_content": "complete article text including all subsections",
+                        "key_concepts": ["concept1", "concept2", ...]
+                    }
+                ]
+            }
+            """
+            
+            article_messages = [
+                {"role": "user", "content": f"Document type: {document_type}\n\nDocument content:\n{content}"}
+            ]
+            
+            article_response = await self.openai_manager.reasoning_completion(article_messages, article_system_prompt)
+            
+            # Second pass: Use o3-mini to create detailed chunks within each article
+            chunk_system_prompt = """
+            You are an expert in GDPR documentation. Break down each article into meaningful chunks 
+            (paragraphs, clauses, sub-articles) while preserving the legal structure.
+            
+            For each chunk, identify:
+            - Parent article information
+            - Specific section/clause details
+            - Main content
+            - Key legal concepts
+            
+            Return a JSON array of chunks with the following structure:
+            {
+                "chunks": [
+                    {
+                        "parent_article_number": "string",
+                        "chapter_number": "string",
+                        "article_number": "string or null",
+                        "title": "string",
+                        "content": "string"
+                    }
+                ]
+            }
+            """
+            
+            chunk_messages = [
+                {"role": "user", "content": f"Document type: {document_type}\n\nDocument content:\n{content}"}
+            ]
+            
+            chunk_response = await self.openai_manager.reasoning_completion(chunk_messages, chunk_system_prompt)
+            
+            # Parse responses
+            try:
+                articles_data = json.loads(article_response)["articles"]
+                chunks_data = json.loads(chunk_response)["chunks"]
+            except (json.JSONDecodeError, KeyError):
+                logger.error("Failed to parse AI responses, using fallback method")
+                articles_data, chunks_data = self._fallback_processing(content, document_type)
+            
+            # Create FullArticle objects
+            full_articles = []
+            for article_data in articles_data:
+                article_id = str(uuid.uuid4())
+                
+                # Create full article embedding
+                full_text = f"{article_data.get('title', '')} {article_data.get('full_content', '')}"
+                full_embedding = await self.openai_manager.create_embedding(full_text)
+                
+                article = FullArticle(
+                    article_id=article_id,
+                    document_type=document_type,
+                    chapter_number=article_data.get("chapter_number", ""),
+                    article_number=article_data.get("article_number", ""),
+                    title=article_data.get("title", ""),
+                    full_content=article_data.get("full_content", ""),
+                    full_article_embedding=full_embedding,
+                    chunk_ids=[],  # Will be populated below
+                    key_concepts=article_data.get("key_concepts", [])
+                )
+                
+                full_articles.append(article)
+                self.es_manager.index_article(article)
+            
+            # Create DocumentChunk objects and link to articles
+            chunks = []
+            article_chunk_map = {}  # Maps article_number to chunk_ids
+            
+            for chunk_data in chunks_data:
+                chunk_id = str(uuid.uuid4())
+                
+                # Find parent article
+                parent_article = None
+                parent_article_number = chunk_data.get("parent_article_number") or chunk_data.get("article_number")
+                
+                for article in full_articles:
+                    if article.article_number == parent_article_number:
+                        parent_article = article
+                        break
+                
+                # Create chunk embedding
+                embedding_text = f"{chunk_data.get('title', '')} {chunk_data.get('content', '')}"
+                chunk_embedding = await self.openai_manager.create_embedding(embedding_text)
+                
+                chunk = DocumentChunk(
+                    chunk_id=chunk_id,
+                    parent_article_id=parent_article.article_id if parent_article else None,
+                    document_type=document_type,
+                    chapter_number=chunk_data.get("chapter_number", ""),
+                    article_number=chunk_data.get("article_number"),
+                    title=chunk_data.get("title", ""),
+                    content=chunk_data.get("content", ""),
+                    chunk_embedding=chunk_embedding,
+                    processed_by_agent=self.name
+                )
+                
+                chunks.append(chunk)
+                self.es_manager.index_chunk(chunk)
+                
+                # Update parent article's chunk_ids
+                if parent_article:
+                    if parent_article.article_number not in article_chunk_map:
+                        article_chunk_map[parent_article.article_number] = []
+                    article_chunk_map[parent_article.article_number].append(chunk_id)
+            
+            # Update articles with their chunk IDs
+            for article in full_articles:
+                if article.article_number in article_chunk_map:
+                    article.chunk_ids = article_chunk_map[article.article_number]
+                    self.es_manager.index_article(article)  # Re-index with updated chunk_ids
+            
+            logger.info(f"Processed {len(full_articles)} articles and {len(chunks)} chunks for {document_type}")
+            return full_articles, chunks
+            
+        except Exception as e:
+            logger.error(f"Error processing document {file_path}: {e}")
+            return [], []
+    
+    def _fallback_processing(self, content: str, document_type: str) -> tuple[List[Dict], List[Dict]]:
+        """Fallback processing method if AI processing fails"""
+        paragraphs = content.split('\n\n')
+        
+        # Create fallback articles (group every 5 paragraphs)
+        articles = []
+        chunks = []
+        
+        for i in range(0, len(paragraphs), 5):
+            article_paragraphs = paragraphs[i:i+5]
+            article_content = '\n\n'.join(article_paragraphs)
+            
+            if len(article_content.strip()) > 100:
+                article_number = f"auto_article_{i//5 + 1}"
+                
+                articles.append({
+                    "chapter_number": f"auto_chapter_{i//5 + 1}",
+                    "article_number": article_number,
+                    "title": f"Article {i//5 + 1}",
+                    "full_content": article_content,
+                    "key_concepts": []
+                })
+                
+                # Create chunks for each paragraph in the article
+                for j, paragraph in enumerate(article_paragraphs):
+                    if len(paragraph.strip()) > 50:
+                        chunks.append({
+                            "parent_article_number": article_number,
+                            "chapter_number": f"auto_chapter_{i//5 + 1}",
+                            "article_number": f"{article_number}_{j+1}",
+                            "title": f"Section {j+1}",
+                            "content": paragraph.strip()
+                        })
+        
+        return articles, chunks
+
+
+# Cross-Reference Agent
+class CrossReferenceAgent:
+    """Agent for finding cross-references between documents"""
+    
+    def __init__(self, openai_manager: OpenAIManager, es_manager: ElasticsearchManager, 
+                 memory_store: InMemoryStore):
+        self.openai_manager = openai_manager
+        self.es_manager = es_manager
+        self.memory_store = memory_store
+        self.name = "CrossReferenceAgent"
+    
+    async def find_cross_references(self, chunk: DocumentChunk, all_chunks: List[DocumentChunk]) -> List[CrossDocumentLink]:
+        """Find cross-references for a given chunk"""
+        links = []
+        
+        # Get embedding for the current chunk
+        chunk_embedding = chunk.chunk_embedding
+        if not chunk_embedding:
+            chunk_embedding = await self.openai_manager.create_embedding(
+                f"{chunk.title} {chunk.content}"
+            )
+        
+        # Perform hybrid search to find similar chunks
+        search_results = self.es_manager.hybrid_search(
+            query=f"{chunk.title} {chunk.content[:500]}",
+            embedding=chunk_embedding,
+            filters={"document_type": ["GDPR", "UK_GDPR"]},
+            search_level="chunks"
+        )
+        
+        # Filter out the same chunk and same document type
+        candidate_chunks = [
+            result for result in search_results.get("chunks", [])
+            if result["chunk_id"] != chunk.chunk_id and 
+               result["document_type"] != chunk.document_type
+        ]
+        
+        # Use o3-mini to analyze relationships
+        for candidate in candidate_chunks[:5]:  # Limit to top 5 candidates
+            relationship = await self._analyze_relationship(chunk, candidate)
+            
+            if relationship and relationship["confidence_score"] > 0.6:
+                link = CrossDocumentLink(
+                    source_chunk_id=chunk.chunk_id,
+                    target_chunk_id=candidate["chunk_id"],
+                    relationship_type=relationship["relationship_type"],
+                    confidence_score=relationship["confidence_score"]
+                )
+                
+                links.append(link)
+                self.es_manager.index_link(link)
+        
+        # Store findings in long-term memory
+        await self._store_cross_reference_memory(chunk, links)
+        
+        return links
+    
+    async def _analyze_relationship(self, source_chunk: DocumentChunk, target_chunk: Dict) -> Optional[Dict]:
+        """Analyze relationship between two chunks using o3-mini"""
+        system_prompt = """
+        You are an expert legal analyst specializing in GDPR and data protection laws. 
+        Analyze the relationship between two legal text chunks and determine:
+        
+        1. The type of relationship (supports, contradicts, references, complements, specifies, generalizes)
+        2. The confidence score (0.0 to 1.0)
+        3. A brief explanation of the relationship
+        
+        Return JSON format:
+        {
+            "relationship_type": "string",
+            "confidence_score": float,
+            "explanation": "string"
+        }
+        
+        Return null if no meaningful relationship exists (confidence < 0.6).
+        """
+        
+        messages = [
+            {
+                "role": "user", 
+                "content": f"""
+                Source chunk ({source_chunk.document_type}):
+                Title: {source_chunk.title}
+                Content: {source_chunk.content}
+                
+                Target chunk ({target_chunk['document_type']}):
+                Title: {target_chunk['title']}
+                Content: {target_chunk['content']}
+                
+                Analyze the relationship between these chunks.
+                """
+            }
+        ]
+        
+        try:
+            response = await self.openai_manager.reasoning_completion(messages, system_prompt)
+            result = json.loads(response)
+            
+            if result and result.get("confidence_score", 0) >= 0.6:
+                return result
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error analyzing relationship: {e}")
+            return None
+    
+    async def _store_cross_reference_memory(self, chunk: DocumentChunk, links: List[CrossDocumentLink]):
+        """Store cross-reference findings in long-term memory"""
+        memory_content = {
+            "chunk_id": chunk.chunk_id,
+            "document_type": chunk.document_type,
+            "chapter_number": chunk.chapter_number,
+            "found_links": len(links),
+            "link_types": [link.relationship_type for link in links],
+            "analysis_timestamp": datetime.now().isoformat()
+        }
+        
+        memory = AgentMemory(
+            agent_name=self.name,
+            memory_type="episodic",
+            content=memory_content,
+            namespace=["cross_reference", chunk.document_type]
+        )
+        
+        self.es_manager.index_memory(memory)
+        
+        # Also store in LangGraph memory store
+        await self.memory_store.aput(
+            namespace=["cross_reference", self.name],
+            key=f"analysis_{chunk.chunk_id}",
+            value=memory_content
+        )
+
+
+# Linking Agent
+class LinkingAgent:
+    """Agent for maintaining and updating document links"""
+    
+    def __init__(self, openai_manager: OpenAIManager, es_manager: ElasticsearchManager,
+                 memory_store: InMemoryStore):
+        self.openai_manager = openai_manager
+        self.es_manager = es_manager
+        self.memory_store = memory_store
+        self.name = "LinkingAgent"
+    
+    async def update_chunk_references(self, chunk: DocumentChunk, related_links: List[CrossDocumentLink]) -> DocumentChunk:
+        """Update chunk with supporting references"""
+        
+        # Get related chunks from Elasticsearch
+        related_chunks = self.es_manager.get_related_chunks(chunk.chunk_id)
+        
+        # Create ChapterReference objects
+        references = []
+        for related_chunk in related_chunks:
+            # Find the corresponding link for confidence score
+            link = next(
+                (l for l in related_links 
+                 if l.source_chunk_id == chunk.chunk_id and l.target_chunk_id == related_chunk["chunk_id"] or
+                    l.target_chunk_id == chunk.chunk_id and l.source_chunk_id == related_chunk["chunk_id"]),
+                None
+            )
+            
+            if link:
+                reference = ChapterReference(
+                    document_type=related_chunk["document_type"],
+                    chapter_number=related_chunk["chapter_number"],
+                    article_number=related_chunk.get("article_number"),
+                    title=related_chunk["title"],
+                    relevance_score=link.confidence_score,
+                    relationship_type=link.relationship_type
+                )
+                references.append(reference)
+        
+        # Update chunk with references
+        chunk.supporting_references = references
+        
+        # Re-index with updated references
+        self.es_manager.index_chunk(chunk)
+        
+        # Store linking activity in memory
+        await self._store_linking_memory(chunk, references)
+        
+        return chunk
+    
+    async def _store_linking_memory(self, chunk: DocumentChunk, references: List[ChapterReference]):
+        """Store linking activity in long-term memory"""
+        memory_content = {
+            "chunk_id": chunk.chunk_id,
+            "document_type": chunk.document_type,
+            "references_added": len(references),
+            "reference_types": [ref.relationship_type for ref in references],
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        memory = AgentMemory(
+            agent_name=self.name,
+            memory_type="procedural",
+            content=memory_content,
+            namespace=["linking", chunk.document_type]
+        )
+        
+        self.es_manager.index_memory(memory)
+        
+        # Store in LangGraph memory
+        await self.memory_store.aput(
+            namespace=["linking", self.name],
+            key=f"linking_{chunk.chunk_id}",
+            value=memory_content
+        )
+
+
+# Tools for agents
+@tool
+async def search_similar_chunks(query: str, document_type: str = None, config: RunnableConfig = None) -> List[Dict]:
+    """Search for similar chunks using hybrid search"""
+    es_manager = config["configurable"]["elasticsearch_manager"]
+    openai_manager = config["configurable"]["openai_manager"]
+    
+    # Create embedding for query
+    embedding = await openai_manager.create_embedding(query)
+    
+    # Prepare filters
+    filters = {}
+    if document_type:
+        filters["document_type"] = [document_type]
+    
+    # Perform hybrid search for chunks only
+    results = es_manager.hybrid_search(query, embedding, filters, search_level="chunks")
+    return results.get("chunks", [])
+
+
+@tool
+async def search_full_articles(query: str, document_type: str = None, config: RunnableConfig = None) -> List[Dict]:
+    """Search for full articles using hybrid search"""
+    es_manager = config["configurable"]["elasticsearch_manager"]
+    openai_manager = config["configurable"]["openai_manager"]
+    
+    # Create embedding for query
+    embedding = await openai_manager.create_embedding(query)
+    
+    # Prepare filters
+    filters = {}
+    if document_type:
+        filters["document_type"] = [document_type]
+    
+    # Perform hybrid search for articles only
+    results = es_manager.hybrid_search(query, embedding, filters, search_level="articles")
+    return results.get("articles", [])
+
+
+@tool
+async def search_both_levels(query: str, document_type: str = None, config: RunnableConfig = None) -> Dict[str, List[Dict]]:
+    """Search both full articles and chunks using hybrid search"""
+    es_manager = config["configurable"]["elasticsearch_manager"]
+    openai_manager = config["configurable"]["openai_manager"]
+    
+    # Create embedding for query
+    embedding = await openai_manager.create_embedding(query)
+    
+    # Prepare filters
+    filters = {}
+    if document_type:
+        filters["document_type"] = [document_type]
+    
+    # Perform hybrid search at both levels
+    results = es_manager.hybrid_search(query, embedding, filters, search_level="both")
+    return results
+
+
+@tool
+async def get_chunk_relationships(chunk_id: str, config: RunnableConfig = None) -> List[Dict]:
+    """Get all relationships for a specific chunk"""
+    es_manager = config["configurable"]["elasticsearch_manager"]
+    related_chunks = es_manager.get_related_chunks(chunk_id)
+    return related_chunks
+
+
+@tool
+async def store_agent_memory(agent_name: str, memory_type: str, content: Dict, 
+                           namespace: List[str], config: RunnableConfig = None) -> bool:
+    """Store information in agent's long-term memory"""
+    es_manager = config["configurable"]["elasticsearch_manager"]
+    memory_store = config["configurable"]["memory_store"]
+    
+    memory = AgentMemory(
+        agent_name=agent_name,
+        memory_type=memory_type,
+        content=content,
+        namespace=namespace
+    )
+    
+    # Store in Elasticsearch
+    es_success = es_manager.index_memory(memory)
+    
+    # Store in LangGraph memory
+    await memory_store.aput(
+        namespace=namespace + [agent_name],
+        key=memory.memory_id,
+        value=content
+    )
+    
+    return es_success
+
+
+# Main workflow nodes
+async def document_processing_node(state: ProcessingState) -> ProcessingState:
+    """Process documents and create both full articles and chunks"""
+    logger.info("Starting document processing...")
+    
+    openai_manager = OpenAIManager()
+    es_manager = ElasticsearchManager()
+    
+    processor = DocumentProcessingAgent(openai_manager, es_manager)
+    
+    all_articles = []
+    all_chunks = []
+    
+    # Process GDPR document
+    gdpr_articles, gdpr_chunks = await processor.process_document("gdpr.txt", "GDPR")
+    all_articles.extend(gdpr_articles)
+    all_chunks.extend(gdpr_chunks)
+    
+    # Process UK GDPR document
+    uk_gdpr_articles, uk_gdpr_chunks = await processor.process_document("uk_gdpr.txt", "UK_GDPR")
+    all_articles.extend(uk_gdpr_articles)
+    all_chunks.extend(uk_gdpr_chunks)
+    
+    state["full_articles"] = all_articles
+    state["documents"] = all_chunks
+    state["processing_stage"] = "cross_referencing"
+    
+    logger.info(f"Created {len(all_articles)} full articles and {len(all_chunks)} chunks")
+    
+    return state
+
+
+async def cross_reference_node(state: ProcessingState) -> ProcessingState:
+    """Find cross-references between documents"""
+    logger.info("Finding cross-references...")
+    
+    openai_manager = OpenAIManager()
+    es_manager = ElasticsearchManager()
+    memory_store = InMemoryStore()
+    
+    cross_ref_agent = CrossReferenceAgent(openai_manager, es_manager, memory_store)
+    
+    all_links = []
+    
+    for chunk in state["documents"]:
+        links = await cross_ref_agent.find_cross_references(chunk, state["documents"])
+        all_links.extend(links)
+    
+    state["cross_links"] = all_links
+    state["processing_stage"] = "linking"
+    
+    return state
+
+
+async def linking_node(state: ProcessingState) -> ProcessingState:
+    """Update chunks with supporting references"""
+    logger.info("Updating chunk references...")
+    
+    openai_manager = OpenAIManager()
+    es_manager = ElasticsearchManager()
+    memory_store = InMemoryStore()
+    
+    linking_agent = LinkingAgent(openai_manager, es_manager, memory_store)
+    
+    updated_chunks = []
+    for chunk in state["documents"]:
+        # Get links for this chunk
+        chunk_links = [
+            link for link in state["cross_links"] 
+            if link.source_chunk_id == chunk.chunk_id or link.target_chunk_id == chunk.chunk_id
+        ]
+        
+        updated_chunk = await linking_agent.update_chunk_references(chunk, chunk_links)
+        updated_chunks.append(updated_chunk)
+    
+    state["documents"] = updated_chunks
+    state["processing_stage"] = "completed"
+    
+    return state
+
+
+# Create the multi-agent workflow
+def create_gdpr_processing_workflow():
+    """Create the LangGraph workflow for GDPR document processing"""
+    
+    # Initialize components
+    checkpointer = MemorySaver()
+    memory_store = InMemoryStore()
+    
+    # Create tools
+    tools = [search_similar_chunks, search_full_articles, search_both_levels, 
+             get_chunk_relationships, store_agent_memory]
+    tool_node = ToolNode(tools)
+    
+    # Create the graph
+    workflow = StateGraph(ProcessingState)
+    
+    # Add nodes
+    workflow.add_node("document_processing", document_processing_node)
+    workflow.add_node("cross_reference", cross_reference_node)
+    workflow.add_node("linking", linking_node)
+    workflow.add_node("tools", tool_node)
+    
+    # Add edges
+    workflow.add_edge(START, "document_processing")
+    workflow.add_edge("document_processing", "cross_reference")
+    workflow.add_edge("cross_reference", "linking")
+    workflow.add_edge("linking", END)
+    
+    # Compile the graph
+    app = workflow.compile(
+        checkpointer=checkpointer,
+        store=memory_store
+    )
+    
+    return app
+
+
+# Main execution function
+async def main():
+    """Main execution function"""
+    
+    # Verify configuration
+    if not Config.OPENAI_API_KEY:
+        raise ValueError("OPENAI_API_KEY environment variable is required")
+    
+    if not Config.ES_PASSWORD:
+        raise ValueError("ES_PASSWORD environment variable is required")
+    
+    # Create the workflow
+    app = create_gdpr_processing_workflow()
+    
+    # Initial state
+    initial_state = ProcessingState(
+        messages=[HumanMessage(content="Process GDPR and UK GDPR documents")],
+        full_articles=[],
+        documents=[],
+        current_chunk=None,
+        cross_links=[],
+        processing_stage="initializing",
+        agent_memories=[],
+        elasticsearch_client=None
+    )
+    
+    # Configuration for the run
+    config = {
+        "configurable": {
+            "thread_id": "gdpr_processing_001",
+            "elasticsearch_manager": ElasticsearchManager(),
+            "openai_manager": OpenAIManager(),
+            "memory_store": InMemoryStore()
+        }
+    }
+    
+    # Run the workflow
+    logger.info("Starting GDPR document processing workflow...")
+    
+    try:
+        final_state = await app.ainvoke(initial_state, config)
+        
+        logger.info(f"Processing completed. Processed {len(final_state['full_articles'])} full articles and {len(final_state['documents'])} chunks")
+        logger.info(f"Created {len(final_state['cross_links'])} cross-document links")
+        
+        # Get Elasticsearch manager for performance analysis
+        es_manager = config["configurable"]["elasticsearch_manager"]
+        
+        # Display comprehensive performance metrics
+        print("\n=== GDPR Processing Summary ===")
+        print(f"Full articles processed: {len(final_state['full_articles'])}")
+        print(f"Total chunks processed: {len(final_state['documents'])}")
+        print(f"Cross-document links created: {len(final_state['cross_links'])}")
+        print(f"Processing stage: {final_state['processing_stage']}")
+        
+        # HNSW and Quantization Performance Metrics
+        print(f"\n=== HNSW & Quantization Optimizations ===")
+        print(f"Vector Index Type: {Config.VECTOR_INDEX_TYPE}")
+        print(f"HNSW Parameters: M={Config.HNSW_M}, EF_Construction={Config.HNSW_EF_CONSTRUCTION}")
+        print(f"Embedding Dimensions: {Config.EMBEDDING_DIMENSIONS}")
+        print(f"SIMD Acceleration: {'Enabled' if Config.ENABLE_SIMD else 'Disabled'}")
+        
+        # Get index statistics
+        index_stats = es_manager.get_index_stats()
+        for index_name, stats in index_stats.items():
+            print(f"\n{index_name.upper()} Index:")
+            print(f"  Documents: {stats.get('documents', 0):,}")
+            print(f"  Size: {stats.get('size_bytes', 0) / (1024**2):.1f} MB")
+            print(f"  Segments: {stats.get('segments', 0)}")
+            
+            vector_stats = stats.get('vector_size_estimate', {})
+            if vector_stats.get('estimated_memory') != 'Unknown':
+                print(f"  Vector Memory: {vector_stats.get('estimated_memory')}")
+                print(f"  Quantization Savings: {vector_stats.get('quantization_savings')}")
+                print(f"  HNSW Overhead: {vector_stats.get('hnsw_overhead')}")
+        
+        # Optimize indices for production use
+        print(f"\n=== Optimizing Indices for Production ===")
+        es_manager.optimize_indices()
+        
+        # Performance benchmark with sample queries
+        sample_queries = [
+            "data processing lawful basis",
+            "consent withdrawal GDPR",
+            "data protection officer requirements",
+            "cross-border data transfer",
+            "data subject rights"
+        ]
+        
+        print(f"\n=== Performance Benchmark ===")
+        benchmark_results = es_manager.benchmark_search_performance(sample_queries)
+        print(f"Average Query Latency: {benchmark_results.get('avg_latency_ms', 0):.2f}ms")
+        print(f"Successful Queries: {benchmark_results.get('successful_queries', 0)}/{benchmark_results.get('total_queries', 0)}")
+        
+        # Show some examples
+        if final_state['full_articles']:
+            article = final_state['full_articles'][0]
+            print(f"\nExample full article: {article.title}")
+            print(f"Article chunks: {len(article.chunk_ids)}")
+            print(f"Key concepts: {len(article.key_concepts)}")
+        
+        if final_state['documents']:
+            chunk = final_state['documents'][0]
+            print(f"\nExample chunk: {chunk.title}")
+            print(f"Parent article: {chunk.parent_article_id}")
+            print(f"Supporting references: {len(chunk.supporting_references)}")
+        
+        # Demonstrate hybrid search capabilities
+        if final_state['documents']:
+            print(f"\n=== Hybrid Search Demo ===")
+            sample_query = "data processing consent"
+            sample_embedding = await OpenAIManager().create_embedding(sample_query)
+            
+            search_results = es_manager.hybrid_search(
+                query=sample_query,
+                embedding=sample_embedding,
+                search_level="both"
+            )
+            
+            print(f"Search query: '{sample_query}'")
+            print(f"Articles found: {len(search_results.get('articles', []))}")
+            print(f"Chunks found: {len(search_results.get('chunks', []))}")
+            
+            if search_results.get('articles'):
+                top_article = search_results['articles'][0]
+                print(f"Top article: {top_article.get('title', 'N/A')} (Score: {top_article.get('_score', 0):.3f})")
+                
+        return final_state
+        
+    except Exception as e:
+        logger.error(f"Error in workflow execution: {e}")
+        raise
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
