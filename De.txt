@@ -375,12 +375,19 @@ class ElasticsearchManager:
             query_body = {
                 "query": {
                     "bool": {
-                        "must": [
-                            {"term": {"domains": domain}}
-                        ]
+                        "must": []
                     }
                 }
             }
+            
+            # Add domain filter if specified
+            if domain:
+                query_body["query"]["bool"]["must"].append(
+                    {"term": {"domains": domain}}
+                )
+            else:
+                # If no domain specified, match all
+                query_body["query"] = {"match_all": {}}
             
             if jurisdiction:
                 query_body["query"]["bool"]["must"].append(
@@ -411,22 +418,26 @@ class ElasticsearchManager:
                 stats[f"{index_type}_count"] = count_response["count"]
             
             # Get jurisdiction distribution
-            jurisdiction_agg = self.client.search(
-                index=self.indices["documents"],
-                body={
-                    "size": 0,
-                    "aggs": {
-                        "jurisdictions": {
-                            "terms": {"field": "jurisdiction"}
+            try:
+                jurisdiction_agg = self.client.search(
+                    index=self.indices["documents"],
+                    body={
+                        "size": 0,
+                        "aggs": {
+                            "jurisdictions": {
+                                "terms": {"field": "jurisdiction"}
+                            }
                         }
                     }
+                )
+                
+                stats["jurisdictions"] = {
+                    bucket["key"]: bucket["doc_count"] 
+                    for bucket in jurisdiction_agg["aggregations"]["jurisdictions"]["buckets"]
                 }
-            )
-            
-            stats["jurisdictions"] = {
-                bucket["key"]: bucket["doc_count"] 
-                for bucket in jurisdiction_agg["aggregations"]["jurisdictions"]["buckets"]
-            }
+            except Exception as e:
+                logger.warning(f"Failed to get jurisdiction statistics: {e}")
+                stats["jurisdictions"] = {}
             
             return stats
             
@@ -509,11 +520,22 @@ class LegalDocumentProcessor:
                 # Set the tiktoken cache directory to our local folder
                 os.environ["TIKTOKEN_CACHE_DIR"] = str(tiktoken_models_path)
                 logger.info(f"Using local tiktoken models from: {tiktoken_models_path}")
+                
+                # Check for available tiktoken models in the local directory
+                available_models = list(tiktoken_models_path.glob("*.tiktoken"))
+                logger.info(f"Found tiktoken models: {[m.name for m in available_models]}")
+                
+                # Use cl100k_base if available (used by GPT-4 and o3-mini)
+                if (tiktoken_models_path / "cl100k_base.tiktoken").exists():
+                    logger.info("Using cl100k_base encoding for o3-mini compatibility")
+                    encoding = tiktoken.get_encoding("cl100k_base")
+                else:
+                    # Fallback to any available encoding
+                    encoding = tiktoken.encoding_for_model("gpt-4")
             else:
                 logger.warning(f"Tiktoken models path not found: {tiktoken_models_path}")
+                encoding = tiktoken.encoding_for_model("gpt-4")
             
-            # Load encoding for GPT-4 (which is compatible with o3-mini)
-            encoding = tiktoken.encoding_for_model("gpt-4")
             logger.info("Successfully loaded tiktoken encoding")
             return encoding
             
@@ -560,13 +582,23 @@ class LegalDocumentProcessor:
         return FallbackTokenizer()
     
     def _setup_namespaces(self):
-        """Setup RDF namespaces for SKOS ontology."""
-        self.LEG = Namespace("http://example.org/legal-ontology#")
-        self.DATA_MGT = Namespace("http://example.org/data-management#")
+        """Setup RDF namespaces for SKOS ontology with mandatory classes."""
+        self.LEG = Namespace("http://legal-ontology.org/legal#")
+        self.DATA_MGT = Namespace("http://legal-ontology.org/data-management#")
+        self.JURISDICTION = Namespace("http://legal-ontology.org/jurisdiction#")
+        self.ORGANIZATION = Namespace("http://legal-ontology.org/organization#")
+        self.COUNTRY = Namespace("http://legal-ontology.org/country#")
+        self.RULE = Namespace("http://legal-ontology.org/rule#")
+        self.DOMAIN = Namespace("http://legal-ontology.org/domain#")
         
         # Bind namespaces
         self.rdf_graph.bind("leg", self.LEG)
         self.rdf_graph.bind("data_mgt", self.DATA_MGT)
+        self.rdf_graph.bind("jurisdiction", self.JURISDICTION)
+        self.rdf_graph.bind("organization", self.ORGANIZATION)
+        self.rdf_graph.bind("country", self.COUNTRY)
+        self.rdf_graph.bind("rule", self.RULE)
+        self.rdf_graph.bind("domain", self.DOMAIN)
         self.rdf_graph.bind("skos", SKOS)
         self.rdf_graph.bind("rdfs", RDFS)
         self.rdf_graph.bind("owl", OWL)
@@ -575,9 +607,9 @@ class LegalDocumentProcessor:
         """Generate embeddings using OpenAI client directly."""
         try:
             response = self.openai_client.embeddings.create(
-                model="text-embedding-3-large",
+                model=OPENAI_EMBEDDING_MODEL,
                 input=texts,
-                dimensions=3072
+                dimensions=OPENAI_EMBEDDING_DIMENSIONS
             )
             return [data.embedding for data in response.data]
         except Exception as e:
@@ -627,18 +659,22 @@ class LegalDocumentProcessor:
         
         return text.strip()
     
-    def chunk_document_semantically(self, text: str, max_tokens: int = 6000, overlap_tokens: int = 200) -> List[Dict[str, Any]]:
+    def chunk_document_semantically(self, text: str, max_tokens: int = None, overlap_tokens: int = None) -> List[Dict[str, Any]]:
         """
         Chunk document using semantic boundaries (sections, articles, paragraphs).
         
         Args:
             text: Full document text
-            max_tokens: Maximum tokens per chunk
-            overlap_tokens: Overlap between chunks for context preservation
+            max_tokens: Maximum tokens per chunk (uses global default if None)
+            overlap_tokens: Overlap between chunks for context preservation (uses global default if None)
             
         Returns:
             List of chunk dictionaries with metadata
         """
+        # Use global configuration if not specified
+        max_tokens = max_tokens or MAX_TOKENS_PER_CHUNK
+        overlap_tokens = overlap_tokens or OVERLAP_TOKENS
+        
         # Parse document with spaCy
         doc = self.nlp(text)
         
@@ -987,7 +1023,7 @@ class LegalDocumentProcessor:
             
             return concepts
         
-        # Create specialized agents (no longer need memory store since we use Elasticsearch)
+        # Create specialized agents
         self.document_analyzer = create_react_agent(
             self.llm,
             tools=[analyze_document_structure] + memory_tools
@@ -1269,60 +1305,273 @@ class LegalDocumentProcessor:
         return results
     
     def _generate_ontology_outputs(self, processing_result: Dict[str, Any]) -> Dict[str, str]:
-        """Generate SKOS ontology in multiple formats."""
+        """Generate SKOS ontology in multiple formats with mandatory jurisdiction/country/organization classes."""
         
         # Clear existing graph
         self.rdf_graph = Graph()
         self._setup_namespaces()
         
-        # Create concept scheme
+        # Create main concept scheme
         scheme_uri = self.LEG["legal_compliance_scheme"]
         self.rdf_graph.add((scheme_uri, RDF.type, SKOS.ConceptScheme))
-        self.rdf_graph.add((scheme_uri, SKOS.prefLabel, Literal("Legal Compliance Ontology")))
-        self.rdf_graph.add((scheme_uri, RDFS.comment, Literal("SKOS ontology for legal compliance rules and data management requirements")))
+        self.rdf_graph.add((scheme_uri, SKOS.prefLabel, Literal("Legal Compliance Ontology", lang="en")))
+        self.rdf_graph.add((scheme_uri, RDFS.comment, Literal("Machine-readable SKOS ontology for legal compliance rules, jurisdictions, organizations, and data management requirements", lang="en")))
+        self.rdf_graph.add((scheme_uri, SKOS.definition, Literal("A comprehensive ontology for legal document processing that enables querying from any starting point including jurisdiction, country, organization, domain, or rule level", lang="en")))
         
-        # Add concepts
-        concepts = processing_result.get("ontology_concepts", [])
-        for concept_data in concepts:
-            concept_uri = self.LEG[concept_data["id"]]
+        # Create mandatory top-level concept classes
+        top_level_concepts = {
+            "jurisdiction_class": {
+                "uri": self.LEG["JurisdictionClass"],
+                "label": "Legal Jurisdiction",
+                "definition": "Top-level class for all legal jurisdictions and regulatory authorities"
+            },
+            "country_class": {
+                "uri": self.LEG["CountryClass"], 
+                "label": "Country",
+                "definition": "Top-level class for all countries and geographical regions"
+            },
+            "organization_class": {
+                "uri": self.LEG["OrganizationClass"],
+                "label": "Organization",
+                "definition": "Top-level class for all organizations, regulatory bodies, and institutions"
+            },
+            "domain_class": {
+                "uri": self.LEG["DomainClass"],
+                "label": "Data Management Domain",
+                "definition": "Top-level class for all data management and compliance domains"
+            },
+            "rule_class": {
+                "uri": self.LEG["RuleClass"],
+                "label": "Legal Rule",
+                "definition": "Top-level class for all legal rules, obligations, permissions, and prohibitions"
+            },
+            "document_class": {
+                "uri": self.LEG["DocumentClass"],
+                "label": "Legal Document",
+                "definition": "Top-level class for all legal documents and legislation"
+            }
+        }
+        
+        # Add top-level concept classes
+        for concept_id, concept_data in top_level_concepts.items():
+            concept_uri = concept_data["uri"]
+            self.rdf_graph.add((concept_uri, RDF.type, SKOS.Concept))
+            self.rdf_graph.add((concept_uri, SKOS.prefLabel, Literal(concept_data["label"], lang="en")))
+            self.rdf_graph.add((concept_uri, SKOS.definition, Literal(concept_data["definition"], lang="en")))
+            self.rdf_graph.add((concept_uri, SKOS.inScheme, scheme_uri))
+            self.rdf_graph.add((concept_uri, SKOS.topConceptOf, scheme_uri))
+            # Add custom properties for machine readability
+            self.rdf_graph.add((concept_uri, self.LEG.conceptLevel, Literal("top_level")))
+            self.rdf_graph.add((concept_uri, self.LEG.queryable, Literal(True)))
+        
+        # Create jurisdiction instances
+        jurisdiction = processing_result.get("jurisdiction", "unknown")
+        organization = processing_result.get("organization", "unknown")
+        
+        jurisdiction_uri = self.JURISDICTION[self._safe_uri_name(jurisdiction)]
+        self.rdf_graph.add((jurisdiction_uri, RDF.type, SKOS.Concept))
+        self.rdf_graph.add((jurisdiction_uri, SKOS.prefLabel, Literal(jurisdiction, lang="en")))
+        self.rdf_graph.add((jurisdiction_uri, SKOS.definition, Literal(f"Legal jurisdiction: {jurisdiction}", lang="en")))
+        self.rdf_graph.add((jurisdiction_uri, SKOS.inScheme, scheme_uri))
+        self.rdf_graph.add((jurisdiction_uri, SKOS.broader, self.LEG["JurisdictionClass"]))
+        self.rdf_graph.add((jurisdiction_uri, self.LEG.conceptLevel, Literal("jurisdiction")))
+        self.rdf_graph.add((jurisdiction_uri, self.LEG.queryable, Literal(True)))
+        
+        # Create organization instance
+        organization_uri = self.ORGANIZATION[self._safe_uri_name(organization)]
+        self.rdf_graph.add((organization_uri, RDF.type, SKOS.Concept))
+        self.rdf_graph.add((organization_uri, SKOS.prefLabel, Literal(organization, lang="en")))
+        self.rdf_graph.add((organization_uri, SKOS.definition, Literal(f"Regulatory organization: {organization}", lang="en")))
+        self.rdf_graph.add((organization_uri, SKOS.inScheme, scheme_uri))
+        self.rdf_graph.add((organization_uri, SKOS.broader, self.LEG["OrganizationClass"]))
+        self.rdf_graph.add((organization_uri, self.LEG.conceptLevel, Literal("organization")))
+        self.rdf_graph.add((organization_uri, self.LEG.queryable, Literal(True)))
+        
+        # Link jurisdiction to organization
+        self.rdf_graph.add((jurisdiction_uri, self.LEG.governedBy, organization_uri))
+        self.rdf_graph.add((organization_uri, self.LEG.governs, jurisdiction_uri))
+        
+        # Create country instance if different from jurisdiction
+        country = processing_result.get("country", jurisdiction)
+        if country != jurisdiction:
+            country_uri = self.COUNTRY[self._safe_uri_name(country)]
+            self.rdf_graph.add((country_uri, RDF.type, SKOS.Concept))
+            self.rdf_graph.add((country_uri, SKOS.prefLabel, Literal(country, lang="en")))
+            self.rdf_graph.add((country_uri, SKOS.definition, Literal(f"Country or region: {country}", lang="en")))
+            self.rdf_graph.add((country_uri, SKOS.inScheme, scheme_uri))
+            self.rdf_graph.add((country_uri, SKOS.broader, self.LEG["CountryClass"]))
+            self.rdf_graph.add((country_uri, self.LEG.conceptLevel, Literal("country")))
+            self.rdf_graph.add((country_uri, self.LEG.queryable, Literal(True)))
+            
+            # Link jurisdiction to country
+            self.rdf_graph.add((jurisdiction_uri, self.LEG.withinCountry, country_uri))
+            self.rdf_graph.add((country_uri, self.LEG.hasJurisdiction, jurisdiction_uri))
+        
+        # Create document instance
+        document_id = processing_result.get("document_id", "unknown")
+        document_uri = self.LEG[self._safe_uri_name(f"document_{document_id}")]
+        self.rdf_graph.add((document_uri, RDF.type, SKOS.Concept))
+        self.rdf_graph.add((document_uri, SKOS.prefLabel, Literal(f"Document: {document_id}", lang="en")))
+        self.rdf_graph.add((document_uri, SKOS.definition, Literal(f"Legal document processed from {document_id}", lang="en")))
+        self.rdf_graph.add((document_uri, SKOS.inScheme, scheme_uri))
+        self.rdf_graph.add((document_uri, SKOS.broader, self.LEG["DocumentClass"]))
+        self.rdf_graph.add((document_uri, self.LEG.conceptLevel, Literal("document")))
+        self.rdf_graph.add((document_uri, self.LEG.queryable, Literal(True)))
+        
+        # Link document to jurisdiction and organization
+        self.rdf_graph.add((document_uri, self.LEG.fromJurisdiction, jurisdiction_uri))
+        self.rdf_graph.add((document_uri, self.LEG.issuedBy, organization_uri))
+        self.rdf_graph.add((jurisdiction_uri, self.LEG.hasDocument, document_uri))
+        self.rdf_graph.add((organization_uri, self.LEG.issues, document_uri))
+        
+        # Create domain concepts with proper hierarchy
+        domains = processing_result.get("domain_classifications", {})
+        domain_uris = {}
+        
+        for domain_name in domains.keys():
+            domain_uri = self.DOMAIN[self._safe_uri_name(domain_name)]
+            domain_uris[domain_name] = domain_uri
+            
+            self.rdf_graph.add((domain_uri, RDF.type, SKOS.Concept))
+            self.rdf_graph.add((domain_uri, SKOS.prefLabel, Literal(domain_name, lang="en")))
+            self.rdf_graph.add((domain_uri, SKOS.definition, Literal(f"Data management domain: {domain_name}", lang="en")))
+            self.rdf_graph.add((domain_uri, SKOS.inScheme, scheme_uri))
+            self.rdf_graph.add((domain_uri, SKOS.broader, self.LEG["DomainClass"]))
+            self.rdf_graph.add((domain_uri, self.LEG.conceptLevel, Literal("domain")))
+            self.rdf_graph.add((domain_uri, self.LEG.queryable, Literal(True)))
+            
+            # Link domain to jurisdiction
+            self.rdf_graph.add((domain_uri, self.LEG.appliesInJurisdiction, jurisdiction_uri))
+            self.rdf_graph.add((jurisdiction_uri, self.LEG.hasApplicableDomain, domain_uri))
+        
+        # Add rule concepts with comprehensive metadata
+        rules = processing_result.get("extracted_rules", [])
+        for i, rule in enumerate(rules):
+            rule_id = f"rule_{document_id}_{i}"
+            rule_uri = self.RULE[self._safe_uri_name(rule_id)]
             
             # Basic concept properties
-            self.rdf_graph.add((concept_uri, RDF.type, SKOS.Concept))
-            self.rdf_graph.add((concept_uri, SKOS.prefLabel, Literal(concept_data.get("prefLabel", ""))))
-            self.rdf_graph.add((concept_uri, SKOS.definition, Literal(concept_data.get("definition", ""))))
-            self.rdf_graph.add((concept_uri, SKOS.inScheme, scheme_uri))
+            self.rdf_graph.add((rule_uri, RDF.type, SKOS.Concept))
             
-            # Hierarchical relationships
-            for broader_id in concept_data.get("broader", []):
-                broader_uri = self.LEG[broader_id]
-                self.rdf_graph.add((concept_uri, SKOS.broader, broader_uri))
+            # Create readable label
+            subject = rule.get("subject", "Unknown")
+            predicate = rule.get("predicate", "action")
+            rule_label = f"{subject} {predicate}"
             
-            for narrower_id in concept_data.get("narrower", []):
-                narrower_uri = self.LEG[narrower_id]
-                self.rdf_graph.add((concept_uri, SKOS.narrower, narrower_uri))
+            self.rdf_graph.add((rule_uri, SKOS.prefLabel, Literal(rule_label, lang="en")))
+            self.rdf_graph.add((rule_uri, SKOS.definition, Literal(self._generate_rule_definition(rule), lang="en")))
+            self.rdf_graph.add((rule_uri, SKOS.inScheme, scheme_uri))
+            self.rdf_graph.add((rule_uri, SKOS.broader, self.LEG["RuleClass"]))
             
-            # Related concepts
-            for related_id in concept_data.get("related", []):
-                related_uri = self.LEG[related_id]
-                self.rdf_graph.add((concept_uri, SKOS.related, related_uri))
+            # Rule-specific properties for machine readability
+            self.rdf_graph.add((rule_uri, self.LEG.conceptLevel, Literal("rule")))
+            self.rdf_graph.add((rule_uri, self.LEG.queryable, Literal(True)))
+            self.rdf_graph.add((rule_uri, self.LEG.ruleId, Literal(rule_id)))
+            self.rdf_graph.add((rule_uri, self.LEG.ruleIndex, Literal(i)))
             
-            # Custom properties for legal rules
-            if concept_data.get("modality"):
-                self.rdf_graph.add((concept_uri, self.LEG.modality, Literal(concept_data["modality"])))
+            # Add detailed rule components
+            if rule.get("subject"):
+                self.rdf_graph.add((rule_uri, self.LEG.subject, Literal(rule["subject"], lang="en")))
+            if rule.get("predicate"):
+                self.rdf_graph.add((rule_uri, self.LEG.predicate, Literal(rule["predicate"], lang="en")))
+            if rule.get("object"):
+                self.rdf_graph.add((rule_uri, self.LEG.object, Literal(rule["object"], lang="en")))
+            if rule.get("modality"):
+                self.rdf_graph.add((rule_uri, self.LEG.modality, Literal(rule["modality"])))
             
-            # Add domain classifications
-            for domain in concept_data.get("domains", []):
-                domain_uri = self.DATA_MGT[domain.lower().replace(" ", "_")]
-                self.rdf_graph.add((concept_uri, self.LEG.appliesToDomain, domain_uri))
+            # Add conditions and exceptions as structured data
+            conditions = rule.get("conditions", [])
+            if conditions:
+                if isinstance(conditions, list):
+                    for condition in conditions:
+                        self.rdf_graph.add((rule_uri, self.LEG.hasCondition, Literal(str(condition), lang="en")))
+                else:
+                    self.rdf_graph.add((rule_uri, self.LEG.hasCondition, Literal(str(conditions), lang="en")))
+            
+            exceptions = rule.get("exceptions", [])
+            if exceptions:
+                if isinstance(exceptions, list):
+                    for exception in exceptions:
+                        self.rdf_graph.add((rule_uri, self.LEG.hasException, Literal(str(exception), lang="en")))
+                else:
+                    self.rdf_graph.add((rule_uri, self.LEG.hasException, Literal(str(exceptions), lang="en")))
+            
+            # Link rule to document, jurisdiction, and organization
+            self.rdf_graph.add((rule_uri, self.LEG.fromDocument, document_uri))
+            self.rdf_graph.add((rule_uri, self.LEG.governedByJurisdiction, jurisdiction_uri))
+            self.rdf_graph.add((rule_uri, self.LEG.enforcedBy, organization_uri))
+            
+            # Reverse links for queryability
+            self.rdf_graph.add((document_uri, self.LEG.containsRule, rule_uri))
+            self.rdf_graph.add((jurisdiction_uri, self.LEG.governsRule, rule_uri))
+            self.rdf_graph.add((organization_uri, self.LEG.enforcesRule, rule_uri))
+            
+            # Link rules to domains
+            for domain_name, rule_indices in domains.items():
+                if i in rule_indices:
+                    domain_uri = domain_uris[domain_name]
+                    self.rdf_graph.add((rule_uri, self.LEG.appliesToDomain, domain_uri))
+                    self.rdf_graph.add((domain_uri, self.LEG.hasApplicableRule, rule_uri))
+            
+            # Add chunk-level metadata for traceability
+            if rule.get("source_chunk") is not None:
+                self.rdf_graph.add((rule_uri, self.LEG.sourceChunk, Literal(rule["source_chunk"])))
+            if rule.get("chunk_section"):
+                self.rdf_graph.add((rule_uri, self.LEG.chunkSection, Literal(rule["chunk_section"], lang="en")))
         
-        # Generate output formats
+        # Add cross-references and related concepts for enhanced queryability
+        self._add_cross_references(jurisdiction_uri, organization_uri, domain_uris, document_uri)
+        
+        # Generate machine-readable output formats
         outputs = {
             "json_ld": self.rdf_graph.serialize(format="json-ld"),
             "turtle": self.rdf_graph.serialize(format="turtle"),
-            "xml": self.rdf_graph.serialize(format="xml")
+            "xml": self.rdf_graph.serialize(format="xml"),
+            "n3": self.rdf_graph.serialize(format="n3"),
+            "nt": self.rdf_graph.serialize(format="nt")
         }
         
         return outputs
+    
+    def _safe_uri_name(self, name: str) -> str:
+        """Convert a name to a safe URI component."""
+        # Replace spaces and special characters with underscores
+        safe_name = re.sub(r'[^\w\-_]', '_', str(name))
+        # Remove multiple underscores
+        safe_name = re.sub(r'_+', '_', safe_name)
+        # Remove leading/trailing underscores
+        safe_name = safe_name.strip('_')
+        return safe_name or "unknown"
+    
+    def _add_cross_references(self, jurisdiction_uri, organization_uri, domain_uris, document_uri):
+        """Add cross-references between concepts for enhanced queryability."""
+        
+        # Add semantic relationships between domains
+        domain_relationships = {
+            "Privacy and Consent": ["Data Usage and Processing", "Data Storage and Retention"],
+            "Security and Protection": ["Data Storage and Retention", "Access and Disclosure"],
+            "Governance and Compliance": ["Audit and Monitoring", "Data Quality and Integrity"],
+            "Data Movement and Transfer": ["Security and Protection", "Privacy and Consent"]
+        }
+        
+        for source_domain, related_domains in domain_relationships.items():
+            if source_domain in domain_uris:
+                source_uri = domain_uris[source_domain]
+                for related_domain in related_domains:
+                    if related_domain in domain_uris:
+                        related_uri = domain_uris[related_domain]
+                        self.rdf_graph.add((source_uri, SKOS.related, related_uri))
+        
+        # Add temporal and hierarchical metadata
+        self.rdf_graph.add((document_uri, self.LEG.processedDate, Literal(datetime.now().isoformat())))
+        self.rdf_graph.add((jurisdiction_uri, self.LEG.lastUpdated, Literal(datetime.now().isoformat())))
+        
+        # Add counts for machine processing
+        rule_count = len([s for s, p, o in self.rdf_graph.triples((None, SKOS.broader, self.LEG["RuleClass"]))])
+        domain_count = len([s for s, p, o in self.rdf_graph.triples((None, SKOS.broader, self.LEG["DomainClass"]))])
+        
+        self.rdf_graph.add((document_uri, self.LEG.ruleCount, Literal(rule_count)))
+        self.rdf_graph.add((jurisdiction_uri, self.LEG.domainCount, Literal(domain_count)))
     
     def _update_knowledge_graph(self, result: Dict[str, Any], chunks: List[Dict[str, Any]] = None):
         """Update the knowledge graph with extracted information including chunks."""
@@ -1468,18 +1717,18 @@ class LegalDocumentProcessor:
             related_rules = []
             for chunk in similar_chunks:
                 # Search for rules from the same document and chunk
-                chunk_rules = self.elasticsearch.search_rules_by_domain(
+                all_rules = self.elasticsearch.search_rules_by_domain(
                     domain="",  # Search all domains
                     jurisdiction=None
                 )
                 # Filter rules that come from this chunk
                 chunk_id = chunk.get("chunk_id")
                 document_chunk_rules = [
-                    rule for rule in chunk_rules 
+                    rule for rule in all_rules 
                     if rule.get("document_id") == chunk.get("document_id") and 
                        rule.get("source_chunk") == chunk_id
                 ]
-                related_rules.extend(chunk_chunk_rules)
+                related_rules.extend(document_chunk_rules)
             
             return {
                 "query": query,
@@ -1491,6 +1740,472 @@ class LegalDocumentProcessor:
         else:
             # Fallback to keyword search in knowledge graph
             return self._keyword_search(query)
+    
+    def query_by_jurisdiction(self, jurisdiction: str, query_type: str = "all") -> Dict[str, Any]:
+        """
+        Query all information related to a specific jurisdiction.
+        
+        Args:
+            jurisdiction: The jurisdiction to query
+            query_type: Type of query ("all", "rules", "domains", "documents")
+            
+        Returns:
+            All information related to the jurisdiction
+        """
+        try:
+            # Search documents by jurisdiction
+            doc_query = {
+                "query": {
+                    "term": {"jurisdiction": jurisdiction}
+                }
+            }
+            
+            doc_response = self.elasticsearch.client.search(
+                index=self.elasticsearch.indices["documents"],
+                body=doc_query,
+                size=100
+            )
+            
+            documents = [hit["_source"] for hit in doc_response["hits"]["hits"]]
+            
+            # Search rules by jurisdiction
+            rules_query = {
+                "query": {
+                    "term": {"jurisdiction": jurisdiction}
+                }
+            }
+            
+            rules_response = self.elasticsearch.client.search(
+                index=self.elasticsearch.indices["rules"],
+                body=rules_query,
+                size=1000
+            )
+            
+            rules = [hit["_source"] for hit in rules_response["hits"]["hits"]]
+            
+            # Get domains from rules
+            domains = set()
+            for rule in rules:
+                rule_domains = rule.get("domains", [])
+                if isinstance(rule_domains, list):
+                    domains.update(rule_domains)
+                elif rule_domains:
+                    domains.add(rule_domains)
+            
+            result = {
+                "jurisdiction": jurisdiction,
+                "query_type": query_type,
+                "documents": documents,
+                "rules": rules,
+                "domains": list(domains),
+                "total_documents": len(documents),
+                "total_rules": len(rules),
+                "total_domains": len(domains),
+                "search_method": "jurisdiction_based"
+            }
+            
+            if query_type == "rules":
+                return {"jurisdiction": jurisdiction, "rules": rules, "count": len(rules)}
+            elif query_type == "domains":
+                return {"jurisdiction": jurisdiction, "domains": list(domains), "count": len(domains)}
+            elif query_type == "documents":
+                return {"jurisdiction": jurisdiction, "documents": documents, "count": len(documents)}
+            else:
+                return result
+                
+        except Exception as e:
+            logger.error(f"Failed to query by jurisdiction: {e}")
+            return {"error": str(e), "jurisdiction": jurisdiction}
+    
+    def query_by_organization(self, organization: str, query_type: str = "all") -> Dict[str, Any]:
+        """
+        Query all information related to a specific organization.
+        
+        Args:
+            organization: The organization to query
+            query_type: Type of query ("all", "rules", "domains", "documents", "jurisdictions")
+            
+        Returns:
+            All information related to the organization
+        """
+        try:
+            # Search documents by organization
+            doc_query = {
+                "query": {
+                    "term": {"organization": organization}
+                }
+            }
+            
+            doc_response = self.elasticsearch.client.search(
+                index=self.elasticsearch.indices["documents"],
+                body=doc_query,
+                size=100
+            )
+            
+            documents = [hit["_source"] for hit in doc_response["hits"]["hits"]]
+            
+            # Get jurisdictions from documents
+            jurisdictions = set()
+            for doc in documents:
+                if doc.get("jurisdiction"):
+                    jurisdictions.add(doc["jurisdiction"])
+            
+            # Search rules by organization (through documents)
+            document_ids = [doc["document_id"] for doc in documents]
+            rules = []
+            
+            if document_ids:
+                rules_query = {
+                    "query": {
+                        "terms": {"document_id": document_ids}
+                    }
+                }
+                
+                rules_response = self.elasticsearch.client.search(
+                    index=self.elasticsearch.indices["rules"],
+                    body=rules_query,
+                    size=1000
+                )
+                
+                rules = [hit["_source"] for hit in rules_response["hits"]["hits"]]
+            
+            # Get domains from rules
+            domains = set()
+            for rule in rules:
+                rule_domains = rule.get("domains", [])
+                if isinstance(rule_domains, list):
+                    domains.update(rule_domains)
+                elif rule_domains:
+                    domains.add(rule_domains)
+            
+            result = {
+                "organization": organization,
+                "query_type": query_type,
+                "documents": documents,
+                "rules": rules,
+                "domains": list(domains),
+                "jurisdictions": list(jurisdictions),
+                "total_documents": len(documents),
+                "total_rules": len(rules),
+                "total_domains": len(domains),
+                "total_jurisdictions": len(jurisdictions),
+                "search_method": "organization_based"
+            }
+            
+            if query_type == "rules":
+                return {"organization": organization, "rules": rules, "count": len(rules)}
+            elif query_type == "domains":
+                return {"organization": organization, "domains": list(domains), "count": len(domains)}
+            elif query_type == "documents":
+                return {"organization": organization, "documents": documents, "count": len(documents)}
+            elif query_type == "jurisdictions":
+                return {"organization": organization, "jurisdictions": list(jurisdictions), "count": len(jurisdictions)}
+            else:
+                return result
+                
+        except Exception as e:
+            logger.error(f"Failed to query by organization: {e}")
+            return {"error": str(e), "organization": organization}
+    
+    def query_by_country(self, country: str, query_type: str = "all") -> Dict[str, Any]:
+        """
+        Query all information related to a specific country.
+        
+        Args:
+            country: The country to query
+            query_type: Type of query ("all", "rules", "domains", "documents", "jurisdictions", "organizations")
+            
+        Returns:
+            All information related to the country
+        """
+        try:
+            # Search documents by country
+            doc_query = {
+                "query": {
+                    "term": {"country": country}
+                }
+            }
+            
+            doc_response = self.elasticsearch.client.search(
+                index=self.elasticsearch.indices["documents"],
+                body=doc_query,
+                size=100
+            )
+            
+            documents = [hit["_source"] for hit in doc_response["hits"]["hits"]]
+            
+            # Get jurisdictions and organizations from documents
+            jurisdictions = set()
+            organizations = set()
+            for doc in documents:
+                if doc.get("jurisdiction"):
+                    jurisdictions.add(doc["jurisdiction"])
+                if doc.get("organization"):
+                    organizations.add(doc["organization"])
+            
+            # Get rules through documents
+            document_ids = [doc["document_id"] for doc in documents]
+            rules = []
+            
+            if document_ids:
+                rules_query = {
+                    "query": {
+                        "terms": {"document_id": document_ids}
+                    }
+                }
+                
+                rules_response = self.elasticsearch.client.search(
+                    index=self.elasticsearch.indices["rules"],
+                    body=rules_query,
+                    size=1000
+                )
+                
+                rules = [hit["_source"] for hit in rules_response["hits"]["hits"]]
+            
+            # Get domains from rules
+            domains = set()
+            for rule in rules:
+                rule_domains = rule.get("domains", [])
+                if isinstance(rule_domains, list):
+                    domains.update(rule_domains)
+                elif rule_domains:
+                    domains.add(rule_domains)
+            
+            result = {
+                "country": country,
+                "query_type": query_type,
+                "documents": documents,
+                "rules": rules,
+                "domains": list(domains),
+                "jurisdictions": list(jurisdictions),
+                "organizations": list(organizations),
+                "total_documents": len(documents),
+                "total_rules": len(rules),
+                "total_domains": len(domains),
+                "total_jurisdictions": len(jurisdictions),
+                "total_organizations": len(organizations),
+                "search_method": "country_based"
+            }
+            
+            if query_type == "rules":
+                return {"country": country, "rules": rules, "count": len(rules)}
+            elif query_type == "domains":
+                return {"country": country, "domains": list(domains), "count": len(domains)}
+            elif query_type == "documents":
+                return {"country": country, "documents": documents, "count": len(documents)}
+            elif query_type == "jurisdictions":
+                return {"country": country, "jurisdictions": list(jurisdictions), "count": len(jurisdictions)}
+            elif query_type == "organizations":
+                return {"country": country, "organizations": list(organizations), "count": len(organizations)}
+            else:
+                return result
+                
+        except Exception as e:
+            logger.error(f"Failed to query by country: {e}")
+            return {"error": str(e), "country": country}
+    
+    def query_by_rule_id(self, rule_id: str) -> Dict[str, Any]:
+        """
+        Query detailed information about a specific rule.
+        
+        Args:
+            rule_id: The rule ID to query
+            
+        Returns:
+            Detailed information about the rule and its relationships
+        """
+        try:
+            # Search for the specific rule
+            rule_query = {
+                "query": {
+                    "term": {"rule_id": rule_id}
+                }
+            }
+            
+            rule_response = self.elasticsearch.client.search(
+                index=self.elasticsearch.indices["rules"],
+                body=rule_query,
+                size=1
+            )
+            
+            if not rule_response["hits"]["hits"]:
+                return {"error": "Rule not found", "rule_id": rule_id}
+            
+            rule = rule_response["hits"]["hits"][0]["_source"]
+            
+            # Get related document
+            document_id = rule.get("document_id")
+            document = None
+            if document_id:
+                doc_response = self.elasticsearch.client.get(
+                    index=self.elasticsearch.indices["documents"],
+                    id=document_id
+                )
+                document = doc_response["_source"] if doc_response.get("found") else None
+            
+            # Get related chunk if available
+            chunk = None
+            source_chunk = rule.get("source_chunk")
+            if document_id and source_chunk is not None:
+                chunk_query = {
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {"term": {"document_id": document_id}},
+                                {"term": {"chunk_id": source_chunk}}
+                            ]
+                        }
+                    }
+                }
+                
+                chunk_response = self.elasticsearch.client.search(
+                    index=self.elasticsearch.indices["chunks"],
+                    body=chunk_query,
+                    size=1
+                )
+                
+                if chunk_response["hits"]["hits"]:
+                    chunk = chunk_response["hits"]["hits"][0]["_source"]
+            
+            # Get related rules in the same domain
+            related_rules = []
+            rule_domains = rule.get("domains", [])
+            if rule_domains:
+                if not isinstance(rule_domains, list):
+                    rule_domains = [rule_domains]
+                
+                for domain in rule_domains:
+                    domain_rules = self.elasticsearch.search_rules_by_domain(
+                        domain=domain,
+                        jurisdiction=rule.get("jurisdiction")
+                    )
+                    # Filter out the current rule
+                    domain_rules = [r for r in domain_rules if r.get("rule_id") != rule_id]
+                    related_rules.extend(domain_rules[:5])  # Limit to 5 per domain
+            
+            return {
+                "rule_id": rule_id,
+                "rule": rule,
+                "document": document,
+                "chunk": chunk,
+                "related_rules": related_rules[:10],  # Limit total related rules
+                "search_method": "rule_based"
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to query by rule ID: {e}")
+            return {"error": str(e), "rule_id": rule_id}
+    
+    def query_ontology_sparql(self, sparql_query: str) -> Dict[str, Any]:
+        """
+        Execute SPARQL queries on the generated ontology.
+        
+        Args:
+            sparql_query: SPARQL query string
+            
+        Returns:
+            Query results
+        """
+        try:
+            if not self.rdf_graph:
+                return {"error": "No ontology loaded. Process documents first."}
+            
+            results = self.rdf_graph.query(sparql_query)
+            
+            # Convert results to a more usable format
+            formatted_results = []
+            for row in results:
+                result_row = {}
+                for var_name in results.vars:
+                    value = row[var_name]
+                    if value:
+                        result_row[str(var_name)] = str(value)
+                formatted_results.append(result_row)
+            
+            return {
+                "sparql_query": sparql_query,
+                "results": formatted_results,
+                "total_results": len(formatted_results),
+                "search_method": "sparql"
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to execute SPARQL query: {e}")
+            return {"error": str(e), "sparql_query": sparql_query}
+    
+    def get_ontology_hierarchy(self, start_point: str = "top") -> Dict[str, Any]:
+        """
+        Get the hierarchical structure of the ontology for navigation.
+        
+        Args:
+            start_point: Starting point ("top", "jurisdiction", "organization", "country", "domain", "rule")
+            
+        Returns:
+            Hierarchical structure of the ontology
+        """
+        try:
+            if not self.rdf_graph:
+                return {"error": "No ontology loaded. Process documents first."}
+            
+            hierarchy = {}
+            
+            if start_point == "top":
+                # Get all top-level concepts
+                sparql_query = """
+                PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+                PREFIX leg: <http://legal-ontology.org/legal#>
+                
+                SELECT ?concept ?label ?definition WHERE {
+                    ?concept skos:topConceptOf ?scheme .
+                    ?concept skos:prefLabel ?label .
+                    OPTIONAL { ?concept skos:definition ?definition }
+                }
+                """
+                
+                results = self.rdf_graph.query(sparql_query)
+                hierarchy["top_concepts"] = [
+                    {
+                        "uri": str(row.concept),
+                        "label": str(row.label),
+                        "definition": str(row.definition) if row.definition else ""
+                    }
+                    for row in results
+                ]
+            
+            elif start_point == "jurisdiction":
+                # Get all jurisdictions
+                sparql_query = """
+                PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+                PREFIX leg: <http://legal-ontology.org/legal#>
+                
+                SELECT ?jurisdiction ?label ?definition WHERE {
+                    ?jurisdiction skos:broader leg:JurisdictionClass .
+                    ?jurisdiction skos:prefLabel ?label .
+                    OPTIONAL { ?jurisdiction skos:definition ?definition }
+                }
+                """
+                
+                results = self.rdf_graph.query(sparql_query)
+                hierarchy["jurisdictions"] = [
+                    {
+                        "uri": str(row.jurisdiction),
+                        "label": str(row.label),
+                        "definition": str(row.definition) if row.definition else ""
+                    }
+                    for row in results
+                ]
+            
+            # Add more hierarchy types as needed
+            
+            return {
+                "start_point": start_point,
+                "hierarchy": hierarchy,
+                "search_method": "ontology_hierarchy"
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to get ontology hierarchy: {e}")
+            return {"error": str(e), "start_point": start_point}
     
     def search_by_domain(self, domain: str, jurisdiction: str = None) -> Dict[str, Any]:
         """
@@ -1725,9 +2440,9 @@ if __name__ == "__main__":
         # Export ontology
         processor.export_ontology()
         
-        # Example queries using Elasticsearch
+        # Example queries using Elasticsearch and new query methods
         if successful_docs:
-            print(f"\n🔍 EXAMPLE QUERIES:")
+            print(f"\n🔍 EXAMPLE QUERIES - Starting from Any Point:")
             
             # Semantic search example
             semantic_result = processor.semantic_search("data storage requirements", top_k=3)
@@ -1737,9 +2452,66 @@ if __name__ == "__main__":
             domain_result = processor.search_by_domain("Data Storage and Retention")
             print(f"Domain search for 'Data Storage and Retention': {domain_result['count']} rules")
             
+            # Jurisdiction-based queries
+            first_doc = successful_docs[0]
+            jurisdiction = first_doc.get("jurisdiction", "EU")
+            
+            jurisdiction_result = processor.query_by_jurisdiction(jurisdiction, "all")
+            print(f"Jurisdiction query for '{jurisdiction}': {jurisdiction_result.get('total_rules', 0)} rules, {jurisdiction_result.get('total_documents', 0)} documents")
+            
+            # Organization-based queries
+            organization = first_doc.get("organization", "European_Union")
+            org_result = processor.query_by_organization(organization, "all")
+            print(f"Organization query for '{organization}': {org_result.get('total_rules', 0)} rules across {org_result.get('total_jurisdictions', 0)} jurisdictions")
+            
+            # Country-based queries
+            country = first_doc.get("country", "European Union")
+            country_result = processor.query_by_country(country, "all")
+            print(f"Country query for '{country}': {country_result.get('total_rules', 0)} rules from {country_result.get('total_organizations', 0)} organizations")
+            
+            # Rule-specific query
+            if jurisdiction_result.get("rules"):
+                sample_rule = jurisdiction_result["rules"][0]
+                rule_id = sample_rule.get("rule_id")
+                if rule_id:
+                    rule_result = processor.query_by_rule_id(rule_id)
+                    print(f"Rule query for '{rule_id}': Found rule with {len(rule_result.get('related_rules', []))} related rules")
+            
+            # Ontology hierarchy
+            hierarchy_result = processor.get_ontology_hierarchy("top")
+            if "hierarchy" in hierarchy_result:
+                top_concepts = len(hierarchy_result["hierarchy"].get("top_concepts", []))
+                print(f"Ontology hierarchy: {top_concepts} top-level concepts available for navigation")
+            
+            # SPARQL query example
+            sparql_query = """
+            PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+            PREFIX leg: <http://legal-ontology.org/legal#>
+            
+            SELECT ?jurisdiction ?ruleCount WHERE {
+                ?jurisdiction skos:broader leg:JurisdictionClass .
+                ?jurisdiction leg:domainCount ?ruleCount .
+            }
+            LIMIT 5
+            """
+            
+            sparql_result = processor.query_ontology_sparql(sparql_query)
+            if "results" in sparql_result:
+                print(f"SPARQL query: Found {sparql_result.get('total_results', 0)} jurisdiction-rule mappings")
+            
             # Knowledge graph query example
             kg_result = processor.query_knowledge_graph("privacy consent requirements")
             print(f"Knowledge graph query: {len(kg_result.get('similar_chunks', []))} relevant chunks")
+            
+            print(f"\n📋 QUERY ENTRY POINTS AVAILABLE:")
+            print(f"   🏛️  Jurisdiction: query_by_jurisdiction(jurisdiction)")
+            print(f"   🏢 Organization: query_by_organization(organization)")
+            print(f"   🌍 Country: query_by_country(country)")
+            print(f"   📊 Domain: search_by_domain(domain)")
+            print(f"   📄 Rule: query_by_rule_id(rule_id)")
+            print(f"   🔍 Semantic: semantic_search(query)")
+            print(f"   🕸️  SPARQL: query_ontology_sparql(sparql)")
+            print(f"   🌳 Hierarchy: get_ontology_hierarchy(start_point)")
         
         # Show Elasticsearch statistics
         try:
