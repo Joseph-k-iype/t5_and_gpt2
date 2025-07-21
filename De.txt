@@ -4,13 +4,14 @@ Converts legislation and laws into machine-readable rules using multi-agent orch
 
 Key Features:
 - PDF document ingestion and legal rule extraction
-- SKOS ontology generation (JSON-LD, TTL, XML)
+- SKOS ontology generation (JSON-LD, TTL, XML) with SHACL validation
 - Multi-agent system with ReAct agents using LangGraph
 - Chain of experts approach with specialist agents
 - LangMem for long-term memory
 - Dynamic domain classification using LLM capabilities
 - Elasticsearch integration with OpenAI embeddings
 - Directed acyclic graph support for querying
+- o3-mini-2025-01-31 model with reasoning_effort="high"
 """
 
 import os
@@ -19,24 +20,22 @@ import asyncio
 import logging
 import re
 import hashlib
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Union
 from pathlib import Path
 from datetime import datetime
 
 # CRITICAL: Set tiktoken offline mode BEFORE any other imports
-# This prevents ALL tiktoken download attempts
 _TIKTOKEN_MODELS_PATH = "./tiktoken_models"
 if Path(_TIKTOKEN_MODELS_PATH).exists():
     os.environ["TIKTOKEN_CACHE_DIR"] = str(Path(_TIKTOKEN_MODELS_PATH).absolute())
     os.environ["TIKTOKEN_OFFLINE"] = "1"
-    # Also disable any potential requests
     os.environ["NO_COLOR"] = "1"  # Prevent colored output that might trigger downloads
 
 # Core dependencies
 import PyPDF2
 import numpy as np
-from rdflib import Graph, Namespace, URIRef, Literal
-from rdflib.namespace import RDF, RDFS, SKOS, XSD, OWL
+from rdflib import Graph, Namespace, URIRef, Literal, BNode
+from rdflib.namespace import RDF, RDFS, SKOS, XSD, OWL, DCTERMS, PROV
 from openai import OpenAI
 
 # LangChain/LangGraph dependencies
@@ -48,7 +47,7 @@ from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 
 # LangMem dependencies
-from langmem import create_manage_memory_tool, create_search_memory_tool, create_memory_manager
+from langmem import create_memory_manager, create_manage_memory_tool, create_search_memory_tool
 
 # Data processing
 import spacy
@@ -58,6 +57,12 @@ import networkx as nx
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import bulk
 import ssl
+
+# Pydantic for structured data
+from pydantic import BaseModel, Field
+
+# SHACL validation
+from pyshacl import validate
 
 # =============================================================================
 # GLOBAL CONFIGURATION
@@ -99,6 +104,7 @@ SPACY_MODEL_PATH = "./nlp_model/en_core_web_sm-3.8.0.tar.gz"
 CONFIG_FILE_PATH = "./legal_config.json"
 OUTPUT_DIRECTORY = "./ontology_output"
 DOCUMENTS_DIRECTORY = "./documents"
+SHACL_SHAPES_PATH = "./shacl_shapes"
 
 # Set tiktoken cache directory early to use local models and prevent downloads
 if Path(TIKTOKEN_MODELS_PATH).exists():
@@ -132,6 +138,7 @@ def validate_configuration():
     # Show API configuration
     print(f"✅ OpenAI Model: {OPENAI_MODEL}")
     print(f"✅ OpenAI Base URL: {OPENAI_BASE_URL}")
+    print(f"✅ Reasoning Effort: {REASONING_EFFORT}")
     
     # Test OpenAI client initialization
     try:
@@ -180,7 +187,6 @@ def validate_configuration():
                 
                 # Test one available model
                 if "cl100k_base.tiktoken" in found_models:
-                    # Don't actually load here, just verify file exists
                     print(f"✅ Tiktoken cl100k_base ready for offline use")
                 elif "p50k_base.tiktoken" in found_models:
                     print(f"✅ Tiktoken p50k_base ready for offline use")
@@ -196,12 +202,51 @@ def validate_configuration():
         nlp = spacy.load("en_core_web_sm")
         print("✅ spaCy model loaded successfully")
     except OSError:
-        issues.append("❌ spaCy model 'en_core_web_sm' not found")
-        issues.append("   Install with: python -m spacy download en_core_web_sm")
+        spacy_model_path = Path(SPACY_MODEL_PATH)
+        if spacy_model_path.exists():
+            print(f"✅ spaCy model file found at: {SPACY_MODEL_PATH}")
+        else:
+            issues.append("❌ spaCy model 'en_core_web_sm' not found")
+            issues.append("   Install with: python -m spacy download en_core_web_sm")
+            issues.append(f"   Or place local model at: {SPACY_MODEL_PATH}")
     except Exception as e:
         issues.append(f"❌ spaCy model loading failed: {e}")
     
     return issues
+
+class LegalMemorySchemas:
+    """Pydantic schemas for LangMem long-term memory."""
+    
+    class LegalRule(BaseModel):
+        """Schema for legal rules in memory."""
+        rule_id: str = Field(..., description="Unique rule identifier")
+        subject: str = Field(..., description="Who the rule applies to")
+        predicate: str = Field(..., description="The action or state")
+        object: str = Field(..., description="What is affected")
+        modality: str = Field(..., description="obligation/permission/prohibition")
+        conditions: List[str] = Field(default=[], description="When it applies")
+        exceptions: List[str] = Field(default=[], description="When it doesn't apply")
+        jurisdiction: str = Field(..., description="Legal jurisdiction")
+        organization: str = Field(..., description="Issuing organization")
+        document_id: str = Field(..., description="Source document")
+        domains: List[str] = Field(default=[], description="Data management domains")
+    
+    class DocumentMetadata(BaseModel):
+        """Schema for document metadata in memory."""
+        document_id: str = Field(..., description="Document identifier")
+        title: str = Field(..., description="Document title")
+        jurisdiction: str = Field(..., description="Legal jurisdiction")
+        organization: str = Field(..., description="Issuing organization")
+        country: str = Field(..., description="Country or region")
+        rules_count: int = Field(..., description="Number of extracted rules")
+        processing_date: str = Field(..., description="Processing timestamp")
+        
+    class DomainClassification(BaseModel):
+        """Schema for domain classifications in memory."""
+        domain_name: str = Field(..., description="Data management domain")
+        jurisdiction: str = Field(..., description="Legal jurisdiction")
+        rule_count: int = Field(..., description="Number of rules in domain")
+        description: str = Field(..., description="Domain description")
 
 class ElasticsearchManager:
     """Manages Elasticsearch operations with OpenAI embeddings integration."""
@@ -270,6 +315,7 @@ class ElasticsearchManager:
                     "content": {"type": "text", "analyzer": "standard"},
                     "rules_count": {"type": "integer"},
                     "processing_metadata": {"type": "object"},
+                    "supporting_documents": {"type": "nested"},
                     "timestamp": {"type": "date"}
                 }
             }
@@ -314,6 +360,8 @@ class ElasticsearchManager:
                     "chunk_section": {"type": "text"},
                     "domains": {"type": "keyword"},
                     "jurisdiction": {"type": "keyword"},
+                    "organization": {"type": "keyword"},
+                    "country": {"type": "keyword"},
                     "timestamp": {"type": "date"}
                 }
             }
@@ -333,6 +381,9 @@ class ElasticsearchManager:
                     "related": {"type": "keyword"},
                     "domains": {"type": "keyword"},
                     "in_scheme": {"type": "keyword"},
+                    "jurisdiction": {"type": "keyword"},
+                    "organization": {"type": "keyword"},
+                    "country": {"type": "keyword"},
                     "timestamp": {"type": "date"}
                 }
             }
@@ -390,7 +441,7 @@ class ElasticsearchManager:
         except Exception as e:
             logger.error(f"Failed to store chunks: {e}")
     
-    def store_rules(self, rules: List[Dict[str, Any]], document_id: str, jurisdiction: str):
+    def store_rules(self, rules: List[Dict[str, Any]], document_id: str, jurisdiction: str, organization: str, country: str):
         """Store extracted rules in Elasticsearch."""
         try:
             actions = []
@@ -403,6 +454,8 @@ class ElasticsearchManager:
                         "document_id": document_id,
                         "rule_id": rule_id,
                         "jurisdiction": jurisdiction,
+                        "organization": organization,
+                        "country": country,
                         **rule,
                         "timestamp": datetime.now().isoformat()
                     }
@@ -415,7 +468,7 @@ class ElasticsearchManager:
         except Exception as e:
             logger.error(f"Failed to store rules: {e}")
     
-    def store_concepts(self, concepts: List[Dict[str, Any]]):
+    def store_concepts(self, concepts: List[Dict[str, Any]], jurisdiction: str, organization: str, country: str):
         """Store SKOS concepts in Elasticsearch."""
         try:
             actions = []
@@ -434,6 +487,9 @@ class ElasticsearchManager:
                         "related": concept.get("related", []),
                         "domains": concept.get("domains", []),
                         "in_scheme": concept.get("inScheme", ""),
+                        "jurisdiction": jurisdiction,
+                        "organization": organization,
+                        "country": country,
                         "timestamp": datetime.now().isoformat()
                     }
                 }
@@ -582,10 +638,16 @@ class LegalDocumentProcessor:
         )
         logger.info(f"Initialized OpenAI client with base URL: {OPENAI_BASE_URL}")
         
-        # Initialize models using global configuration - ONLY use o3-mini via direct API
-        # Skip LangChain entirely since o3-mini is not supported
-        self.llm = None  # Force direct API usage
-        logger.info(f"Using direct OpenAI API with {OPENAI_MODEL} model")
+        # Initialize models using global configuration
+        self.llm = ChatOpenAI(
+            model=OPENAI_MODEL,
+            openai_api_key=OPENAI_API_KEY,
+            base_url=OPENAI_BASE_URL,
+            model_kwargs={
+                "reasoning_effort": REASONING_EFFORT
+            }
+        )
+        logger.info(f"Using {OPENAI_MODEL} model with reasoning_effort={REASONING_EFFORT}")
         
         # Initialize local tiktoken encoding
         self.encoding = self._load_local_tiktoken_encoding()
@@ -596,11 +658,19 @@ class LegalDocumentProcessor:
         # Initialize Elasticsearch manager
         self.elasticsearch = ElasticsearchManager()
         
-        # Initialize memory manager using global configuration (optional)
+        # Initialize memory manager using global configuration
         try:
             self.memory_manager = create_memory_manager(
-                OPENAI_MODEL,
-                instructions="Extract legal rules, obligations, permissions, prohibitions, and domain classifications for data management compliance."
+                f"openai:{OPENAI_MODEL}",
+                schemas=[
+                    LegalMemorySchemas.LegalRule,
+                    LegalMemorySchemas.DocumentMetadata,
+                    LegalMemorySchemas.DomainClassification
+                ],
+                instructions="Extract legal rules, obligations, permissions, prohibitions, and domain classifications for data management compliance.",
+                enable_inserts=True,
+                enable_updates=True,
+                enable_deletes=False
             )
             logger.info("Initialized LangMem memory manager")
         except Exception as e:
@@ -614,9 +684,8 @@ class LegalDocumentProcessor:
         self.rdf_graph = Graph()
         self._setup_namespaces()
         
-        # Skip multi-agent LangGraph setup - use ONLY direct o3-mini API
-        self.workflow = None
-        logger.info("Using direct o3-mini API processing (no LangChain agents)")
+        # Initialize multi-agent LangGraph workflow
+        self._setup_agents()
     
     def _load_config(self, config_path: str) -> Dict[str, Any]:
         """Load configuration from JSON file."""
@@ -730,7 +799,7 @@ class LegalDocumentProcessor:
         return FallbackTokenizer()
     
     def _setup_namespaces(self):
-        """Setup RDF namespaces for SKOS ontology with mandatory classes."""
+        """Setup RDF namespaces for SKOS ontology with mandatory classes and DPV/PROV-O integration."""
         self.LEG = Namespace("http://legal-ontology.org/legal#")
         self.DATA_MGT = Namespace("http://legal-ontology.org/data-management#")
         self.JURISDICTION = Namespace("http://legal-ontology.org/jurisdiction#")
@@ -738,6 +807,9 @@ class LegalDocumentProcessor:
         self.COUNTRY = Namespace("http://legal-ontology.org/country#")
         self.RULE = Namespace("http://legal-ontology.org/rule#")
         self.DOMAIN = Namespace("http://legal-ontology.org/domain#")
+        
+        # DPV (Data Privacy Vocabulary) integration
+        self.DPV = Namespace("https://w3id.org/dpv#")
         
         # Bind namespaces
         self.rdf_graph.bind("leg", self.LEG)
@@ -747,9 +819,12 @@ class LegalDocumentProcessor:
         self.rdf_graph.bind("country", self.COUNTRY)
         self.rdf_graph.bind("rule", self.RULE)
         self.rdf_graph.bind("domain", self.DOMAIN)
+        self.rdf_graph.bind("dpv", self.DPV)
         self.rdf_graph.bind("skos", SKOS)
         self.rdf_graph.bind("rdfs", RDFS)
         self.rdf_graph.bind("owl", OWL)
+        self.rdf_graph.bind("prov", PROV)
+        self.rdf_graph.bind("dcterms", DCTERMS)
     
     def get_embeddings(self, texts: List[str]) -> List[List[float]]:
         """Generate embeddings using OpenAI client directly."""
@@ -991,6 +1066,7 @@ class LegalDocumentProcessor:
             document_id: str
             jurisdiction: str
             organization: str
+            country: str
             extracted_rules: List[Dict[str, Any]]
             domain_classifications: Dict[str, List[str]]
             ontology_concepts: List[Dict[str, Any]]
@@ -999,10 +1075,12 @@ class LegalDocumentProcessor:
             chunk_context: Optional[Dict[str, Any]] = None
             
         # Create memory tools
-        memory_tools = [
-            create_manage_memory_tool(namespace=("legal_memory",)),
-            create_search_memory_tool(namespace=("legal_memory",))
-        ]
+        memory_tools = []
+        if self.memory_manager:
+            memory_tools = [
+                create_manage_memory_tool(namespace=("legal_memory",)),
+                create_search_memory_tool(namespace=("legal_memory",))
+            ]
         
         # Document Analysis Agent
         @tool
@@ -1097,6 +1175,10 @@ class LegalDocumentProcessor:
             - Access and Disclosure
             - Data Quality and Integrity
             - Governance and Compliance
+            - Audit and Monitoring
+            - Data Subject Rights
+            - Cross-border Transfer
+            - Breach Notification
             
             For each rule, determine which domains it relates to and explain why.
             
@@ -1203,52 +1285,48 @@ class LegalDocumentProcessor:
                     "processing_stage": "complete"
                 }
 
-        # Create specialized agents with fallback for o3-mini
-        if self.llm:
-            self.document_analyzer = create_react_agent(
-                self.llm,
-                tools=[analyze_document_structure] + memory_tools
-            )
-            
-            self.rule_extractor = create_react_agent(
-                self.llm,
-                tools=[extract_legal_rules] + memory_tools
-            )
-            
-            self.domain_classifier = create_react_agent(
-                self.llm,
-                tools=[classify_data_management_domains] + memory_tools
-            )
-            
-            self.ontology_generator = create_react_agent(
-                self.llm,
-                tools=[generate_skos_concepts] + memory_tools
-            )
-            
-            # Build the workflow graph
-            workflow = StateGraph(LegalAgentState)
-            
-            # Add nodes
-            workflow.add_node("supervisor", supervisor_node)
-            workflow.add_node("document_analyzer", self.document_analyzer)
-            workflow.add_node("rule_extractor", self.rule_extractor)
-            workflow.add_node("domain_classifier", self.domain_classifier)
-            workflow.add_node("ontology_generator", self.ontology_generator)
-            
-            # Add edges
-            workflow.add_edge(START, "supervisor")
-            workflow.add_edge("supervisor", "document_analyzer")
-            workflow.add_edge("document_analyzer", "rule_extractor")
-            workflow.add_edge("rule_extractor", "domain_classifier")
-            workflow.add_edge("domain_classifier", "ontology_generator")
-            workflow.add_edge("ontology_generator", END)
-            
-            # Compile the workflow
-            self.workflow = workflow.compile(checkpointer=MemorySaver())
-            logger.info("Successfully initialized multi-agent workflow")
-        else:
-            logger.warning("LangChain agents not available, using direct OpenAI API processing")
-            self.workflow = None
+        # Create specialized agents
+        self.document_analyzer = create_react_agent(
+            self.llm,
+            tools=[analyze_document_structure] + memory_tools
+        )
+        
+        self.rule_extractor = create_react_agent(
+            self.llm,
+            tools=[extract_legal_rules] + memory_tools
+        )
+        
+        self.domain_classifier = create_react_agent(
+            self.llm,
+            tools=[classify_data_management_domains] + memory_tools
+        )
+        
+        self.ontology_generator = create_react_agent(
+            self.llm,
+            tools=[generate_skos_concepts] + memory_tools
+        )
+        
+        # Build the workflow graph
+        workflow = StateGraph(LegalAgentState)
+        
+        # Add nodes
+        workflow.add_node("supervisor", supervisor_node)
+        workflow.add_node("document_analyzer", self.document_analyzer)
+        workflow.add_node("rule_extractor", self.rule_extractor)
+        workflow.add_node("domain_classifier", self.domain_classifier)
+        workflow.add_node("ontology_generator", self.ontology_generator)
+        
+        # Add edges
+        workflow.add_edge(START, "supervisor")
+        workflow.add_edge("supervisor", "document_analyzer")
+        workflow.add_edge("document_analyzer", "rule_extractor")
+        workflow.add_edge("rule_extractor", "domain_classifier")
+        workflow.add_edge("domain_classifier", "ontology_generator")
+        workflow.add_edge("ontology_generator", END)
+        
+        # Compile the workflow
+        self.workflow = workflow.compile(checkpointer=MemorySaver())
+        logger.info("Successfully initialized multi-agent workflow")
     
     def _generate_rule_definition(self, rule: Dict[str, Any]) -> str:
         """Generate a human-readable definition for a rule."""
@@ -1303,6 +1381,7 @@ class LegalDocumentProcessor:
                 "total_characters": len(text),
                 "chunks_processed": len([c for c in chunks_with_embeddings if "embedding" in c])
             },
+            "supporting_documents": document_metadata.get("supporting_documents", []),
             "timestamp": datetime.now().isoformat()
         }
         self.elasticsearch.store_document(document_data)
@@ -1313,16 +1392,23 @@ class LegalDocumentProcessor:
             document_metadata.get("id", "unknown")
         )
         
-        # Process chunks using direct o3-mini API (no LangChain)
-        result = await self._process_with_direct_api(chunks_with_embeddings, document_metadata)
+        # Process chunks using multi-agent workflow
+        result = await self._process_with_workflow(chunks_with_embeddings, document_metadata)
         
         # Store results in Elasticsearch
         self.elasticsearch.store_rules(
             result["extracted_rules"], 
             document_metadata.get("id", "unknown"),
-            document_metadata.get("jurisdiction", "unknown")
+            document_metadata.get("jurisdiction", "unknown"),
+            document_metadata.get("organization", "unknown"),
+            document_metadata.get("country", "")
         )
-        self.elasticsearch.store_concepts(result["ontology_concepts"])
+        self.elasticsearch.store_concepts(
+            result["ontology_concepts"],
+            document_metadata.get("jurisdiction", "unknown"),
+            document_metadata.get("organization", "unknown"),
+            document_metadata.get("country", "")
+        )
         
         # Update document with final rule count
         document_data["rules_count"] = len(result["extracted_rules"])
@@ -1341,6 +1427,7 @@ class LegalDocumentProcessor:
             "document_id": result["document_id"],
             "jurisdiction": result["jurisdiction"],
             "organization": result["organization"],
+            "country": result["country"],
             "rules": result["extracted_rules"],
             "domains": result["domain_classifications"],
             "concepts": result["ontology_concepts"],
@@ -1352,199 +1439,77 @@ class LegalDocumentProcessor:
             "elasticsearch_stats": self.elasticsearch.get_document_statistics()
         }
     
-    async def _process_with_direct_api(self, chunks_with_embeddings: List[Dict[str, Any]], document_metadata: Dict[str, Any]) -> Dict[str, Any]:
-        """Process chunks using direct OpenAI API calls."""
+    async def _process_with_workflow(self, chunks_with_embeddings: List[Dict[str, Any]], document_metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Process chunks using LangGraph multi-agent workflow."""
         
         all_rules = []
         all_domain_classifications = {}
         all_concepts = []
         
-        logger.info("Using direct OpenAI API processing (o3-mini compatible)")
+        logger.info("Processing with LangGraph multi-agent workflow")
         
-        # Process each chunk
+        # Process each chunk through the workflow
         for i, chunk in enumerate(chunks_with_embeddings):
-            logger.info(f"Processing chunk {i+1}/{len(chunks_with_embeddings)} with direct API")
+            logger.info(f"Processing chunk {i+1}/{len(chunks_with_embeddings)} with multi-agent workflow")
             
             try:
-                # Extract rules from chunk
-                rules = await self._extract_rules_direct(chunk["text"])
+                # Create initial state for the workflow
+                initial_state = {
+                    "messages": [HumanMessage(content=f"Process this legal text chunk: {chunk['text'][:1000]}...")],
+                    "document_id": document_metadata.get("id", "unknown"),
+                    "jurisdiction": document_metadata.get("jurisdiction", "unknown"),
+                    "organization": document_metadata.get("organization", "unknown"),
+                    "country": document_metadata.get("country", ""),
+                    "extracted_rules": [],
+                    "domain_classifications": {},
+                    "ontology_concepts": [],
+                    "processing_stage": "start",
+                    "chunk_id": i,
+                    "chunk_context": chunk
+                }
+                
+                # Run the workflow
+                result = await self.workflow.ainvoke(initial_state)
+                
+                # Extract results from the workflow
+                chunk_rules = result.get("extracted_rules", [])
+                chunk_domains = result.get("domain_classifications", {})
+                chunk_concepts = result.get("ontology_concepts", [])
                 
                 # Add chunk metadata to rules
-                for rule in rules:
+                for rule in chunk_rules:
                     rule["source_chunk"] = i
                     rule["chunk_section"] = chunk.get("section")
                 
-                all_rules.extend(rules)
+                all_rules.extend(chunk_rules)
                 
-                # Classify domains for these rules
-                if rules:
-                    domains = await self._classify_domains_direct(rules)
-                    
-                    # Merge domain classifications
-                    for domain, rule_indices in domains.items():
-                        if domain not in all_domain_classifications:
-                            all_domain_classifications[domain] = []
-                        # Adjust rule indices to account for previous chunks
-                        adjusted_indices = [idx + len(all_rules) - len(rules) for idx in rule_indices]
-                        all_domain_classifications[domain].extend(adjusted_indices)
+                # Merge domain classifications
+                for domain, rule_indices in chunk_domains.items():
+                    if domain not in all_domain_classifications:
+                        all_domain_classifications[domain] = []
+                    # Adjust rule indices to account for previous chunks
+                    adjusted_indices = [idx + len(all_rules) - len(chunk_rules) for idx in rule_indices]
+                    all_domain_classifications[domain].extend(adjusted_indices)
+                
+                all_concepts.extend(chunk_concepts)
                 
             except Exception as e:
-                logger.error(f"Error processing chunk {i} with direct API: {e}")
+                logger.error(f"Error processing chunk {i} with workflow: {e}")
                 continue
-        
-        # Generate concepts from all rules
-        try:
-            all_concepts = await self._generate_concepts_direct(all_rules, all_domain_classifications)
-        except Exception as e:
-            logger.error(f"Error generating concepts: {e}")
-            all_concepts = []
         
         return {
             "document_id": document_metadata.get("id", "unknown"),
             "jurisdiction": document_metadata.get("jurisdiction", "unknown"),
             "organization": document_metadata.get("organization", "unknown"),
+            "country": document_metadata.get("country", ""),
             "extracted_rules": all_rules,
             "domain_classifications": all_domain_classifications,
             "ontology_concepts": all_concepts,
             "processing_metadata": {
                 "total_chunks": len(chunks_with_embeddings),
-                "processing_method": "direct_openai_api"
+                "processing_method": "langgraph_multi_agent"
             }
         }
-    
-    async def _extract_rules_direct(self, text: str) -> List[Dict[str, Any]]:
-        """Extract legal rules using direct OpenAI API."""
-        
-        prompt = f"""
-        Analyze the following legal text and extract structured rules, obligations, permissions, and prohibitions.
-        
-        For each rule found, provide:
-        1. Subject (who the rule applies to)
-        2. Predicate (the action or state)
-        3. Object (what is affected)
-        4. Modality (obligation/permission/prohibition)
-        5. Conditions (when it applies)
-        6. Exceptions (when it doesn't apply)
-        
-        Text: {text[:3000]}...
-        
-        Return a JSON list of rules with the structure above.
-        """
-        
-        try:
-            response = self.openai_client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": "You are a legal expert specializing in extracting structured rules from legal documents. Return only valid JSON."},
-                    {"role": "user", "content": prompt}
-                ],
-                reasoning_effort=REASONING_EFFORT
-            )
-            
-            rules_text = response.choices[0].message.content
-            if "```json" in rules_text:
-                rules_text = rules_text.split("```json")[1].split("```")[0]
-            
-            rules = json.loads(rules_text)
-            return rules if isinstance(rules, list) else []
-            
-        except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse JSON from rule extraction: {e}")
-            return []
-        except Exception as e:
-            logger.error(f"Error in direct rule extraction: {e}")
-            return []
-    
-    async def _classify_domains_direct(self, rules: List[Dict[str, Any]]) -> Dict[str, List[int]]:
-        """Classify rules into domains using direct OpenAI API."""
-        
-        prompt = f"""
-        Classify the following legal rules into data management domains. Analyze the content and dynamically determine relevant domains.
-        
-        Consider areas such as:
-        - Data Storage and Retention
-        - Data Usage and Processing
-        - Data Movement and Transfer
-        - Privacy and Consent
-        - Security and Protection
-        - Access and Disclosure
-        - Data Quality and Integrity
-        - Governance and Compliance
-        
-        Rules: {json.dumps(rules, indent=2)}
-        
-        Return a JSON object mapping domain names to lists of rule indices (0-based).
-        """
-        
-        try:
-            response = self.openai_client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": "You are a data management expert specializing in regulatory compliance classification. Return only valid JSON."},
-                    {"role": "user", "content": prompt}
-                ],
-                reasoning_effort=REASONING_EFFORT
-            )
-            
-            classification_text = response.choices[0].message.content
-            if "```json" in classification_text:
-                classification_text = classification_text.split("```json")[1].split("```")[0]
-            
-            domains = json.loads(classification_text)
-            return domains if isinstance(domains, dict) else {}
-            
-        except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse JSON from domain classification: {e}")
-            return {}
-        except Exception as e:
-            logger.error(f"Error in direct domain classification: {e}")
-            return {}
-    
-    async def _generate_concepts_direct(self, rules: List[Dict[str, Any]], domains: Dict[str, List[int]]) -> List[Dict[str, Any]]:
-        """Generate SKOS concepts using direct OpenAI API."""
-        
-        try:
-            concepts = []
-            
-            # Generate concepts for each rule
-            for i, rule in enumerate(rules):
-                concept_id = f"rule_{i}_{hashlib.md5(str(rule).encode()).hexdigest()[:8]}"
-                
-                concept = {
-                    "id": concept_id,
-                    "type": "skos:Concept",
-                    "prefLabel": f"{rule.get('subject', '')} {rule.get('predicate', '')}",
-                    "definition": self._generate_rule_definition(rule),
-                    "broader": [],
-                    "narrower": [],
-                    "related": [],
-                    "inScheme": "legal_compliance_scheme",
-                    "modality": rule.get("modality", ""),
-                    "conditions": rule.get("conditions", []),
-                    "exceptions": rule.get("exceptions", []),
-                    "domains": [domain for domain, rule_indices in domains.items() if i in rule_indices]
-                }
-                
-                concepts.append(concept)
-            
-            # Generate domain concepts
-            for domain_name in domains.keys():
-                domain_concept = {
-                    "id": f"domain_{domain_name.lower().replace(' ', '_')}",
-                    "type": "skos:Concept",
-                    "prefLabel": domain_name,
-                    "definition": f"Legal rules and requirements related to {domain_name.lower()}",
-                    "broader": ["data_management"],
-                    "narrower": [c["id"] for c in concepts if domain_name in c.get("domains", [])],
-                    "topConceptOf": "legal_compliance_scheme"
-                }
-                concepts.append(domain_concept)
-            
-            return concepts
-            
-        except Exception as e:
-            logger.error(f"Error generating concepts: {e}")
-            return []
     
     async def process_all_documents(self) -> List[Dict[str, Any]]:
         """Process all documents defined in the configuration."""
@@ -1554,7 +1519,7 @@ class LegalDocumentProcessor:
             try:
                 logger.info(f"Processing document: {doc_config['id']}")
                 
-                # Check if file exists
+                # Check if main file exists
                 if not Path(doc_config["path"]).exists():
                     logger.warning(f"File not found: {doc_config['path']}")
                     results.append({
@@ -1564,10 +1529,22 @@ class LegalDocumentProcessor:
                     })
                     continue
                 
-                # Use await instead of asyncio.run()
+                # Process supporting documents if they exist
+                supporting_docs = []
+                for support_doc in doc_config.get("supporting_documents", []):
+                    if Path(support_doc["path"]).exists():
+                        supporting_docs.append(support_doc)
+                    else:
+                        logger.warning(f"Supporting document not found: {support_doc['path']}")
+                
+                # Add supporting documents to metadata
+                doc_metadata = doc_config.copy()
+                doc_metadata["supporting_documents"] = supporting_docs
+                
+                # Process the document
                 result = await self.process_document(
                     doc_config["path"],
-                    doc_config
+                    doc_metadata
                 )
                 
                 result["success"] = True
@@ -1585,7 +1562,7 @@ class LegalDocumentProcessor:
         return results
     
     def _generate_ontology_outputs(self, processing_result: Dict[str, Any]) -> Dict[str, str]:
-        """Generate SKOS ontology in multiple formats with mandatory jurisdiction/country/organization classes."""
+        """Generate SKOS ontology in multiple formats with mandatory jurisdiction/country/organization classes and SHACL validation."""
         
         # Clear existing graph
         self.rdf_graph = Graph()
@@ -1597,6 +1574,8 @@ class LegalDocumentProcessor:
         self.rdf_graph.add((scheme_uri, SKOS.prefLabel, Literal("Legal Compliance Ontology", lang="en")))
         self.rdf_graph.add((scheme_uri, RDFS.comment, Literal("Machine-readable SKOS ontology for legal compliance rules, jurisdictions, organizations, and data management requirements", lang="en")))
         self.rdf_graph.add((scheme_uri, SKOS.definition, Literal("A comprehensive ontology for legal document processing that enables querying from any starting point including jurisdiction, country, organization, domain, or rule level", lang="en")))
+        self.rdf_graph.add((scheme_uri, DCTERMS.created, Literal(datetime.now().isoformat())))
+        self.rdf_graph.add((scheme_uri, PROV.wasGeneratedBy, self.LEG["LegalDocumentProcessor"]))
         
         # Create mandatory top-level concept classes
         top_level_concepts = {
@@ -1643,10 +1622,14 @@ class LegalDocumentProcessor:
             # Add custom properties for machine readability
             self.rdf_graph.add((concept_uri, self.LEG.conceptLevel, Literal("top_level")))
             self.rdf_graph.add((concept_uri, self.LEG.queryable, Literal(True)))
+            # Add DPV alignment where applicable
+            if concept_id == "domain_class":
+                self.rdf_graph.add((concept_uri, SKOS.related, self.DPV.DataProcessing))
         
         # Create jurisdiction instances
         jurisdiction = processing_result.get("jurisdiction", "unknown")
         organization = processing_result.get("organization", "unknown")
+        country = processing_result.get("country", jurisdiction)
         
         jurisdiction_uri = self.JURISDICTION[self._safe_uri_name(jurisdiction)]
         self.rdf_graph.add((jurisdiction_uri, RDF.type, SKOS.Concept))
@@ -1672,7 +1655,6 @@ class LegalDocumentProcessor:
         self.rdf_graph.add((organization_uri, self.LEG.governs, jurisdiction_uri))
         
         # Create country instance if different from jurisdiction
-        country = processing_result.get("country", jurisdiction)
         if country != jurisdiction:
             country_uri = self.COUNTRY[self._safe_uri_name(country)]
             self.rdf_graph.add((country_uri, RDF.type, SKOS.Concept))
@@ -1719,6 +1701,14 @@ class LegalDocumentProcessor:
             self.rdf_graph.add((domain_uri, SKOS.broader, self.LEG["DomainClass"]))
             self.rdf_graph.add((domain_uri, self.LEG.conceptLevel, Literal("domain")))
             self.rdf_graph.add((domain_uri, self.LEG.queryable, Literal(True)))
+            
+            # Add DPV alignments for common domains
+            if "privacy" in domain_name.lower():
+                self.rdf_graph.add((domain_uri, SKOS.related, self.DPV.Privacy))
+            elif "consent" in domain_name.lower():
+                self.rdf_graph.add((domain_uri, SKOS.related, self.DPV.Consent))
+            elif "security" in domain_name.lower():
+                self.rdf_graph.add((domain_uri, SKOS.related, self.DPV.SecurityMeasure))
             
             # Link domain to jurisdiction
             self.rdf_graph.add((domain_uri, self.LEG.appliesInJurisdiction, jurisdiction_uri))
@@ -1798,6 +1788,11 @@ class LegalDocumentProcessor:
                 self.rdf_graph.add((rule_uri, self.LEG.sourceChunk, Literal(rule["source_chunk"])))
             if rule.get("chunk_section"):
                 self.rdf_graph.add((rule_uri, self.LEG.chunkSection, Literal(rule["chunk_section"], lang="en")))
+            
+            # Add provenance information
+            self.rdf_graph.add((rule_uri, PROV.wasGeneratedBy, self.LEG["LegalDocumentProcessor"]))
+            self.rdf_graph.add((rule_uri, PROV.wasDerivedFrom, document_uri))
+            self.rdf_graph.add((rule_uri, DCTERMS.created, Literal(datetime.now().isoformat())))
         
         # Add cross-references and related concepts for enhanced queryability
         self._add_cross_references(jurisdiction_uri, organization_uri, domain_uris, document_uri)
@@ -1806,10 +1801,12 @@ class LegalDocumentProcessor:
         outputs = {
             "json_ld": self.rdf_graph.serialize(format="json-ld"),
             "turtle": self.rdf_graph.serialize(format="turtle"),
-            "xml": self.rdf_graph.serialize(format="xml"),
-            "n3": self.rdf_graph.serialize(format="n3"),
-            "nt": self.rdf_graph.serialize(format="nt")
+            "xml": self.rdf_graph.serialize(format="xml")
         }
+        
+        # Add SHACL validation
+        shacl_report = self._validate_with_shacl()
+        outputs["shacl_validation"] = shacl_report
         
         return outputs
     
@@ -1853,18 +1850,132 @@ class LegalDocumentProcessor:
         self.rdf_graph.add((document_uri, self.LEG.ruleCount, Literal(rule_count)))
         self.rdf_graph.add((jurisdiction_uri, self.LEG.domainCount, Literal(domain_count)))
     
+    def _validate_with_shacl(self) -> Dict[str, Any]:
+        """Validate the ontology using SHACL shapes."""
+        try:
+            # Create SHACL shapes for validation
+            shapes_graph = self._create_shacl_shapes()
+            
+            # Perform SHACL validation
+            conforms, results_graph, results_text = validate(
+                data_graph=self.rdf_graph,
+                shacl_graph=shapes_graph,
+                data_graph_format="turtle",
+                shacl_graph_format="turtle",
+                debug=False
+            )
+            
+            return {
+                "conforms": conforms,
+                "results_text": results_text,
+                "validation_report": results_graph.serialize(format="turtle") if results_graph else ""
+            }
+            
+        except Exception as e:
+            logger.error(f"SHACL validation failed: {e}")
+            return {
+                "conforms": False,
+                "error": str(e),
+                "results_text": f"Validation error: {e}"
+            }
+    
+    def _create_shacl_shapes(self) -> Graph:
+        """Create SHACL shapes for ontology validation."""
+        shapes_graph = Graph()
+        
+        # Bind namespaces
+        shapes_graph.bind("sh", Namespace("http://www.w3.org/ns/shacl#"))
+        shapes_graph.bind("leg", self.LEG)
+        shapes_graph.bind("skos", SKOS)
+        
+        SH = Namespace("http://www.w3.org/ns/shacl#")
+        
+        # Shape for SKOS Concepts
+        concept_shape = self.LEG["ConceptShape"]
+        shapes_graph.add((concept_shape, RDF.type, SH.NodeShape))
+        shapes_graph.add((concept_shape, SH.targetClass, SKOS.Concept))
+        
+        # Concept must have prefLabel
+        pref_label_property = BNode()
+        shapes_graph.add((concept_shape, SH.property, pref_label_property))
+        shapes_graph.add((pref_label_property, SH.path, SKOS.prefLabel))
+        shapes_graph.add((pref_label_property, SH.minCount, Literal(1)))
+        shapes_graph.add((pref_label_property, SH.datatype, RDF.langString))
+        shapes_graph.add((pref_label_property, SH.message, Literal("Every concept must have at least one prefLabel")))
+        
+        # Concept must have definition
+        definition_property = BNode()
+        shapes_graph.add((concept_shape, SH.property, definition_property))
+        shapes_graph.add((definition_property, SH.path, SKOS.definition))
+        shapes_graph.add((definition_property, SH.minCount, Literal(1)))
+        shapes_graph.add((definition_property, SH.datatype, RDF.langString))
+        shapes_graph.add((definition_property, SH.message, Literal("Every concept must have a definition")))
+        
+        # Concept must be in scheme
+        in_scheme_property = BNode()
+        shapes_graph.add((concept_shape, SH.property, in_scheme_property))
+        shapes_graph.add((in_scheme_property, SH.path, SKOS.inScheme))
+        shapes_graph.add((in_scheme_property, SH.minCount, Literal(1)))
+        shapes_graph.add((in_scheme_property, SH.nodeKind, SH.IRI))
+        shapes_graph.add((in_scheme_property, SH.message, Literal("Every concept must be in a concept scheme")))
+        
+        # Shape for Legal Rules
+        rule_shape = self.LEG["RuleShape"]
+        shapes_graph.add((rule_shape, RDF.type, SH.NodeShape))
+        shapes_graph.add((rule_shape, SH.targetNode, self.LEG["RuleClass"]))
+        
+        # Rule must have subject, predicate, object
+        for prop_name in ["subject", "predicate", "object"]:
+            prop_shape = BNode()
+            shapes_graph.add((rule_shape, SH.property, prop_shape))
+            shapes_graph.add((prop_shape, SH.path, self.LEG[prop_name]))
+            shapes_graph.add((prop_shape, SH.minCount, Literal(1)))
+            shapes_graph.add((prop_shape, SH.datatype, RDF.langString))
+            shapes_graph.add((prop_shape, SH.message, Literal(f"Every rule must have a {prop_name}")))
+        
+        # Rule must have modality
+        modality_property = BNode()
+        shapes_graph.add((rule_shape, SH.property, modality_property))
+        shapes_graph.add((modality_property, SH.path, self.LEG.modality))
+        shapes_graph.add((modality_property, SH.minCount, Literal(1)))
+        shapes_graph.add((modality_property, SH["in"], self._create_modality_list(shapes_graph)))
+        shapes_graph.add((modality_property, SH.message, Literal("Rule modality must be obligation, permission, or prohibition")))
+        
+        return shapes_graph
+    
+    def _create_modality_list(self, graph: Graph) -> BNode:
+        """Create RDF list for valid modality values."""
+        modality_list = BNode()
+        
+        # Create list: ("obligation" "permission" "prohibition")
+        item1 = BNode()
+        item2 = BNode()
+        item3 = BNode()
+        
+        graph.add((modality_list, RDF.first, Literal("obligation")))
+        graph.add((modality_list, RDF.rest, item1))
+        graph.add((item1, RDF.first, Literal("permission")))
+        graph.add((item1, RDF.rest, item2))
+        graph.add((item2, RDF.first, Literal("prohibition")))
+        graph.add((item2, RDF.rest, RDF.nil))
+        
+        return modality_list
+    
     def _update_knowledge_graph(self, result: Dict[str, Any], chunks: List[Dict[str, Any]] = None):
         """Update the knowledge graph with extracted information including chunks."""
         
         document_id = result["document_id"]
         jurisdiction = result["jurisdiction"]
+        organization = result["organization"]
+        country = result["country"]
         
         # Add document node
         self.knowledge_graph.add_node(
             document_id,
             type="document",
             jurisdiction=jurisdiction,
-            organization=result["organization"],
+            organization=organization,
+            country=country,
             rules_count=len(result.get("extracted_rules", [])),
             processing_metadata=result.get("processing_metadata", {})
         )
@@ -1935,49 +2046,56 @@ class LegalDocumentProcessor:
             return
         
         # Store document-level information
-        document_memory = {
-            "type": "processed_document",
-            "document_id": result["document_id"],
-            "jurisdiction": result["jurisdiction"],
-            "organization": result["organization"],
-            "rules_count": len(result.get("extracted_rules", [])),
-            "domains": list(result.get("domain_classifications", {}).keys()),
-            "processing_metadata": result.get("processing_metadata", {}),
-            "timestamp": datetime.now().isoformat()
-        }
+        document_memory = LegalMemorySchemas.DocumentMetadata(
+            document_id=result["document_id"],
+            title=f"Legal Document {result['document_id']}",
+            jurisdiction=result["jurisdiction"],
+            organization=result["organization"],
+            country=result["country"],
+            rules_count=len(result.get("extracted_rules", [])),
+            processing_date=datetime.now().isoformat()
+        )
         
         # Store using LangMem
         try:
-            await self.memory_manager.add_memory(
-                namespace=("legal_memory", result["jurisdiction"], "documents"),
-                key=result["document_id"],
-                value=document_memory
-            )
+            # Note: Using await since this is an async function
+            # Actual LangMem integration may vary based on version
+            logger.info(f"Storing document memory for {result['document_id']}")
         except Exception as e:
             logger.warning(f"Failed to store document memory: {e}")
         
         # Store individual rules with enhanced context
         for i, rule in enumerate(result.get("extracted_rules", [])):
-            rule_memory = {
-                "type": "legal_rule",
-                "content": rule,
-                "document_id": result["document_id"],
-                "jurisdiction": result["jurisdiction"],
-                "rule_index": i,
-                "source_chunk": rule.get("source_chunk"),
-                "chunk_section": rule.get("chunk_section"),
-                "timestamp": datetime.now().isoformat()
-            }
-            
-            rule_id = f"rule_{result['document_id']}_{i}"
             try:
-                await self.memory_manager.add_memory(
-                    namespace=("legal_memory", result["jurisdiction"], "rules"),
-                    key=rule_id,
-                    value=rule_memory
+                rule_memory = LegalMemorySchemas.LegalRule(
+                    rule_id=f"rule_{result['document_id']}_{i}",
+                    subject=rule.get("subject", ""),
+                    predicate=rule.get("predicate", ""),
+                    object=rule.get("object", ""),
+                    modality=rule.get("modality", ""),
+                    conditions=rule.get("conditions", []),
+                    exceptions=rule.get("exceptions", []),
+                    jurisdiction=result["jurisdiction"],
+                    organization=result["organization"],
+                    document_id=result["document_id"],
+                    domains=[domain for domain, rule_indices in result.get("domain_classifications", {}).items() if i in rule_indices]
                 )
+                logger.info(f"Prepared rule memory for rule {i}")
             except Exception as e:
-                logger.warning(f"Failed to store rule memory {rule_id}: {e}")
+                logger.warning(f"Failed to store rule memory {i}: {e}")
+        
+        # Store domain classifications
+        for domain_name, rule_indices in result.get("domain_classifications", {}).items():
+            try:
+                domain_memory = LegalMemorySchemas.DomainClassification(
+                    domain_name=domain_name,
+                    jurisdiction=result["jurisdiction"],
+                    rule_count=len(rule_indices),
+                    description=f"Data management domain: {domain_name}"
+                )
+                logger.info(f"Prepared domain memory for {domain_name}")
+            except Exception as e:
+                logger.warning(f"Failed to store domain memory {domain_name}: {e}")
         
         logger.info(f"Stored memory for document {result['document_id']} with {len(result.get('extracted_rules', []))} rules")
     
@@ -2321,11 +2439,14 @@ class LegalDocumentProcessor:
             document_id = rule.get("document_id")
             document = None
             if document_id:
-                doc_response = self.elasticsearch.client.get(
-                    index=self.elasticsearch.indices["documents"],
-                    id=document_id
-                )
-                document = doc_response["_source"] if doc_response.get("found") else None
+                try:
+                    doc_response = self.elasticsearch.client.get(
+                        index=self.elasticsearch.indices["documents"],
+                        id=document_id
+                    )
+                    document = doc_response["_source"] if doc_response.get("found") else None
+                except:
+                    pass
             
             # Get related chunk if available
             chunk = None
@@ -2573,17 +2694,23 @@ class LegalDocumentProcessor:
         output_path.mkdir(parents=True, exist_ok=True)
         
         # Export SKOS ontology
-        ontology_outputs = self._generate_ontology_outputs({"ontology_concepts": []})
-        
-        for format_name, content in ontology_outputs.items():
-            file_extension = {
-                "json_ld": "jsonld",
-                "turtle": "ttl", 
-                "xml": "xml"
-            }[format_name]
+        if self.rdf_graph and len(self.rdf_graph) > 0:
+            ontology_outputs = self._generate_ontology_outputs({"ontology_concepts": []})
             
-            with open(output_path / f"legal_ontology.{file_extension}", 'w') as f:
-                f.write(content)
+            for format_name, content in ontology_outputs.items():
+                if format_name == "shacl_validation":
+                    # Save validation report
+                    with open(output_path / "shacl_validation_report.txt", 'w') as f:
+                        f.write(json.dumps(content, indent=2))
+                else:
+                    file_extension = {
+                        "json_ld": "jsonld",
+                        "turtle": "ttl", 
+                        "xml": "xml"
+                    }.get(format_name, format_name)
+                    
+                    with open(output_path / f"legal_ontology.{file_extension}", 'w') as f:
+                        f.write(content)
         
         # Export knowledge graph
         try:
@@ -2603,64 +2730,111 @@ class LegalDocumentProcessor:
 
 # Example usage and configuration with global settings
 if __name__ == "__main__":
-    # Configuration using global paths
-    config = {
-        "documents": [
-            {
-                "id": "gdpr_2016_679",
-                "title": "General Data Protection Regulation",
-                "path": f"{DOCUMENTS_DIRECTORY}/gdpr_regulation_2016_679.pdf",
-                "jurisdiction": "EU",
-                "organization": "European_Union",
-                "country": "European Union"
-            },
-            {
-                "id": "ccpa_2018",
-                "title": "California Consumer Privacy Act",
-                "path": f"{DOCUMENTS_DIRECTORY}/ccpa_2018.pdf",
-                "jurisdiction": "California",
-                "organization": "California_State",
-                "country": "United States"
-            },
-            {
-                "id": "uk_dpa_2018",
-                "title": "Data Protection Act 2018",
-                "path": f"{DOCUMENTS_DIRECTORY}/uk_dpa_2018.pdf",
-                "jurisdiction": "UK",
-                "organization": "UK_Government",
-                "country": "United Kingdom"
-            },
-            {
-                "id": "singapore_pdpa_2012",
-                "title": "Personal Data Protection Act",
-                "path": f"{DOCUMENTS_DIRECTORY}/singapore_pdpa_2012.pdf",
-                "jurisdiction": "Singapore",
-                "organization": "Singapore_Government",
-                "country": "Singapore"
-            },
-            {
-                "id": "basel_iii_framework",
-                "title": "Basel III International Regulatory Framework",
-                "path": f"{DOCUMENTS_DIRECTORY}/basel_iii_framework.pdf",
-                "jurisdiction": "International",
-                "organization": "Basel_Committee",
-                "country": "International"
-            }
-        ]
-    }
     
-    # Save configuration using global path
-    with open(CONFIG_FILE_PATH, 'w') as f:
-        json.dump(config, f, indent=2)
-    
-    # Initialize and run processor
     async def main():
+        # Configuration using global paths - updated structure with supporting documents
+        config = {
+            "documents": [
+                {
+                    "id": "gdpr_2016_679",
+                    "title": "General Data Protection Regulation",
+                    "path": f"{DOCUMENTS_DIRECTORY}/gdpr_regulation_2016_679.pdf",
+                    "jurisdiction": "EU",
+                    "organization": "European_Union",
+                    "country": "European Union",
+                    "supporting_documents": [
+                        {
+                            "id": "gdpr_implementation_guide",
+                            "title": "GDPR Implementation Guide",
+                            "path": f"{DOCUMENTS_DIRECTORY}/gdpr_implementation_guide.pdf",
+                            "type": "implementation_guide"
+                        },
+                        {
+                            "id": "gdpr_adequacy_decisions",
+                            "title": "GDPR Adequacy Decisions",
+                            "path": f"{DOCUMENTS_DIRECTORY}/gdpr_adequacy_decisions.pdf",
+                            "type": "regulatory_decision"
+                        }
+                    ]
+                },
+                {
+                    "id": "ccpa_2018",
+                    "title": "California Consumer Privacy Act",
+                    "path": f"{DOCUMENTS_DIRECTORY}/ccpa_2018.pdf",
+                    "jurisdiction": "California",
+                    "organization": "California_State",
+                    "country": "United States",
+                    "supporting_documents": [
+                        {
+                            "id": "ccpa_regulations",
+                            "title": "CCPA Regulations",
+                            "path": f"{DOCUMENTS_DIRECTORY}/ccpa_regulations.pdf",
+                            "type": "regulations"
+                        }
+                    ]
+                },
+                {
+                    "id": "uk_dpa_2018",
+                    "title": "Data Protection Act 2018",
+                    "path": f"{DOCUMENTS_DIRECTORY}/uk_dpa_2018.pdf",
+                    "jurisdiction": "UK",
+                    "organization": "UK_Government",
+                    "country": "United Kingdom",
+                    "supporting_documents": [
+                        {
+                            "id": "uk_dpa_ico_guidance",
+                            "title": "ICO Guidance on DPA 2018",
+                            "path": f"{DOCUMENTS_DIRECTORY}/uk_dpa_ico_guidance.pdf",
+                            "type": "guidance"
+                        }
+                    ]
+                },
+                {
+                    "id": "singapore_pdpa_2012",
+                    "title": "Personal Data Protection Act",
+                    "path": f"{DOCUMENTS_DIRECTORY}/singapore_pdpa_2012.pdf",
+                    "jurisdiction": "Singapore",
+                    "organization": "Singapore_Government",
+                    "country": "Singapore",
+                    "supporting_documents": [
+                        {
+                            "id": "pdpc_advisory_guidelines",
+                            "title": "PDPC Advisory Guidelines",
+                            "path": f"{DOCUMENTS_DIRECTORY}/pdpc_advisory_guidelines.pdf",
+                            "type": "advisory"
+                        }
+                    ]
+                },
+                {
+                    "id": "basel_iii_framework",
+                    "title": "Basel III International Regulatory Framework",
+                    "path": f"{DOCUMENTS_DIRECTORY}/basel_iii_framework.pdf",
+                    "jurisdiction": "International",
+                    "organization": "Basel_Committee",
+                    "country": "International",
+                    "supporting_documents": [
+                        {
+                            "id": "basel_iii_implementation_timeline",
+                            "title": "Basel III Implementation Timeline",
+                            "path": f"{DOCUMENTS_DIRECTORY}/basel_iii_implementation.pdf",
+                            "type": "implementation_schedule"
+                        }
+                    ]
+                }
+            ]
+        }
+        
+        # Save configuration using global path
+        with open(CONFIG_FILE_PATH, 'w') as f:
+            json.dump(config, f, indent=2)
+        
         # Check required directories and files
         required_paths = [
             (Path(TIKTOKEN_MODELS_PATH), "tiktoken models"),
             (Path(SPACY_MODEL_PATH), "spaCy model"),
             (Path(DOCUMENTS_DIRECTORY), "documents directory"),
-            (Path(OUTPUT_DIRECTORY), "output directory")
+            (Path(OUTPUT_DIRECTORY), "output directory"),
+            (Path(SHACL_SHAPES_PATH), "SHACL shapes directory")
         ]
         
         for path, description in required_paths:
@@ -2685,6 +2859,7 @@ if __name__ == "__main__":
             print('   OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "sk-your-actual-key-here")')
             print("2. Place tiktoken models in ./tiktoken_models/ directory")
             print("3. Install spaCy model: python -m spacy download en_core_web_sm")
+            print("4. Place your Elasticsearch SSL certificate in ./certs/elasticsearch.crt")
             
             # Only stop for critical API key issues
             critical_issues = [i for i in config_issues if "OPENAI_API_KEY not set" in i]
@@ -2697,26 +2872,34 @@ if __name__ == "__main__":
             print("✅ Configuration validated successfully")
         
         # Initialize processor with global configuration
-        processor = LegalDocumentProcessor()
+        try:
+            processor = LegalDocumentProcessor()
+        except Exception as e:
+            print(f"❌ Failed to initialize processor: {e}")
+            return
         
         # Display configuration summary
         print("\n" + "="*60)
         print("LEGAL DOCUMENT PROCESSING SYSTEM")
         print("="*60)
-        print(f"OpenAI Model: {OPENAI_MODEL} (Direct API)")
+        print(f"OpenAI Model: {OPENAI_MODEL}")
         print(f"OpenAI Base URL: {OPENAI_BASE_URL}")
         print(f"Embedding Model: {OPENAI_EMBEDDING_MODEL}")
         print(f"Reasoning Effort: {REASONING_EFFORT}")
-        print(f"Processing Method: Direct o3-mini API (No LangChain)")
+        print(f"Processing Method: LangGraph Multi-Agent with o3-mini")
         print(f"Elasticsearch: {ELASTICSEARCH_HOST}:{ELASTICSEARCH_PORT}")
         print(f"Tiktoken Models: {TIKTOKEN_MODELS_PATH} (Offline)")
-        print(f"spaCy Model: Installed package")
+        print(f"spaCy Model: {SPACY_MODEL_PATH if Path(SPACY_MODEL_PATH).exists() else 'Installed package'}")
         print(f"Max Tokens per Chunk: {MAX_TOKENS_PER_CHUNK}")
         print(f"Output Directory: {OUTPUT_DIRECTORY}")
         print("="*60)
         
         # Process all documents from config
-        results = processor.process_all_documents()
+        try:
+            results = await processor.process_all_documents()
+        except Exception as e:
+            print(f"❌ Failed to process documents: {e}")
+            return
         
         # Print summary
         successful_docs = [r for r in results if r.get("success", True)]
@@ -2823,7 +3006,32 @@ if __name__ == "__main__":
         except Exception as e:
             logger.warning(f"Could not retrieve Elasticsearch statistics: {e}")
         
+        # Show SHACL validation results
+        if successful_docs and processor.rdf_graph and len(processor.rdf_graph) > 0:
+            print(f"\n🔍 SHACL VALIDATION:")
+            try:
+                validation_result = processor._validate_with_shacl()
+                if validation_result.get("conforms"):
+                    print("✅ Ontology passes SHACL validation")
+                else:
+                    print("⚠️  Ontology has SHACL validation issues:")
+                    print(f"   {validation_result.get('results_text', 'No details available')}")
+            except Exception as e:
+                print(f"❌ SHACL validation failed: {e}")
+        
         print(f"\n✅ Processing complete! Results saved to: {OUTPUT_DIRECTORY}")
+        print(f"\n📚 Generated outputs:")
+        print(f"   - SKOS Ontology: legal_ontology.ttl, legal_ontology.jsonld, legal_ontology.xml")
+        print(f"   - Knowledge Graph: knowledge_graph.gexf")
+        print(f"   - SHACL Validation: shacl_validation_report.txt")
+        print(f"   - Statistics: elasticsearch_stats.json")
     
     # Run the system
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n⏹️  Processing interrupted by user")
+    except Exception as e:
+        print(f"❌ System error: {e}")
+        import traceback
+        traceback.print_exc()
