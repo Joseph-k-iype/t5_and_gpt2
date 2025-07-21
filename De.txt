@@ -1,622 +1,1198 @@
+"""
+Legal Document Processing System
+Converts legislation and laws into machine-readable rules using multi-agent orchestration.
+
+Key Features:
+- PDF document ingestion and legal rule extraction
+- SKOS ontology generation (JSON-LD, TTL, XML)
+- Multi-agent system with ReAct agents using LangGraph
+- Chain of experts approach with specialist agents
+- LangMem for long-term memory
+- Dynamic domain classification using LLM capabilities
+- Directed acyclic graph support for querying
+"""
+
 import os
-import sys
 import json
+import asyncio
 import logging
-import pandas as pd
-import numpy as np
-from typing import Optional, Any, Dict, List
-from pathlib import Path
-from openai import OpenAI
-from pydantic import BaseModel, ValidationError, field_validator
-from langchain.chat_models import ChatOpenAI
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationChain
 import re
+import hashlib
+from typing import Dict, List, Any, Optional
+from pathlib import Path
+from datetime import datetime
 
-# ============================================================================
-# GLOBAL CONFIGURATION
-# ============================================================================
+# Core dependencies
+import PyPDF2
+import numpy as np
+from rdflib import Graph, Namespace, URIRef, Literal
+from rdflib.namespace import RDF, RDFS, SKOS, XSD, OWL
+from openai import OpenAI
 
-# OpenAI API Configuration
-OPENAI_API_KEY = "your-openai-api-key"  # Replace with your actual API key
-OPENAI_BASE_URL = "https://api.openai.com/v1"  # Replace with your base URL if different
-OPENAI_MODEL = "gpt-4"  # Fixed to GPT-4
-OPENAI_TEMPERATURE = 0.7
-OPENAI_MAX_TOKENS = 800
+# LangChain/LangGraph dependencies
+from langchain_openai import ChatOpenAI
+from langchain.schema import SystemMessage, HumanMessage, AIMessage
+from langchain.tools import tool
+from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.prebuilt import create_react_agent
+from langgraph.store.memory import InMemoryStore
+from langgraph.checkpoint.memory import MemorySaver
 
-# File Paths
-INPUT_CSV_PATH = "incidents.csv"  # Input CSV file path
-OUTPUT_CSV_PATH = "classified_incidents_streaming.csv"  # Output CSV file path
-LOG_FILE_PATH = "data_issue_analysis.log"  # Log file path
+# LangMem dependencies
+from langmem import create_manage_memory_tool, create_search_memory_tool, create_memory_manager
 
-# Processing Configuration
-BATCH_SIZE = 10  # Number of records to process before logging progress
-AUTO_SAVE_FREQUENCY = 50  # Save progress every N records
+# Data processing
+import spacy
+import networkx as nx
 
-# Input CSV Column Mapping
-REQUIRED_COLUMNS = {
-    'incident_id': 'IT_INCIDENT_ID',
-    'incident_desc': 'IT_INCIDENT_DESC',
-    'incident_area_category': 'IT_INCIDENT_AREA_CATEGORY',
-    'incident_area_subcategory': 'IT_INCIDENT_AREA_SUBCATEGORY_NAME',
-    'incident_location': 'IT_INCIDENT_IMPACTED_LOCATION_NAME',
-    'incident_cause': 'IT_INCIDENT_CAUSE_TEXT',
-    'incident_summary': 'MAJOR_IT_INCIDENT_SUMMARY_TEXT',
-    'incident_findings': 'MAJOR_IT_INCIDENT_FINDINGS_TEXT',
-    'incident_resolution': 'IT_INCIDENT_RESOLUTION_DESC'
-}
-
-# ============================================================================
-
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+# Setup logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-## Document class
-
-class MyDocument(BaseModel):
-    id: str = ""
-    text: str = ""
-    metadata: Dict[str, Any] = {}
-
-## Chatbot components
-
-class OpenAIChatbot:
-    def __init__(self):
-        self.api_key = OPENAI_API_KEY
-        self.base_url = OPENAI_BASE_URL
-        self.model_name = OPENAI_MODEL
-        self.temperature = OPENAI_TEMPERATURE
-        self.max_tokens = OPENAI_MAX_TOKENS
-        self._setup_chat_model()
-        self.memory = ConversationBufferMemory()
-        self.conversation = ConversationChain(llm=self.llm, memory=self.memory, verbose=True)
+class LegalDocumentProcessor:
+    """Main orchestrator for legal document processing system."""
     
-    def _setup_chat_model(self):
-        try:
-            self.llm = ChatOpenAI(
-                model_name=self.model_name,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                openai_api_key=self.api_key,
-                openai_api_base=self.base_url
-            )
-        except Exception as e:
-            logger.error(f"Error setting up chatbot: {e}")
-            raise
-
-# Enhanced Data Issue Classifier with Confidence Scoring
-
-class DataIssueReasoning(BaseModel):
-    """Model for reasoning behind data issue classification"""
-    supporting_reasons: List[str] = []
-    contrary_reasons: List[str] = []
-    confidence_calculation: Dict[str, float] = {}
-
-class DataIssueClassifier(BaseModel):
-    """Enhanced model for classifying incidents as data issues with confidence scoring"""
-    incident_id: str
-    is_data_issue: bool
-    data_quality_dimension: Optional[str] = None
-    confidence_score: float = 0.0
-    reasoning: DataIssueReasoning
-    summary: str = ""
-
-    @field_validator('data_quality_dimension')
-    @classmethod
-    def validate_dimension(cls, v):
-        if v is not None:
-            valid_dimensions = [
-                # HSBC categories
-                "Consistency",
-                "Accuracy",
-                "Completeness",
-                "Validity",
-                "Conformity",
-                "Uniqueness",
-                "Timeliness",
-                "Reasonableness",
-                "Integrity",
-                
-                # Industry categories
-                "Incomplete Data",
-                "Inaccurate Data",
-                "Duplicate Data",
-                "Inconsistent Data",
-                "Outdated Data",
-                "Invalid Data",
-                "Ambiguous Data",
-                "Data Integrity Issues",
-                "Data Redundancy"
-            ]
-            if v not in valid_dimensions:
-                raise ValueError(f"Must be one of {valid_dimensions}")
-        return v
-
-class DataIssueAnalyzer:
-    def __init__(self, chatbot: OpenAIChatbot):
-        self.chatbot = chatbot
-        self.classification_prompt_template = """
-        You are a data quality expert at HSBC analyzing incidents to determine if they are data issues.
-        
-        A data quality issue is a problem with data that impacts a process or a system through, for example:
-        erroneous, inaccurate, incomplete, invalid, duplicate, irrelevant, nonstandard data.
-        
-        The data quality issue is NOT an issue related to:
-        - system configuration,
-        - system maintenance,
-        - issues with logging to the system,
-        - issues connected to system UI refresh time,
-        - issues connected to phone/fax/email
-        
-        The data quality could be related to system and application issues, but not all system and applications issues are classified as data quality issue. In order to classify system and/or application issue as data quality issue, the problem has to be connected to the data quality.
-        
-        The examples of DQ Issues:
-        - Customers with date of birth in future
-        - Legal Entities missing Legal Entity Identifier
-        - Customer records missing Customer Risk Rating
-        - Customers invalid email address
-        - Inconsistent legal entity names and identifiers across multiple systems and jurisdictions;
-        - Inconsistent institutional client names and identifiers across multiple banking systems used by institutional clients;
-        - Inter-company transfer amounts and details are inconsistent across multiple accounting systems by HSBC legal entity;
-        - Lack of timely accessibility to vendor payment amounts by the Finance team when creating quarterly financials; and
-        - Multiple vendors listed multiple times and in many different addresses and variations of names in Vendor Payment systems.
-        
-        HSBC definitions of DQ issue dimensions (categories):
-        
-        Consistency: where data is represented differently across various records or systems. For example, Inconsistent categorization of expenses in financial statements.
-        
-        Accuracy: refers to information that is incorrect or misleading. For example, incorrect sales figures reported in financial statement.
-        
-        Completeness: arises when records are missing essential information, such as missing fields or values that are necessary for analysis or reporting. For example, missing customer email addresses in a CRM system.
-        
-        Validity: data that does not conform to predefined formats or rules. For example, out-of-range values in numerical fields, such as age or salary.
-        
-        Conformity: data that does not conform to predefined formats or rules. For example, email addresses that do not conform to standard formats.
-        
-        Uniqueness: duplicate data occurs when the same record is entered multiple times within a dataset, leading to redundancy and inflated counts, multiple entries for the same customer in a database.
-        
-        Timeliness: refers to information that is no longer current or relevant. For example, old customer contact information that hasn't been updated.
-        
-        Reasonableness: reasonableness asks whether a data pattern meets expectations. For example, whether a distribution of sales across a geographic idea makes sense based on what is known about the customers in that area.
-        
-        Integrity: data integrity issues occur when the accuracy and consistency of data are compromised, often due to unauthorized changes, corruption, or system failures. For example, corrupted data files leading to loss of critical information.
-        
-        Note: HSBC categorization is slightly different than industry categorization, but both types of categorization should be used to learn what Data Quality issue is.
-        
-        Industry categorization of data quality dimensions:
-        
-        1. Incomplete Data: This issue arises when records are missing essential information, such as missing fields or values that are necessary for analysis or reporting. Incomplete data can lead to inaccurate conclusions and hinder decision-making processes.
-        
-        2. Inaccurate Data: Inaccurate data refers to information that is incorrect or misleading, often due to human error, outdated information, or faulty data entry processes. This can result in flawed analyses and poor business decisions.
-        
-        3. Duplicate Data: Duplicate data occurs when the same record is entered multiple times within a dataset, leading to redundancy and inflated counts. This can skew analysis results and complicate data management efforts. In HSBC, the sheer scale of data sources often causes redundancy and overlap via duplicate records. Data issues like duplication of contact information may also increase the likelihood of distorted analytical outcomes. Marketing initiatives suffer when certain prospects are overlooked while others are addressed repeatedly. Duplicate records may also lead to distorted analysis outcomes.
-        
-        4. Inconsistent Data: Inconsistent data arises when the same data element is represented differently across various records or systems, such as variations in naming conventions or formats. This can create confusion and hinder data integration efforts. When you're working with various data sources, the differences might be in formats, units, or spellings. Inconsistencies in data values tend to accumulate and degrade the usefulness of data.
-        
-        5. Outdated Data: Outdated data refers to information that is no longer current or relevant, often due to changes in business processes, regulations, or market conditions. Relying on outdated data can lead to misguided strategies and decisions.
-        
-        6. Invalid Data: Invalid data includes entries that do not conform to predefined formats or rules, such as incorrect data types or values outside acceptable ranges. This can cause errors in processing and analysis.
-        
-        7. Ambiguous Data: Ambiguous data is information that can be interpreted in multiple ways, leading to confusion or misinterpretation. Clear definitions and standards are necessary to mitigate this issue.
-        
-        8. Data Integrity Issues: Data integrity issues occur when the accuracy and consistency of data are compromised, often due to unauthorized changes, corruption, or system failures. Maintaining data integrity is crucial for reliable reporting and analysis.
-        
-        9. Data Redundancy: Data redundancy refers to the unnecessary duplication of data within a database or system, which can lead to increased storage costs and maintenance challenges. It can also complicate data retrieval and analysis.
-        
-        Examples of HSBC specific data quality issues:
-        
-        Incomplete Data:
-        - Missing customer email addresses in a CRM system.
-        - Incomplete transaction records lacking item descriptions.
-        - Missing fields in employee records, such as job titles or departments.
-        - Incomplete loan applications without required financial information.
-        - Missing product specifications in inventory records.
-        
-        Inaccurate Data:
-        - Incorrect sales figures reported in financial statements.
-        - Wrong customer addresses leading to failed deliveries.
-        - Misreported inventory levels due to data entry errors.
-        - Incorrect pricing information in product catalogs.
-        - Inaccurate employee salary records affecting payroll.
-        
-        Duplicate Data:
-        - Multiple entries for the same customer in a database.
-        - Duplicate product listings in an e-commerce platform.
-        - Repeated records of transactions in a financial system.
-        - Duplicate patient records in a healthcare database.
-        - Multiple entries for the same invoice in accounting software.
-        
-        Inconsistent Data:
-        - Different formats for date entries (MM/DD/YYYY vs. DD/MM/YYYY).
-        - Variations in product names across different systems (e.g., "Widget A" vs. "Widget A1").
-        - Inconsistent currency formats in financial reports.
-        - Different naming conventions for departments in HR records.
-        - Inconsistent categorization of expenses in financial statements.
-        
-        Outdated Data:
-        - Old customer contact information that hasn't been updated.
-        - Expired product listings still visible on a website.
-        - Outdated employee records not reflecting recent job changes.
-        - Old marketing campaign data that no longer applies.
-        - Historical sales data that is no longer relevant for current analysis.
-        
-        Invalid Data:
-        - Incorrect phone number formats (e.g., letters included).
-        - Invalid email addresses that do not conform to standard formats.
-        - Out-of-range values in numerical fields, such as age or salary.
-        - Incorrectly formatted social security numbers.
-        - Invalid product codes that do not match any existing items.
-        
-        Ambiguous Data:
-        - Vague product descriptions that do not specify features.
-        - Customer feedback that lacks context or specifics.
-        - Multiple meanings for a term used in data, leading to confusion.
-        - Unclear instructions in data entry forms.
-        - Ambiguous survey responses that cannot be easily categorized.
-        
-        Data Integrity Issues:
-        - Unauthorized changes made to financial records.
-        - Corrupted data files leading to loss of critical information.
-        - Inconsistent data across different databases due to synchronization issues.
-        - Data breaches resulting in compromised sensitive information.
-        - Loss of data integrity due to system failures or crashes.
-        
-        Data Redundancy:
-        - Multiple databases storing the same customer information.
-        - Repeated entries of the same transaction in different systems.
-        - Overlapping datasets in data warehouses leading to increased storage costs.
-        
-        Analyze the following IT incident:
-        ID: {incident_id}
-        Description: {description}
-        Area Category: {area_category}
-        Area Subcategory: {area_subcategory}
-        Impacted Location: {location}
-        Cause: {cause}
-        Summary: {summary}
-        Findings: {findings}
-        Resolution: {resolution}
-        
-        Provide a detailed analysis with:
-        1. Whether this is a data issue according to HSBC's definition
-        2. If yes, the most appropriate data quality dimension from HSBC's categorization
-        3. List of supporting reasons (factors that indicate this is a data issue)
-        4. List of contrary reasons (factors that indicate this is not a data issue)
-        5. A confidence score explanation based on the reasons
-        
-        You must respond ONLY with a valid JSON object using the following exact format:
-        {{
-            "is_data_issue": true/false,
-            "data_quality_dimension": "dimension here or null if not a data issue",
-            "supporting_reasons": ["reason1", "reason2", ...],
-            "contrary_reasons": ["reason1", "reason2", ...],
-            "confidence_calculation": {{
-                "base_score": 0.5,
-                "supporting_weight": 0.15,
-                "contrary_weight": -0.1,
-                "final_score": 0.0-1.0
-            }},
-            "summary": "brief explanation of the classification"
-        }}
-        
-        Do not include any text before or after the JSON object. The response must be valid JSON that can be parsed directly.
+    def __init__(self, config_path: str, openai_base_url: str = None):
         """
+        Initialize the legal document processor.
         
-    def calculate_confidence_score(self, supporting_reasons: List[str], contrary_reasons: List[str]) -> Dict[str, float]:
-        """Calculate confidence score based on supporting and contrary reasons"""
-        base_score = 0.5  # Start neutral
-        supporting_weight = 0.15  # Each supporting reason adds this much
-        contrary_weight = -0.1    # Each contrary reason subtracts this much
+        Args:
+            config_path: Path to JSON configuration file
+            openai_base_url: Base URL for OpenAI API connection
+        """
+        self.config = self._load_config(config_path)
+        self.openai_base_url = openai_base_url or "https://api.openai.com/v1"
         
-        # Calculate adjustments
-        supporting_adjustment = len(supporting_reasons) * supporting_weight
-        contrary_adjustment = len(contrary_reasons) * contrary_weight
+        # Initialize OpenAI client
+        self.openai_client = OpenAI(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            base_url=self.openai_base_url
+        )
         
-        # Calculate raw score
-        raw_score = base_score + supporting_adjustment + contrary_adjustment
+        # Initialize models
+        self.llm = ChatOpenAI(
+            model="o3-mini-2025-01-31",
+            openai_api_key=os.getenv("OPENAI_API_KEY"),
+            openai_api_base=self.openai_base_url,
+            model_kwargs={"reasoning_effort": "high"}
+        )
         
-        # Normalize to 0-1 range using sigmoid function
-        final_score = 1 / (1 + np.exp(-4 * (raw_score - 0.5)))
+        # Initialize local tiktoken encoding
+        self.encoding = self._load_local_tiktoken_encoding()
         
-        return {
-            "base_score": base_score,
-            "supporting_weight": supporting_weight,
-            "contrary_weight": contrary_weight,
-            "supporting_adjustment": supporting_adjustment,
-            "contrary_adjustment": contrary_adjustment,
-            "raw_score": raw_score,
-            "final_score": float(final_score)
+        # Initialize NLP models
+        self.nlp = spacy.load("en_core_web_sm")
+        
+        # Initialize memory store
+        self.memory_store = InMemoryStore()
+        
+        # Initialize memory manager
+        self.memory_manager = create_memory_manager(
+            "o3-mini-2025-01-31",
+            instructions="Extract legal rules, obligations, permissions, prohibitions, and domain classifications for data management compliance."
+        )
+        
+        # Initialize knowledge graph
+        self.knowledge_graph = nx.DiGraph()
+        
+        # Initialize RDF graph for SKOS ontology
+        self.rdf_graph = Graph()
+        self._setup_namespaces()
+        
+        # Initialize multi-agent system
+        self._setup_agents()
+    
+    def _load_config(self, config_path: str) -> Dict[str, Any]:
+        """Load configuration from JSON file."""
+        with open(config_path, 'r') as f:
+            return json.load(f)
+    
+    def _load_local_tiktoken_encoding(self):
+        """Load tiktoken encoding from local models folder."""
+        try:
+            import tiktoken
+            
+            # Try to load from local folder first
+            tiktoken_models_path = Path("./tiktoken_models")
+            if tiktoken_models_path.exists():
+                # Set the tiktoken cache directory to our local folder
+                os.environ["TIKTOKEN_CACHE_DIR"] = str(tiktoken_models_path)
+                logger.info(f"Using local tiktoken models from: {tiktoken_models_path}")
+            
+            # Load encoding for GPT-4 (which is compatible with o3-mini)
+            encoding = tiktoken.encoding_for_model("gpt-4")
+            logger.info("Successfully loaded tiktoken encoding")
+            return encoding
+            
+        except Exception as e:
+            logger.warning(f"Failed to load tiktoken encoding: {e}")
+            # Fallback: create a simple token counter
+            return self._create_fallback_tokenizer()
+    
+    def _create_fallback_tokenizer(self):
+        """Create a fallback tokenizer if tiktoken fails."""
+        class FallbackTokenizer:
+            def encode(self, text: str) -> list:
+                # Approximate token count (rough estimate: 1 token ≈ 4 characters)
+                return list(range(len(text) // 4))
+        
+        logger.warning("Using fallback tokenizer - token counts will be approximate")
+        return FallbackTokenizer()
+    
+    def _setup_namespaces(self):
+        """Setup RDF namespaces for SKOS ontology."""
+        self.LEG = Namespace("http://example.org/legal-ontology#")
+        self.DATA_MGT = Namespace("http://example.org/data-management#")
+        
+        # Bind namespaces
+        self.rdf_graph.bind("leg", self.LEG)
+        self.rdf_graph.bind("data_mgt", self.DATA_MGT)
+        self.rdf_graph.bind("skos", SKOS)
+        self.rdf_graph.bind("rdfs", RDFS)
+        self.rdf_graph.bind("owl", OWL)
+    
+    def get_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """Generate embeddings using OpenAI client directly."""
+        try:
+            response = self.openai_client.embeddings.create(
+                model="text-embedding-3-large",
+                input=texts,
+                dimensions=3072
+            )
+            return [data.embedding for data in response.data]
+        except Exception as e:
+            logger.error(f"Error generating embeddings: {e}")
+            return []
+    
+    def extract_text_from_pdf(self, pdf_path: str) -> str:
+        """Extract text from PDF document with improved handling for large files."""
+        try:
+            with open(pdf_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                text_parts = []
+                
+                total_pages = len(pdf_reader.pages)
+                logger.info(f"Extracting text from {total_pages} pages")
+                
+                for page_num, page in enumerate(pdf_reader.pages):
+                    page_text = page.extract_text()
+                    if page_text.strip():  # Only add non-empty pages
+                        # Clean up text
+                        page_text = self._clean_extracted_text(page_text)
+                        text_parts.append(f"[PAGE {page_num + 1}]\n{page_text}")
+                    
+                    if (page_num + 1) % 10 == 0:
+                        logger.info(f"Processed {page_num + 1}/{total_pages} pages")
+                
+                full_text = "\n\n".join(text_parts)
+                logger.info(f"Extracted {len(full_text)} characters from PDF")
+                return full_text
+                
+        except Exception as e:
+            logger.error(f"Error extracting text from PDF: {e}")
+            return ""
+    
+    def _clean_extracted_text(self, text: str) -> str:
+        """Clean extracted PDF text for better processing."""
+        # Remove excessive whitespace
+        text = re.sub(r'\s+', ' ', text)
+        
+        # Fix common PDF extraction issues
+        text = re.sub(r'(\w)-\s*\n\s*(\w)', r'\1\2', text)  # Fix hyphenated words across lines
+        text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)  # Normalize paragraph breaks
+        
+        # Remove page headers/footers patterns
+        text = re.sub(r'Page \d+ of \d+', '', text)
+        text = re.sub(r'\d{1,3}\s*$', '', text, flags=re.MULTILINE)  # Remove page numbers at end of line
+        
+        return text.strip()
+    
+    def chunk_document_semantically(self, text: str, max_tokens: int = 6000, overlap_tokens: int = 200) -> List[Dict[str, Any]]:
+        """
+        Chunk document using semantic boundaries (sections, articles, paragraphs).
+        
+        Args:
+            text: Full document text
+            max_tokens: Maximum tokens per chunk
+            overlap_tokens: Overlap between chunks for context preservation
+            
+        Returns:
+            List of chunk dictionaries with metadata
+        """
+        # Parse document with spaCy
+        doc = self.nlp(text)
+        
+        chunks = []
+        current_chunk = ""
+        current_tokens = 0
+        chunk_metadata = {
+            "section": None,
+            "start_char": 0,
+            "end_char": 0,
+            "chunk_id": 0
         }
         
-    def analyze_incident(self, incident_id: str, description: str, area_category: str, 
-                        area_subcategory: str, location: str, cause: str, summary: str, 
-                        findings: str, resolution: str) -> DataIssueClassifier:
-        """Analyze a single incident for data quality issues with enhanced reasoning"""
-        try:
-            prompt = self.classification_prompt_template.format(
-                incident_id=incident_id,
-                description=description,
-                area_category=area_category,
-                area_subcategory=area_subcategory,
-                location=location,
-                cause=cause,
-                summary=summary,
-                findings=findings,
-                resolution=resolution
+        # Legal document section patterns
+        section_patterns = [
+            r'(?i)^(SECTION|ARTICLE|CHAPTER|PART|CLAUSE|PARAGRAPH)\s+\d+',
+            r'(?i)^(\d+\.)+\s',  # Numbered sections like 1.1, 1.2.3
+            r'(?i)^[A-Z][A-Z\s]{10,}$',  # ALL CAPS headers
+        ]
+        
+        sentences = list(doc.sents)
+        overlap_text = ""
+        
+        for i, sent in enumerate(sentences):
+            sent_text = sent.text.strip()
+            sent_tokens = len(self.encoding.encode(sent_text))
+            
+            # Check if this is a section header
+            is_section_header = any(
+                re.match(pattern, sent_text) 
+                for pattern in section_patterns
             )
             
-            response = self.chatbot.llm.predict(prompt)
-            
-            # Extract JSON from response (in case there's additional text)
-            json_match = re.search(r'({[\s\S]*})', response)
-            if json_match:
-                json_str = json_match.group(1)
-                try:
-                    response_json = json.loads(json_str)
-                except json.JSONDecodeError:
-                    # Try cleaning the JSON string if initial parsing fails
-                    json_str = re.sub(r'```json|```', '', json_str).strip()
-                    response_json = json.loads(json_str)
-            else:
-                # If no JSON pattern found, try parsing the whole response
-                response_json = json.loads(response)
-            
-            # Extract reasoning components
-            supporting_reasons = response_json.get("supporting_reasons", [])
-            contrary_reasons = response_json.get("contrary_reasons", [])
-            
-            # Calculate confidence score
-            confidence_calculation = self.calculate_confidence_score(supporting_reasons, contrary_reasons)
-            
-            # Handle potential missing confidence_calculation in response
-            if "confidence_calculation" not in response_json:
-                response_json["confidence_calculation"] = {}
-            
-            # Update with our algorithm
-            response_json["confidence_calculation"].update(confidence_calculation)
-            
-            reasoning = DataIssueReasoning(
-                supporting_reasons=supporting_reasons,
-                contrary_reasons=contrary_reasons,
-                confidence_calculation=confidence_calculation
-            )
-            
-            return DataIssueClassifier(
-                incident_id=incident_id,
-                is_data_issue=response_json.get("is_data_issue", False),
-                data_quality_dimension=response_json.get("data_quality_dimension"),
-                confidence_score=confidence_calculation["final_score"],
-                reasoning=reasoning,
-                summary=response_json.get("summary", "")
-            )
-            
-        except (json.JSONDecodeError, ValidationError) as e:
-            logger.error(f"Error parsing response for incident {incident_id}: {e}")
-            logger.error(f"Raw response: {response}")
-            
-            # Fallback classification
-            reasoning = DataIssueReasoning(
-                supporting_reasons=[],
-                contrary_reasons=["Error in classification: Unable to parse response"],
-                confidence_calculation={"final_score": 0.0}
-            )
-            return DataIssueClassifier(
-                incident_id=incident_id,
-                is_data_issue=False,
-                data_quality_dimension=None,
-                confidence_score=0.0,
-                reasoning=reasoning,
-                summary="Error in classification: Unable to parse AI response"
-            )
-    
-    def process_csv(self, file_path: str = None, output_path: str = None) -> Dict[str, any]:
-        """Process a CSV file and classify all incidents, writing results immediately row by row"""
-        # Use global paths if not provided
-        if file_path is None:
-            file_path = INPUT_CSV_PATH
-        if output_path is None:
-            output_path = OUTPUT_CSV_PATH
-            
-        try:
-            # Read CSV file
-            df = pd.read_csv(file_path)
-            logger.info(f"Loaded CSV file: {file_path} with {len(df)} records")
-            
-            # Validate required columns
-            missing_columns = []
-            for logical_name, actual_column in REQUIRED_COLUMNS.items():
-                if actual_column not in df.columns:
-                    missing_columns.append(actual_column)
-            
-            if missing_columns:
-                raise ValueError(f"Missing required columns: {missing_columns}")
-            
-            logger.info(f"All required columns found: {list(REQUIRED_COLUMNS.values())}")
-            
-            # Define additional columns for results
-            result_columns = [
-                'is_data_issue', 
-                'data_quality_dimension', 
-                'confidence_score',
-                'supporting_reasons', 
-                'contrary_reasons',
-                'classification_summary', 
-                'confidence_calculation'
-            ]
-            
-            # Create output file with headers
-            all_columns = df.columns.tolist() + result_columns
-            with open(output_path, 'w', newline='', encoding='utf-8') as f:
-                f.write(','.join(all_columns) + '\n')
-            logger.info(f"Created output file: {output_path}")
-            
-            # Initialize counters for summary
-            total_incidents = len(df)
-            processed_count = 0
-            data_issues_count = 0
-            dimension_counts = {}
-            
-            # Process each incident and write results immediately
-            for idx, row in df.iterrows():
-                try:
-                    # Process the incident with all available fields
-                    classification = self.analyze_incident(
-                        incident_id=str(row[REQUIRED_COLUMNS['incident_id']]),
-                        description=str(row[REQUIRED_COLUMNS['incident_desc']]),
-                        area_category=str(row[REQUIRED_COLUMNS['incident_area_category']]),
-                        area_subcategory=str(row[REQUIRED_COLUMNS['incident_area_subcategory']]),
-                        location=str(row[REQUIRED_COLUMNS['incident_location']]),
-                        cause=str(row[REQUIRED_COLUMNS['incident_cause']]),
-                        summary=str(row[REQUIRED_COLUMNS['incident_summary']]),
-                        findings=str(row[REQUIRED_COLUMNS['incident_findings']]),
-                        resolution=str(row[REQUIRED_COLUMNS['incident_resolution']])
-                    )
-                    
-                    # Update counters
-                    processed_count += 1
-                    if classification.is_data_issue:
-                        data_issues_count += 1
-                        dim = classification.data_quality_dimension
-                        if dim:
-                            dimension_counts[dim] = dimension_counts.get(dim, 0) + 1
-                    
-                    # Prepare row data
-                    result_data = {
-                        'is_data_issue': classification.is_data_issue,
-                        'data_quality_dimension': classification.data_quality_dimension or "",
-                        'confidence_score': classification.confidence_score,
-                        'supporting_reasons': '; '.join(classification.reasoning.supporting_reasons),
-                        'contrary_reasons': '; '.join(classification.reasoning.contrary_reasons),
-                        'classification_summary': classification.summary,
-                        'confidence_calculation': json.dumps(classification.reasoning.confidence_calculation)
-                    }
-                    
-                    # Combine original row with results
-                    combined_row = {**row.to_dict(), **result_data}
-                    
-                    # Convert to a pandas Series to ensure proper ordering
-                    result_series = pd.Series(combined_row)
-                    
-                    # Write the row to CSV immediately (save on the fly)
-                    with open(output_path, 'a', newline='', encoding='utf-8') as f:
-                        # Escape any commas in the values and wrap in quotes if needed
-                        csv_row = []
-                        for col in all_columns:
-                            val = str(result_series.get(col, ""))
-                            if ',' in val or '"' in val or '\n' in val:
-                                # Replace double quotes with two double quotes for CSV escaping
-                                val = val.replace('"', '""')
-                                val = f'"{val}"'
-                            csv_row.append(val)
-                        f.write(','.join(csv_row) + '\n')
-                    
-                    # Log progress at specified intervals
-                    if processed_count % BATCH_SIZE == 0 or processed_count == total_incidents:
-                        logger.info(f"Processed {processed_count}/{total_incidents} incidents ({(processed_count/total_incidents)*100:.1f}%)")
-                        logger.info(f"Data issues found so far: {data_issues_count}")
-                    
-                    # Auto-save progress summary every N records for large datasets
-                    if processed_count % AUTO_SAVE_FREQUENCY == 0:
-                        logger.info(f"Auto-save checkpoint: {processed_count} records processed")
-                        logger.info(f"Current data issues: {data_issues_count} ({(data_issues_count/processed_count)*100:.1f}%)")
+            # If we hit a section header and have content, finalize current chunk
+            if is_section_header and current_chunk:
+                self._finalize_chunk(chunks, current_chunk, chunk_metadata, overlap_text)
                 
-                except Exception as e:
-                    logger.error(f"Error processing row {idx}, incident ID {row.get(REQUIRED_COLUMNS['incident_id'], 'Unknown')}: {e}")
-                    # Continue with the next row instead of failing the entire process
-                    continue
+                # Start new chunk with overlap
+                current_chunk = overlap_text
+                current_tokens = len(self.encoding.encode(current_chunk))
+                chunk_metadata = {
+                    "section": sent_text,
+                    "start_char": sent.start_char,
+                    "end_char": sent.end_char,
+                    "chunk_id": len(chunks)
+                }
             
-            # Generate summary
-            summary = {
-                "total_incidents": total_incidents,
-                "processed_count": processed_count,
-                "data_issues_count": data_issues_count,
-                "dimension_counts": dimension_counts,
-                "output_path": output_path,
-                "input_path": file_path
+            # Check if adding this sentence would exceed token limit
+            if current_tokens + sent_tokens > max_tokens and current_chunk:
+                self._finalize_chunk(chunks, current_chunk, chunk_metadata, overlap_text)
+                
+                # Start new chunk with overlap
+                current_chunk = overlap_text + " " + sent_text
+                current_tokens = len(self.encoding.encode(current_chunk))
+                chunk_metadata = {
+                    "section": chunk_metadata.get("section"),
+                    "start_char": sent.start_char,
+                    "end_char": sent.end_char,
+                    "chunk_id": len(chunks)
+                }
+            else:
+                # Add sentence to current chunk
+                if current_chunk:
+                    current_chunk += " " + sent_text
+                else:
+                    current_chunk = sent_text
+                    chunk_metadata["start_char"] = sent.start_char
+                
+                current_tokens += sent_tokens
+                chunk_metadata["end_char"] = sent.end_char
+            
+            # Prepare overlap text (last few sentences)
+            if i >= len(sentences) - 3:  # Last 3 sentences for overlap
+                overlap_sentences = sentences[max(0, i-2):i+1]
+                overlap_text = " ".join([s.text.strip() for s in overlap_sentences])
+                overlap_token_count = len(self.encoding.encode(overlap_text))
+                if overlap_token_count > overlap_tokens:
+                    overlap_text = " ".join([s.text.strip() for s in overlap_sentences[-2:]])
+        
+        # Finalize last chunk
+        if current_chunk:
+            self._finalize_chunk(chunks, current_chunk, chunk_metadata, "")
+        
+        logger.info(f"Document chunked into {len(chunks)} semantic chunks")
+        return chunks
+    
+    def _finalize_chunk(self, chunks: List[Dict[str, Any]], chunk_text: str, 
+                       metadata: Dict[str, Any], overlap_text: str):
+        """Finalize and add chunk to chunks list."""
+        chunk_data = {
+            "text": chunk_text.strip(),
+            "tokens": len(self.encoding.encode(chunk_text)),
+            "chunk_id": metadata["chunk_id"],
+            "section": metadata.get("section"),
+            "start_char": metadata["start_char"],
+            "end_char": metadata["end_char"],
+            "overlap": overlap_text.strip() if overlap_text else None
+        }
+        chunks.append(chunk_data)
+    
+    def create_chunk_embeddings(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Create embeddings for document chunks.
+        
+        Args:
+            chunks: List of chunk dictionaries
+            
+        Returns:
+            Chunks with embeddings added
+        """
+        # Extract texts for embedding
+        chunk_texts = [chunk["text"] for chunk in chunks]
+        
+        # Generate embeddings in batches to handle large documents
+        batch_size = 100  # OpenAI API limit consideration
+        all_embeddings = []
+        
+        for i in range(0, len(chunk_texts), batch_size):
+            batch_texts = chunk_texts[i:i + batch_size]
+            batch_embeddings = self.get_embeddings(batch_texts)
+            all_embeddings.extend(batch_embeddings)
+            
+            logger.info(f"Generated embeddings for batch {i//batch_size + 1}/{(len(chunk_texts)-1)//batch_size + 1}")
+        
+        # Add embeddings to chunks
+        for i, chunk in enumerate(chunks):
+            if i < len(all_embeddings):
+                chunk["embedding"] = all_embeddings[i]
+                chunk["embedding_model"] = "text-embedding-3-large"
+                chunk["embedding_dimensions"] = 3072
+        
+        return chunks
+    
+    def find_similar_chunks(self, query_text: str, chunks: List[Dict[str, Any]], 
+                           top_k: int = 5) -> List[Dict[str, Any]]:
+        """
+        Find chunks most similar to query using embeddings.
+        
+        Args:
+            query_text: Query text
+            chunks: List of chunks with embeddings
+            top_k: Number of top similar chunks to return
+            
+        Returns:
+            Top similar chunks with similarity scores
+        """
+        # Get query embedding
+        query_embeddings = self.get_embeddings([query_text])
+        if not query_embeddings:
+            return []
+        
+        query_embedding = query_embeddings[0]
+        
+        # Calculate similarities
+        similarities = []
+        for chunk in chunks:
+            if "embedding" in chunk:
+                # Cosine similarity
+                chunk_embedding = np.array(chunk["embedding"])
+                query_vec = np.array(query_embedding)
+                
+                similarity = np.dot(chunk_embedding, query_vec) / (
+                    np.linalg.norm(chunk_embedding) * np.linalg.norm(query_vec)
+                )
+                
+                similarities.append({
+                    **chunk,
+                    "similarity_score": float(similarity)
+                })
+        
+        # Sort by similarity and return top_k
+        similarities.sort(key=lambda x: x["similarity_score"], reverse=True)
+        return similarities[:top_k]
+    
+    def _setup_agents(self):
+        """Setup the multi-agent system using LangGraph."""
+        
+        # Define agent state
+        class LegalAgentState(MessagesState):
+            document_id: str
+            jurisdiction: str
+            organization: str
+            extracted_rules: List[Dict[str, Any]]
+            domain_classifications: Dict[str, List[str]]
+            ontology_concepts: List[Dict[str, Any]]
+            processing_stage: str
+            chunk_id: Optional[int] = None
+            chunk_context: Optional[Dict[str, Any]] = None
+            
+        # Create memory tools
+        memory_tools = [
+            create_manage_memory_tool(namespace=("legal_memory",)),
+            create_search_memory_tool(namespace=("legal_memory",))
+        ]
+        
+        # Document Analysis Agent
+        @tool
+        def analyze_document_structure(text: str) -> Dict[str, Any]:
+            """Analyze document structure and extract sections."""
+            doc = self.nlp(text)
+            
+            sections = []
+            current_section = None
+            
+            for sent in doc.sents:
+                # Identify section headers using linguistic patterns
+                if any(pattern in sent.text.lower() for pattern in 
+                      ['section', 'article', 'chapter', 'part', 'clause']):
+                    if current_section:
+                        sections.append(current_section)
+                    current_section = {
+                        "title": sent.text.strip(),
+                        "content": [],
+                        "start_pos": sent.start_char
+                    }
+                elif current_section:
+                    current_section["content"].append(sent.text.strip())
+            
+            if current_section:
+                sections.append(current_section)
+            
+            return {
+                "sections": sections,
+                "total_sentences": len(list(doc.sents)),
+                "entities": [(ent.text, ent.label_) for ent in doc.ents]
+            }
+        
+        # Rule Extraction Agent
+        @tool
+        def extract_legal_rules(text: str) -> List[Dict[str, Any]]:
+            """Extract legal rules using ReAct reasoning."""
+            
+            prompt = f"""
+            Analyze the following legal text and extract structured rules, obligations, permissions, and prohibitions.
+            
+            For each rule found, provide:
+            1. Subject (who the rule applies to)
+            2. Predicate (the action or state)
+            3. Object (what is affected)
+            4. Modality (obligation/permission/prohibition)
+            5. Conditions (when it applies)
+            6. Exceptions (when it doesn't apply)
+            
+            Text: {text[:3000]}...
+            
+            Return a JSON list of rules with the structure above.
+            """
+            
+            try:
+                response = self.openai_client.chat.completions.create(
+                    model="o3-mini-2025-01-31",
+                    messages=[
+                        {"role": "system", "content": "You are a legal expert specializing in extracting structured rules from legal documents."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    reasoning_effort="high"
+                )
+                
+                rules_text = response.choices[0].message.content
+                if "```json" in rules_text:
+                    rules_text = rules_text.split("```json")[1].split("```")[0]
+                
+                rules = json.loads(rules_text)
+                return rules
+            except json.JSONDecodeError:
+                logger.warning("Failed to parse JSON from rule extraction")
+                return []
+            except Exception as e:
+                logger.error(f"Error in rule extraction: {e}")
+                return []
+        
+        # Domain Classification Agent
+        @tool
+        def classify_data_management_domains(rules: List[Dict[str, Any]]) -> Dict[str, List[int]]:
+            """Classify rules into data management domains using LLM capabilities."""
+            
+            prompt = f"""
+            Classify the following legal rules into data management domains. Analyze the content and dynamically determine relevant domains.
+            
+            Consider areas such as:
+            - Data Storage and Retention
+            - Data Usage and Processing
+            - Data Movement and Transfer
+            - Privacy and Consent
+            - Security and Protection
+            - Access and Disclosure
+            - Data Quality and Integrity
+            - Governance and Compliance
+            
+            For each rule, determine which domains it relates to and explain why.
+            
+            Rules: {json.dumps(rules, indent=2)}
+            
+            Return a JSON object mapping domain names to lists of rule indices (0-based).
+            """
+            
+            try:
+                response = self.openai_client.chat.completions.create(
+                    model="o3-mini-2025-01-31",
+                    messages=[
+                        {"role": "system", "content": "You are a data management expert specializing in regulatory compliance classification."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    reasoning_effort="high"
+                )
+                
+                classification_text = response.choices[0].message.content
+                if "```json" in classification_text:
+                    classification_text = classification_text.split("```json")[1].split("```")[0]
+                
+                domains = json.loads(classification_text)
+                return domains
+            except json.JSONDecodeError:
+                logger.warning("Failed to parse JSON from domain classification")
+                return {}
+            except Exception as e:
+                logger.error(f"Error in domain classification: {e}")
+                return {}
+        
+        # Ontology Generation Agent
+        @tool
+        def generate_skos_concepts(rules: List[Dict[str, Any]], domains: Dict[str, List[int]]) -> List[Dict[str, Any]]:
+            """Generate SKOS concepts from extracted rules."""
+            
+            concepts = []
+            
+            # Generate concepts for each rule
+            for i, rule in enumerate(rules):
+                concept_id = f"rule_{i}_{hashlib.md5(str(rule).encode()).hexdigest()[:8]}"
+                
+                concept = {
+                    "id": concept_id,
+                    "type": "skos:Concept",
+                    "prefLabel": f"{rule.get('subject', '')} {rule.get('predicate', '')}",
+                    "definition": self._generate_rule_definition(rule),
+                    "broader": [],
+                    "narrower": [],
+                    "related": [],
+                    "inScheme": "legal_compliance_scheme",
+                    "modality": rule.get("modality", ""),
+                    "conditions": rule.get("conditions", []),
+                    "exceptions": rule.get("exceptions", []),
+                    "domains": [domain for domain, rule_indices in domains.items() if i in rule_indices]
+                }
+                
+                concepts.append(concept)
+            
+            # Generate domain concepts
+            for domain_name in domains.keys():
+                domain_concept = {
+                    "id": f"domain_{domain_name.lower().replace(' ', '_')}",
+                    "type": "skos:Concept",
+                    "prefLabel": domain_name,
+                    "definition": f"Legal rules and requirements related to {domain_name.lower()}",
+                    "broader": ["data_management"],
+                    "narrower": [c["id"] for c in concepts if domain_name in c.get("domains", [])],
+                    "topConceptOf": "legal_compliance_scheme"
+                }
+                concepts.append(domain_concept)
+            
+            return concepts
+        
+        # Create specialized agents
+        self.document_analyzer = create_react_agent(
+            self.llm,
+            tools=[analyze_document_structure] + memory_tools,
+            store=self.memory_store
+        )
+        
+        self.rule_extractor = create_react_agent(
+            self.llm,
+            tools=[extract_legal_rules] + memory_tools,
+            store=self.memory_store
+        )
+        
+        self.domain_classifier = create_react_agent(
+            self.llm,
+            tools=[classify_data_management_domains] + memory_tools,
+            store=self.memory_store
+        )
+        
+        self.ontology_generator = create_react_agent(
+            self.llm,
+            tools=[generate_skos_concepts] + memory_tools,
+            store=self.memory_store
+        )
+        
+        # Create supervisor agent
+        def supervisor_node(state: LegalAgentState):
+            """Supervisor agent that orchestrates the workflow."""
+            
+            stage = state.get("processing_stage", "start")
+            
+            if stage == "start":
+                return {
+                    "messages": [AIMessage(content="Starting document analysis")],
+                    "processing_stage": "document_analysis"
+                }
+            elif stage == "document_analysis":
+                return {
+                    "messages": [AIMessage(content="Moving to rule extraction")],
+                    "processing_stage": "rule_extraction"
+                }
+            elif stage == "rule_extraction":
+                return {
+                    "messages": [AIMessage(content="Moving to domain classification")],
+                    "processing_stage": "domain_classification"
+                }
+            elif stage == "domain_classification":
+                return {
+                    "messages": [AIMessage(content="Moving to ontology generation")],
+                    "processing_stage": "ontology_generation"
+                }
+            else:
+                return {
+                    "messages": [AIMessage(content="Processing complete")],
+                    "processing_stage": "complete"
+                }
+        
+        # Build the workflow graph
+        workflow = StateGraph(LegalAgentState)
+        
+        # Add nodes
+        workflow.add_node("supervisor", supervisor_node)
+        workflow.add_node("document_analyzer", self.document_analyzer)
+        workflow.add_node("rule_extractor", self.rule_extractor)
+        workflow.add_node("domain_classifier", self.domain_classifier)
+        workflow.add_node("ontology_generator", self.ontology_generator)
+        
+        # Add edges
+        workflow.add_edge(START, "supervisor")
+        workflow.add_edge("supervisor", "document_analyzer")
+        workflow.add_edge("document_analyzer", "rule_extractor")
+        workflow.add_edge("rule_extractor", "domain_classifier")
+        workflow.add_edge("domain_classifier", "ontology_generator")
+        workflow.add_edge("ontology_generator", END)
+        
+        # Compile the workflow
+        self.workflow = workflow.compile(checkpointer=MemorySaver())
+    
+    def _generate_rule_definition(self, rule: Dict[str, Any]) -> str:
+        """Generate a human-readable definition for a rule."""
+        modality = rule.get("modality", "").lower()
+        subject = rule.get("subject", "")
+        predicate = rule.get("predicate", "")
+        obj = rule.get("object", "")
+        
+        if modality == "obligation":
+            return f"{subject} must {predicate} {obj}"
+        elif modality == "permission":
+            return f"{subject} may {predicate} {obj}"
+        elif modality == "prohibition":
+            return f"{subject} must not {predicate} {obj}"
+        else:
+            return f"{subject} {predicate} {obj}"
+    
+    async def process_document(self, pdf_path: str, document_metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Process a legal document through the multi-agent system with chunking."""
+        
+        # Extract text from PDF
+        text = self.extract_text_from_pdf(pdf_path)
+        if not text:
+            raise ValueError("Failed to extract text from PDF")
+        
+        logger.info(f"Processing document: {document_metadata.get('id', 'unknown')}")
+        logger.info(f"Document length: {len(text)} characters")
+        
+        # Create semantic chunks for large documents
+        chunks = self.chunk_document_semantically(text, max_tokens=6000, overlap_tokens=200)
+        logger.info(f"Document split into {len(chunks)} chunks")
+        
+        # Create embeddings for chunks
+        chunks_with_embeddings = self.create_chunk_embeddings(chunks)
+        
+        # Process chunks through multi-agent system
+        all_rules = []
+        all_domain_classifications = {}
+        all_concepts = []
+        
+        # Process each chunk through the workflow
+        for i, chunk in enumerate(chunks_with_embeddings):
+            logger.info(f"Processing chunk {i+1}/{len(chunks_with_embeddings)}")
+            
+            # Create initial state for this chunk
+            chunk_state = {
+                "messages": [HumanMessage(content=f"Process this legal document chunk: {chunk['text'][:1500]}...")],
+                "document_id": document_metadata.get("id", "unknown"),
+                "jurisdiction": document_metadata.get("jurisdiction", "unknown"),
+                "organization": document_metadata.get("organization", "unknown"),
+                "chunk_id": chunk["chunk_id"],
+                "chunk_context": {
+                    "section": chunk.get("section"),
+                    "tokens": chunk["tokens"],
+                    "chunk_index": i,
+                    "total_chunks": len(chunks_with_embeddings)
+                },
+                "extracted_rules": [],
+                "domain_classifications": {},
+                "ontology_concepts": [],
+                "processing_stage": "start"
             }
             
-            # Log final summary
-            logger.info("="*60)
-            logger.info("FINAL PROCESSING SUMMARY")
-            logger.info("="*60)
-            logger.info(f"Input file: {file_path}")
-            logger.info(f"Output file: {output_path}")
-            logger.info(f"Total incidents: {total_incidents}")
-            logger.info(f"Successfully processed: {processed_count}")
-            logger.info(f"Data issues identified: {data_issues_count}")
-            if processed_count > 0:
-                data_issue_percentage = (data_issues_count / processed_count) * 100
-                logger.info(f"Data issues percentage: {data_issue_percentage:.1f}%")
-            logger.info("\nData Quality Dimension Distribution:")
-            for dimension, count in dimension_counts.items():
-                percentage = (count / data_issues_count) * 100 if data_issues_count > 0 else 0
-                logger.info(f"  {dimension}: {count} ({percentage:.1f}%)")
-            logger.info("="*60)
-            
-            return summary
+            try:
+                # Run the workflow for this chunk
+                chunk_result = await self.workflow.ainvoke(chunk_state)
+                
+                # Aggregate results
+                chunk_rules = chunk_result.get("extracted_rules", [])
+                for rule in chunk_rules:
+                    rule["source_chunk"] = i
+                    rule["chunk_section"] = chunk.get("section")
+                
+                all_rules.extend(chunk_rules)
+                
+                # Merge domain classifications
+                chunk_domains = chunk_result.get("domain_classifications", {})
+                for domain, rule_indices in chunk_domains.items():
+                    if domain not in all_domain_classifications:
+                        all_domain_classifications[domain] = []
+                    # Adjust rule indices to account for previous chunks
+                    adjusted_indices = [idx + len(all_rules) - len(chunk_rules) for idx in rule_indices]
+                    all_domain_classifications[domain].extend(adjusted_indices)
+                
+                all_concepts.extend(chunk_result.get("ontology_concepts", []))
+                
+            except Exception as e:
+                logger.error(f"Error processing chunk {i}: {e}")
+                continue
         
-        except Exception as e:
-            logger.error(f"Error processing CSV file: {e}")
-            raise
-
-# Example usage
-if __name__ == "__main__":
-    logger.info("="*60)
-    logger.info("STARTING DATA ISSUE CLASSIFICATION")
-    logger.info("="*60)
-    logger.info(f"OpenAI Model: {OPENAI_MODEL}")
-    logger.info(f"Input CSV: {INPUT_CSV_PATH}")
-    logger.info(f"Output CSV: {OUTPUT_CSV_PATH}")
-    logger.info(f"Batch Size: {BATCH_SIZE}")
-    logger.info(f"Auto-save Frequency: {AUTO_SAVE_FREQUENCY}")
-    logger.info("="*60)
+        # Create final aggregated result
+        aggregated_result = {
+            "document_id": document_metadata.get("id", "unknown"),
+            "jurisdiction": document_metadata.get("jurisdiction", "unknown"),
+            "organization": document_metadata.get("organization", "unknown"),
+            "extracted_rules": all_rules,
+            "domain_classifications": all_domain_classifications,
+            "ontology_concepts": all_concepts,
+            "processing_metadata": {
+                "total_chunks": len(chunks_with_embeddings),
+                "total_characters": len(text),
+                "chunks_processed": len([c for c in chunks_with_embeddings if "embedding" in c])
+            }
+        }
+        
+        # Generate ontology outputs
+        ontology_outputs = self._generate_ontology_outputs(aggregated_result)
+        
+        # Update knowledge graph
+        self._update_knowledge_graph(aggregated_result, chunks_with_embeddings)
+        
+        # Store in long-term memory
+        await self._store_in_memory(aggregated_result, chunks_with_embeddings)
+        
+        return {
+            "document_id": aggregated_result["document_id"],
+            "jurisdiction": aggregated_result["jurisdiction"],
+            "organization": aggregated_result["organization"],
+            "rules": aggregated_result["extracted_rules"],
+            "domains": aggregated_result["domain_classifications"],
+            "concepts": aggregated_result["ontology_concepts"],
+            "ontology": ontology_outputs,
+            "chunks": chunks_with_embeddings,
+            "processing_metadata": aggregated_result["processing_metadata"],
+            "knowledge_graph_nodes": len(self.knowledge_graph.nodes),
+            "knowledge_graph_edges": len(self.knowledge_graph.edges)
+        }
     
-    try:
-        # Initialize OpenAI chatbot with global configuration
-        logger.info("Initializing OpenAI chatbot...")
-        chatbot = OpenAIChatbot()
+    def process_all_documents(self) -> List[Dict[str, Any]]:
+        """Process all documents defined in the configuration."""
+        results = []
         
-        # Initialize Data Issue Analyzer
-        logger.info("Initializing Data Issue Analyzer...")
-        analyzer = DataIssueAnalyzer(chatbot)
+        for doc_config in self.config["documents"]:
+            try:
+                logger.info(f"Processing document: {doc_config['id']}")
+                
+                # Check if file exists
+                if not Path(doc_config["path"]).exists():
+                    logger.warning(f"File not found: {doc_config['path']}")
+                    results.append({
+                        "document_id": doc_config['id'],
+                        "error": f"File not found: {doc_config['path']}",
+                        "success": False
+                    })
+                    continue
+                
+                # Run async processing
+                result = asyncio.run(self.process_document(
+                    doc_config["path"],
+                    doc_config
+                ))
+                
+                result["success"] = True
+                results.append(result)
+                logger.info(f"Successfully processed {doc_config['id']}: {len(result['rules'])} rules extracted")
+                
+            except Exception as e:
+                logger.error(f"Failed to process document {doc_config['id']}: {e}")
+                results.append({
+                    "document_id": doc_config['id'],
+                    "error": str(e),
+                    "success": False
+                })
         
-        # Process CSV file with streaming output for large datasets
-        logger.info("Starting CSV processing...")
-        summary = analyzer.process_csv()
+        return results
+    
+    def _generate_ontology_outputs(self, processing_result: Dict[str, Any]) -> Dict[str, str]:
+        """Generate SKOS ontology in multiple formats."""
         
-        # Display final summary statistics
-        logger.info("\nFINAL STATISTICS:")
-        logger.info(f"Total incidents: {summary['total_incidents']}")
-        logger.info(f"Successfully processed: {summary['processed_count']}")
-        logger.info(f"Data issues identified: {summary['data_issues_count']}")
+        # Clear existing graph
+        self.rdf_graph = Graph()
+        self._setup_namespaces()
         
-        # Calculate percentages
-        if summary['processed_count'] > 0:
-            data_issue_percentage = (summary['data_issues_count'] / summary['processed_count']) * 100
-            logger.info(f"Data issues percentage: {data_issue_percentage:.1f}%")
+        # Create concept scheme
+        scheme_uri = self.LEG["legal_compliance_scheme"]
+        self.rdf_graph.add((scheme_uri, RDF.type, SKOS.ConceptScheme))
+        self.rdf_graph.add((scheme_uri, SKOS.prefLabel, Literal("Legal Compliance Ontology")))
+        self.rdf_graph.add((scheme_uri, RDFS.comment, Literal("SKOS ontology for legal compliance rules and data management requirements")))
         
-        # Show high vs low confidence classifications
+        # Add concepts
+        concepts = processing_result.get("ontology_concepts", [])
+        for concept_data in concepts:
+            concept_uri = self.LEG[concept_data["id"]]
+            
+            # Basic concept properties
+            self.rdf_graph.add((concept_uri, RDF.type, SKOS.Concept))
+            self.rdf_graph.add((concept_uri, SKOS.prefLabel, Literal(concept_data.get("prefLabel", ""))))
+            self.rdf_graph.add((concept_uri, SKOS.definition, Literal(concept_data.get("definition", ""))))
+            self.rdf_graph.add((concept_uri, SKOS.inScheme, scheme_uri))
+            
+            # Hierarchical relationships
+            for broader_id in concept_data.get("broader", []):
+                broader_uri = self.LEG[broader_id]
+                self.rdf_graph.add((concept_uri, SKOS.broader, broader_uri))
+            
+            for narrower_id in concept_data.get("narrower", []):
+                narrower_uri = self.LEG[narrower_id]
+                self.rdf_graph.add((concept_uri, SKOS.narrower, narrower_uri))
+            
+            # Related concepts
+            for related_id in concept_data.get("related", []):
+                related_uri = self.LEG[related_id]
+                self.rdf_graph.add((concept_uri, SKOS.related, related_uri))
+            
+            # Custom properties for legal rules
+            if concept_data.get("modality"):
+                self.rdf_graph.add((concept_uri, self.LEG.modality, Literal(concept_data["modality"])))
+            
+            # Add domain classifications
+            for domain in concept_data.get("domains", []):
+                domain_uri = self.DATA_MGT[domain.lower().replace(" ", "_")]
+                self.rdf_graph.add((concept_uri, self.LEG.appliesToDomain, domain_uri))
+        
+        # Generate output formats
+        outputs = {
+            "json_ld": self.rdf_graph.serialize(format="json-ld"),
+            "turtle": self.rdf_graph.serialize(format="turtle"),
+            "xml": self.rdf_graph.serialize(format="xml")
+        }
+        
+        return outputs
+    
+    def _update_knowledge_graph(self, result: Dict[str, Any], chunks: List[Dict[str, Any]] = None):
+        """Update the knowledge graph with extracted information including chunks."""
+        
+        document_id = result["document_id"]
+        jurisdiction = result["jurisdiction"]
+        
+        # Add document node
+        self.knowledge_graph.add_node(
+            document_id,
+            type="document",
+            jurisdiction=jurisdiction,
+            organization=result["organization"],
+            rules_count=len(result.get("extracted_rules", [])),
+            processing_metadata=result.get("processing_metadata", {})
+        )
+        
+        # Add chunk nodes if available
+        if chunks:
+            for chunk in chunks:
+                chunk_id = f"{document_id}_chunk_{chunk['chunk_id']}"
+                
+                self.knowledge_graph.add_node(
+                    chunk_id,
+                    type="chunk",
+                    document_id=document_id,
+                    chunk_id=chunk["chunk_id"],
+                    text=chunk["text"][:500] + "..." if len(chunk["text"]) > 500 else chunk["text"],
+                    section=chunk.get("section"),
+                    tokens=chunk["tokens"],
+                    has_embedding="embedding" in chunk,
+                    start_char=chunk.get("start_char"),
+                    end_char=chunk.get("end_char")
+                )
+                
+                # Connect document to chunk
+                self.knowledge_graph.add_edge(document_id, chunk_id, relationship="contains_chunk")
+        
+        # Add rule nodes and relationships
+        for i, rule in enumerate(result.get("extracted_rules", [])):
+            rule_id = f"{document_id}_rule_{i}"
+            
+            self.knowledge_graph.add_node(
+                rule_id,
+                type="rule",
+                modality=rule.get("modality"),
+                subject=rule.get("subject"),
+                predicate=rule.get("predicate"),
+                object=rule.get("object"),
+                conditions=rule.get("conditions", []),
+                exceptions=rule.get("exceptions", []),
+                source_chunk=rule.get("source_chunk"),
+                chunk_section=rule.get("chunk_section")
+            )
+            
+            # Connect document to rule
+            self.knowledge_graph.add_edge(document_id, rule_id, relationship="contains_rule")
+            
+            # Connect chunk to rule if chunk information available
+            if "source_chunk" in rule and chunks:
+                chunk_id = f"{document_id}_chunk_{rule['source_chunk']}"
+                if self.knowledge_graph.has_node(chunk_id):
+                    self.knowledge_graph.add_edge(chunk_id, rule_id, relationship="contains_rule")
+            
+            # Connect to domains
+            for domain, rule_indices in result.get("domain_classifications", {}).items():
+                if i in rule_indices:
+                    domain_node = f"domain_{domain.lower().replace(' ', '_')}"
+                    if not self.knowledge_graph.has_node(domain_node):
+                        self.knowledge_graph.add_node(domain_node, type="domain", name=domain)
+                    
+                    self.knowledge_graph.add_edge(rule_id, domain_node, relationship="belongs_to_domain")
+        
+        logger.info(f"Updated knowledge graph: {len(self.knowledge_graph.nodes)} nodes, {len(self.knowledge_graph.edges)} edges")
+    
+    async def _store_in_memory(self, result: Dict[str, Any], chunks: List[Dict[str, Any]] = None):
+        """Store processing results in long-term memory with chunk support."""
+        
+        # Store document-level information
+        document_memory = {
+            "type": "processed_document",
+            "document_id": result["document_id"],
+            "jurisdiction": result["jurisdiction"],
+            "organization": result["organization"],
+            "rules_count": len(result.get("extracted_rules", [])),
+            "domains": list(result.get("domain_classifications", {}).keys()),
+            "processing_metadata": result.get("processing_metadata", {}),
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        # Store using LangMem
         try:
-            # Read the completed CSV to get confidence statistics
-            result_df = pd.read_csv(summary['output_path'])
-            high_confidence = result_df[result_df['confidence_score'] >= 0.8]
-            medium_confidence = result_df[(result_df['confidence_score'] >= 0.5) & (result_df['confidence_score'] < 0.8)]
-            low_confidence = result_df[result_df['confidence_score'] < 0.5]
-            
-            logger.info(f"\nCONFIDENCE DISTRIBUTION:")
-            logger.info(f"High confidence (>=0.8): {len(high_confidence)} ({len(high_confidence)/len(result_df)*100:.1f}%)")
-            logger.info(f"Medium confidence (0.5-0.8): {len(medium_confidence)} ({len(medium_confidence)/len(result_df)*100:.1f}%)")
-            logger.info(f"Low confidence (<0.5): {len(low_confidence)} ({len(low_confidence)/len(result_df)*100:.1f}%)")
-            
+            await self.memory_manager.add_memory(
+                namespace=("legal_memory", result["jurisdiction"], "documents"),
+                key=result["document_id"],
+                value=document_memory
+            )
         except Exception as e:
-            logger.error(f"Error generating confidence statistics: {e}")
+            logger.warning(f"Failed to store document memory: {e}")
+        
+        # Store individual rules with enhanced context
+        for i, rule in enumerate(result.get("extracted_rules", [])):
+            rule_memory = {
+                "type": "legal_rule",
+                "content": rule,
+                "document_id": result["document_id"],
+                "jurisdiction": result["jurisdiction"],
+                "rule_index": i,
+                "source_chunk": rule.get("source_chunk"),
+                "chunk_section": rule.get("chunk_section"),
+                "timestamp": datetime.now().isoformat()
+            }
             
-        logger.info("="*60)
-        logger.info("PROCESSING COMPLETED SUCCESSFULLY")
-        logger.info("="*60)
+            rule_id = f"rule_{result['document_id']}_{i}"
+            try:
+                await self.memory_manager.add_memory(
+                    namespace=("legal_memory", result["jurisdiction"], "rules"),
+                    key=rule_id,
+                    value=rule_memory
+                )
+            except Exception as e:
+                logger.warning(f"Failed to store rule memory {rule_id}: {e}")
+        
+        logger.info(f"Stored memory for document {result['document_id']} with {len(result.get('extracted_rules', []))} rules")
+    
+    def query_knowledge_graph(self, query: str, use_embeddings: bool = True) -> Dict[str, Any]:
+        """
+        Query the knowledge graph using natural language with optional embedding-based search.
+        
+        Args:
+            query: Natural language query
+            use_embeddings: Whether to use embedding-based semantic search
             
-    except FileNotFoundError:
-        logger.error(f"CSV file '{INPUT_CSV_PATH}' not found. Please ensure the file exists.")
-    except Exception as e:
-        logger.error(f"An error occurred: {e}")
-        raise
+        Returns:
+            Query results with relevant nodes and edges
+        """
+        if use_embeddings:
+            # Find all chunks with embeddings
+            all_chunks = []
+            for node_id, node_data in self.knowledge_graph.nodes(data=True):
+                if node_data.get("type") == "chunk" and node_data.get("has_embedding"):
+                    # Reconstruct chunk data for similarity search
+                    chunk_data = {
+                        "chunk_id": node_data.get("chunk_id"),
+                        "text": node_data.get("text", ""),
+                        "section": node_data.get("section"),
+                        "tokens": node_data.get("tokens"),
+                        "embedding": []  # Would need to retrieve from storage
+                    }
+                    all_chunks.append(chunk_data)
+            
+            if not all_chunks:
+                return {"query": query, "results": [], "message": "No chunks with embeddings available for search"}
+            
+            # Note: In a real implementation, you'd retrieve embeddings from storage
+            # For now, return keyword-based search
+            return self._keyword_search(query)
+        else:
+            return self._keyword_search(query)
+    
+    def _keyword_search(self, query: str) -> Dict[str, Any]:
+        """Fallback keyword-based search."""
+        nodes = []
+        edges = []
+        
+        # Simple keyword matching
+        query_terms = query.lower().split()
+        
+        for node_id, node_data in self.knowledge_graph.nodes(data=True):
+            node_text = str(node_data).lower()
+            if any(term in node_text for term in query_terms):
+                nodes.append({"id": node_id, "data": node_data})
+        
+        # Get edges for relevant nodes
+        for node in nodes:
+            for edge in self.knowledge_graph.edges(node["id"], data=True):
+                edges.append({
+                    "source": edge[0],
+                    "target": edge[1],
+                    "data": edge[2]
+                })
+        
+        return {
+            "query": query,
+            "nodes": nodes,
+            "edges": edges,
+            "search_method": "keyword_based",
+            "graph_stats": {
+                "total_nodes": len(self.knowledge_graph.nodes),
+                "total_edges": len(self.knowledge_graph.edges)
+            }
+        }
+    
+    def export_ontology(self, output_dir: str):
+        """Export the complete ontology in multiple formats."""
+        
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        # Export SKOS ontology
+        ontology_outputs = self._generate_ontology_outputs({"ontology_concepts": []})
+        
+        for format_name, content in ontology_outputs.items():
+            file_extension = {
+                "json_ld": "jsonld",
+                "turtle": "ttl", 
+                "xml": "xml"
+            }[format_name]
+            
+            with open(output_path / f"legal_ontology.{file_extension}", 'w') as f:
+                f.write(content)
+        
+        # Export knowledge graph
+        try:
+            nx.write_gexf(self.knowledge_graph, output_path / "knowledge_graph.gexf")
+        except Exception as e:
+            logger.warning(f"Failed to export knowledge graph: {e}")
+        
+        logger.info(f"Ontology exported to {output_dir}")
+
+# Example usage and configuration
+if __name__ == "__main__":
+    # Simplified configuration - just array of documents with mappings
+    config = {
+        "documents": [
+            {
+                "id": "gdpr_2016_679",
+                "title": "General Data Protection Regulation",
+                "path": "/path/to/gdpr_regulation_2016_679.pdf",
+                "jurisdiction": "EU",
+                "organization": "European_Union",
+                "country": "European Union"
+            },
+            {
+                "id": "ccpa_2018",
+                "title": "California Consumer Privacy Act",
+                "path": "/path/to/ccpa_2018.pdf",
+                "jurisdiction": "California",
+                "organization": "California_State",
+                "country": "United States"
+            },
+            {
+                "id": "uk_dpa_2018",
+                "title": "Data Protection Act 2018",
+                "path": "/path/to/uk_dpa_2018.pdf",
+                "jurisdiction": "UK",
+                "organization": "UK_Government",
+                "country": "United Kingdom"
+            },
+            {
+                "id": "singapore_pdpa_2012",
+                "title": "Personal Data Protection Act",
+                "path": "/path/to/singapore_pdpa_2012.pdf",
+                "jurisdiction": "Singapore",
+                "organization": "Singapore_Government",
+                "country": "Singapore"
+            },
+            {
+                "id": "basel_iii_framework",
+                "title": "Basel III International Regulatory Framework",
+                "path": "/path/to/basel_iii_framework.pdf",
+                "jurisdiction": "International",
+                "organization": "Basel_Committee",
+                "country": "International"
+            }
+        ],
+        "output_directory": "./ontology_output",
+        "openai_base_url": "https://api.openai.com/v1"
+    }
+    
+    # Save configuration
+    with open("legal_config.json", 'w') as f:
+        json.dump(config, f, indent=2)
+    
+    # Initialize and run processor
+    async def main():
+        # Note: Ensure tiktoken_models folder exists with downloaded models
+        tiktoken_models_path = Path("./tiktoken_models")
+        if not tiktoken_models_path.exists():
+            print("Warning: tiktoken_models folder not found. Creating placeholder...")
+            tiktoken_models_path.mkdir(exist_ok=True)
+            print("Please download tiktoken models to ./tiktoken_models/ folder")
+        
+        processor = LegalDocumentProcessor(
+            config_path="legal_config.json",
+            openai_base_url=config.get("openai_base_url", "https://api.openai.com/v1")
+        )
+        
+        # Process all documents from config
+        results = processor.process_all_documents()
+        
+        # Print summary
+        successful_docs = [r for r in results if r.get("success", True)]
+        print(f"Successfully processed {len(successful_docs)} out of {len(results)} documents")
+        
+        for result in successful_docs:
+            print(f"- {result['document_id']}: {len(result.get('rules', []))} rules extracted")
+        
+        # Export ontology
+        processor.export_ontology(config["output_directory"])
+        
+        # Example query
+        query_result = processor.query_knowledge_graph("data storage requirements", use_embeddings=True)
+        print(f"Query result: {len(query_result.get('nodes', []))} relevant nodes found")
+        
+        # Example chunk analysis
+        if results:
+            sample_result = [r for r in results if r.get("success", True)]
+            if sample_result and sample_result[0].get("chunks"):
+                chunks = sample_result[0]["chunks"]
+                print(f"Sample document chunking:")
+                print(f"- Total chunks: {len(chunks)}")
+                print(f"- Average tokens per chunk: {sum(c['tokens'] for c in chunks) / len(chunks):.0f}")
+                print(f"- Chunks with embeddings: {sum(1 for c in chunks if 'embedding' in c)}")
+    
+    # Run the system
+    asyncio.run(main())
