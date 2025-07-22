@@ -1,232 +1,1127 @@
+#!/usr/bin/env python3
+"""
+Legal Document to Machine-Readable Rules System
+A comprehensive system for converting legal documents into machine-readable rules
+using LangGraph, LangMem, OpenAI o3-mini, and Elasticsearch.
+
+Author: AI Assistant
+Date: July 2025
+"""
+
+import os
+import json
+import logging
+import asyncio
+from typing import Dict, List, Any, Optional, Union, Tuple
+from pathlib import Path
+from datetime import datetime
+import uuid
+
+# Core dependencies
+import openai
+from dotenv import load_dotenv
+from elasticsearch import Elasticsearch
+from elasticsearch.helpers import bulk
+import ssl
+
+# RDF and SKOS dependencies
+from rdflib import Graph, Namespace, URIRef, Literal, BNode
+from rdflib.namespace import RDF, RDFS, OWL, SKOS, XSD, DCTERMS
+import pyshacl
+
+# LangGraph and LangMem dependencies
+from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.prebuilt import create_react_agent
+from langgraph.store.memory import InMemoryStore
+from langmem import create_manage_memory_tool, create_search_memory_tool, create_memory_manager
+
+# Document processing
+import pymupdf  # PyMuPDF for PDF processing
+
+# Async processing
+import aiohttp
+import asyncio
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# ====================================
+# GLOBAL CONFIGURATION
+# ====================================
+
+class Config:
+    """Global configuration for the system"""
+    
+    # OpenAI Configuration
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    OPENAI_MODEL = "o3-mini-2025-01-31"
+    OPENAI_EMBEDDING_MODEL = "text-embedding-3-large"
+    
+    # Elasticsearch Configuration
+    ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "https://localhost:9200")
+    ELASTICSEARCH_USERNAME = os.getenv("ELASTICSEARCH_USERNAME", "elastic")
+    ELASTICSEARCH_PASSWORD = os.getenv("ELASTICSEARCH_PASSWORD")
+    ELASTICSEARCH_CERT_PATH = os.getenv("ELASTICSEARCH_CERT_PATH", "./elasticsearch.crt")
+    ELASTICSEARCH_INDEX = "legal_rules_index"
+    
+    # Data paths
+    CONFIG_PATH = os.getenv("CONFIG_PATH", "./config.json")
+    OUTPUT_PATH = os.getenv("OUTPUT_PATH", "./output")
+    ONTOLOGY_PATH = os.getenv("ONTOLOGY_PATH", "./ontologies")
+    
+    @classmethod
+    def validate_config(cls):
+        """Validate that all required configuration is present"""
+        missing_vars = []
+        
+        if not cls.OPENAI_API_KEY:
+            missing_vars.append("OPENAI_API_KEY")
+        
+        if not cls.ELASTICSEARCH_PASSWORD:
+            missing_vars.append("ELASTICSEARCH_PASSWORD")
+        
+        if missing_vars:
+            raise ValueError(
+                f"Required environment variables are missing: {', '.join(missing_vars)}\n"
+                f"Please set them in your .env file or environment variables.\n"
+                f"Example .env file:\n"
+                f"OPENAI_API_KEY=your_openai_api_key_here\n"
+                f"ELASTICSEARCH_PASSWORD=your_elasticsearch_password_here"
+            )
+    
+    # Model parameters
+    MAX_TOKENS = 4000
+    TEMPERATURE = 0.1
+    REASONING_EFFORT = "medium"  # low, medium, high
+    
+    # Processing parameters
+    BATCH_SIZE = 10
+    MAX_CONCURRENT = 5
+    CHUNK_SIZE = 2000  # For document chunking
+
+# ====================================
+# ONTOLOGY NAMESPACES AND SETUP
+# ====================================
+
+class OntologyNamespaces:
+    """Define all ontology namespaces used in the system"""
+    
+    # Core vocabularies
+    DPV = Namespace("https://w3id.org/dpv#")
+    PROV = Namespace("http://www.w3.org/ns/prov#")
+    
+    # Legal and jurisdictional
+    ELI = Namespace("http://data.europa.eu/eli/ontology#")
+    LEX = Namespace("http://www.lexinfo.net/ontology/2.0/lexinfo#")
+    
+    # Custom namespace for our legal rules
+    LEGAL = Namespace("https://legal-rules.org/ontology#")
+    
+    # Data management domains
+    STORAGE = Namespace("https://legal-rules.org/storage#")
+    USAGE = Namespace("https://legal-rules.org/usage#")
+    MOVEMENT = Namespace("https://legal-rules.org/movement#")
+    PRIVACY = Namespace("https://legal-rules.org/privacy#")
+    SECURITY = Namespace("https://legal-rules.org/security#")
+    ACCESS = Namespace("https://legal-rules.org/access#")
+    
+    @classmethod
+    def bind_to_graph(cls, graph: Graph) -> Graph:
+        """Bind all namespaces to a graph"""
+        graph.bind("dpv", cls.DPV)
+        graph.bind("prov", cls.PROV)
+        graph.bind("eli", cls.ELI)
+        graph.bind("lex", cls.LEX)
+        graph.bind("legal", cls.LEGAL)
+        graph.bind("storage", cls.STORAGE)
+        graph.bind("usage", cls.USAGE)
+        graph.bind("movement", cls.MOVEMENT)
+        graph.bind("privacy", cls.PRIVACY)
+        graph.bind("security", cls.SECURITY)
+        graph.bind("access", cls.ACCESS)
+        graph.bind("skos", SKOS)
+        graph.bind("rdf", RDF)
+        graph.bind("rdfs", RDFS)
+        graph.bind("owl", OWL)
+        graph.bind("xsd", XSD)
+        graph.bind("dcterms", DCTERMS)
+        return graph
+
+# ====================================
+# ELASTICSEARCH CLIENT
+# ====================================
+
+class ElasticsearchClient:
+    """Enhanced Elasticsearch client with SSL and authentication"""
+    
+    def __init__(self):
+        self.client = None
+        self._initialize_client()
+    
+    def _initialize_client(self):
+        """Initialize Elasticsearch client with proper configuration"""
+        # SSL context
+        ssl_context = ssl.create_default_context()
+        if os.path.exists(Config.ELASTICSEARCH_CERT_PATH):
+            ssl_context.load_verify_locations(Config.ELASTICSEARCH_CERT_PATH)
+        else:
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            logger.warning("SSL certificate not found, using insecure connection")
+        
+        self.client = Elasticsearch(
+            [Config.ELASTICSEARCH_URL],
+            basic_auth=(Config.ELASTICSEARCH_USERNAME, Config.ELASTICSEARCH_PASSWORD),
+            ssl_context=ssl_context,
+            verify_certs=True if os.path.exists(Config.ELASTICSEARCH_CERT_PATH) else False
+        )
+        
+        # Test connection
+        if self.client.ping():
+            logger.info("Successfully connected to Elasticsearch")
+        else:
+            raise ConnectionError("Failed to connect to Elasticsearch")
+    
+    def create_index(self):
+        """Create the legal rules index with proper mappings"""
+        mapping = {
+            "mappings": {
+                "properties": {
+                    "document_id": {"type": "keyword"},
+                    "country": {"type": "keyword"},
+                    "jurisdiction": {"type": "keyword"},
+                    "organization": {"type": "keyword"},
+                    "title": {"type": "text", "analyzer": "standard"},
+                    "content": {"type": "text", "analyzer": "standard"},
+                    "rules": {"type": "nested"},
+                    "obligations": {"type": "nested"},
+                    "permissions": {"type": "nested"},
+                    "prohibitions": {"type": "nested"},
+                    "concepts": {"type": "keyword"},
+                    "actors": {"type": "keyword"},
+                    "objects": {"type": "keyword"},
+                    "data_domains": {"type": "keyword"},
+                    "content_vector": {
+                        "type": "dense_vector",
+                        "dims": 3072,  # text-embedding-3-large dimensions
+                        "index": True,
+                        "similarity": "cosine"
+                    },
+                    "created_at": {"type": "date"},
+                    "updated_at": {"type": "date"}
+                }
+            },
+            "settings": {
+                "number_of_shards": 2,
+                "number_of_replicas": 1,
+                "index": {
+                    "max_result_window": 50000
+                }
+            }
+        }
+        
+        if not self.client.indices.exists(index=Config.ELASTICSEARCH_INDEX):
+            self.client.indices.create(index=Config.ELASTICSEARCH_INDEX, body=mapping)
+            logger.info(f"Created index: {Config.ELASTICSEARCH_INDEX}")
+        else:
+            logger.info(f"Index {Config.ELASTICSEARCH_INDEX} already exists")
+
+# ====================================
+# OPENAI CLIENT
+# ====================================
+
+class OpenAIClient:
+    """Enhanced OpenAI client for embeddings and completions"""
+    
+    def __init__(self):
+        # Validate configuration first
+        Config.validate_config()
+        
+        self.client = openai.OpenAI(
+            api_key=Config.OPENAI_API_KEY,
+            base_url=Config.OPENAI_BASE_URL
+        )
+        
+        # Test the client with a simple API call
+        try:
+            # Test with a minimal embedding request
+            test_response = self.client.embeddings.create(
+                input=["test"],
+                model=Config.OPENAI_EMBEDDING_MODEL
+            )
+            logger.info(f"OpenAI client initialized successfully with model {Config.OPENAI_EMBEDDING_MODEL}")
+        except Exception as e:
+            logger.error(f"Failed to initialize OpenAI client: {e}")
+            raise ConnectionError(f"OpenAI API connection failed: {e}")
+    
+    async def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """Generate embeddings for a list of texts"""
+        response = self.client.embeddings.create(
+            input=texts,
+            model=Config.OPENAI_EMBEDDING_MODEL
+        )
+        return [embedding.embedding for embedding in response.data]
+    
+    async def chat_completion(self, messages: List[Dict], **kwargs) -> str:
+        """Generate chat completion with reasoning model"""
+        response = self.client.chat.completions.create(
+            model=Config.OPENAI_MODEL,
+            messages=messages,
+            max_completion_tokens=kwargs.get('max_tokens', Config.MAX_TOKENS),
+            temperature=kwargs.get('temperature', Config.TEMPERATURE),
+            reasoning_effort=kwargs.get('reasoning_effort', Config.REASONING_EFFORT)
+        )
+        return response.choices[0].message.content
+
+# ====================================
+# DOCUMENT PROCESSOR
+# ====================================
+
+class DocumentProcessor:
+    """Process PDF documents and extract text content"""
+    
+    def __init__(self):
+        self.openai_client = OpenAIClient()
+    
+    def extract_text_from_pdf(self, pdf_path: str) -> str:
+        """Extract text from PDF using PyMuPDF"""
+        doc = pymupdf.open(pdf_path)
+        text = ""
+        for page in doc:
+            text += page.get_text()
+        doc.close()
+        return text.strip()
+    
+    def chunk_text(self, text: str, chunk_size: int = Config.CHUNK_SIZE) -> List[str]:
+        """Split text into manageable chunks"""
+        words = text.split()
+        chunks = []
+        current_chunk = []
+        current_length = 0
+        
+        for word in words:
+            if current_length + len(word) > chunk_size and current_chunk:
+                chunks.append(' '.join(current_chunk))
+                current_chunk = [word]
+                current_length = len(word)
+            else:
+                current_chunk.append(word)
+                current_length += len(word) + 1  # +1 for space
+        
+        if current_chunk:
+            chunks.append(' '.join(current_chunk))
+        
+        return chunks
+
+# ====================================
+# LEGAL ANALYSIS AGENTS
+# ====================================
+
+class LegalAnalysisState(MessagesState):
+    """State for legal analysis workflow"""
+    document_content: str = ""
+    country: str = ""
+    jurisdiction: str = ""
+    organization: str = ""
+    extracted_rules: List[Dict] = []
+    extracted_concepts: List[Dict] = []
+    data_domains: List[str] = []
+    ontology_graph: Optional[Graph] = None
+    analysis_complete: bool = False
+
+class RuleExtractionAgent:
+    """Agent specialized in extracting legal rules from text"""
+    
+    def __init__(self, openai_client: OpenAIClient):
+        self.openai_client = openai_client
+    
+    async def extract_rules(self, text: str, context: Dict) -> Dict:
+        """Extract legal rules, obligations, permissions, and prohibitions"""
+        
+        system_prompt = """You are a specialized legal analysis expert focused on extracting machine-readable rules from legal documents. Your task is to identify and categorize legal provisions into:
+
+1. OBLIGATIONS - Requirements that must be fulfilled
+2. PERMISSIONS - Actions that are allowed
+3. PROHIBITIONS - Actions that are forbidden
+4. CONDITIONS - Circumstances that trigger rules
+5. ACTIONS - Specific activities mentioned
+6. OUTCOMES - Results or consequences
+
+For each rule, identify:
+- Subject (who/what the rule applies to)
+- Predicate (the relationship or action)
+- Object (what is being acted upon)
+- Modality (must, may, shall not, etc.)
+- Conditions (when, where, if, unless)
+- Data management domain (storage, usage, movement, privacy, security, access, entitlements)
+
+CRITICAL: Respond ONLY with valid JSON. Do not include any text outside of the JSON structure.
+
+Output format:
 {
-  "documents": [
+  "rules": [
     {
-      "country": "European Union",
-      "jurisdiction": "EU",
-      "organization": "European Commission",
-      "pdf_document": "./documents/gdpr/gdpr_regulation.pdf",
-      "supporting_documents": [
-        "./documents/gdpr/gdpr_recitals.pdf",
-        "./documents/gdpr/gdpr_implementation_guide.pdf",
-        "./documents/gdpr/edpb_guidelines.pdf",
-        "./documents/gdpr/article_29_opinions.pdf"
-      ]
-    },
-    {
-      "country": "United States",
-      "jurisdiction": "California",
-      "organization": "California Attorney General",
-      "pdf_document": "./documents/ccpa/ccpa_full_text.pdf",
-      "supporting_documents": [
-        "./documents/ccpa/ccpa_regulations.pdf",
-        "./documents/ccpa/ccpa_enforcement_guidelines.pdf",
-        "./documents/ccpa/ag_guidance_2023.pdf"
-      ]
-    },
-    {
-      "country": "United States",
-      "jurisdiction": "Federal",
-      "organization": "Federal Trade Commission",
-      "pdf_document": "./documents/federal/ftc_privacy_act.pdf",
-      "supporting_documents": [
-        "./documents/federal/ftc_enforcement_policy.pdf",
-        "./documents/federal/section_5_guidelines.pdf"
-      ]
-    },
-    {
-      "country": "United Kingdom",
-      "jurisdiction": "UK",
-      "organization": "Information Commissioner's Office",
-      "pdf_document": "./documents/uk/uk_gdpr.pdf",
-      "supporting_documents": [
-        "./documents/uk/ico_guidance_controllers.pdf",
-        "./documents/uk/ico_guidance_processors.pdf",
-        "./documents/uk/data_protection_act_2018.pdf",
-        "./documents/uk/ico_enforcement_guidance.pdf"
-      ]
-    },
-    {
-      "country": "Canada",
-      "jurisdiction": "Federal",
-      "organization": "Office of the Privacy Commissioner",
-      "pdf_document": "./documents/canada/pipeda.pdf",
-      "supporting_documents": [
-        "./documents/canada/pipeda_guidelines.pdf",
-        "./documents/canada/opc_guidance_2023.pdf",
-        "./documents/canada/breach_notification_rules.pdf"
-      ]
-    },
-    {
-      "country": "Australia",
-      "jurisdiction": "Federal",
-      "organization": "Office of the Australian Information Commissioner",
-      "pdf_document": "./documents/australia/privacy_act_1988.pdf",
-      "supporting_documents": [
-        "./documents/australia/australian_privacy_principles.pdf",
-        "./documents/australia/oaic_guidance.pdf",
-        "./documents/australia/notifiable_data_breaches.pdf"
-      ]
-    },
-    {
-      "country": "Germany",
-      "jurisdiction": "Federal",
-      "organization": "Federal Commissioner for Data Protection and Freedom of Information",
-      "pdf_document": "./documents/germany/bdsg.pdf",
-      "supporting_documents": [
-        "./documents/germany/german_gdpr_implementation.pdf",
-        "./documents/germany/bfdi_guidance.pdf"
-      ]
-    },
-    {
-      "country": "France",
-      "jurisdiction": "National",
-      "organization": "Commission Nationale de l'Informatique et des Libertés",
-      "pdf_document": "./documents/france/french_data_protection_law.pdf",
-      "supporting_documents": [
-        "./documents/france/cnil_guidelines.pdf",
-        "./documents/france/french_gdpr_implementation.pdf"
-      ]
-    },
-    {
-      "country": "Singapore",
-      "jurisdiction": "National",
-      "organization": "Personal Data Protection Commission",
-      "pdf_document": "./documents/singapore/pdpa.pdf",
-      "supporting_documents": [
-        "./documents/singapore/pdpc_guidelines.pdf",
-        "./documents/singapore/advisory_guidelines_2023.pdf"
-      ]
-    },
-    {
-      "country": "Brazil",
-      "jurisdiction": "Federal",
-      "organization": "National Data Protection Authority",
-      "pdf_document": "./documents/brazil/lgpd.pdf",
-      "supporting_documents": [
-        "./documents/brazil/anpd_guidance.pdf",
-        "./documents/brazil/lgpd_implementation_guide.pdf"
-      ]
-    },
-    {
-      "country": "Japan",
-      "jurisdiction": "National",
-      "organization": "Personal Information Protection Commission",
-      "pdf_document": "./documents/japan/appi.pdf",
-      "supporting_documents": [
-        "./documents/japan/pipc_guidelines.pdf",
-        "./documents/japan/cross_border_transfer_rules.pdf"
-      ]
-    },
-    {
-      "country": "India",
-      "jurisdiction": "Federal",
-      "organization": "Ministry of Electronics and Information Technology",
-      "pdf_document": "./documents/india/digital_personal_data_protection_act.pdf",
-      "supporting_documents": [
-        "./documents/india/dpdp_rules_2024.pdf",
-        "./documents/india/meity_guidelines.pdf"
-      ]
-    },
-    {
-      "country": "South Africa",
-      "jurisdiction": "National",
-      "organization": "Information Regulator",
-      "pdf_document": "./documents/south_africa/popia.pdf",
-      "supporting_documents": [
-        "./documents/south_africa/ir_guidance.pdf",
-        "./documents/south_africa/popia_codes_of_conduct.pdf"
-      ]
-    },
-    {
-      "country": "Switzerland",
-      "jurisdiction": "Federal",
-      "organization": "Federal Data Protection and Information Commissioner",
-      "pdf_document": "./documents/switzerland/fadp.pdf",
-      "supporting_documents": [
-        "./documents/switzerland/fdpic_guidance.pdf",
-        "./documents/switzerland/swiss_data_protection_ordinance.pdf"
-      ]
-    },
-    {
-      "country": "Hong Kong",
-      "jurisdiction": "SAR",
-      "organization": "Office of the Privacy Commissioner for Personal Data",
-      "pdf_document": "./documents/hong_kong/pdpo.pdf",
-      "supporting_documents": [
-        "./documents/hong_kong/pcpd_guidance.pdf",
-        "./documents/hong_kong/data_transfer_guidance.pdf"
-      ]
+      "id": "unique_id",
+      "type": "obligation|permission|prohibition",
+      "subject": "entity or role",
+      "predicate": "action or relationship",
+      "object": "target of action",
+      "modality": "must|may|shall not|etc",
+      "conditions": ["condition1", "condition2"],
+      "data_domain": "storage|usage|movement|privacy|security|access|entitlements",
+      "original_text": "exact text from document",
+      "confidence": 0.0-1.0
     }
   ],
-  "processing_options": {
-    "batch_size": 5,
-    "max_concurrent": 3,
-    "enable_memory": true,
-    "export_formats": ["ttl", "jsonld", "xml"],
-    "chunk_size": 2000,
-    "overlap_size": 200,
-    "reasoning_effort": "medium",
-    "temperature": 0.1,
-    "max_tokens": 4000,
-    "embedding_batch_size": 100
+  "concepts": [
+    {
+      "concept": "concept name",
+      "type": "actor|object|process|principle",
+      "definition": "definition from context",
+      "related_terms": ["term1", "term2"]
+    }
+  ],
+  "relationships": [
+    {
+      "source": "concept1",
+      "relationship": "hasChild|isPartOf|requires|etc",
+      "target": "concept2"
+    }
+  ]
+}"""
+
+        user_prompt = f"""
+Analyze the following legal text and extract machine-readable rules:
+
+CONTEXT:
+- Country/Jurisdiction: {context.get('country', 'Unknown')} / {context.get('jurisdiction', 'Unknown')}
+- Organization: {context.get('organization', 'Unknown')}
+
+LEGAL TEXT:
+{text}
+
+Extract all rules, concepts, and relationships according to the specified JSON format. Focus on data management aspects including storage, usage, movement, privacy, security, access, and entitlements.
+"""
+
+        response = await self.openai_client.chat_completion([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ])
+        
+        # Parse JSON response
+        response_text = response.strip()
+        
+        # Handle markdown-wrapped JSON
+        if "```json" in response_text:
+            json_start = response_text.find("```json") + 7
+            json_end = response_text.find("```", json_start)
+            response_text = response_text[json_start:json_end].strip()
+        
+        result = json.loads(response_text)
+        return result
+
+class ConceptAnalysisAgent:
+    """Agent specialized in analyzing legal concepts and building taxonomies"""
+    
+    def __init__(self, openai_client: OpenAIClient):
+        self.openai_client = openai_client
+    
+    async def analyze_concepts(self, rules: List[Dict], context: Dict) -> Dict:
+        """Analyze extracted rules and build concept hierarchies"""
+        
+        system_prompt = """You are a legal ontology expert specializing in creating hierarchical concept structures for data management law. Your task is to analyze extracted legal rules and create a structured taxonomy of concepts.
+
+Build hierarchical relationships using established vocabularies:
+- Data Privacy Vocabulary (DPV) concepts
+- PROV-O provenance concepts  
+- SKOS hierarchical relationships
+
+Focus on data management domains:
+- Data Storage and Retention
+- Data Usage and Processing
+- Data Movement and Transfer
+- Privacy and Consent
+- Security and Protection
+- Access and Entitlements
+
+CRITICAL: Respond ONLY with valid JSON. Do not include any text outside of the JSON structure.
+
+Output format:
+{
+  "concept_hierarchy": {
+    "storage": {
+      "broader_concepts": ["DataManagement"],
+      "narrower_concepts": ["DataRetention", "DataArchiving", "DataDeletion"],
+      "related_concepts": ["DataProcessing", "DataSecurity"]
+    }
   },
-  "ontology_settings": {
-    "enable_shacl_validation": true,
-    "include_dpv_mappings": true,
-    "include_prov_mappings": true,
-    "generate_hierarchy_levels": 5,
-    "auto_detect_domains": true,
-    "custom_domains": [
-      "data_storage",
-      "data_usage", 
-      "data_movement",
-      "data_privacy",
-      "data_security",
-      "data_access",
-      "data_entitlements",
-      "data_retention",
-      "data_deletion",
-      "consent_management",
-      "breach_notification",
-      "cross_border_transfer",
-      "vendor_management",
-      "risk_assessment"
-    ]
+  "data_domains": ["storage", "usage", "movement", "privacy", "security", "access"],
+  "key_entities": {
+    "actors": ["DataController", "DataProcessor", "DataSubject"],
+    "objects": ["PersonalData", "NonPersonalData", "SensitiveData"],
+    "processes": ["DataCollection", "DataProcessing", "DataSharing"]
   },
-  "elasticsearch_settings": {
-    "index_name": "legal_rules_index",
-    "number_of_shards": 2,
-    "number_of_replicas": 1,
-    "refresh_interval": "30s",
-    "max_result_window": 50000,
-    "similarity": "cosine"
-  },
-  "memory_settings": {
-    "enable_long_term_memory": true,
-    "memory_consolidation_threshold": 100,
-    "memory_retention_days": 365,
-    "semantic_similarity_threshold": 0.8,
-    "memory_namespaces": [
-      "legal_analysis",
-      "rule_extraction", 
-      "concept_analysis",
-      "domain_mapping",
-      "compliance_requirements"
-    ]
-  },
-  "output_settings": {
-    "output_directory": "./output",
-    "ontology_directory": "./ontologies",
-    "reports_directory": "./reports",
-    "create_summary_reports": true,
-    "generate_visualizations": true,
-    "export_compliance_matrix": true
-  },
-  "logging_settings": {
-    "log_level": "INFO",
-    "log_file": "./logs/legal_analysis.log",
-    "enable_detailed_logging": true,
-    "log_rotation": "daily",
-    "max_log_files": 30
-  }
-}
+  "compliance_requirements": [
+    {
+      "requirement": "requirement text",
+      "domain": "privacy|security|storage|etc",
+      "mandatory": true|false,
+      "related_rules": ["rule_id1", "rule_id2"]
+    }
+  ]
+}"""
+
+        user_prompt = f"""
+Analyze these extracted legal rules and create a comprehensive concept hierarchy:
+
+CONTEXT:
+- Country/Jurisdiction: {context.get('country', 'Unknown')} / {context.get('jurisdiction', 'Unknown')}
+- Organization: {context.get('organization', 'Unknown')}
+
+EXTRACTED RULES:
+{json.dumps(rules, indent=2)}
+
+Create a hierarchical concept structure that organizes these rules into logical data management domains. Include relationships between concepts and identify key compliance requirements.
+"""
+
+        response = await self.openai_client.chat_completion([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ])
+        
+        response_text = response.strip()
+        
+        # Handle markdown-wrapped JSON
+        if "```json" in response_text:
+            json_start = response_text.find("```json") + 7
+            json_end = response_text.find("```", json_start)
+            response_text = response_text[json_start:json_end].strip()
+        
+        result = json.loads(response_text)
+        return result
+
+class OntologyBuilderAgent:
+    """Agent specialized in building SKOS+DPV+PROV-O ontologies"""
+    
+    def __init__(self):
+        self.ns = OntologyNamespaces()
+    
+    def build_ontology(self, rules: List[Dict], concepts: Dict, context: Dict) -> Graph:
+        """Build a comprehensive ontology from extracted rules and concepts"""
+        
+        g = Graph()
+        g = self.ns.bind_to_graph(g)
+        
+        # Create ontology metadata
+        ontology_uri = URIRef(f"{self.ns.LEGAL}ontology_{context['country']}_{datetime.now().strftime('%Y%m%d')}")
+        g.add((ontology_uri, RDF.type, OWL.Ontology))
+        g.add((ontology_uri, DCTERMS.title, Literal(f"Legal Rules Ontology for {context['country']}")))
+        g.add((ontology_uri, DCTERMS.created, Literal(datetime.now().isoformat(), datatype=XSD.dateTime)))
+        g.add((ontology_uri, DCTERMS.description, Literal(f"Machine-readable legal rules extracted from {context['country']} legislation")))
+        
+        # Add mandatory classes
+        self._add_core_classes(g, context)
+        
+        # Add concepts from hierarchy
+        self._add_concept_hierarchy(g, concepts.get('concept_hierarchy', {}))
+        
+        # Add rules as instances
+        self._add_rules_as_instances(g, rules, context)
+        
+        # Add DPV and PROV-O references
+        self._add_vocabulary_references(g)
+        
+        return g
+    
+    def _add_core_classes(self, g: Graph, context: Dict):
+        """Add mandatory core classes"""
+        
+        # Country/Jurisdiction/Organization classes
+        country_uri = URIRef(f"{self.ns.LEGAL}Country_{context['country'].replace(' ', '_')}")
+        jurisdiction_uri = URIRef(f"{self.ns.LEGAL}Jurisdiction_{context['jurisdiction'].replace(' ', '_')}")
+        org_uri = URIRef(f"{self.ns.LEGAL}Organization_{context['organization'].replace(' ', '_')}")
+        
+        g.add((country_uri, RDF.type, OWL.Class))
+        g.add((country_uri, RDF.type, SKOS.Concept))
+        g.add((country_uri, RDFS.label, Literal(context['country'])))
+        g.add((country_uri, SKOS.prefLabel, Literal(context['country'])))
+        
+        g.add((jurisdiction_uri, RDF.type, OWL.Class))
+        g.add((jurisdiction_uri, RDF.type, SKOS.Concept))
+        g.add((jurisdiction_uri, RDFS.label, Literal(context['jurisdiction'])))
+        g.add((jurisdiction_uri, SKOS.broader, country_uri))
+        
+        g.add((org_uri, RDF.type, OWL.Class))
+        g.add((org_uri, RDF.type, SKOS.Concept))
+        g.add((org_uri, RDFS.label, Literal(context['organization'])))
+        
+        # Core data management classes
+        data_domains = [
+            "DataStorage", "DataUsage", "DataMovement", 
+            "DataPrivacy", "DataSecurity", "DataAccess", "DataEntitlements"
+        ]
+        
+        for domain in data_domains:
+            domain_uri = URIRef(f"{self.ns.LEGAL}{domain}")
+            g.add((domain_uri, RDF.type, OWL.Class))
+            g.add((domain_uri, RDF.type, SKOS.Concept))
+            g.add((domain_uri, RDFS.label, Literal(domain)))
+            g.add((domain_uri, SKOS.broader, URIRef(f"{self.ns.LEGAL}DataManagement")))
+    
+    def _add_concept_hierarchy(self, g: Graph, hierarchy: Dict):
+        """Add concept hierarchy using SKOS relationships"""
+        
+        for domain, relationships in hierarchy.items():
+            domain_uri = URIRef(f"{self.ns.LEGAL}{domain}")
+            
+            # Add broader concepts
+            for broader in relationships.get('broader_concepts', []):
+                broader_uri = URIRef(f"{self.ns.LEGAL}{broader}")
+                g.add((domain_uri, SKOS.broader, broader_uri))
+                g.add((broader_uri, SKOS.narrower, domain_uri))
+            
+            # Add narrower concepts
+            for narrower in relationships.get('narrower_concepts', []):
+                narrower_uri = URIRef(f"{self.ns.LEGAL}{narrower}")
+                g.add((narrower_uri, SKOS.broader, domain_uri))
+                g.add((domain_uri, SKOS.narrower, narrower_uri))
+            
+            # Add related concepts
+            for related in relationships.get('related_concepts', []):
+                related_uri = URIRef(f"{self.ns.LEGAL}{related}")
+                g.add((domain_uri, SKOS.related, related_uri))
+    
+    def _add_rules_as_instances(self, g: Graph, rules: List[Dict], context: Dict):
+        """Add legal rules as instances with properties"""
+        
+        for rule in rules:
+            rule_uri = URIRef(f"{self.ns.LEGAL}Rule_{rule.get('id', str(uuid.uuid4()))}")
+            
+            # Basic rule properties
+            g.add((rule_uri, RDF.type, URIRef(f"{self.ns.LEGAL}LegalRule")))
+            g.add((rule_uri, RDF.type, URIRef(f"{self.ns.LEGAL}{rule['type'].title()}")))
+            g.add((rule_uri, RDFS.label, Literal(f"{rule['type']}: {rule['subject']} {rule['predicate']} {rule['object']}")))
+            
+            # Add rule components
+            if rule.get('subject'):
+                g.add((rule_uri, URIRef(f"{self.ns.LEGAL}hasSubject"), Literal(rule['subject'])))
+            if rule.get('predicate'):
+                g.add((rule_uri, URIRef(f"{self.ns.LEGAL}hasPredicate"), Literal(rule['predicate'])))
+            if rule.get('object'):
+                g.add((rule_uri, URIRef(f"{self.ns.LEGAL}hasObject"), Literal(rule['object'])))
+            if rule.get('modality'):
+                g.add((rule_uri, URIRef(f"{self.ns.LEGAL}hasModality"), Literal(rule['modality'])))
+            
+            # Add data domain
+            if rule.get('data_domain'):
+                domain_uri = URIRef(f"{self.ns.LEGAL}Data{rule['data_domain'].title()}")
+                g.add((rule_uri, URIRef(f"{self.ns.LEGAL}appliesToDomain"), domain_uri))
+            
+            # Add provenance
+            g.add((rule_uri, self.ns.PROV.wasDerivedFrom, Literal(rule.get('original_text', ''))))
+            g.add((rule_uri, self.ns.PROV.wasGeneratedBy, URIRef(f"{self.ns.LEGAL}ExtractionProcess")))
+            g.add((rule_uri, self.ns.PROV.generatedAtTime, Literal(datetime.now().isoformat(), datatype=XSD.dateTime)))
+    
+    def _add_vocabulary_references(self, g: Graph):
+        """Add references to DPV and PROV-O vocabularies"""
+        
+        # Add imports
+        g.add((URIRef(f"{self.ns.LEGAL}"), OWL.imports, URIRef("https://w3id.org/dpv")))
+        g.add((URIRef(f"{self.ns.LEGAL}"), OWL.imports, URIRef("http://www.w3.org/ns/prov")))
+        
+        # Map to DPV concepts
+        dpv_mappings = {
+            "DataStorage": "dpv:Store",
+            "DataProcessing": "dpv:Process", 
+            "DataSharing": "dpv:Share",
+            "PersonalData": "dpv:PersonalData",
+            "DataController": "dpv:DataController",
+            "DataProcessor": "dpv:DataProcessor"
+        }
+        
+        for local_concept, dpv_concept in dpv_mappings.items():
+            local_uri = URIRef(f"{self.ns.LEGAL}{local_concept}")
+            dpv_uri = URIRef(f"{self.ns.DPV}{dpv_concept.split(':')[1]}")
+            g.add((local_uri, SKOS.exactMatch, dpv_uri))
+
+# ====================================
+# SHACL VALIDATION
+# ====================================
+
+class SHACLValidator:
+    """SHACL validation for ontologies"""
+    
+    def __init__(self):
+        self.shapes_graph = self._create_validation_shapes()
+    
+    def _create_validation_shapes(self) -> Graph:
+        """Create SHACL shapes for validation"""
+        
+        shapes = Graph()
+        ns = OntologyNamespaces()
+        shapes = ns.bind_to_graph(shapes)
+        
+        # Add SHACL namespace
+        SH = Namespace("http://www.w3.org/ns/shacl#")
+        shapes.bind("sh", SH)
+        
+        # Rule shape
+        rule_shape = URIRef(f"{ns.LEGAL}RuleShape")
+        shapes.add((rule_shape, RDF.type, SH.NodeShape))
+        shapes.add((rule_shape, SH.targetClass, URIRef(f"{ns.LEGAL}LegalRule")))
+        
+        # Required properties for rules
+        subject_prop = BNode()
+        shapes.add((rule_shape, SH.property, subject_prop))
+        shapes.add((subject_prop, SH.path, URIRef(f"{ns.LEGAL}hasSubject")))
+        shapes.add((subject_prop, SH.minCount, Literal(1)))
+        shapes.add((subject_prop, SH.datatype, XSD.string))
+        
+        predicate_prop = BNode()
+        shapes.add((rule_shape, SH.property, predicate_prop))
+        shapes.add((predicate_prop, SH.path, URIRef(f"{ns.LEGAL}hasPredicate")))
+        shapes.add((predicate_prop, SH.minCount, Literal(1)))
+        shapes.add((predicate_prop, SH.datatype, XSD.string))
+        
+        return shapes
+    
+    def validate_ontology(self, ontology_graph: Graph) -> Tuple[bool, Graph]:
+        """Validate ontology against SHACL shapes"""
+        
+        conforms, results_graph, results_text = pyshacl.validate(
+            data_graph=ontology_graph,
+            shacl_graph=self.shapes_graph,
+            inference='rdfs',
+            serialize_report_graph=True
+        )
+        
+        if not conforms:
+            logger.warning(f"SHACL validation failed: {results_text}")
+        else:
+            logger.info("SHACL validation passed")
+        
+        return conforms, results_graph
+
+# ====================================
+# MULTI-AGENT ORCHESTRATOR
+# ====================================
+
+class LegalAnalysisOrchestrator:
+    """Main orchestrator for the multi-agent legal analysis system"""
+    
+    def __init__(self):
+        self.openai_client = OpenAIClient()
+        self.es_client = ElasticsearchClient()
+        self.doc_processor = DocumentProcessor()
+        self.rule_agent = RuleExtractionAgent(self.openai_client)
+        self.concept_agent = ConceptAnalysisAgent(self.openai_client)
+        self.ontology_builder = OntologyBuilderAgent()
+        self.shacl_validator = SHACLValidator()
+        
+        # Initialize LangMem for long-term memory
+        self.memory_store = InMemoryStore(
+            index={
+                "dims": 3072,  # text-embedding-3-large dimensions
+                "embed": f"openai:{Config.OPENAI_EMBEDDING_MODEL}"
+            }
+        )
+        
+        # Create memory tools
+        self.memory_tools = [
+            create_manage_memory_tool(namespace=("legal_analysis",)),
+            create_search_memory_tool(namespace=("legal_analysis",))
+        ]
+        
+        # Build the workflow graph
+        self.workflow = self._build_workflow()
+    
+    def _build_workflow(self) -> StateGraph:
+        """Build the LangGraph workflow for legal analysis"""
+        
+        workflow = StateGraph(LegalAnalysisState)
+        
+        # Add nodes
+        workflow.add_node("document_processing", self._process_document_node)
+        workflow.add_node("rule_extraction", self._rule_extraction_node)
+        workflow.add_node("concept_analysis", self._concept_analysis_node)
+        workflow.add_node("ontology_building", self._ontology_building_node)
+        workflow.add_node("validation", self._validation_node)
+        workflow.add_node("storage", self._storage_node)
+        
+        # Add edges
+        workflow.add_edge(START, "document_processing")
+        workflow.add_edge("document_processing", "rule_extraction")
+        workflow.add_edge("rule_extraction", "concept_analysis")
+        workflow.add_edge("concept_analysis", "ontology_building")
+        workflow.add_edge("ontology_building", "validation")
+        workflow.add_edge("validation", "storage")
+        workflow.add_edge("storage", END)
+        
+        return workflow.compile()
+    
+    def _process_document_node(self, state: LegalAnalysisState) -> LegalAnalysisState:
+        """Process document and extract text"""
+        logger.info("Processing document...")
+        
+        if not state.document_content:
+            logger.error("No document content provided")
+            return state
+        
+        # Chunk the document for processing
+        chunks = self.doc_processor.chunk_text(state.document_content)
+        state.document_content = " ".join(chunks[:10])  # Limit for processing
+        
+        return state
+    
+    def _rule_extraction_node(self, state: LegalAnalysisState) -> LegalAnalysisState:
+        """Extract legal rules from document"""
+        logger.info("Extracting legal rules...")
+        
+        context = {
+            "country": state.country,
+            "jurisdiction": state.jurisdiction, 
+            "organization": state.organization
+        }
+        
+        # Create and run async task
+        async def extract_rules_async():
+            return await self.rule_agent.extract_rules(state.document_content, context)
+        
+        # Run in event loop
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Create task and run until complete
+                task = loop.create_task(extract_rules_async())
+                result = asyncio.run_coroutine_threadsafe(extract_rules_async(), loop).result()
+            else:
+                result = asyncio.run(extract_rules_async())
+        except RuntimeError:
+            # No event loop running, create new one
+            result = asyncio.run(extract_rules_async())
+        
+        state.extracted_rules = result.get('rules', [])
+        
+        # Store in long-term memory
+        memory_content = {
+            "type": "rule_extraction",
+            "country": state.country,
+            "rules_count": len(state.extracted_rules),
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        logger.info(f"Extracted {len(state.extracted_rules)} rules")
+        
+        return state
+    
+    def _concept_analysis_node(self, state: LegalAnalysisState) -> LegalAnalysisState:
+        """Analyze concepts and build hierarchies"""
+        logger.info("Analyzing concepts...")
+        
+        context = {
+            "country": state.country,
+            "jurisdiction": state.jurisdiction,
+            "organization": state.organization
+        }
+        
+        # Create and run async task
+        async def analyze_concepts_async():
+            return await self.concept_agent.analyze_concepts(state.extracted_rules, context)
+        
+        # Run in event loop
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                result = asyncio.run_coroutine_threadsafe(analyze_concepts_async(), loop).result()
+            else:
+                result = asyncio.run(analyze_concepts_async())
+        except RuntimeError:
+            result = asyncio.run(analyze_concepts_async())
+        
+        state.extracted_concepts = result
+        state.data_domains = result.get('data_domains', [])
+        
+        return state
+    
+    def _ontology_building_node(self, state: LegalAnalysisState) -> LegalAnalysisState:
+        """Build ontology from extracted data"""
+        logger.info("Building ontology...")
+        
+        context = {
+            "country": state.country,
+            "jurisdiction": state.jurisdiction,
+            "organization": state.organization
+        }
+        
+        ontology = self.ontology_builder.build_ontology(
+            state.extracted_rules,
+            state.extracted_concepts,
+            context
+        )
+        
+        state.ontology_graph = ontology
+        return state
+    
+    def _validation_node(self, state: LegalAnalysisState) -> LegalAnalysisState:
+        """Validate ontology with SHACL"""
+        logger.info("Validating ontology...")
+        
+        if state.ontology_graph:
+            conforms, validation_results = self.shacl_validator.validate_ontology(state.ontology_graph)
+            if not conforms:
+                logger.warning("Ontology validation failed")
+            else:
+                logger.info("Ontology validation passed")
+        
+        return state
+    
+    def _storage_node(self, state: LegalAnalysisState) -> LegalAnalysisState:
+        """Store results in Elasticsearch"""
+        logger.info("Storing results...")
+        
+        # Create and run async task for embeddings
+        async def generate_embeddings_async():
+            return await self.openai_client.generate_embeddings([state.document_content])
+        
+        # Run in event loop
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                embeddings = asyncio.run_coroutine_threadsafe(generate_embeddings_async(), loop).result()
+            else:
+                embeddings = asyncio.run(generate_embeddings_async())
+        except RuntimeError:
+            embeddings = asyncio.run(generate_embeddings_async())
+        
+        # Prepare document for storage
+        doc = {
+            "document_id": str(uuid.uuid4()),
+            "country": state.country,
+            "jurisdiction": state.jurisdiction,
+            "organization": state.organization,
+            "content": state.document_content,
+            "rules": state.extracted_rules,
+            "concepts": state.extracted_concepts,
+            "data_domains": state.data_domains,
+            "content_vector": embeddings[0] if embeddings else [],
+            "created_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat()
+        }
+        
+        # Store in Elasticsearch
+        self.es_client.client.index(
+            index=Config.ELASTICSEARCH_INDEX,
+            body=doc
+        )
+        logger.info("Document stored successfully")
+        
+        state.analysis_complete = True
+        return state
+    
+    async def process_document(self, document_path: str, metadata: Dict) -> Dict:
+        """Main method to process a legal document"""
+        
+        # Extract text from document
+        text_content = self.doc_processor.extract_text_from_pdf(document_path)
+        
+        # Initialize state
+        initial_state = LegalAnalysisState(
+            document_content=text_content,
+            country=metadata.get('country', 'Unknown'),
+            jurisdiction=metadata.get('jurisdiction', 'Unknown'),
+            organization=metadata.get('organization', 'Unknown')
+        )
+        
+        # Run the workflow
+        try:
+            final_state = self.workflow.invoke(initial_state)
+            
+            # Export ontology in multiple formats
+            ontology_exports = {}
+            if final_state.ontology_graph:
+                ontology_exports = self._export_ontology(
+                    final_state.ontology_graph,
+                    metadata['country']
+                )
+            
+            return {
+                "success": True,
+                "rules_extracted": len(final_state.extracted_rules),
+                "concepts_analyzed": len(final_state.extracted_concepts.get('concept_hierarchy', {})),
+                "data_domains": final_state.data_domains,
+                "ontology_exports": ontology_exports,
+                "analysis_complete": final_state.analysis_complete
+            }
+            
+        except Exception as e:
+            logger.error(f"Error processing document: {e}")
+            return {"success": False, "error": str(e)}
+    
+    def _export_ontology(self, graph: Graph, country: str) -> Dict[str, str]:
+        """Export ontology in multiple formats"""
+        
+        output_dir = Path(Config.OUTPUT_PATH) / country
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        exports = {}
+        formats = {
+            'ttl': 'turtle',
+            'jsonld': 'json-ld', 
+            'xml': 'xml'
+        }
+        
+        for ext, format_name in formats.items():
+            filename = output_dir / f"ontology_{country}.{ext}"
+            graph.serialize(destination=str(filename), format=format_name)
+            exports[ext] = str(filename)
+            logger.info(f"Exported ontology to {filename}")
+        
+        return exports
+
+# ====================================
+# CONFIGURATION MANAGER
+# ====================================
+
+class ConfigurationManager:
+    """Manage document configuration and processing queue"""
+    
+    @staticmethod
+    def load_config(config_path: str) -> Dict:
+        """Load configuration from JSON file"""
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        
+        # Validate configuration structure
+        required_fields = ['documents']
+        for field in required_fields:
+            if field not in config:
+                raise ValueError(f"Missing required field: {field}")
+        
+        return config
+    
+    @staticmethod
+    def create_sample_config() -> Dict:
+        """Create a sample configuration file"""
+        return {
+            "documents": [
+                {
+                    "country": "European Union",
+                    "jurisdiction": "EU",
+                    "organization": "European Commission",
+                    "pdf_document": "./documents/gdpr.pdf",
+                    "supporting_documents": [
+                        "./documents/gdpr_guidance.pdf",
+                        "./documents/gdpr_implementation.pdf"
+                    ]
+                },
+                {
+                    "country": "United States",
+                    "jurisdiction": "Federal",
+                    "organization": "Federal Trade Commission",
+                    "pdf_document": "./documents/ccpa.pdf",
+                    "supporting_documents": [
+                        "./documents/ccpa_regulations.pdf"
+                    ]
+                },
+                {
+                    "country": "United Kingdom", 
+                    "jurisdiction": "UK",
+                    "organization": "Information Commissioner's Office",
+                    "pdf_document": "./documents/uk_gdpr.pdf",
+                    "supporting_documents": [
+                        "./documents/ico_guidance.pdf"
+                    ]
+                }
+            ],
+            "processing_options": {
+                "batch_size": 5,
+                "max_concurrent": 3,
+                "enable_memory": True,
+                "export_formats": ["ttl", "jsonld", "xml"]
+            }
+        }
+
+# ====================================
+# MAIN APPLICATION
+# ====================================
+
+async def main():
+    """Main application entry point"""
+    
+    # Load environment variables from .env file
+    load_dotenv()
+    
+    # Initialize logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    logger.info("Starting Legal Document Analysis System")
+    
+    # Validate configuration early
+    try:
+        Config.validate_config()
+        logger.info("Configuration validation passed")
+    except ValueError as e:
+        logger.error(f"Configuration error: {e}")
+        return
+    
+    # Create sample configuration if it doesn't exist
+    if not os.path.exists(Config.CONFIG_PATH):
+        logger.info("Creating sample configuration file")
+        sample_config = ConfigurationManager.create_sample_config()
+        with open(Config.CONFIG_PATH, 'w') as f:
+            json.dump(sample_config, f, indent=2)
+        logger.info(f"Sample configuration created at {Config.CONFIG_PATH}")
+        logger.info("Please update the configuration file with your documents and run again")
+        return
+    
+    # Load configuration
+    config = ConfigurationManager.load_config(Config.CONFIG_PATH)
+    logger.info(f"Loaded configuration with {len(config['documents'])} documents")
+    
+    # Initialize system components
+    orchestrator = LegalAnalysisOrchestrator()
+    logger.info("Initialized system components")
+    
+    # Ensure Elasticsearch index exists
+    orchestrator.es_client.create_index()
+    
+    # Process documents
+    results = []
+    for doc_config in config['documents']:
+        logger.info(f"Processing document for {doc_config['country']}")
+        
+        # Check if document exists
+        if not os.path.exists(doc_config['pdf_document']):
+            logger.warning(f"Document not found: {doc_config['pdf_document']}")
+            continue
+        
+        # Process the main document
+        result = await orchestrator.process_document(
+            doc_config['pdf_document'],
+            doc_config
+        )
+        
+        results.append({
+            "country": doc_config['country'],
+            "result": result
+        })
+        
+        logger.info(f"Completed processing for {doc_config['country']}")
+    
+    # Summary
+    successful = sum(1 for r in results if r['result']['success'])
+    logger.info(f"Processing complete: {successful}/{len(results)} documents processed successfully")
+    
+    # Save results summary
+    summary_path = Path(Config.OUTPUT_PATH) / "processing_summary.json"
+    with open(summary_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    logger.info(f"Processing summary saved to {summary_path}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
