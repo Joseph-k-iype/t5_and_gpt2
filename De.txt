@@ -1,7 +1,9 @@
 """
 GDC Record Class Mapping System using OpenAI o3-mini with LangGraph ReAct Agents
+Supports ONE-TO-MANY mappings with RAG using text-embedding-3-large
 Implements mixture of experts pattern with dynamic chain of thought reasoning
 Uses Pydantic v2 for validation and latest LangChain/LangGraph
+Uses InMemoryVectorStore for semantic search
 """
 
 import json
@@ -10,7 +12,9 @@ from typing import List, Dict, Optional, Annotated
 from operator import add
 import pandas as pd
 from pydantic import BaseModel, Field, ValidationError, field_validator
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_core.documents import Document
 from langgraph.prebuilt import create_react_agent
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
@@ -22,6 +26,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 OPENAI_MODEL = "o3-mini"
 REASONING_EFFORT = "high"
+EMBEDDING_MODEL = "text-embedding-3-large"
+EMBEDDING_DIMENSIONS = 3072  # Full dimensions for maximum accuracy
 
 # Initialize global LLM instance
 llm = ChatOpenAI(
@@ -30,6 +36,17 @@ llm = ChatOpenAI(
     base_url=OPENAI_BASE_URL,
     model_kwargs={"reasoning_effort": REASONING_EFFORT}
 )
+
+# Initialize global Embeddings instance
+embeddings = OpenAIEmbeddings(
+    model=EMBEDDING_MODEL,
+    api_key=OPENAI_API_KEY,
+    dimensions=EMBEDDING_DIMENSIONS
+)
+
+# Global vector stores (will be populated after data load)
+gdc_master_vectorstore: Optional[InMemoryVectorStore] = None
+gdc_context_vectorstore: Optional[InMemoryVectorStore] = None
 
 # ==================== PYDANTIC V2 MODELS ====================
 
@@ -115,20 +132,21 @@ class SemanticMatch(BaseModel):
 
 class SemanticMatchResponse(BaseModel):
     """Pydantic model for Semantic Matching Expert response"""
-    matches: List[SemanticMatch] = Field(description="List of semantic matches")
+    matches: List[SemanticMatch] = Field(description="List of all relevant semantic matches")
+    multiple_matches_rationale: str = Field(description="Explanation of why multiple GDCs are relevant")
 
 class ContextEvidence(BaseModel):
     """Pydantic model for Context Evidence"""
     gdc_name: str = Field(description="Name of the GDC")
     context_evidence: List[str] = Field(description="List of contextual evidence", default_factory=list)
     alignment_score: float = Field(ge=0, le=100, description="Alignment score")
-    confidence_adjustment: str = Field(description="Confidence adjustment with reasoning")
+    relevance_justification: str = Field(description="Justification for why this GDC is relevant")
     reasoning: str = Field(description="Detailed reasoning for context analysis")
 
 class ContextAnalysisResponse(BaseModel):
     """Pydantic model for Context Analysis Expert response"""
-    context_analysis: List[ContextEvidence] = Field(description="List of context analyses")
-    recommended_gdc: str = Field(description="Recommended GDC name")
+    context_analysis: List[ContextEvidence] = Field(description="List of context analyses for all relevant GDCs")
+    all_relevant_gdcs: List[str] = Field(description="List of all GDC names that are relevant")
 
 class ValidationMatch(BaseModel):
     """Pydantic model for Validation Match"""
@@ -140,40 +158,132 @@ class ValidationMatch(BaseModel):
 
 class ValidationResponse(BaseModel):
     """Pydantic model for Validation Expert response"""
-    validation_found: bool = Field(description="Whether validation entry was found")
-    matching_entry: Optional[ValidationMatch] = Field(None, description="Matching validation entry")
-    validation_status: str = Field(description="Status: CONFIRMED/CONFLICTED/NOT_FOUND")
-    validation_reasoning: str = Field(description="Detailed validation reasoning")
+    validation_results: List[Dict[str, any]] = Field(description="Validation results for each proposed GDC")
+    overall_validation_reasoning: str = Field(description="Overall validation reasoning")
 
-class FinalMappingDecision(BaseModel):
-    """Pydantic model for Final Mapping Decision"""
-    final_gdc_name: str = Field(description="Final selected GDC name")
-    final_gdc_description: str = Field(description="Final GDC description")
-    reasoning: str = Field(description="Comprehensive reasoning for the decision")
+class SingleGDCMapping(BaseModel):
+    """Pydantic model for a single GDC mapping"""
+    gdc_name: str = Field(description="GDC name")
+    gdc_description: str = Field(description="GDC description")
+    mapping_rank: int = Field(ge=1, description="Rank of this mapping (1=primary, 2=secondary, etc.)")
+    reasoning: str = Field(description="Comprehensive reasoning for this specific GDC mapping")
     evidence_summary: List[str] = Field(description="Summary of evidence", default_factory=list)
 
+class FinalMappingDecision(BaseModel):
+    """Pydantic model for Final Mapping Decision (supports multiple GDCs)"""
+    gdc_mappings: List[SingleGDCMapping] = Field(description="All relevant GDC mappings, ranked by relevance")
+    overall_reasoning: str = Field(description="Overall reasoning for the mapping decisions")
+
 class MappingResult(BaseModel):
-    """Pydantic model for final mapping result"""
+    """Pydantic model for final mapping result (one row per GDC mapping)"""
     guid: str = Field(alias="GUID")
     code: str = Field(alias="Code")
     name: str = Field(alias="Name")
     description: str = Field(alias="Description")
     gdc_name: str = Field(alias="GDC Name")
     gdc_description: str = Field(alias="GDC Description")
+    mapping_rank: int = Field(alias="Mapping Rank")
     reasoning: str = Field(alias="Reasoning")
     
     class Config:
         populate_by_name = True
 
+# ==================== TEXT PREPROCESSING ====================
+
+def to_lowercase(text: str) -> str:
+    """Convert text to lowercase for consistent processing"""
+    return text.lower() if text else ""
+
+def preprocess_text(text: str) -> str:
+    """Preprocess text: lowercase and clean"""
+    text = to_lowercase(text)
+    # Remove extra whitespace
+    text = " ".join(text.split())
+    return text
+
+# ==================== CONTEXT ENGINEERING ====================
+
+def create_enriched_gdc_master_document(gdc: GDCMaster) -> Document:
+    """Create context-enriched document for GDC Master with metadata"""
+    # Create rich context for embedding
+    gdc_name_lower = preprocess_text(gdc.gdc_name)
+    definition_lower = preprocess_text(gdc.definition)
+    domain_lower = preprocess_text(gdc.data_domain)
+    
+    # Context engineering: combine all fields with semantic markers
+    enriched_content = f"""gdc category name: {gdc_name_lower}
+data domain: {domain_lower}
+definition and description: {definition_lower}
+this is a group data category for classification purposes
+keywords: {gdc_name_lower} {domain_lower}"""
+    
+    metadata = {
+        "gdc_name": gdc_name_lower,
+        "data_domain": domain_lower,
+        "definition": definition_lower,
+        "type": "gdc_master"
+    }
+    
+    return Document(page_content=enriched_content, metadata=metadata)
+
+def create_enriched_gdc_context_document(gdc_ctx: GDCWithContext) -> Document:
+    """Create context-enriched document for GDC with hierarchical context"""
+    gdc_name_lower = preprocess_text(gdc_ctx.gdc_name)
+    gdc_desc_lower = preprocess_text(gdc_ctx.gdc_description)
+    
+    # Extract PBT, App, and Process information
+    pbt_names = []
+    app_names = []
+    process_names = []
+    
+    for pbt in gdc_ctx.pbts:
+        pbt_name_lower = preprocess_text(pbt.pbt_name)
+        pbt_desc_lower = preprocess_text(pbt.pbt_desc)
+        pbt_names.append(f"{pbt_name_lower} ({pbt_desc_lower})")
+        
+        for app in pbt.apps:
+            app_name_lower = preprocess_text(app.app_name)
+            app_desc_lower = preprocess_text(app.app_description)
+            app_names.append(f"{app_name_lower} - {app_desc_lower}")
+            
+            for proc in app.processes:
+                proc_name_lower = preprocess_text(proc.process_name)
+                proc_desc_lower = preprocess_text(proc.process_description)
+                process_names.append(f"{proc_name_lower}: {proc_desc_lower}")
+    
+    # Context engineering: hierarchical structure with semantic markers
+    enriched_content = f"""gdc category: {gdc_name_lower}
+gdc description: {gdc_desc_lower}
+
+primary business types (pbts):
+{chr(10).join(f"- {pbt}" for pbt in pbt_names) if pbt_names else "- none"}
+
+applications using this gdc:
+{chr(10).join(f"- {app}" for app in app_names) if app_names else "- none"}
+
+related processes:
+{chr(10).join(f"- {proc}" for proc in process_names) if process_names else "- none"}
+
+contextual keywords: {gdc_name_lower} {' '.join(pbt_names)} {' '.join(app_names)}"""
+    
+    metadata = {
+        "gdc_name": gdc_name_lower,
+        "gdc_description": gdc_desc_lower,
+        "pbt_count": len(pbt_names),
+        "app_count": len(app_names),
+        "process_count": len(process_names),
+        "type": "gdc_context"
+    }
+    
+    return Document(page_content=enriched_content, metadata=metadata)
+
 # ==================== UTILITY FUNCTIONS ====================
 
 def extract_json_from_text(text: str) -> str:
     """Extract JSON from text that might contain markdown code blocks"""
-    # Remove any markdown code blocks
     text = re.sub(r'```(?:json)?\s*', '', text)
     text = re.sub(r'```\s*$', '', text)
     
-    # Try to find JSON object or array
     json_match = re.search(r'(\{.*\}|\[.*\])', text, re.DOTALL)
     if json_match:
         return json_match.group(1)
@@ -210,117 +320,203 @@ def load_json_file(filepath: str, model_class: BaseModel) -> List[BaseModel]:
         print(f"Error loading {filepath}: {e}")
         return []
 
+# ==================== RAG VECTOR STORE SETUP ====================
+
+def build_gdc_master_vectorstore(gdc_master_list: List[GDCMaster]) -> InMemoryVectorStore:
+    """Build vector store for GDC Master data with context engineering"""
+    print("🔧 Building GDC Master vector store with text-embedding-3-large...")
+    
+    documents = [create_enriched_gdc_master_document(gdc) for gdc in gdc_master_list]
+    
+    vectorstore = InMemoryVectorStore.from_documents(
+        documents=documents,
+        embedding=embeddings
+    )
+    
+    print(f"✓ GDC Master vector store created with {len(documents)} enriched documents")
+    return vectorstore
+
+def build_gdc_context_vectorstore(gdc_context_list: List[GDCWithContext]) -> InMemoryVectorStore:
+    """Build vector store for GDC Context data with hierarchical context engineering"""
+    print("🔧 Building GDC Context vector store with hierarchical context...")
+    
+    documents = [create_enriched_gdc_context_document(gdc_ctx) for gdc_ctx in gdc_context_list]
+    
+    vectorstore = InMemoryVectorStore.from_documents(
+        documents=documents,
+        embedding=embeddings
+    )
+    
+    print(f"✓ GDC Context vector store created with {len(documents)} context-enriched documents")
+    return vectorstore
+
+def rag_retrieve_relevant_gdcs(query: str, k: int = 10) -> str:
+    """RAG: Retrieve relevant GDCs using semantic search"""
+    global gdc_master_vectorstore, gdc_context_vectorstore
+    
+    # Preprocess query
+    query_lower = preprocess_text(query)
+    
+    # Retrieve from both vector stores
+    master_results = gdc_master_vectorstore.similarity_search(query_lower, k=k)
+    context_results = gdc_context_vectorstore.similarity_search(query_lower, k=k)
+    
+    # Combine results
+    retrieved_info = {
+        "master_matches": [],
+        "context_matches": []
+    }
+    
+    for doc in master_results:
+        retrieved_info["master_matches"].append({
+            "gdc_name": doc.metadata.get("gdc_name", ""),
+            "definition": doc.metadata.get("definition", ""),
+            "data_domain": doc.metadata.get("data_domain", "")
+        })
+    
+    for doc in context_results:
+        retrieved_info["context_matches"].append({
+            "gdc_name": doc.metadata.get("gdc_name", ""),
+            "gdc_description": doc.metadata.get("gdc_description", ""),
+            "pbt_count": doc.metadata.get("pbt_count", 0),
+            "app_count": doc.metadata.get("app_count", 0),
+            "process_count": doc.metadata.get("process_count", 0),
+            "content_preview": doc.page_content[:300]
+        })
+    
+    return json.dumps(retrieved_info, indent=2)
+
 # ==================== EXPERT TOOLS ====================
 
 @tool
-def semantic_similarity_expert(record_name: str, record_desc: str, gdc_candidates: str) -> str:
+def semantic_similarity_expert(record_name: str, record_desc: str) -> str:
     """
-    Expert for semantic similarity analysis between record and GDC candidates.
-    Uses o3-mini's reasoning capabilities to find best semantic matches.
+    Expert for semantic similarity analysis using RAG with text-embedding-3-large.
+    Identifies ALL relevant GDCs using vector similarity search.
     
     Args:
         record_name: Name of the record class
         record_desc: Description of the record class
-        gdc_candidates: JSON string of GDC candidates
     
     Returns:
-        JSON string with top 5 semantic matches and similarity scores
+        JSON string with ALL relevant semantic matches
     """
-    prompt = f"""You are a semantic similarity expert specializing in data classification and entity matching.
+    # Preprocess inputs
+    record_name_lower = preprocess_text(record_name)
+    record_desc_lower = preprocess_text(record_desc)
+    
+    # RAG: Retrieve relevant GDCs
+    query = f"{record_name_lower} {record_desc_lower}"
+    retrieved_gdcs = rag_retrieve_relevant_gdcs(query, k=15)
+    
+    prompt = f"""You are a semantic similarity expert with access to a RAG-retrieved set of relevant GDCs.
 
-TASK: Analyze the semantic similarity between the given Record Class and GDC candidates.
+IMPORTANT: A Record Class can map to MULTIPLE GDCs if the content spans multiple categories.
+
+TASK: Analyze semantic similarity and identify ALL relevant GDC matches.
 
 RECORD CLASS:
-Name: {record_name}
-Description: {record_desc}
+Name: {record_name_lower}
+Description: {record_desc_lower}
 
-GDC CANDIDATES:
-{gdc_candidates}
+RAG-RETRIEVED RELEVANT GDCs (from vector similarity search):
+{retrieved_gdcs}
 
 INSTRUCTIONS:
-1. Carefully analyze the record name and description
-2. Compare against each GDC name and definition
-3. Consider domain overlap, terminology similarity, and conceptual alignment
-4. Score each match from 0-100 based on semantic similarity (for internal ranking only, not as confidence)
-5. Return top 5 matches with detailed reasoning
+1. Review the RAG-retrieved GDCs which are already semantically close to the record
+2. Identify ALL GDCs that are relevant (not just the top match)
+3. Consider that records may span multiple categories
+4. Score each match from 0-100 (for internal ranking)
+5. Provide detailed reasoning for each match
 
-OUTPUT FORMAT - Must be valid JSON matching this exact structure:
+OUTPUT FORMAT - Must be valid JSON:
 {{
   "matches": [
     {{
-      "gdc_name": "GDC Name",
-      "gdc_description": "GDC Definition",
-      "similarity_score": 85.5,
-      "reasoning": "Detailed explanation of why this is a strong match based on semantic overlap, domain alignment, and terminology consistency"
+      "gdc_name": "primary gdc name",
+      "gdc_description": "definition",
+      "similarity_score": 88.5,
+      "reasoning": "detailed explanation of alignment"
     }}
-  ]
+  ],
+  "multiple_matches_rationale": "explanation of why multiple gdcs are needed"
 }}
 
-CRITICAL: Return ONLY valid JSON, no additional text or markdown. Think step-by-step and provide thorough reasoning for each match."""
+CRITICAL: Return ALL relevant GDCs, only valid JSON."""
 
     try:
         response = llm.invoke([HumanMessage(content=prompt)])
         return response.content
     except Exception as e:
-        error_response = SemanticMatchResponse(matches=[])
+        error_response = SemanticMatchResponse(
+            matches=[],
+            multiple_matches_rationale=f"error: {str(e)}"
+        )
         return error_response.model_dump_json()
 
 @tool
-def context_analysis_expert(record_name: str, record_desc: str, gdc_with_context: str, top_matches: str) -> str:
+def context_analysis_expert(record_name: str, record_desc: str, semantic_matches: str) -> str:
     """
-    Expert for analyzing GDC context (PBTs, Apps, Processes) to refine matching.
+    Expert for analyzing GDC context using RAG retrieval.
     
     Args:
         record_name: Name of the record class
         record_desc: Description of the record class
-        gdc_with_context: JSON string of GDC context data
-        top_matches: JSON string of top semantic matches
+        semantic_matches: JSON string of semantic matches
     
     Returns:
         JSON string with context-enriched analysis
     """
-    prompt = f"""You are a context analysis expert specializing in hierarchical data relationships.
+    # Preprocess inputs
+    record_name_lower = preprocess_text(record_name)
+    record_desc_lower = preprocess_text(record_desc)
+    
+    # Extract GDC names from semantic matches
+    try:
+        matches_data = json.loads(extract_json_from_text(semantic_matches))
+        gdc_names = [m.get("gdc_name", "").lower() for m in matches_data.get("matches", [])]
+    except:
+        gdc_names = []
+    
+    # RAG: Retrieve context for these GDCs
+    context_query = f"{record_name_lower} {record_desc_lower} {' '.join(gdc_names)}"
+    retrieved_context = rag_retrieve_relevant_gdcs(context_query, k=10)
+    
+    prompt = f"""You are a context analysis expert with RAG-retrieved hierarchical context.
 
-TASK: Analyze the contextual evidence to validate and refine GDC matches.
+TASK: Analyze contextual evidence for ALL relevant GDC matches.
 
 RECORD CLASS:
-Name: {record_name}
-Description: {record_desc}
+Name: {record_name_lower}
+Description: {record_desc_lower}
 
-TOP SEMANTIC MATCHES:
-{top_matches}
+SEMANTIC MATCHES:
+{semantic_matches}
 
-GDC CONTEXT DATA (with PBTs, Apps, Processes):
-{gdc_with_context}
+RAG-RETRIEVED CONTEXT (PBTs, Apps, Processes):
+{retrieved_context}
 
 INSTRUCTIONS:
-1. For each top match, find its context in the GDC context data
-2. Analyze PBTs, Applications, and Processes associated with the GDC
-3. Determine if the record class aligns with these contexts
-4. Look for domain-specific terminology and use cases
-5. Provide evidence-based analysis and adjustments
+1. For each semantic match, analyze the RAG-retrieved context
+2. Identify PBTs, Applications, and Processes that support each GDC
+3. Keep ALL GDCs with valid contextual support
+4. Provide evidence-based justification
 
-OUTPUT FORMAT - Must be valid JSON matching this exact structure:
+OUTPUT FORMAT - Must be valid JSON:
 {{
   "context_analysis": [
     {{
-      "gdc_name": "GDC Name",
-      "context_evidence": [
-        "Found in PBT: X with description showing alignment in domain Y",
-        "Used in Application: A for purpose B which relates to the record class",
-        "Related Process: P which handles similar data types"
-      ],
+      "gdc_name": "gdc name",
+      "context_evidence": ["pbt: ...", "app: ...", "process: ..."],
       "alignment_score": 90.0,
-      "confidence_adjustment": "Strong contextual alignment due to matching PBT domain and application usage",
-      "reasoning": "Detailed explanation of how context supports or refutes the match, including specific PBT names, application purposes, and process descriptions that relate to the record class"
+      "relevance_justification": "why this gdc is relevant",
+      "reasoning": "detailed explanation with specific references"
     }}
   ],
-  "recommended_gdc": "Final recommended GDC name based on strongest contextual evidence"
+  "all_relevant_gdcs": ["gdc1", "gdc2"]
 }}
 
-Note: alignment_score is for internal ranking, not a confidence measure.
-
-CRITICAL: Return ONLY valid JSON, no additional text or markdown. Reason through each piece of contextual evidence systematically."""
+CRITICAL: Analyze ALL matches, only valid JSON."""
 
     try:
         response = llm.invoke([HumanMessage(content=prompt)])
@@ -328,126 +524,131 @@ CRITICAL: Return ONLY valid JSON, no additional text or markdown. Reason through
     except Exception as e:
         error_response = ContextAnalysisResponse(
             context_analysis=[],
-            recommended_gdc="UNKNOWN"
+            all_relevant_gdcs=[]
         )
         return error_response.model_dump_json()
 
 @tool
-def validation_expert(record_name: str, proposed_gdc: str, validation_data: str) -> str:
+def validation_expert(record_name: str, proposed_gdcs: str, validation_data: str) -> str:
     """
-    Expert for validating proposed mapping against known validation set.
+    Expert for validating ALL proposed GDC mappings.
     
     Args:
         record_name: Name of the record class
-        proposed_gdc: Proposed GDC mapping
+        proposed_gdcs: JSON list of proposed GDC names
         validation_data: JSON string of validation set
     
     Returns:
         JSON string with validation results
     """
-    prompt = f"""You are a validation expert specializing in data quality and accuracy verification.
+    record_name_lower = preprocess_text(record_name)
+    
+    # Preprocess validation data
+    try:
+        val_data = json.loads(validation_data)
+        val_data_lower = []
+        for entry in val_data:
+            val_data_lower.append({
+                "gdc_name": to_lowercase(entry.get("GDC Name", "")),
+                "gdc_description": to_lowercase(entry.get("GDC Description", "")),
+                "ilm_category_name": to_lowercase(entry.get("ILM Category Name", ""))
+            })
+        validation_data_lower = json.dumps(val_data_lower, indent=2)
+    except:
+        validation_data_lower = validation_data
+    
+    prompt = f"""You are a validation expert.
 
-TASK: Validate the proposed GDC mapping against the validation dataset.
+TASK: Validate each proposed GDC mapping.
 
-RECORD CLASS NAME: {record_name}
-PROPOSED GDC: {proposed_gdc}
+RECORD CLASS NAME: {record_name_lower}
+PROPOSED GDCs: {proposed_gdcs}
 
-VALIDATION DATASET:
-{validation_data}
+VALIDATION DATASET (preprocessed):
+{validation_data_lower}
 
 INSTRUCTIONS:
-1. Search for similar record names in the validation set
-2. Check if the proposed GDC matches validation data
-3. Look for related ILM categories that might provide hints
-4. Identify any conflicts or confirmations
-5. Provide detailed validation reasoning
+1. For each proposed GDC, search validation set
+2. Identify confirmations or conflicts
+3. Provide reasoning for each
 
-OUTPUT FORMAT - Must be valid JSON matching this exact structure:
+OUTPUT FORMAT - Must be valid JSON:
 {{
-  "validation_found": true,
-  "matching_entry": {{
-    "GDC Name": "Validated GDC Name",
-    "ILM Category Name": "Related ILM Category"
-  }},
-  "validation_status": "CONFIRMED",
-  "validation_reasoning": "Detailed explanation of validation results including any matches found, conflicts identified, or related patterns in the validation dataset"
+  "validation_results": [
+    {{
+      "gdc_name": "gdc name",
+      "validation_found": true,
+      "matching_entry": {{"gdc_name": "...", "ilm_category_name": "..."}},
+      "validation_status": "confirmed/conflicted/not_found",
+      "validation_reasoning": "explanation"
+    }}
+  ],
+  "overall_validation_reasoning": "summary"
 }}
 
-Note: validation_status must be one of: CONFIRMED, CONFLICTED, NOT_FOUND
-Note: If no match found, set validation_found to false and matching_entry to null
-
-CRITICAL: Return ONLY valid JSON, no additional text or markdown. Be thorough and consider partial matches or related terms."""
+CRITICAL: Validate each GDC, only valid JSON."""
 
     try:
         response = llm.invoke([HumanMessage(content=prompt)])
         return response.content
     except Exception as e:
         error_response = ValidationResponse(
-            validation_found=False,
-            matching_entry=None,
-            validation_status="NOT_FOUND",
-            validation_reasoning=f"Error: {str(e)}"
+            validation_results=[],
+            overall_validation_reasoning=f"error: {str(e)}"
         )
         return error_response.model_dump_json()
 
 @tool
 def final_decision_expert(record_info: str, all_analyses: str) -> str:
     """
-    Expert for making final mapping decision by synthesizing all expert inputs.
+    Expert for making final mapping decisions for ALL relevant GDCs.
     
     Args:
         record_info: JSON string with record information
         all_analyses: JSON string with all expert analyses
     
     Returns:
-        JSON string with final decision and comprehensive reasoning
+        JSON string with final decisions
     """
-    prompt = f"""You are a final decision expert specializing in evidence synthesis and mapping decisions.
+    prompt = f"""You are a final decision expert.
 
-TASK: Make the final GDC mapping decision by synthesizing all expert analyses.
+TASK: Make final GDC mapping decisions for ALL relevant GDCs.
 
 RECORD INFORMATION:
 {record_info}
 
-ALL EXPERT ANALYSES:
+ALL ANALYSES:
 {all_analyses}
 
 INSTRUCTIONS:
-1. Review semantic similarity scores and reasoning
-2. Consider contextual evidence from PBTs, Apps, and Processes
-3. Factor in validation results
-4. Weigh all evidence systematically
-5. Make a well-reasoned final decision
-6. Provide comprehensive reasoning chain
+1. Synthesize semantic, context, and validation analyses
+2. Rank GDCs by relevance (1=primary, 2=secondary, etc.)
+3. Provide comprehensive reasoning for EACH mapping
+4. Explain why multiple GDCs are needed
 
-OUTPUT FORMAT - Must be valid JSON matching this exact structure:
+OUTPUT FORMAT - Must be valid JSON:
 {{
-  "final_gdc_name": "Selected GDC Name",
-  "final_gdc_description": "GDC Definition",
-  "reasoning": "Multi-paragraph comprehensive reasoning that includes:\n\n1. DECISION SUMMARY: Clear statement of which GDC was selected and why\n\n2. SEMANTIC ANALYSIS: Key findings from semantic matching including similarity scores and reasoning\n\n3. CONTEXTUAL EVIDENCE: Specific PBTs, Applications, and Processes that support this mapping, with detailed explanations of how they align\n\n4. VALIDATION RESULTS: Whether the mapping was confirmed, conflicted, or not found in validation data\n\n5. ALTERNATIVE CONSIDERATIONS: Brief discussion of other candidates and why they were not chosen\n\n6. FINAL JUSTIFICATION: Clear synthesis of all evidence supporting this decision",
-  "evidence_summary": [
-    "Semantic similarity: Strong match with score of 88/100 based on domain alignment",
-    "Context alignment: Found in PBT 'X' supporting Application 'Y' for Process 'Z'",
-    "Validation: Confirmed in validation set with matching ILM category",
-    "Alternative analysis: Second choice was GDC 'A' but lacked contextual support"
-  ]
+  "gdc_mappings": [
+    {{
+      "gdc_name": "primary gdc",
+      "gdc_description": "definition",
+      "mapping_rank": 1,
+      "reasoning": "comprehensive reasoning with sections",
+      "evidence_summary": ["semantic: ...", "context: ...", "validation: ..."]
+    }}
+  ],
+  "overall_reasoning": "rationale for multiple mappings"
 }}
 
-CRITICAL: 
-- Return ONLY valid JSON, no additional text or markdown
-- Provide thorough, well-structured reasoning with specific references to PBTs, Applications, and Processes
-- Do not include confidence scores or percentages in your reasoning - focus on evidence quality and alignment
-- Reference specific tool outputs and findings in your reasoning"""
+CRITICAL: Include ALL relevant mappings, only valid JSON."""
 
     try:
         response = llm.invoke([HumanMessage(content=prompt)])
         return response.content
     except Exception as e:
         error_response = FinalMappingDecision(
-            final_gdc_name="UNKNOWN",
-            final_gdc_description="",
-            reasoning=f"Error during decision making: {str(e)}",
-            evidence_summary=[]
+            gdc_mappings=[],
+            overall_reasoning=f"error: {str(e)}"
         )
         return error_response.model_dump_json()
 
@@ -463,24 +664,17 @@ def create_react_agent_workflow():
         final_decision_expert
     ]
     
-    system_prompt = """You are an expert GDC (Group Data Category) mapping coordinator using a mixture of experts approach.
+    system_prompt = """You are an expert GDC mapping coordinator using RAG and mixture of experts.
 
-Your task is to map Record Classes to GDCs by coordinating multiple expert tools in a systematic workflow:
+CRITICAL: Record Classes can map to MULTIPLE GDCs. Use RAG-retrieved context.
 
-1. SEMANTIC MATCHING: First, use the semantic_similarity_expert tool to find top 5 semantically similar GDCs
-2. CONTEXT ANALYSIS: Then, use the context_analysis_expert tool to analyze PBTs, Applications, and Processes
-3. VALIDATION: Next, use the validation_expert tool to validate against known mappings
-4. FINAL DECISION: Finally, use the final_decision_expert tool to synthesize all evidence
+Workflow:
+1. SEMANTIC MATCHING: Use semantic_similarity_expert (with RAG)
+2. CONTEXT ANALYSIS: Use context_analysis_expert (with RAG context)
+3. VALIDATION: Use validation_expert
+4. FINAL DECISION: Use final_decision_expert
 
-WORKFLOW RULES:
-- Always call tools in this exact order
-- Pass outputs from one tool as inputs to the next
-- Ensure all JSON data is properly formatted
-- Validate outputs at each step
-- Provide the final mapping with comprehensive reasoning that references specific PBTs, Applications, and Processes
-- Do not provide confidence scores - focus on evidence quality
-
-You must be systematic and thorough in your analysis."""
+All text is preprocessed to lowercase. Focus on evidence quality."""
     
     agent = create_react_agent(
         model=llm,
@@ -493,23 +687,17 @@ You must be systematic and thorough in your analysis."""
 def process_single_record(
     agent,
     record: RecordClass,
-    gdc_master: List[GDCMaster],
-    gdc_context: List[GDCWithContext],
     validation_set: List[ValidationEntry]
-) -> MappingResult:
-    """Process a single record through the ReAct agent"""
+) -> List[MappingResult]:
+    """Process a single record through the ReAct agent with RAG"""
     
     print(f"\n{'='*80}")
     print(f"Processing: {record.name}")
     print(f"{'='*80}")
     
-    # Prepare data for the agent
-    gdc_master_json = json.dumps([g.model_dump() for g in gdc_master], indent=2)
-    gdc_context_json = json.dumps([g.model_dump() for g in gdc_context], indent=2)
     validation_json = json.dumps([v.model_dump() for v in validation_set], indent=2)
     
-    # Create the query for the agent
-    query = f"""Please map the following Record Class to the most appropriate GDC using the complete workflow:
+    query = f"""Map this Record Class to ALL relevant GDCs using RAG:
 
 RECORD CLASS:
 - GUID: {record.guid}
@@ -517,87 +705,98 @@ RECORD CLASS:
 - Name: {record.name}
 - Description: {record.description}
 
-Follow these steps exactly:
-1. Call semantic_similarity_expert with record_name="{record.name}", record_desc="{record.description}", and gdc_candidates=<GDC_MASTER_DATA>
-2. Call context_analysis_expert with the semantic matches and GDC context data
-3. Call validation_expert with the recommended GDC and validation data
-4. Call final_decision_expert to synthesize all analyses and make the final decision
+Steps:
+1. semantic_similarity_expert (uses RAG retrieval)
+2. context_analysis_expert (uses RAG context)
+3. validation_expert
+4. final_decision_expert
 
-Provide the complete mapping with comprehensive reasoning that references specific PBTs, Applications, and Processes."""
+Provide comprehensive reasoning with PBT/App/Process references."""
     
     try:
-        # Invoke the ReAct agent
         result = agent.invoke({
-            "messages": [
-                HumanMessage(content=query)
-            ]
+            "messages": [HumanMessage(content=query)]
         })
         
-        # Extract the final response
         messages = result.get("messages", [])
         final_message = messages[-1] if messages else None
         
         if not final_message:
             raise ValueError("No response from agent")
         
-        # Parse the final decision from the agent's response
         response_content = final_message.content
-        
-        # Extract final decision from the response
         final_decision = extract_final_decision(response_content)
         
-        return MappingResult(
-            guid=record.guid,
-            code=record.code,
-            name=record.name,
-            description=record.description,
-            gdc_name=final_decision.get("final_gdc_name", "UNKNOWN"),
-            gdc_description=final_decision.get("final_gdc_description", ""),
-            reasoning=format_comprehensive_reasoning(final_decision)
-        )
+        mapping_results = []
+        gdc_mappings = final_decision.get("gdc_mappings", [])
+        overall_reasoning = final_decision.get("overall_reasoning", "")
+        
+        if not gdc_mappings:
+            mapping_results.append(MappingResult(
+                guid=record.guid,
+                code=record.code,
+                name=record.name,
+                description=record.description,
+                gdc_name="unknown",
+                gdc_description="",
+                mapping_rank=1,
+                reasoning="no valid gdc mappings identified"
+            ))
+        else:
+            for mapping in gdc_mappings:
+                mapping_results.append(MappingResult(
+                    guid=record.guid,
+                    code=record.code,
+                    name=record.name,
+                    description=record.description,
+                    gdc_name=mapping.get("gdc_name", "unknown"),
+                    gdc_description=mapping.get("gdc_description", ""),
+                    mapping_rank=mapping.get("mapping_rank", 1),
+                    reasoning=format_mapping_reasoning(mapping, overall_reasoning)
+                ))
+        
+        return mapping_results
         
     except Exception as e:
-        print(f"Error processing record: {e}")
-        return MappingResult(
+        print(f"Error: {e}")
+        return [MappingResult(
             guid=record.guid,
             code=record.code,
             name=record.name,
             description=record.description,
-            gdc_name="ERROR",
+            gdc_name="error",
             gdc_description="",
-            reasoning=f"Error during processing: {str(e)}"
-        )
+            mapping_rank=1,
+            reasoning=f"error: {str(e)}"
+        )]
 
 def extract_final_decision(response_text: str) -> Dict:
     """Extract final decision from agent response"""
-    # Look for JSON in the response
     try:
         json_str = extract_json_from_text(response_text)
         decision_data = json.loads(json_str)
-        
-        # Validate with Pydantic
         final_decision = FinalMappingDecision.model_validate(decision_data)
         return final_decision.model_dump()
     except:
-        # Return default if parsing fails
         return {
-            "final_gdc_name": "UNKNOWN",
-            "final_gdc_description": "",
-            "reasoning": "Unable to extract final decision from agent response",
-            "evidence_summary": []
+            "gdc_mappings": [],
+            "overall_reasoning": "unable to extract decision"
         }
 
-def format_comprehensive_reasoning(final_decision: Dict) -> str:
-    """Format comprehensive reasoning for output"""
+def format_mapping_reasoning(mapping: Dict, overall_reasoning: str) -> str:
+    """Format reasoning for output"""
     parts = []
     
-    reasoning = final_decision.get("reasoning", "")
+    reasoning = mapping.get("reasoning", "")
     if reasoning:
-        parts.append(f"DECISION REASONING:\n{reasoning}")
+        parts.append(f"mapping reasoning:\n{reasoning}")
     
-    evidence = final_decision.get("evidence_summary", [])
+    evidence = mapping.get("evidence_summary", [])
     if evidence:
-        parts.append(f"\n\nEVIDENCE SUMMARY:\n" + "\n".join(f"• {e}" for e in evidence))
+        parts.append(f"\n\nevidence summary:\n" + "\n".join(f"• {e}" for e in evidence))
+    
+    if overall_reasoning and mapping.get("mapping_rank", 1) == 1:
+        parts.append(f"\n\noverall context:\n{overall_reasoning}")
     
     return "\n".join(parts)
 
@@ -605,97 +804,86 @@ def format_comprehensive_reasoning(final_decision: Dict) -> str:
 
 def main():
     """Main execution function"""
+    global gdc_master_vectorstore, gdc_context_vectorstore
     
     print("=" * 80)
     print("GDC RECORD CLASS MAPPING SYSTEM")
-    print("Using OpenAI o3-mini with LangGraph ReAct Agents")
-    print("Pydantic v2 Validation | Latest LangChain & LangGraph")
+    print("RAG with text-embedding-3-large | InMemoryVectorStore")
+    print("One-to-Many Mappings | LangGraph ReAct Agents")
     print("=" * 80)
     
-    # Validate API key
     if not OPENAI_API_KEY:
-        print("\n❌ ERROR: OPENAI_API_KEY environment variable not set")
-        print("Please set it using: export OPENAI_API_KEY='your-api-key'")
+        print("\n❌ ERROR: OPENAI_API_KEY not set")
         return
     
-    # Load and validate data files
-    print("\n📁 Loading and validating data files...")
-    
+    print("\n📁 Loading data...")
     gdc_master = load_json_file("GDC_master.json", GDCMaster)
     gdc_context = load_json_file("GDC_with_context.json", GDCWithContext)
     validation_set = load_json_file("GDC_MSS_ILM.json", ValidationEntry)
     record_classes = load_json_file("Record_Classes.json", RecordClass)
     
-    print(f"✓ Loaded and validated {len(gdc_master)} GDC master entries")
-    print(f"✓ Loaded and validated {len(gdc_context)} GDC context entries")
-    print(f"✓ Loaded and validated {len(validation_set)} validation entries")
-    print(f"✓ Loaded and validated {len(record_classes)} record classes")
+    print(f"✓ Loaded {len(gdc_master)} gdc master entries")
+    print(f"✓ Loaded {len(gdc_context)} gdc context entries")
+    print(f"✓ Loaded {len(validation_set)} validation entries")
+    print(f"✓ Loaded {len(record_classes)} record classes")
     
     if not all([gdc_master, gdc_context, validation_set, record_classes]):
-        print("\n❌ ERROR: Failed to load required data files")
+        print("\n❌ ERROR: Failed to load data")
         return
     
-    # Create ReAct agent
-    print("\n🤖 Creating LangGraph ReAct agent with expert tools...")
-    agent = create_react_agent_workflow()
-    print("✓ ReAct agent created with 4 expert tools")
-    print(f"✓ Using model: {OPENAI_MODEL}")
-    print(f"✓ Reasoning effort: {REASONING_EFFORT}")
+    # Build vector stores with RAG
+    print("\n🔍 Building RAG vector stores...")
+    gdc_master_vectorstore = build_gdc_master_vectorstore(gdc_master)
+    gdc_context_vectorstore = build_gdc_context_vectorstore(gdc_context)
     
-    # Process each record
-    print("\n🚀 Starting mapping process...\n")
-    results = []
+    print("\n🤖 Creating ReAct agent...")
+    agent = create_react_agent_workflow()
+    print(f"✓ Model: {OPENAI_MODEL}")
+    print(f"✓ Embeddings: {EMBEDDING_MODEL} ({EMBEDDING_DIMENSIONS}d)")
+    print(f"✓ Mode: one-to-many with rag")
+    
+    print("\n🚀 Starting mapping...\n")
+    all_results = []
     
     for i, record in enumerate(record_classes, 1):
-        print(f"\nRecord {i}/{len(record_classes)}")
+        print(f"\nrecord {i}/{len(record_classes)}")
         
         try:
-            result = process_single_record(
+            record_mappings = process_single_record(
                 agent=agent,
                 record=record,
-                gdc_master=gdc_master,
-                gdc_context=gdc_context,
                 validation_set=validation_set
             )
-            results.append(result)
-            print(f"✓ Completed: Mapped to '{result.gdc_name}'")
+            
+            all_results.extend(record_mappings)
+            gdc_names = [m.gdc_name for m in record_mappings]
+            print(f"✓ mapped to {len(record_mappings)} gdc(s): {', '.join(gdc_names)}")
             
         except Exception as e:
-            print(f"✗ Error: {e}")
-            error_result = MappingResult(
+            print(f"✗ error: {e}")
+            all_results.append(MappingResult(
                 guid=record.guid,
                 code=record.code,
                 name=record.name,
                 description=record.description,
-                gdc_name="ERROR",
+                gdc_name="error",
                 gdc_description="",
-                reasoning=f"Error: {str(e)}"
-            )
-            results.append(error_result)
+                mapping_rank=1,
+                reasoning=f"error: {str(e)}"
+            ))
     
-    # Convert to DataFrame and save
     print("\n" + "="*80)
-    print("💾 Saving results...")
-    
-    results_dict = [r.model_dump(by_alias=True) for r in results]
+    print("💾 Saving...")
+    results_dict = [r.model_dump(by_alias=True) for r in all_results]
     df = pd.DataFrame(results_dict)
+    df.to_csv("GDC_Mapping_Results.csv", index=False, encoding='utf-8-sig')
+    print("✓ Results saved")
     
-    output_file = "GDC_Mapping_Results.csv"
-    df.to_csv(output_file, index=False, encoding='utf-8-sig')
-    print(f"✓ Results saved to {output_file}")
-    
-    # Print summary
-    print("\n" + "="*80)
-    print("📊 SUMMARY")
+    print("\n📊 SUMMARY")
     print("="*80)
-    print(f"Total records processed: {len(results)}")
-    successful = sum(1 for r in results if r.gdc_name not in ["ERROR", "UNKNOWN"])
-    errors = sum(1 for r in results if r.gdc_name == "ERROR")
-    unknown = sum(1 for r in results if r.gdc_name == "UNKNOWN")
-    
-    print(f"✓ Successful mappings: {successful}")
-    print(f"⚠ Unknown mappings: {unknown}")
-    print(f"✗ Errors: {errors}")
+    print(f"records: {len(record_classes)}")
+    print(f"mappings: {len(all_results)}")
+    print(f"avg mappings/record: {len(all_results)/len(record_classes):.2f}")
     print("="*80)
 
 if __name__ == "__main__":
