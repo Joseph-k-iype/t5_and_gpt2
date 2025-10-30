@@ -1,444 +1,544 @@
 """
-Enhanced ODRL to Rego Conversion CLI with Coverage-Based Rules
-Uses OpenAI o3-mini reasoning model with advanced agent patterns
+Data Processing Purpose Mapper using LangGraph, LangChain, and OpenAI o3-mini
+Maps case data to processing purposes with dynamic chain of thought and mixture of experts
 """
-import argparse
-import json
+
 import os
-import sys
-from pathlib import Path
+import csv
+import json
+import asyncio
+from typing import Dict, List, TypedDict, Annotated, Sequence
+from dataclasses import dataclass
+import numpy as np
+from collections import Counter
+import statistics
 
-# Add project root to path
-project_root = Path(__file__).parent
-sys.path.insert(0, str(project_root))
+# OpenAI
+import openai
+from openai import OpenAI, AsyncOpenAI
 
-from src.config import Config, OPENAI_MODEL
-from src.agents.react_workflow import convert_odrl_file_to_rego, convert_odrl_to_rego_with_coverage
+# Pydantic
+from pydantic import BaseModel, Field
+
+# LangChain
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import ChatOpenAI
+
+# LangGraph
+from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode
+
+# ============================================================================
+# GLOBAL CONFIGURATION
+# ============================================================================
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "your-api-key-here")
+OPENAI_BASE_URL = "https://api.openai.com/v1"
+OPENAI_MODEL = "o3-mini"
+EMBEDDING_MODEL = "text-embedding-3-large"
+
+# Initialize OpenAI clients
+openai_client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+async_openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+
+# Target categories
+TARGET_CATEGORIES = [
+    "Manage Relationship (clients/employees/vendors)",
+    "Internal Management",
+    "Merger and acquisition",
+    "Establishment, exercise or defense of legal claims"
+]
 
 
-def cli_convert(args):
+# ============================================================================
+# DATA MODELS
+# ============================================================================
+
+class CaseData(BaseModel):
+    """Case data model"""
+    case_id: str
+    project_title: str
+    project_overview: str
+    purpose_of_processing: str
+    dv_purpose_of_processing: str
+    m_rop_purpose_of_processing: str
+
+
+class ExpertOpinion(BaseModel):
+    """Expert opinion model"""
+    expert_name: str
+    categories: List[str]
+    reasoning: str
+    confidence: float
+
+
+class MappingResult(BaseModel):
+    """Final mapping result"""
+    case_id: str
+    mapped_categories: List[str]
+    reasoning: str
+    confidence_score: float
+    expert_opinions: List[ExpertOpinion]
+    semantic_scores: Dict[str, float]
+    keyword_scores: Dict[str, float]
+
+
+class GraphState(TypedDict):
+    """State for LangGraph workflow"""
+    case_data: CaseData
+    context_analysis: str
+    expert_opinions: List[ExpertOpinion]
+    vector_store: InMemoryVectorStore
+    mapping_result: MappingResult
+    messages: Sequence[HumanMessage | AIMessage | SystemMessage]
+
+
+# ============================================================================
+# EMBEDDING UTILITY (Direct OpenAI API Client)
+# ============================================================================
+
+class DirectEmbeddings:
+    """Direct OpenAI embeddings using API client (not LangChain's way)"""
+    
+    def __init__(self, model: str = EMBEDDING_MODEL):
+        self.model = model
+        self.client = openai_client
+        self.async_client = async_openai_client
+    
+    def embed_query(self, text: str) -> List[float]:
+        """Embed a single query"""
+        response = self.client.embeddings.create(
+            model=self.model,
+            input=text
+        )
+        return response.data[0].embedding
+    
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """Embed multiple documents"""
+        response = self.client.embeddings.create(
+            model=self.model,
+            input=texts
+        )
+        return [item.embedding for item in response.data]
+    
+    async def aembed_query(self, text: str) -> List[float]:
+        """Async embed a single query"""
+        response = await self.async_client.embeddings.create(
+            model=self.model,
+            input=text
+        )
+        return response.data[0].embedding
+    
+    async def aembed_documents(self, texts: List[str]) -> List[List[float]]:
+        """Async embed multiple documents"""
+        response = await self.async_client.embeddings.create(
+            model=self.model,
+            input=texts
+        )
+        return [item.embedding for item in response.data]
+
+
+# ============================================================================
+# VECTOR STORE SETUP
+# ============================================================================
+
+def setup_vector_store() -> InMemoryVectorStore:
+    """Setup InMemoryVectorStore with category descriptions"""
+    embeddings = DirectEmbeddings()
+    vector_store = InMemoryVectorStore(embedding=embeddings)
+    
+    # Category descriptions for semantic matching
+    category_docs = [
+        Document(
+            page_content="Managing relationships with clients, customers, employees, vendors, suppliers, partners, and other stakeholders. Customer relationship management, employee management, vendor management, supplier relations, client communications, partnership management.",
+            metadata={"category": TARGET_CATEGORIES[0]}
+        ),
+        Document(
+            page_content="Internal management, business operations, administrative tasks, organizational management, internal processes, operational efficiency, business administration, internal controls, management systems, organizational structure.",
+            metadata={"category": TARGET_CATEGORIES[1]}
+        ),
+        Document(
+            page_content="Mergers and acquisitions, M&A, corporate transactions, due diligence, company acquisition, merger process, business combination, corporate restructuring, acquisition planning, post-merger integration.",
+            metadata={"category": TARGET_CATEGORIES[2]}
+        ),
+        Document(
+            page_content="Legal claims, establishment of legal claims, exercise of legal rights, defense against legal claims, litigation, legal proceedings, legal disputes, lawful claims, legal defense, claim management, dispute resolution.",
+            metadata={"category": TARGET_CATEGORIES[3]}
+        )
+    ]
+    
+    vector_store.add_documents(category_docs)
+    return vector_store
+
+
+# ============================================================================
+# CHAIN OF THOUGHT PROMPT GENERATOR
+# ============================================================================
+
+def generate_dynamic_cot_prompt(case_data: CaseData, context: str) -> str:
+    """Generate dynamic chain of thought prompt based on case context"""
+    
+    prompt = f"""You are an expert data privacy analyst specializing in purpose of processing categorization.
+
+**Case Information:**
+- Case ID: {case_data.case_id}
+- Project Title: {case_data.project_title}
+- Project Overview: {case_data.project_overview}
+- Purpose of Processing: {case_data.purpose_of_processing}
+- DV Purpose of Processing: {case_data.dv_purpose_of_processing}
+- M ROP Purpose of Processing: {case_data.m_rop_purpose_of_processing}
+
+**Context Analysis:**
+{context}
+
+**Available Categories:**
+1. Manage Relationship (clients/employees/vendors)
+2. Internal Management
+3. Merger and acquisition
+4. Establishment, exercise or defense of legal claims
+
+**Your Task:**
+Using chain of thought reasoning, analyze this case step by step:
+
+1. **Initial Understanding**: What is the primary business activity described?
+2. **Key Indicators**: What keywords, phrases, or concepts indicate specific purposes?
+3. **Category Evaluation**: For each category, assess relevance (0-10 scale):
+   - Manage Relationship: Does it involve client, employee, or vendor interactions?
+   - Internal Management: Does it relate to internal operations or administration?
+   - Merger and acquisition: Does it involve M&A activities or due diligence?
+   - Legal claims: Does it relate to legal proceedings or claim management?
+4. **Reasoning**: Explain your reasoning for each potential match
+5. **Final Decision**: Select one or more categories that best fit
+
+Provide your analysis in JSON format:
+{{
+    "categories": ["category1", "category2"],
+    "reasoning": "detailed reasoning",
+    "confidence": 0.85
+}}"""
+    
+    return prompt
+
+
+# ============================================================================
+# LANGGRAPH NODES
+# ============================================================================
+
+async def analyze_context(state: GraphState) -> GraphState:
+    """Node: Analyze case context using o3-mini"""
+    case_data = state["case_data"]
+    
+    # Combine all case information for context
+    full_context = f"""
+    Project Title: {case_data.project_title}
+    Overview: {case_data.project_overview}
+    Purpose: {case_data.purpose_of_processing}
+    DV Purpose: {case_data.dv_purpose_of_processing}
+    M ROP Purpose: {case_data.m_rop_purpose_of_processing}
     """
-    Handle conversion command with coverage-based approach.
-    """
-    input_file = args.input
-    output_file = args.output
-    existing_rego_file = args.existing_rego
-    use_moe = args.use_mixture_of_experts
-    verbose = args.verbose
     
-    # Validate input file
-    if not os.path.exists(input_file):
-        print(f"✗ Error: Input file not found: {input_file}")
-        return 1
+    # Use o3-mini for context analysis
+    response = await async_openai_client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": "You are a data processing expert. Analyze the following case and provide a comprehensive summary of the key activities, stakeholders, and purposes."},
+            {"role": "user", "content": full_context}
+        ]
+    )
     
-    # Validate existing rego file if provided
-    if existing_rego_file and not os.path.exists(existing_rego_file):
-        print(f"✗ Error: Existing Rego file not found: {existing_rego_file}")
-        return 1
+    context_analysis = response.choices[0].message.content
+    state["context_analysis"] = context_analysis
     
-    print(f"\n{'='*80}")
-    print(f"ODRL to Rego Conversion (Coverage-Based)")
-    print(f"{'='*80}")
-    print(f"Model: {OPENAI_MODEL}")
-    print(f"Input: {input_file}")
-    print(f"Output: {output_file or input_file.replace('.json', '.rego')}")
-    print(f"Mixture of Experts: {use_moe}")
-    print(f"Verbose: {verbose}")
-    if existing_rego_file:
-        print(f"Appending to: {existing_rego_file}")
-    print(f"{'='*80}\n")
+    return state
+
+
+async def mixture_of_experts(state: GraphState) -> GraphState:
+    """Node: Get opinions from multiple expert perspectives"""
+    case_data = state["case_data"]
+    context = state["context_analysis"]
     
-    try:
-        result = convert_odrl_file_to_rego(
-            input_file=input_file,
-            output_file=output_file,
-            existing_rego_file=existing_rego_file,
-            use_mixture_of_experts=use_moe,
-            verbose=verbose
+    # Define expert perspectives
+    experts = [
+        {
+            "name": "Legal Compliance Expert",
+            "system_prompt": "You are a legal compliance expert focusing on GDPR and data protection regulations. Analyze from a legal compliance perspective."
+        },
+        {
+            "name": "Business Operations Expert",
+            "system_prompt": "You are a business operations expert. Analyze from a business process and operational perspective."
+        },
+        {
+            "name": "Data Privacy Expert",
+            "system_prompt": "You are a data privacy specialist. Analyze from a data processing and privacy perspective."
+        }
+    ]
+    
+    expert_opinions = []
+    
+    for expert in experts:
+        prompt = generate_dynamic_cot_prompt(case_data, context)
+        
+        response = await async_openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": expert["system_prompt"]},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"}
         )
         
-        if result["success"]:
-            print("\n" + "="*80)
-            print("CONVERSION SUMMARY")
-            print("="*80)
-            
-            # Check if multiple policies were processed
-            if "individual_results" in result:
-                num_policies = len(result["individual_results"])
-                successful = sum(1 for r in result["individual_results"] if r["success"])
-                print(f"✓ Total Policies: {num_policies}")
-                print(f"✓ Successful: {successful}")
-                print(f"✗ Failed: {num_policies - successful}")
-                print(f"✓ Total Correction Attempts: {result['correction_attempts']}")
-                
-                # Show individual policy summaries
-                print(f"\n{'='*80}")
-                print("INDIVIDUAL POLICY RESULTS")
-                print(f"{'='*80}")
-                for idx, individual_result in enumerate(result["individual_results"], 1):
-                    status = "✓ SUCCESS" if individual_result["success"] else "✗ FAILED"
-                    print(f"\nPolicy {idx}: {individual_result['policy_id']}")
-                    print(f"  Status: {status}")
-                    print(f"  Stage Reached: {individual_result['stage_reached']}")
-                    
-                    # Safely access expert_analyses
-                    expert_analyses = individual_result.get("expert_analyses")
-                    if expert_analyses and isinstance(expert_analyses, dict):
-                        expert_count = expert_analyses.get("expert_count")
-                        if expert_count is not None:
-                            print(f"  Expert Consultations: {expert_count}")
-                        
-                        consensus = expert_analyses.get("consensus")
-                        if consensus and isinstance(consensus, dict):
-                            consensus_reached = consensus.get("consensus_reached")
-                            if consensus_reached is not None:
-                                print(f"  Expert Consensus: {consensus_reached}")
-                    
-                    if not individual_result["success"]:
-                        print(f"  Error: {individual_result.get('error_message', 'Unknown error')}")
-            else:
-                # Single policy
-                print(f"✓ Success: {result['success']}")
-                print(f"✓ Policy ID: {result['policy_id']}")
-                print(f"✓ Stage Reached: {result['stage_reached']}")
-                print(f"✓ Correction Attempts: {result['correction_attempts']}")
-                
-                # Safely access expert_analyses for single policy
-                expert_analyses = result.get("expert_analyses")
-                if expert_analyses and isinstance(expert_analyses, dict):
-                    expert_count = expert_analyses.get("expert_count")
-                    if expert_count is not None:
-                        print(f"✓ Expert Consultations: {expert_count}")
-                    
-                    consensus = expert_analyses.get("consensus")
-                    if consensus and isinstance(consensus, dict):
-                        consensus_reached = consensus.get("consensus_reached")
-                        confidence = consensus.get("confidence")
-                        if consensus_reached is not None:
-                            print(f"✓ Expert Consensus: {consensus_reached}")
-                        if confidence is not None:
-                            print(f"✓ Confidence: {confidence:.2f}")
-            
-            print("="*80)
-            
-            return 0
-        else:
-            print("\n" + "="*80)
-            print("CONVERSION FAILED")
-            print("="*80)
-            print(f"✗ Error: {result.get('error_message', 'Unknown error')}")
-            print(f"✗ Stage: {result['stage_reached']}")
-            print("="*80)
-            return 1
+        try:
+            result = json.loads(response.choices[0].message.content)
+            opinion = ExpertOpinion(
+                expert_name=expert["name"],
+                categories=result.get("categories", []),
+                reasoning=result.get("reasoning", ""),
+                confidence=result.get("confidence", 0.5)
+            )
+            expert_opinions.append(opinion)
+        except Exception as e:
+            print(f"Error parsing expert opinion: {e}")
     
-    except Exception as e:
-        print(f"\n✗ Fatal Error: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return 1
+    state["expert_opinions"] = expert_opinions
+    return state
 
 
-def cli_analyze(args):
-    """
-    Handle analyze command - show ODRL policy structure.
-    """
-    input_file = args.input
+async def calculate_semantic_similarity(state: GraphState) -> GraphState:
+    """Node: Calculate semantic similarity scores"""
+    case_data = state["case_data"]
+    vector_store = state["vector_store"]
     
-    if not os.path.exists(input_file):
-        print(f"✗ Error: Input file not found: {input_file}")
-        return 1
+    # Combine case text for semantic search
+    case_text = f"{case_data.project_title} {case_data.project_overview} {case_data.purpose_of_processing} {case_data.dv_purpose_of_processing} {case_data.m_rop_purpose_of_processing}"
     
-    try:
-        with open(input_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        # Handle both single policy and array of policies
-        policies = data if isinstance(data, list) else [data]
-        
-        print(f"\n{'='*80}")
-        print(f"ODRL POLICY ANALYSIS")
-        print(f"{'='*80}")
-        print(f"File: {input_file}")
-        print(f"Number of policies: {len(policies)}\n")
-        
-        for idx, policy in enumerate(policies, 1):
-            if len(policies) > 1:
-                print(f"\n{'='*80}")
-                print(f"POLICY {idx}/{len(policies)}")
-                print(f"{'='*80}")
-            
-            # Basic info
-            print(f"[Policy Info]")
-            print(f"  ID: {policy.get('@id', 'N/A')}")
-            print(f"  Type: {policy.get('@type', 'N/A')}")
-            print(f"  Profile: {policy.get('profile', 'N/A')}")
-            
-            # Permissions
-            print(f"\n[Permissions]")
-            permissions = policy.get('permission', [])
-            print(f"  Count: {len(permissions)}")
-            for i, perm in enumerate(permissions, 1):
-                action = perm.get('action', 'unknown')
-                target = perm.get('target', 'unknown')
-                print(f"  {i}. Action: {action}, Target: {target}")
-                constraints = perm.get('constraint', [])
-                if constraints:
-                    print(f"     Constraints: {len(constraints)}")
-            
-            # Prohibitions
-            print(f"\n[Prohibitions]")
-            prohibitions = policy.get('prohibition', [])
-            print(f"  Count: {len(prohibitions)}")
-            for i, prohib in enumerate(prohibitions, 1):
-                action = prohib.get('action', 'unknown')
-                target = prohib.get('target', 'unknown')
-                print(f"  {i}. Action: {action}, Target: {target}")
-                constraints = prohib.get('constraint', [])
-                if constraints:
-                    print(f"     Constraints: {len(constraints)}")
-            
-            # Obligations
-            print(f"\n[Obligations]")
-            obligations = policy.get('obligation', [])
-            print(f"  Count: {len(obligations)}")
-            
-            # Constraint analysis
-            print(f"\n[Constraint Types]")
-            constraint_types = {}
-            
-            for perm in policy.get('permission', []):
-                for constraint in perm.get('constraint', []):
-                    left_op = constraint.get('leftOperand', 'unknown')
-                    constraint_types[left_op] = constraint_types.get(left_op, 0) + 1
-            
-            for prohib in policy.get('prohibition', []):
-                for constraint in prohib.get('constraint', []):
-                    left_op = constraint.get('leftOperand', 'unknown')
-                    constraint_types[left_op] = constraint_types.get(left_op, 0) + 1
-            
-            for ctype, count in sorted(constraint_types.items()):
-                print(f"  {ctype}: {count}")
-            
-            # Custom properties
-            print(f"\n[Custom Properties]")
-            has_original_data = False
-            original_data_count = 0
-            
-            def check_original_data(obj):
-                nonlocal has_original_data, original_data_count
-                if isinstance(obj, dict):
-                    if 'custom:originalData' in obj:
-                        has_original_data = True
-                        original_data_count += 1
-                    for value in obj.values():
-                        check_original_data(value)
-                elif isinstance(obj, list):
-                    for item in obj:
-                        check_original_data(item)
-            
-            check_original_data(policy)
-            
-            if has_original_data:
-                print(f"  custom:originalData: {original_data_count} rules tracked")
-            else:
-                print(f"  No custom:originalData found")
-        
-        print(f"\n{'='*80}\n")
-        return 0
+    # Search for similar categories
+    results = vector_store.similarity_search_with_score(case_text, k=4)
     
-    except Exception as e:
-        print(f"✗ Error analyzing policy: {e}")
-        import traceback
-        traceback.print_exc()
-        return 1
+    # Store semantic scores
+    semantic_scores = {}
+    for doc, score in results:
+        category = doc.metadata["category"]
+        semantic_scores[category] = float(1 - score)  # Convert distance to similarity
+    
+    # Ensure all categories have a score
+    for category in TARGET_CATEGORIES:
+        if category not in semantic_scores:
+            semantic_scores[category] = 0.0
+    
+    # Store in a temporary state variable
+    if "mapping_result" not in state:
+        state["mapping_result"] = MappingResult(
+            case_id=case_data.case_id,
+            mapped_categories=[],
+            reasoning="",
+            confidence_score=0.0,
+            expert_opinions=[],
+            semantic_scores={},
+            keyword_scores={}
+        )
+    
+    state["mapping_result"].semantic_scores = semantic_scores
+    return state
 
 
-def cli_server(args):
-    """
-    Start FastAPI server for API access.
-    """
-    try:
-        import uvicorn
-        from src.api.fastapi_server import app
+def calculate_keyword_scores(state: GraphState) -> GraphState:
+    """Node: Calculate keyword matching scores"""
+    case_data = state["case_data"]
+    
+    # Define keywords for each category
+    category_keywords = {
+        TARGET_CATEGORIES[0]: ["client", "customer", "employee", "vendor", "supplier", "partner", "relationship", "crm", "stakeholder"],
+        TARGET_CATEGORIES[1]: ["internal", "management", "operation", "administrative", "organization", "business", "control", "process"],
+        TARGET_CATEGORIES[2]: ["merger", "acquisition", "m&a", "due diligence", "transaction", "corporate", "integration"],
+        TARGET_CATEGORIES[3]: ["legal", "claim", "litigation", "defense", "lawsuit", "dispute", "court", "proceeding", "lawful"]
+    }
+    
+    # Combine all case text
+    case_text = f"{case_data.project_title} {case_data.project_overview} {case_data.purpose_of_processing} {case_data.dv_purpose_of_processing} {case_data.m_rop_purpose_of_processing}".lower()
+    
+    keyword_scores = {}
+    
+    for category, keywords in category_keywords.items():
+        matches = sum(1 for keyword in keywords if keyword in case_text)
+        keyword_scores[category] = matches / len(keywords)
+    
+    state["mapping_result"].keyword_scores = keyword_scores
+    return state
+
+
+def aggregate_and_score(state: GraphState) -> GraphState:
+    """Node: Aggregate expert opinions and calculate final confidence score"""
+    expert_opinions = state["expert_opinions"]
+    mapping_result = state["mapping_result"]
+    
+    # Count category votes from experts
+    category_votes = Counter()
+    for opinion in expert_opinions:
+        for category in opinion.categories:
+            category_votes[category] += 1
+    
+    # Get most voted categories
+    total_experts = len(expert_opinions)
+    threshold = total_experts * 0.5  # At least 50% agreement
+    
+    selected_categories = [cat for cat, votes in category_votes.items() if votes >= threshold]
+    
+    # If no category meets threshold, take top categories
+    if not selected_categories and category_votes:
+        max_votes = max(category_votes.values())
+        selected_categories = [cat for cat, votes in category_votes.items() if votes == max_votes]
+    
+    # Calculate mathematical confidence score
+    confidence_components = []
+    
+    # 1. Expert consensus (weight: 0.4)
+    if selected_categories:
+        avg_expert_votes = statistics.mean([category_votes.get(cat, 0) / total_experts for cat in selected_categories])
+        confidence_components.append(avg_expert_votes * 0.4)
+    
+    # 2. Semantic similarity (weight: 0.3)
+    if selected_categories and mapping_result.semantic_scores:
+        avg_semantic = statistics.mean([mapping_result.semantic_scores.get(cat, 0) for cat in selected_categories])
+        confidence_components.append(avg_semantic * 0.3)
+    
+    # 3. Keyword matching (weight: 0.2)
+    if selected_categories and mapping_result.keyword_scores:
+        avg_keyword = statistics.mean([mapping_result.keyword_scores.get(cat, 0) for cat in selected_categories])
+        confidence_components.append(avg_keyword * 0.2)
+    
+    # 4. Expert confidence average (weight: 0.1)
+    expert_confidences = [op.confidence for op in expert_opinions if any(cat in selected_categories for cat in op.categories)]
+    if expert_confidences:
+        avg_expert_conf = statistics.mean(expert_confidences)
+        confidence_components.append(avg_expert_conf * 0.1)
+    
+    # Final confidence score
+    final_confidence = sum(confidence_components) if confidence_components else 0.0
+    
+    # Compile reasoning
+    reasoning_parts = []
+    for opinion in expert_opinions:
+        if any(cat in selected_categories for cat in opinion.categories):
+            reasoning_parts.append(f"{opinion.expert_name}: {opinion.reasoning}")
+    
+    combined_reasoning = "\n\n".join(reasoning_parts)
+    
+    # Update mapping result
+    mapping_result.mapped_categories = selected_categories
+    mapping_result.reasoning = combined_reasoning
+    mapping_result.confidence_score = round(final_confidence, 4)
+    mapping_result.expert_opinions = expert_opinions
+    
+    state["mapping_result"] = mapping_result
+    
+    return state
+
+
+# ============================================================================
+# LANGGRAPH WORKFLOW
+# ============================================================================
+
+def create_workflow() -> StateGraph:
+    """Create LangGraph workflow"""
+    workflow = StateGraph(GraphState)
+    
+    # Add nodes
+    workflow.add_node("analyze_context", analyze_context)
+    workflow.add_node("mixture_of_experts", mixture_of_experts)
+    workflow.add_node("calculate_semantic", calculate_semantic_similarity)
+    workflow.add_node("calculate_keywords", calculate_keyword_scores)
+    workflow.add_node("aggregate_score", aggregate_and_score)
+    
+    # Add edges
+    workflow.set_entry_point("analyze_context")
+    workflow.add_edge("analyze_context", "mixture_of_experts")
+    workflow.add_edge("mixture_of_experts", "calculate_semantic")
+    workflow.add_edge("calculate_semantic", "calculate_keywords")
+    workflow.add_edge("calculate_keywords", "aggregate_score")
+    workflow.add_edge("aggregate_score", END)
+    
+    return workflow.compile()
+
+
+# ============================================================================
+# MAIN PROCESSING FUNCTION
+# ============================================================================
+
+async def process_csv(csv_path: str, output_path: str = "mapping_results.json"):
+    """Process CSV file and generate mappings"""
+    
+    print("Setting up vector store...")
+    vector_store = setup_vector_store()
+    
+    print(f"Reading CSV from {csv_path}...")
+    cases = []
+    
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            case = CaseData(
+                case_id=row.get('CaseId', ''),
+                project_title=row.get('ProjectTitle', ''),
+                project_overview=row.get('ProjectOverview', ''),
+                purpose_of_processing=row.get('Purpose of Processing', ''),
+                dv_purpose_of_processing=row.get('DV Purpose of Processing', ''),
+                m_rop_purpose_of_processing=row.get('M ROP Purpose of Processing', '')
+            )
+            cases.append(case)
+    
+    print(f"Processing {len(cases)} cases...")
+    
+    # Create workflow
+    workflow = create_workflow()
+    
+    results = []
+    
+    for i, case in enumerate(cases, 1):
+        print(f"\nProcessing case {i}/{len(cases)}: {case.case_id}")
         
-        print(f"\n{'='*80}")
-        print(f"STARTING ODRL TO REGO API SERVER")
-        print(f"{'='*80}")
-        print(f"Host: {args.host}")
-        print(f"Port: {args.port}")
-        print(f"Reload: {args.reload}")
-        print(f"Model: {OPENAI_MODEL}")
-        print(f"{'='*80}\n")
-        
-        uvicorn.run(
-            "src.api.fastapi_server:app",
-            host=args.host,
-            port=args.port,
-            reload=args.reload
+        # Initialize state
+        initial_state = GraphState(
+            case_data=case,
+            context_analysis="",
+            expert_opinions=[],
+            vector_store=vector_store,
+            mapping_result=None,
+            messages=[]
         )
         
-        return 0
+        # Run workflow
+        final_state = await workflow.ainvoke(initial_state)
         
-    except ImportError as e:
-        print(f"✗ Error: FastAPI or uvicorn not installed")
-        print(f"Install with: pip install fastapi uvicorn")
-        return 1
-    except Exception as e:
-        print(f"✗ Error starting server: {e}")
-        import traceback
-        traceback.print_exc()
-        return 1
+        # Get result
+        result = final_state["mapping_result"]
+        results.append(result.model_dump())
+        
+        print(f"  Mapped to: {', '.join(result.mapped_categories)}")
+        print(f"  Confidence: {result.confidence_score:.4f}")
+    
+    # Save results
+    print(f"\nSaving results to {output_path}...")
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    
+    print("Processing complete!")
+    return results
 
 
-def main():
-    """
-    Main CLI entry point.
-    """
-    parser = argparse.ArgumentParser(
-        description="Enhanced ODRL to Rego Converter with Coverage-Based Rules",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Convert ODRL to Rego with coverage-based rules
-  python main_odrl_rego.py convert -i policy.json -o policy.rego
-  
-  # Convert with verbose output (shows reasoning chains)
-  python main_odrl_rego.py convert -i policy.json -o policy.rego -v
-  
-  # Convert file with multiple policies (all will be processed)
-  python main_odrl_rego.py convert -i policies_array.json -o all_policies.rego
-  
-  # Convert with Mixture of Experts (default)
-  python main_odrl_rego.py convert -i policy.json -o policy.rego --use-moe
-  
-  # Convert without Mixture of Experts (faster)
-  python main_odrl_rego.py convert -i policy.json -o policy.rego --no-moe
-  
-  # Append to existing Rego file
-  python main_odrl_rego.py convert -i new_policy.json -e existing.rego -o combined.rego
-  
-  # Analyze ODRL policy structure (handles arrays too)
-  python main_odrl_rego.py analyze -i policy.json
-  
-  # Start API server
-  python main_odrl_rego.py server --port 8000
-  
-  # Start API server with auto-reload (development)
-  python main_odrl_rego.py server --port 8000 --reload
-
-Key Features:
-  - Coverage-Based Rules: Groups rules by jurisdiction + action
-  - Multiple Policy Support: Processes arrays of policies automatically
-  - Regex Pattern Matching: Uses regex.match() and regex.find_all_string_submatch_n()
-  - Hierarchical Jurisdictions: Supports parent-child relationships (US > US:CA)
-  - AST Validation: Validates logic via Abstract Syntax Trees
-  - Mixture of Experts: Consults specialized expert agents
-  - Chain of Thought: Documents reasoning at each step
-  - Self-Reflection: Validates and corrects its own output
-  - OpenAI o3-mini: Uses reasoning model (no temperature/max_tokens needed)
-
-Model: {model}
-        """.format(model=OPENAI_MODEL)
-    )
-    
-    subparsers = parser.add_subparsers(dest='command', help='Available commands')
-    
-    # Convert command
-    convert_parser = subparsers.add_parser(
-        'convert',
-        help='Convert ODRL policy to Rego using coverage-based approach'
-    )
-    convert_parser.add_argument(
-        '-i', '--input',
-        required=True,
-        help='Input ODRL JSON file path (single policy or array of policies)'
-    )
-    convert_parser.add_argument(
-        '-o', '--output',
-        help='Output Rego file path (default: <input>.rego)'
-    )
-    convert_parser.add_argument(
-        '-e', '--existing-rego',
-        help='Existing Rego file to append to'
-    )
-    convert_parser.add_argument(
-        '--use-moe',
-        dest='use_mixture_of_experts',
-        action='store_true',
-        default=True,
-        help='Use Mixture of Experts pattern (default)'
-    )
-    convert_parser.add_argument(
-        '--no-moe',
-        dest='use_mixture_of_experts',
-        action='store_false',
-        help='Skip Mixture of Experts (faster but less thorough)'
-    )
-    convert_parser.add_argument(
-        '-v', '--verbose',
-        action='store_true',
-        help='Verbose output showing agent reasoning chains'
-    )
-    
-    # Analyze command
-    analyze_parser = subparsers.add_parser(
-        'analyze',
-        help='Analyze ODRL policy structure without conversion'
-    )
-    analyze_parser.add_argument(
-        '-i', '--input',
-        required=True,
-        help='Input ODRL JSON file path (single policy or array of policies)'
-    )
-    
-    # Server command
-    server_parser = subparsers.add_parser(
-        'server',
-        help='Start FastAPI server for API access'
-    )
-    server_parser.add_argument(
-        '--host',
-        default='0.0.0.0',
-        help='Server host (default: 0.0.0.0)'
-    )
-    server_parser.add_argument(
-        '--port',
-        type=int,
-        default=8000,
-        help='Server port (default: 8000)'
-    )
-    server_parser.add_argument(
-        '--reload',
-        action='store_true',
-        help='Enable auto-reload (development only)'
-    )
-    
-    args = parser.parse_args()
-    
-    # Validate API key before running any command
-    if not Config.API_KEY:
-        print("\n✗ ERROR: OPENAI_API_KEY is not configured")
-        print("Please set it in your environment:")
-        print("  export OPENAI_API_KEY='your-api-key-here'")
-        print("\nOr create a .env file with:")
-        print("  OPENAI_API_KEY=your-api-key-here")
-        return 1
-    
-    if not args.command:
-        parser.print_help()
-        return 1
-    
-    # Route to appropriate handler
-    if args.command == 'convert':
-        return cli_convert(args)
-    elif args.command == 'analyze':
-        return cli_analyze(args)
-    elif args.command == 'server':
-        return cli_server(args)
-    else:
-        parser.print_help()
-        return 1
-
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
 
 if __name__ == "__main__":
-    sys.exit(main())
+    import sys
+    
+    if len(sys.argv) < 2:
+        print("Usage: python purpose_mapper.py <csv_file_path> [output_path]")
+        sys.exit(1)
+    
+    csv_file = sys.argv[1]
+    output_file = sys.argv[2] if len(sys.argv) > 2 else "mapping_results.json"
+    
+    asyncio.run(process_csv(csv_file, output_file))
