@@ -1,1257 +1,1106 @@
 """
-ISO 11179 Data Enrichment with Intelligent Context Usage
-========================================================
-UPDATED:
-- Removed ALL modelling features
-- FIXED: Semantic-focused rationale instead of method-focused
-- Strict validation to prevent bad separate search results
-- Search-first: intersection → supervisor → if rejected: separate → supervisor with comparison
-- Intersection fallback: reverts to intersection if separate is worse
-- Confidence penalties: separate searches get lower scores (40-70 max vs 85-95 for intersection)
+Anti-hallucination prompting strategies focused on dual action inference, decision-making, and whole document analysis.
+Enhanced with decision inference capabilities for yes/no/maybe outcomes.
 
-WORKFLOW:
-1. Search intersection (object.property combos) 
-2. Supervisor validates intersection with semantic reasoning
-3. If rejected → Search objects and properties separately
-4. Supervisor compares separate result with intersection semantically
-5. Decision: Use intersection if separate is worse/risky, otherwise use separate with penalties
+UPDATED: 
+- Handle legal article references (reason but don't include in output)
+- Standardize action taxonomy to: share, store, process, update, create
+- Remove assigner/assignee fields
+- Enhanced detailed comments for lawyers and non-lawyers
+- Handle DataVisa references (HSBC internal tool)
 
-OUTPUT INCLUDES:
-- Mapping Rationale: WHY the mapping makes semantic sense (not just which method)
-- Object Reasoning: WHY the object represents the correct entity/concept
-- Property Reasoning: WHY the property represents the correct characteristic
-- Comparison Note: How separate vs intersection compared (if applicable)
-- Supporting/Contradicting Reasons: SEMANTIC evidence for the mapping
-
-REQUIREMENTS:
-pip install chromadb langchain-community
-
-FIRST RUN: Creates embeddings and stores in ChromaDB
-SUBSEQUENT RUNS: Only embeds new items, reuses existing embeddings
+Location: src/prompting/strategies.py
 """
 
 import json
-import os
-import pandas as pd
-from typing import TypedDict, Annotated, List, Dict, Any, Literal, Sequence, Tuple
-import numpy as np
-from openai import OpenAI
-import time
-from datetime import datetime
-from collections import defaultdict
-import networkx as nx
-from difflib import SequenceMatcher
-import pickle
-import chromadb
-from chromadb.config import Settings
-
-# LangChain and LangGraph imports
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
-from langchain_core.tools import tool
-from langchain_core.embeddings import Embeddings
-from langchain_community.vectorstores import Chroma
-from langchain_core.documents import Document
-from langgraph.graph import StateGraph, END
-from langgraph.graph.message import add_messages
-
-# ============================================================================
-# GLOBAL CONFIGURATION
-# ============================================================================
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "your-api-key-here")
-OPENAI_BASE_URL = "https://api.openai.com/v1"
-OPENAI_REASONING_MODEL = "o3-mini"
-OPENAI_EMBEDDING_MODEL = "text-embedding-3-large"
-
-openai_client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
-
-INPUT_JSON_PATH = "cib_long_json.json"
-EXCEL_PATH = "pbt.xlsx"
-ACRONYM_CSV_PATH = "acronyms.csv"
-OUTPUT_CSV_PATH = "enriched_mapped_output.csv"
-CACHE_JSON_PATH = "mapping_cache.json"
-PROCEDURAL_MEMORY_PATH = "procedural_memory.json"
-EPISODIC_MEMORY_PATH = "episodic_memory.json"
-KNOWLEDGE_GRAPH_PATH = "semantic_knowledge_graph.gpickle"
-CHROMADB_PATH = "./chroma_embeddings"
-
-# Global stores
-MAPPING_CACHE = {}
-PROCEDURAL_MEMORY = {}
-EPISODIC_MEMORY = []
-SEMANTIC_KNOWLEDGE_GRAPH = nx.MultiDiGraph()
-
-# ChromaDB client (will be initialized)
-CHROMA_CLIENT = None
 
 
-# ============================================================================
-# CHROMADB PERSISTENT EMBEDDING STORAGE
-# ============================================================================
+class PromptingStrategies:
+    """Anti-hallucination prompting strategies focused on dual action inference, decision-making, and whole document analysis."""
 
-def initialize_chromadb():
-    """Initialize ChromaDB client for persistent embedding storage."""
-    global CHROMA_CLIENT
-    
-    print(f"   → Initializing ChromaDB at: {CHROMADB_PATH}")
-    
-    CHROMA_CLIENT = chromadb.PersistentClient(path=CHROMADB_PATH)
-    
-    # Get or create collections
-    collections = [c.name for c in CHROMA_CLIENT.list_collections()]
-    print(f"   → Existing collections: {collections if collections else 'None'}")
-    
-    return CHROMA_CLIENT
+    # Standard action taxonomy - all synonyms should map to these
+    STANDARD_ACTIONS = {
+        "share": ["transfer", "distribute", "disclose", "transmit", "send", "communicate"],
+        "store": ["retain", "keep", "archive", "maintain", "hold", "save"],
+        "process": ["use", "analyze", "transform", "modify", "manipulate", "handle", "execute"],
+        "update": ["change", "amend", "revise", "alter", "edit", "correct"],
+        "create": ["collect", "generate", "produce", "derive", "obtain", "gather"]
+    }
 
+    @staticmethod
+    def comprehensive_document_analysis_prompt(legislation_text: str, existing_context: str = "", level: str = "level_1", chunk_info: str = "") -> str:
+        """Comprehensive document analysis prompt that ensures the entire document is understood."""
+        context_section = f"\n\nEXISTING RULES CONTEXT:\n{existing_context}\n" if existing_context else ""
+        chunk_section = f"\n\nCHUNK INFORMATION:\n{chunk_info}\n" if chunk_info else ""
 
-def create_or_load_vector_stores(objects_dict, all_objects, all_properties, embeddings):
-    """
-    Create or load vector stores from ChromaDB.
-    Only embeds new items that aren't already stored.
-    """
-    client = CHROMA_CLIENT
-    
-    # ========================================================================
-    # 1. INTERSECTION STORE (object.property combinations)
-    # ========================================================================
-    print(f"\n   → Processing INTERSECTION store (object.property)...")
-    
-    intersection_collection = client.get_or_create_collection(
-        name="intersection_embeddings",
-        metadata={"description": "Object.Property combination embeddings"}
-    )
-    
-    # Get existing IDs
-    existing_intersection = set()
-    try:
-        existing_data = intersection_collection.get()
-        if existing_data and existing_data['ids']:
-            existing_intersection = set(existing_data['ids'])
-            print(f"      • Found {len(existing_intersection)} existing intersection embeddings")
-    except:
-        pass
-    
-    # Prepare all intersection documents
-    intersection_docs = []
-    intersection_ids = []
-    new_intersection_count = 0
-    
-    for obj in all_objects:
-        for prop in objects_dict[obj]:
-            doc_id = f"{obj}|{prop}"
-            if doc_id not in existing_intersection:
-                doc_text = f"{obj} {prop}"
-                doc = Document(
-                    page_content=doc_text,
-                    metadata={"object": obj, "property": prop, "id": doc_id}
-                )
-                intersection_docs.append(doc)
-                intersection_ids.append(doc_id)
-                new_intersection_count += 1
-    
-    print(f"      • Need to embed {new_intersection_count} new intersection combinations")
-    
-    # Create vector store from ChromaDB collection
-    if new_intersection_count > 0:
-        print(f"      • Embedding new items...")
-        # Add new documents to collection
-        for i, doc in enumerate(intersection_docs):
-            print(f"        [{i+1}/{len(intersection_docs)}] Embedding: {doc.metadata['object']}.{doc.metadata['property']}")
-            embedding = embeddings.embed_query(doc.page_content)
-            intersection_collection.add(
-                embeddings=[embedding],
-                documents=[doc.page_content],
-                metadatas=[{"object": doc.metadata['object'], "property": doc.metadata['property']}],
-                ids=[intersection_ids[i]]
-            )
-            time.sleep(0.1)
-    
-    print(f"      ✓ Intersection store ready: {intersection_collection.count()} total embeddings")
-    
-    # Wrap in Chroma vector store
-    intersection_store = Chroma(
-        client=client,
-        collection_name="intersection_embeddings",
-        embedding_function=embeddings
-    )
-    
-    # ========================================================================
-    # 2. OBJECT STORE
-    # ========================================================================
-    print(f"\n   → Processing OBJECT store...")
-    
-    object_collection = client.get_or_create_collection(
-        name="object_embeddings",
-        metadata={"description": "Object embeddings"}
-    )
-    
-    # Get existing IDs
-    existing_objects = set()
-    try:
-        existing_data = object_collection.get()
-        if existing_data and existing_data['ids']:
-            existing_objects = set(existing_data['ids'])
-            print(f"      • Found {len(existing_objects)} existing object embeddings")
-    except:
-        pass
-    
-    # Prepare new objects
-    new_objects = []
-    new_object_ids = []
-    
-    for obj in all_objects:
-        obj_id = f"obj:{obj}"
-        if obj_id not in existing_objects:
-            new_objects.append(obj)
-            new_object_ids.append(obj_id)
-    
-    print(f"      • Need to embed {len(new_objects)} new objects")
-    
-    if len(new_objects) > 0:
-        print(f"      • Embedding new items...")
-        for i, obj in enumerate(new_objects):
-            print(f"        [{i+1}/{len(new_objects)}] Embedding: {obj}")
-            embedding = embeddings.embed_query(obj)
-            object_collection.add(
-                embeddings=[embedding],
-                documents=[obj],
-                metadatas=[{"object": obj}],
-                ids=[new_object_ids[i]]
-            )
-            time.sleep(0.1)
-    
-    print(f"      ✓ Object store ready: {object_collection.count()} total embeddings")
-    
-    object_store = Chroma(
-        client=client,
-        collection_name="object_embeddings",
-        embedding_function=embeddings
-    )
-    
-    # ========================================================================
-    # 3. PROPERTY STORE
-    # ========================================================================
-    print(f"\n   → Processing PROPERTY store...")
-    
-    property_collection = client.get_or_create_collection(
-        name="property_embeddings",
-        metadata={"description": "Property embeddings"}
-    )
-    
-    # Get existing IDs
-    existing_properties = set()
-    try:
-        existing_data = property_collection.get()
-        if existing_data and existing_data['ids']:
-            existing_properties = set(existing_data['ids'])
-            print(f"      • Found {len(existing_properties)} existing property embeddings")
-    except:
-        pass
-    
-    # Prepare new properties
-    new_properties = []
-    new_property_ids = []
-    
-    for prop in all_properties:
-        prop_id = f"prop:{prop}"
-        if prop_id not in existing_properties:
-            new_properties.append(prop)
-            new_property_ids.append(prop_id)
-    
-    print(f"      • Need to embed {len(new_properties)} new properties")
-    
-    if len(new_properties) > 0:
-        print(f"      • Embedding new items...")
-        for i, prop in enumerate(new_properties):
-            print(f"        [{i+1}/{len(new_properties)}] Embedding: {prop}")
-            embedding = embeddings.embed_query(prop)
-            property_collection.add(
-                embeddings=[embedding],
-                documents=[prop],
-                metadatas=[{"property": prop}],
-                ids=[new_property_ids[i]]
-            )
-            time.sleep(0.1)
-    
-    print(f"      ✓ Property store ready: {property_collection.count()} total embeddings")
-    
-    property_store = Chroma(
-        client=client,
-        collection_name="property_embeddings",
-        embedding_function=embeddings
-    )
-    
-    return intersection_store, object_store, property_store
+        return f"""
+        Perform a comprehensive analysis of this legislation text with strict adherence to what is stated.
+        Read and understand the ENTIRE document before extracting any rules, conditions, or decisions.
+        {context_section}{chunk_section}
 
+        LEGISLATION TEXT TO ANALYZE:
+        {legislation_text}
 
-# ============================================================================
-# KNOWLEDGE GRAPH (Simplified)
-# ============================================================================
-
-def initialize_knowledge_graph():
-    global SEMANTIC_KNOWLEDGE_GRAPH
-    if os.path.exists(KNOWLEDGE_GRAPH_PATH):
-        try:
-            with open(KNOWLEDGE_GRAPH_PATH, 'rb') as f:
-                SEMANTIC_KNOWLEDGE_GRAPH = pickle.load(f)
-            print(f"   → KG: {SEMANTIC_KNOWLEDGE_GRAPH.number_of_nodes()} nodes, {SEMANTIC_KNOWLEDGE_GRAPH.number_of_edges()} edges")
-        except:
-            SEMANTIC_KNOWLEDGE_GRAPH = nx.MultiDiGraph()
-    else:
-        SEMANTIC_KNOWLEDGE_GRAPH = nx.MultiDiGraph()
-
-def save_knowledge_graph():
-    try:
-        with open(KNOWLEDGE_GRAPH_PATH, 'wb') as f:
-            pickle.dump(SEMANTIC_KNOWLEDGE_GRAPH, f, protocol=pickle.HIGHEST_PROTOCOL)
-    except Exception as e:
-        print(f"   ⚠ KG save failed: {e}")
-
-def add_field_to_graph(field_name, enriched_name, object_name, property_name, confidence, pii_category, application, eim_id):
-    field_node = f"field:{field_name.lower()}"
-    SEMANTIC_KNOWLEDGE_GRAPH.add_node(field_node, type='field', original_name=field_name, enriched_name=enriched_name)
-    enriched_node = f"concept:{enriched_name.lower()}"
-    SEMANTIC_KNOWLEDGE_GRAPH.add_node(enriched_node, type='concept', name=enriched_name)
-    object_node = f"object:{object_name.lower()}"
-    SEMANTIC_KNOWLEDGE_GRAPH.add_node(object_node, type='object', name=object_name)
-    property_node = f"property:{property_name.lower()}"
-    SEMANTIC_KNOWLEDGE_GRAPH.add_node(property_node, type='property', name=property_name)
-    
-    SEMANTIC_KNOWLEDGE_GRAPH.add_edge(field_node, enriched_node, relationship='enriched_to')
-    SEMANTIC_KNOWLEDGE_GRAPH.add_edge(enriched_node, object_node, relationship='mapped_to_object')
-    SEMANTIC_KNOWLEDGE_GRAPH.add_edge(enriched_node, property_node, relationship='mapped_to_property')
-
-
-# ============================================================================
-# LEXICAL + SEMANTIC MATCHING
-# ============================================================================
-
-def calculate_lexical_similarity(str1: str, str2: str) -> float:
-    str1 = str1.lower()
-    str2 = str2.lower()
-    seq_similarity = SequenceMatcher(None, str1, str2).ratio()
-    words1 = set(str1.split('_') + str1.split())
-    words2 = set(str2.split('_') + str2.split())
-    jaccard = len(words1 & words2) / len(words1 | words2) if words1 or words2 else 0
-    return (0.5 * seq_similarity + 0.5 * jaccard)
-
-
-def hybrid_similarity_search(query: str, vector_store: Any, all_items: List[str], top_k: int = 5) -> List[Tuple[str, float, Dict[str, float]]]:
-    """Perform hybrid lexical + semantic similarity search with ChromaDB."""
-    
-    # Semantic search using ChromaDB
-    semantic_results = vector_store.similarity_search_with_score(query, k=top_k * 2)
-    semantic_dict = {}
-    
-    for doc, score in semantic_results:
-        # Extract item from metadata
-        item = doc.metadata.get('object') or doc.metadata.get('property')
-        if item:
-            semantic_dict[item] = float(score)
-    
-    # Lexical search
-    lexical_scores = {item: calculate_lexical_similarity(query, item) for item in all_items}
-    
-    # Combine scores
-    all_items_set = set(semantic_dict.keys()) | set(lexical_scores.keys())
-    combined_results = []
-    
-    for item in all_items_set:
-        semantic_score = semantic_dict.get(item, 0)
-        lexical_score = lexical_scores.get(item, 0)
+        IMPORTANT INSTRUCTIONS FOR LEGAL REFERENCES:
+        - You may encounter references to legal articles, regulations, or external documents (e.g., "Article 6(1)(a)", "GDPR Article 28", "Regulation XYZ")
+        - If the document mentions "DataVisa", this refers to HSBC's internal data privacy governance tool
+        - When processing legal references:
+          * Use your training knowledge to understand what these references mean
+          * Reason about their requirements and implications
+          * Extract the SUBSTANCE of the requirement in plain language
+          * DO NOT include article numbers, legal citations, or document references in the machine-readable output
+          * Convert legal requirements into actionable, testable conditions
         
-        # For ChromaDB, lower score = more similar (L2 distance)
-        # Normalize: convert distance to similarity
-        semantic_score_norm = 1 / (1 + semantic_score) if semantic_score > 0 else 1.0
+        EXAMPLE:
+        - Input: "As required by Article 6(1)(a) GDPR, obtain explicit consent"
+        - Your understanding: Use knowledge of Article 6(1)(a) to know it's about consent as lawful basis
+        - Output: "Obtain explicit consent from data subject before processing" (NO article reference)
+
+        COMPREHENSIVE ANALYSIS REQUIREMENTS:
+
+        1. FULL DOCUMENT UNDERSTANDING:
+        - Read the entire text from beginning to end
+        - Identify all sections, articles, paragraphs, and subsections
+        - Understand the overall structure and purpose of the legislation
+        - Note cross-references between different parts of the document
+        - Identify how different sections relate to each other
+        - Understand legal references using your training knowledge but don't include them in output
+
+        2. EXTRACT ALL OBLIGATIONS FROM ENTIRE DOCUMENT:
+        - Extract every obligation stated anywhere in the text
+        - Identify who has each obligation (controller, processor, joint_controller, data_subject)
+        - Note the exact text that creates each obligation
+        - Link related obligations across different sections
+        - Use simple, clear English without legal jargon or document references
+        - Convert legal citations into plain language requirements
+
+        3. IDENTIFY ALL CONDITIONS AND TRIGGERS:
+        - Find all conditions that trigger obligations throughout the document
+        - Note data-related triggers (data types, processing activities, transfers)
+        - Extract factual conditions that can be evaluated
+        - Identify when conditions in one section affect obligations in another
+        - Express conditions in testable terms without citing articles
+
+        4. COMPREHENSIVE DATA REQUIREMENTS:
+        - Identify all requirements for data handling mentioned anywhere
+        - Note all data categories mentioned throughout the text
+        - Extract all data processing operations referenced
+        - Map data requirements to specific obligations
+        - Use plain language descriptions instead of regulatory references
+
+        5. COMPREHENSIVE ROLE AND RESPONSIBILITY MAPPING:
+        - Identify every role mentioned in the document
+        - Map all responsibilities to each role
+        - Note how roles interact with each other
+        - Identify role-specific obligations throughout the document
+        - DO NOT extract or include "assigner" or "assignee" concepts
+        - Focus on the actual parties performing actions, not who grants permissions
+
+        6. CROSS-REFERENCE RESOLUTION:
+        - When the text references other sections or articles, understand the connection
+        - Use your knowledge to resolve what referenced articles require
+        - Consolidate information from referenced sections into the main requirement
+        - Present the complete requirement without external references
+
+        7. IDENTIFY DECISION POINTS:
+        - Where does the legislation require decisions to be made?
+        - What are the possible outcomes (yes/no/conditional)?
+        - What conditions determine each outcome?
+        - What actions follow from each decision?
+
+        OUTPUT REQUIREMENTS:
+        - Provide comprehensive analysis in plain, clear English
+        - NO legal jargon or citations (Article X, Section Y, etc.)
+        - NO references to external documents unless essential to understanding
+        - Convert all legal requirements into actionable, testable statements
+        - Make the analysis understandable to both lawyers and non-lawyers
+        - Focus on WHAT must be done, not WHERE it's written in law
         
-        combined_score = (0.3 * lexical_score) + (0.7 * semantic_score_norm)
-        combined_results.append((item, combined_score, {'lexical': lexical_score, 'semantic': semantic_score_norm, 'combined': combined_score}))
-    
-    combined_results.sort(key=lambda x: x[1], reverse=True)
-    return combined_results[:top_k]
+        Your analysis should enable precise policy creation without requiring legal expertise to understand.
+        """
 
+    @staticmethod
+    def focused_analysis_prompt(legislation_text: str, existing_context: str = "", level: str = "level_1") -> str:
+        """Focused analysis on specific data operations, conditions, and decision points."""
+        context_section = f"\n\nEXISTING RULES CONTEXT:\n{existing_context}\n" if existing_context else ""
 
-# ============================================================================
-# MEMORY FUNCTIONS
-# ============================================================================
+        return f"""
+        Analyze this legislation text focusing on specific data operations, conditions, and decision scenarios.
+        {context_section}
 
-def load_all_memory():
-    global MAPPING_CACHE, PROCEDURAL_MEMORY, EPISODIC_MEMORY
-    if os.path.exists(CACHE_JSON_PATH):
-        with open(CACHE_JSON_PATH, 'r') as f:
-            MAPPING_CACHE = json.load(f)
-        print(f"   → Cache: {len(MAPPING_CACHE)} entries")
-    if os.path.exists(PROCEDURAL_MEMORY_PATH):
-        with open(PROCEDURAL_MEMORY_PATH, 'r') as f:
-            PROCEDURAL_MEMORY = json.load(f)
-    else:
-        PROCEDURAL_MEMORY = {"prefix_patterns": {}, "suffix_patterns": {}}
-    if os.path.exists(EPISODIC_MEMORY_PATH):
-        with open(EPISODIC_MEMORY_PATH, 'r') as f:
-            EPISODIC_MEMORY = json.load(f)
-    initialize_knowledge_graph()
+        LEGISLATION TEXT:
+        {legislation_text}
 
-def save_all_memory():
-    with open(CACHE_JSON_PATH, 'w') as f:
-        json.dump(MAPPING_CACHE, f, indent=2)
-    with open(PROCEDURAL_MEMORY_PATH, 'w') as f:
-        json.dump(PROCEDURAL_MEMORY, f, indent=2)
-    with open(EPISODIC_MEMORY_PATH, 'w') as f:
-        json.dump(EPISODIC_MEMORY, f, indent=2)
-    save_knowledge_graph()
+        HANDLING LEGAL REFERENCES:
+        - If you encounter legal article references, use your knowledge to understand them
+        - Extract the SUBSTANCE, not the citation
+        - Convert legal language into plain, actionable requirements
+        - Ignore article numbers, section references, and legal citations in your output
 
-def update_all_memory(field_name, enriched_name, obj, prop, strategy, confidence, pii, application, eim_id):
-    cache_key = f"{enriched_name.lower()}|{field_name.lower()[:100]}"
-    MAPPING_CACHE[cache_key] = {'object': obj, 'property': prop, 'confidence': confidence}
-    EPISODIC_MEMORY.append({"timestamp": datetime.now().isoformat(), "field": field_name, "enriched": enriched_name, "mapping": {"object": obj, "property": prop}, "confidence": confidence, "pii": pii})
-    if len(EPISODIC_MEMORY) > 1000:
-        EPISODIC_MEMORY[:] = EPISODIC_MEMORY[-1000:]
-    add_field_to_graph(field_name, enriched_name, obj, prop, confidence, pii, application, eim_id)
+        ACTION TAXONOMY - CRITICAL:
+        All actions MUST be mapped to this standard taxonomy:
+        1. SHARE - any form of transfer, distribution, disclosure, transmission
+        2. STORE - retention, archiving, keeping, maintaining data
+        3. PROCESS - using, analyzing, transforming, handling data
+        4. UPDATE - changing, amending, correcting data
+        5. CREATE - collecting, generating, obtaining, deriving new data
 
+        When you identify actions, you MUST:
+        - Identify the action described in the text
+        - Map it to ONE of the five standard actions above
+        - Use ONLY the standard action name (share, store, process, update, create)
+        - If an action could fit multiple categories, choose the most specific one
 
-# ============================================================================
-# EMBEDDINGS
-# ============================================================================
+        EXAMPLE ACTION MAPPING:
+        - "transfer data to third party" → SHARE
+        - "retain records for 7 years" → STORE
+        - "analyze customer behavior" → PROCESS
+        - "correct inaccurate data" → UPDATE
+        - "collect personal information" → CREATE
 
-class OpenAIEmbeddings(Embeddings):
-    def __init__(self, model: str = OPENAI_EMBEDDING_MODEL):
-        self.model = model
-        self.client = openai_client
-    
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        embeddings = []
-        for idx, text in enumerate(texts, 1):
-            print(f"      📊 Embedding {idx}/{len(texts)}")
-            embeddings.append(self.embed_query(text))
-            time.sleep(0.1)
-        return embeddings
-    
-    def embed_query(self, text: str) -> List[float]:
-        response = self.client.embeddings.create(model=self.model, input=[text[:8000]])
-        return response.data[0].embedding
+        FOCUSED ANALYSIS TASKS:
 
+        1. DATA OPERATIONS:
+        - What specific data operations are mentioned?
+        - Map each operation to standard taxonomy: share, store, process, update, create
+        - What data categories are involved?
+        - What are the conditions for each operation?
+        - Express in plain language without legal references
 
-def call_openai_with_retry(messages: List[Dict], max_retries: int = 10) -> str:
-    for attempt in range(max_retries):
-        try:
-            response = openai_client.chat.completions.create(model=OPENAI_REASONING_MODEL, messages=messages)
-            return response.choices[0].message.content
-        except Exception as e:
-            print(f"      ⚠ Attempt {attempt + 1} failed: {e}")
-            time.sleep(2 ** attempt)
-    raise Exception(f"Failed after {max_retries} attempts")
+        2. CONDITIONAL LOGIC:
+        - What conditions must be evaluated?
+        - What are the logical operators (AND, OR, NOT)?
+        - What data points are checked?
+        - How do conditions combine?
+        - Make conditions testable and concrete
 
+        3. DECISION SCENARIOS:
+        - What decisions need to be made?
+        - What are possible outcomes (yes/no/conditional)?
+        - What triggers each decision?
+        - What actions follow each outcome?
+        - Use plain language for decision criteria
 
-# ============================================================================
-# AGENT STATE
-# ============================================================================
+        4. ROLE-SPECIFIC REQUIREMENTS:
+        - What must the controller do?
+        - What must the processor do?
+        - What must the data subject do?
+        - What must joint controllers do?
+        - Express requirements without "assigner" or "assignee" concepts
 
-class EnrichmentState(TypedDict):
-    messages: Annotated[Sequence[BaseMessage], add_messages]
-    current_field: Dict[str, Any]
-    enriched_name: str
-    enriched_description: str
-    object_name: str
-    property_name: str
-    pii_classification: Dict[str, Any]
-    enrichment_rationale: str
-    mapping_rationale: str
-    object_reasoning: str
-    property_reasoning: str
-    comparison_note: str
-    enrichment_confidence: Dict[str, Any]
-    mapping_confidence: Dict[str, Any]
-    pii_confidence: Dict[str, Any]
-    intersection_vector_store: Any
-    object_vector_store: Any
-    property_vector_store: Any
-    all_objects: List[str]
-    all_properties: List[str]
-    objects_dict: Dict[str, List[str]]
-    acronym_dict: Dict[str, str]
-    mapping_strategy: str
+        5. TEMPORAL ASPECTS:
+        - Are there time limits or deadlines?
+        - Are there sequence requirements?
+        - What triggers timing requirements?
+        - Express timing in concrete, measurable terms
 
+        OUTPUT REQUIREMENTS:
+        - Use ONLY standard action taxonomy (share, store, process, update, create)
+        - NO legal citations or article references
+        - Plain language understandable by non-lawyers
+        - Concrete, testable conditions
+        - Clear decision criteria
+        - NO "assigner" or "assignee" fields
 
-# ============================================================================
-# ENRICHMENT COORDINATOR WITH INTELLIGENT CONTEXT USAGE
-# ============================================================================
+        Provide specific, focused analysis that can be directly converted to machine-readable rules.
+        """
 
-def enrichment_coordinator_node(state: EnrichmentState) -> EnrichmentState:
-    """Coordinator with intelligent context usage and multi-stage validation (NO MODELLING)."""
-    
-    field_name = state['current_field'].get('Field Name', '')
-    app_name = state['current_field'].get('Application Name', '')
-    app_desc = state['current_field'].get('Application Description', '')
-    
-    print(f"\n{'='*80}")
-    print(f"PROCESSING: {field_name}")
-    print(f"APPLICATION: {app_name}")
-    print(f"{'='*80}")
-    
-    # ========================================================================
-    # STEP 1: INTELLIGENT ENRICHMENT WITH SMART CONTEXT USAGE
-    # ========================================================================
-    print("\n[STEP 1] ISO 11179 Name Enrichment (Intelligent Context)...")
-    
-    # Format acronym list for prompt
-    acronym_dict = state.get('acronym_dict', {})
-    if acronym_dict:
-        acronym_list = "ACRONYM REFERENCE (expand these when found):\n"
-        for acr, exp in sorted(acronym_dict.items()):
-            acronym_list += f"  - {acr} = {exp}\n"
-    else:
-        acronym_list = "ACRONYM REFERENCE: (None provided)\n"
-    
-    enrichment_prompt = f"""You are an ISO 11179 naming expert. Create a clear, logical, human-readable name.
+    @staticmethod
+    def expert_verification_prompt(legislation_text: str, focused_analysis: str) -> str:
+        """Expert verification with enhanced comment requirements."""
+        return f"""
+        Verify and enhance the focused analysis with expert review.
+        Ensure all comments are detailed enough for both lawyers and non-lawyers to understand.
 
-FIELD NAME: {field_name}
-APPLICATION CONTEXT: {app_name}
-(Use context intelligently - only when it adds clarity without redundancy)
+        ORIGINAL LEGISLATION:
+        {legislation_text}
 
-{acronym_list}
+        FOCUSED ANALYSIS TO VERIFY:
+        {focused_analysis}
 
-INTELLIGENT CONTEXT USAGE RULES:
+        VERIFICATION TASKS:
 
-1. CHECK IF FIELD HAS ITS OWN ENTITY REFERENCE:
-   Look for entity words in the field name itself:
-   - party, customer, account, transaction, product, employee, user, invoice, payment, order
-   
-   If field contains these, DON'T add context entity:
-   ✓ "partyModelID" → "Party Model Identifier" (NOT "Customer Party Model Identifier")
-   ✓ "accountBalance" → "Account Balance" (NOT "Customer Account Balance")
-   ✓ "transactionAmount" → "Transaction Amount" (NOT "Customer Transaction Amount")
-   ✓ "partyReference" → "Party Reference" (NOT "Customer Party Reference")
-   ✓ "productCode" → "Product Code" (NOT "Customer Product Code")
+        1. ACTION TAXONOMY VERIFICATION:
+        - Confirm all actions use standard taxonomy: share, store, process, update, create
+        - If any action uses synonyms, map it to the correct standard action
+        - Ensure no actions outside the standard taxonomy remain
+        - Verify action choice is the most specific and accurate
 
-2. USE CONTEXT ONLY FOR GENERIC FIELDS:
-   If field is generic (no entity reference), use application context:
-   ✓ "alternateNameType" in Customer app → "Customer Alternate Name Type"
-   ✓ "statusCode" in Customer app → "Customer Status Code"
-   ✓ "identifier" in Customer app → "Customer Identifier"
-   ✓ "referenceNumber" in Customer app → "Customer Reference Number"
+        2. LEGAL REFERENCE REMOVAL:
+        - Check for any remaining legal citations (Article X, Section Y, etc.)
+        - If found, convert to plain language requirements
+        - Ensure all requirements are expressed without legal references
+        - Verify substance is preserved when removing citations
 
-3. AVOID REDUNDANCY:
-   Never create redundant names like:
-   ❌ "Customer Party Identifier" (redundant - party IS the entity)
-   ❌ "Customer Account Balance" (account is already the entity)
-   ❌ "Customer Transaction Amount" (transaction is already the entity)
+        3. COMMENT ENHANCEMENT:
+        For each rule, permission, prohibition, or duty, create DETAILED comments that:
+        - Explain WHAT the requirement is in simple terms
+        - Explain WHY it exists (purpose/rationale)
+        - Explain WHEN it applies (conditions in plain language)
+        - Explain HOW to comply (practical steps)
+        - Use language a non-lawyer can understand
+        - Also include legal context for lawyers (without article citations)
+        - Be specific and comprehensive (minimum 2-3 sentences per comment)
 
-4. EXPAND ABBREVIATIONS LOGICALLY:
-   - ID, Id → Identifier
-   - Num, No → Number
-   - Addr → Address
-   - Ref → Reference
-   - Amt → Amount
-   - Cd → Code
-   - Dt → Date
-   - Type → Type (keep as is)
-   - Model → Model (keep as is)
+        EXAMPLE OF GOOD COMMENT:
+        "This requirement ensures that personal data is only shared with recipients who have adequate 
+        data protection measures in place. It applies whenever data is transferred outside the organization, 
+        particularly to third countries or international organizations. To comply, organizations must verify 
+        that the recipient has equivalent data protection safeguards, such as standard contractual clauses 
+        or binding corporate rules, and document this verification before any data transfer occurs. This 
+        protects individuals' privacy rights by ensuring their data receives consistent protection regardless 
+        of where it is processed."
 
-5. FORMAT:
-   - Title Case with proper spacing
-   - Clear and concise (max 5 words)
-   - Readable by non-technical people
+        4. COMPLETENESS CHECK:
+        - Are all obligations from the legislation captured?
+        - Are all conditions clearly expressed?
+        - Are all decision points identified?
+        - Are comments sufficiently detailed?
+        - Is the language accessible to non-experts?
 
-EXAMPLES:
+        5. PARTY VERIFICATION:
+        - Ensure NO "assigner" or "assignee" fields remain
+        - Focus on who PERFORMS the action
+        - Identify data controller, processor, data subject, or joint controller as appropriate
+        - Remove any permission-granting party references
 
-Field: "partyModelID" in Customer app
-✓ CORRECT: "Party Model Identifier" (expanded ID → Identifier)
-❌ WRONG: "Customer Party Model Identifier" (redundant)
+        6. DATAVISA REFERENCES:
+        - If "DataVisa" is mentioned, note it's HSBC's internal data privacy governance tool
+        - Convert any DataVisa-specific requirements into general data governance principles
+        - Ensure requirements are understandable without knowing about DataVisa
 
-Field: "alternateNameType" in Customer app
-✓ CORRECT: "Customer Alternate Name Type"
-❌ WRONG: "Alternate Name Type" (loses context)
+        OUTPUT REQUIREMENTS:
+        - Verified and enhanced analysis
+        - All actions using standard taxonomy only
+        - No legal citations
+        - Detailed, comprehensive comments (2-3+ sentences each)
+        - Accessible to both lawyers and non-lawyers
+        - No assigner/assignee references
+        - DataVisa references clarified if present
 
-Field: "accountBalance" in Customer app
-✓ CORRECT: "Account Balance"
-❌ WRONG: "Customer Account Balance" (redundant)
+        Provide thorough verification and enhancement focusing on clarity and completeness.
+        """
 
-Field: "custStatusCd" in Customer app (assume CUST=Customer in acronym list)
-✓ CORRECT: "Customer Status Code" (expanded CUST → Customer, Cd → Code)
-❌ WRONG: "Cust Status Code" (didn't expand acronym)
+    @staticmethod
+    def synthesis_prompt_template(
+        legislation_text: str,
+        article_reference: str,
+        source_files: str,
+        document_level: str,
+        chunk_reference: str,
+        existing_context: str,
+        metadata_context: str,
+        applicable_countries: str,
+        adequacy_countries: str,
+        focused_analysis: str,
+        verified_analysis: str,
+        agent_analysis: str,
+        comprehensive_analysis: str,
+        decision_analysis: str = ""
+    ) -> str:
+        """Template for synthesis prompt with all analyses including decisions."""
+        chunk_context = f"\nCHUNK REFERENCE: {chunk_reference}\n" if chunk_reference else ""
+        decision_context = f"\nDECISION ANALYSIS:\n{decision_analysis}\n" if decision_analysis else ""
 
-Field: "txnAmtRef" in Customer app (assume TXN=Transaction in acronym list)
-✓ CORRECT: "Transaction Amount Reference" (expanded TXN → Transaction, Amt → Amount, Ref → Reference)
-❌ WRONG: "Customer Transaction Amount Reference" (redundant, txn already specifies entity)
+        return f"""
+        Based on the analyses below, create machine-readable rules with MAXIMUM COMPREHENSIVENESS including decision support.
+        Extract EVERY possible rule, obligation, condition, requirement, and decision scenario from the legislation text.
+        Create multiple rules if the text covers different aspects or scenarios.
 
-Field: "acctNum" in Customer app (assume ACCT=Account in acronym list)
-✓ CORRECT: "Account Number" (expanded ACCT → Account, Num → Number)
-❌ WRONG: "Customer Account Number" (redundant)
+        EXISTING RULES CONTEXT:
+        {existing_context}
 
-Field: "statusCode" in Customer app
-✓ CORRECT: "Customer Status Code" (generic field, needs context)
-❌ WRONG: "Status Code" (loses context)
+        METADATA CONTEXT:
+        {metadata_context}{chunk_context}
 
-Field: "transactionRef" in Customer app
-✓ CORRECT: "Transaction Reference"
-❌ WRONG: "Customer Transaction Reference" (redundant)
+        COMPREHENSIVE DOCUMENT ANALYSIS:
+        {comprehensive_analysis}
 
-Field: "partyIdentifier" in Customer app
-✓ CORRECT: "Party Identifier"
-❌ WRONG: "Customer Party Identifier" (redundant)
+        SOURCE LEGISLATION:
+        Article: {article_reference}
+        Document Level: {document_level}
+        Source Files: {source_files}
+        Text: {legislation_text}
 
-Field: "referenceNumber" in Customer app
-✓ CORRECT: "Customer Reference Number" (generic, needs context)
-❌ WRONG: "Reference Number" (loses context)
+        ANALYSIS RESULTS:
 
-Field: "empID" in Customer app (assume EMP=Employee in acronym list)
-✓ CORRECT: "Employee Identifier" (expanded EMP → Employee, ID → Identifier)
-❌ WRONG: "Customer Employee Identifier" (redundant)
+        Focused Analysis:
+        {focused_analysis}
 
-THINK STEP BY STEP:
-1. Does the field name contain an entity word (party, account, transaction, product, etc.)?
-2. If YES → Use that entity, don't add application context
-3. If NO → Field is generic, add application context for clarity
-4. Check acronym reference list for any matching acronyms (exact or substring match)
-5. Expand all acronyms and abbreviations properly
-6. Ensure result is logical, human-readable, and non-redundant
+        Expert Verification:
+        {verified_analysis}
 
-Now enrich this field name following these rules.
-OUTPUT: ONLY the enriched name, nothing else."""
+        Agent Dual Action Analysis:
+        {agent_analysis}
+        {decision_context}
 
-    try:
-        enriched_name = call_openai_with_retry([{"role": "user", "content": enrichment_prompt}]).strip()
-        enriched_name = enriched_name.split('\n')[0].strip().strip('"').strip("'")
-        state['enriched_name'] = enriched_name
-        print(f"   ✓ Enriched: {enriched_name}")
-    except:
-        state['enriched_name'] = field_name
-        print(f"   ❌ Using original: {field_name}")
-    
-    # ========================================================================
-    # STEP 2: DEFINITION
-    # ========================================================================
-    print("\n[STEP 2] Definition...")
-    try:
-        definition = call_openai_with_retry([{"role": "user", "content": f"Create a precise, 2-sentence ISO 11179 definition for: {state['enriched_name']}. Be clear and concise."}]).strip()
-        state['enriched_description'] = definition
-        print(f"   ✓ Definition: {definition[:80]}...")
-    except:
-        state['enriched_description'] = f"A data element representing {state['enriched_name'].lower()}."
-    
-    # ========================================================================
-    # STEP 3: INTERSECTION MATCHING
-    # ========================================================================
-    print("\n[STEP 3] Intersection Matching (Object.Property combos)...")
-    
-    query = f"{state['enriched_name']} {state['enriched_description']}"
-    
-    # ChromaDB similarity search
-    intersection_results = state['intersection_vector_store'].similarity_search_with_score(query, k=5)
-    
-    top_matches = []
-    for doc, score in intersection_results:
-        obj = doc.metadata.get('object', '')
-        prop = doc.metadata.get('property', '')
-        if obj and prop:
-            top_matches.append({'object': obj, 'property': prop, 'score': float(score)})
-    
-    if not top_matches:
-        print("   ⚠ No intersection matches found, will use separate search")
-        top_matches = [{'object': 'Unknown', 'property': 'Unknown', 'score': 999.0}]
-    
-    print(f"   → Top 3 intersection matches:")
-    for i, match in enumerate(top_matches[:3], 1):
-        print(f"      {i}. {match['object']}.{match['property']} (score: {match['score']:.4f})")
-    
-    # ========================================================================
-    # STEP 4: SUPERVISOR VALIDATION - INTERSECTION
-    # ========================================================================
-    print("\n[STEP 4] Supervisor Validates Intersection Match...")
-    
-    supervisor_intersection_prompt = f"""You are a SUPERVISOR validating semantic mapping.
+        CRITICAL REQUIREMENTS FOR OUTPUT:
 
-ENRICHED FIELD: {state['enriched_name']}
-DEFINITION: {state['enriched_description']}
+        1. ACTION TAXONOMY (MANDATORY):
+        - ALL actions MUST use standard taxonomy: share, store, process, update, create
+        - Map any synonyms to the correct standard action
+        - ONLY these five actions are permitted in the output
+        - Choose the most specific action for each requirement
 
-TOP INTERSECTION MATCH: {top_matches[0]['object']}.{top_matches[0]['property']}
-MATCH SCORE: {top_matches[0]['score']:.4f}
+        2. LEGAL REFERENCE HANDLING:
+        - DO NOT include legal article citations in the machine-readable output
+        - Convert all legal references to plain language requirements
+        - Express WHAT must be done, not WHERE it's written in law
+        - Use substance from referenced articles without citing them
 
-CONTEXT: This is a PRE-EXISTING object.property combination from the PBT model (not separately constructed).
+        3. COMMENT REQUIREMENTS (MANDATORY):
+        - EVERY rule, action, permission, prohibition must have a detailed comment
+        - Comments must be 2-3+ sentences minimum
+        - Must be understandable by non-lawyers AND provide legal context
+        - Explain: WHAT, WHY, WHEN, and HOW
+        - Use plain, clear English
 
-VALIDATION CRITERIA:
-✓ APPROVE if:
-  - Object accurately represents the entity
-  - Property accurately represents the characteristic  
-  - Combination is semantically sound for this field
-  - Any reasonable domain expert would agree
+        4. PARTY HANDLING:
+        - DO NOT include "assigner" or "assignee" fields
+        - Use primary_impacted_role and secondary_impacted_role instead
+        - Focus on who performs the action, not who grants permission
+        - Valid roles: controller, processor, data_subject, joint_controller
 
-⚠️ BE STRICT but remember:
-  - This is safer than separately finding object + property
-  - Perfect semantic match is rare - "good enough" is acceptable
-  - Reject ONLY if clearly wrong or nonsensical
+        5. DATAVISA HANDLING:
+        - If "DataVisa" is mentioned, understand it's HSBC's internal tool
+        - Convert to general data governance requirements
+        - Don't assume readers know what DataVisa is
 
-OUTPUT (JSON only):
-{{
-    "approved": <true/false>,
-    "semantic_rationale": "<WHY this object.property semantically matches the field - explain the conceptual fit, not the method>",
-    "object_reasoning": "<Why this OBJECT represents the correct entity/concept>",
-    "property_reasoning": "<Why this PROPERTY represents the correct characteristic>",
-    "semantic_correctness_score": <0-100>,
-    "confidence_level": "<high|medium|low>"
-}}"""
-
-    try:
-        supervisor_response = call_openai_with_retry([{"role": "user", "content": supervisor_intersection_prompt}])
-        if '```json' in supervisor_response:
-            supervisor_response = supervisor_response.split('```json')[1].split('```')[0]
-        supervisor_data = json.loads(supervisor_response.strip())
+        COMPREHENSIVE EXTRACTION REQUIREMENTS:
+        1. Extract EVERY obligation, requirement, prohibition, permission mentioned
+        2. Create separate rules for different roles (controller, processor, data_subject, joint_controller)
+        3. Create separate rules for different data categories mentioned
+        4. Create separate rules for different scenarios or conditions
+        5. Create rules for both positive obligations (must do) and negative obligations (must not do)
+        6. Extract rules for different timeframes if mentioned (immediate, within X days, etc.)
+        7. Create rules for different jurisdictions if multiple countries are mentioned
+        8. Extract both explicit and reasonably implied obligations
+        9. Focus on practical data operations using standard action taxonomy
+        10. Create comprehensive conditions that capture all requirements in plain language
+        11. Include decision scenarios with yes/no/maybe outcomes
+        12. Link decisions to required actions for compliance
         
-        intersection_approved = supervisor_data.get('approved', False)
-        intersection_semantic_rationale = supervisor_data.get('semantic_rationale', '')
-        intersection_object_reasoning = supervisor_data.get('object_reasoning', '')
-        intersection_property_reasoning = supervisor_data.get('property_reasoning', '')
-        intersection_score = supervisor_data.get('semantic_correctness_score', 0)
-        intersection_confidence = supervisor_data.get('confidence_level', 'medium')
+        SYNTHESIS REQUIREMENTS:
+        1. Create rules in json-rules-engine format
+        2. Each condition must reference the document level: "{document_level}"
+        3. Each condition must include chunk_reference if applicable: {chunk_reference}
+        4. MANDATORY: Each rule MUST have primary_impacted_role and data_category fields populated
+        5. Actions MUST use standard taxonomy (share, store, process, update, create) ONLY
+        6. Actions must be in simple English without document references or legal citations
+        7. Actions must focus on practical data operations
+        8. User actions must be practical tasks individuals can perform
+        9. Use exact enum values for all structured fields
+        10. Timeline is optional - include only if mentioned in legislation
+        11. Create rich, detailed conditions that can be programmatically evaluated
+        12. Decisions must have clear outcomes and action mappings
+        13. Cross-reference between rules, actions, and decisions
+        14. ALL rules, actions, permissions, prohibitions MUST have detailed comments (2-3+ sentences)
+        15. NO "assigner" or "assignee" fields anywhere in output
+
+        OUTPUT FORMAT:
+        Return a JSON array of rule objects. Each rule must have:
+        - id: Unique identifier
+        - name: Clear, descriptive name in simple English (no legal citations)
+        - description: Full description without document references (detailed comment explaining WHAT, WHY, WHEN, HOW)
+        - source_article: Article reference (for internal tracking only, not in descriptions)
+        - source_file: Source file path
+        - conditions: Comprehensive json-rules-engine conditions (plain language, no legal citations)
+        - event: Event triggered when conditions met
+        - actions: Array of rule actions (organizational level) - MUST use standard taxonomy
+        - user_actions: Array of user actions (individual level) - MUST use standard taxonomy
+        - decisions: Array of decision objects (if applicable)
+        - priority: Priority level
+        - primary_impacted_role: Primary role affected (controller/processor/data_subject/joint_controller)
+        - secondary_impacted_role: Secondary role (if applicable)
+        - data_category: Array of applicable data categories
+        - applicable_countries: {applicable_countries}
+        - adequacy_countries: {adequacy_countries}
+        - comments: Detailed explanation for lawyers and non-lawyers (2-3+ sentences)
+
+        EACH ACTION OBJECT MUST HAVE:
+        - action_type: One of: share, store, process, update, create (ONLY these five)
+        - title: Clear title in plain English
+        - description: Detailed description (2-3+ sentences explaining WHAT, WHY, HOW)
+        - NO "assigner" or "assignee" fields
+
+        CRITICAL: Return ONLY valid JSON. No additional text or explanations outside the JSON structure.
+        Ensure EVERY action uses standard taxonomy and EVERY element has detailed comments.
+        """
+
+    @staticmethod
+    def role_inference_prompt(legislation_text: str) -> str:
+        """Prompt for inferring primary impacted role from legislation text."""
+        return f"""
+        Analyze this legislation text and determine the primary role that is impacted or has obligations.
+
+        TEXT:
+        {legislation_text}
+
+        INSTRUCTIONS:
+        - Determine if the primary obligation falls on: controller, processor, joint_controller, or data_subject
+        - Consider who has the main responsibility or obligation in this text
+        - Focus on the party that must take action
+        - DO NOT consider "assigner" or "assignee" - these are not relevant
+
+        ROLE DEFINITIONS:
+        - controller: Determines the purposes and means of data processing
+        - processor: Processes data on behalf of the controller
+        - joint_controller: Shares determination of purposes and means with another party
+        - data_subject: The individual whose personal data is being processed
+
+        Return ONLY one word: controller, processor, joint_controller, or data_subject
+        """
+
+    @staticmethod
+    def decision_inference_prompt(legislation_text: str, existing_context: str = "") -> str:
+        """Prompt for inferring decision scenarios with yes/no/maybe outcomes."""
+        context_section = f"\n\nEXISTING CONTEXT:\n{existing_context}\n" if existing_context else ""
+
+        return f"""
+        Analyze this legislation to identify decision points and their outcomes.
+        {context_section}
+
+        LEGISLATION TEXT:
+        {legislation_text}
+
+        LEGAL REFERENCE HANDLING:
+        - Use your knowledge to understand any legal article references
+        - Extract decision requirements without citing the articles
+        - Focus on WHAT decision must be made, not WHERE it's written in law
+
+        DECISION ANALYSIS TASKS:
+
+        1. IDENTIFY DECISION POINTS:
+        - Where does the legislation require a yes/no decision?
+        - What questions must be answered?
+        - What triggers the need for a decision?
+        - Express decision criteria in plain language
+
+        2. POSSIBLE OUTCOMES:
+        - YES: What conditions lead to affirmative outcome?
+        - NO: What conditions lead to negative outcome?
+        - MAYBE/CONDITIONAL: What creates conditional outcomes?
+        - Use concrete, testable conditions
+
+        3. REQUIRED ACTIONS:
+        - What actions must be taken for YES outcome?
+        - What actions must be taken for NO outcome?
+        - What actions must be taken for CONDITIONAL outcome?
+        - Use standard action taxonomy (share, store, process, update, create)
+
+        4. CONDITIONS AND CRITERIA:
+        - What specific conditions determine outcomes?
+        - How do multiple conditions combine?
+        - What data points must be evaluated?
+        - Make criteria testable and measurable
+
+        OUTPUT FORMAT:
+        Provide structured decision analysis with:
+        - Decision question (plain language, no legal citations)
+        - Conditions for each outcome
+        - Required actions for each outcome (using standard taxonomy)
+        - Any additional context needed
+        - Detailed comments explaining the decision process (2-3+ sentences)
+
+        Make decision logic clear and implementable in code.
+        """
+
+    @staticmethod
+    def odrl_comprehensive_guidance_analysis(
+        guidance_text: str,
+        rule_name: str,
+        framework_type: str,
+        restriction_condition: str
+    ) -> str:
+        """
+        Comprehensive analysis of guidance text for ODRL extraction.
+        Enhanced with action taxonomy and detailed comment requirements.
+        """
+        return f"""
+        Analyze this guidance text comprehensively to extract all policy-relevant information.
         
-        print(f"   → Supervisor: {'✓ APPROVED' if intersection_approved else '✗ REJECTED'}")
-        print(f"   → Score: {intersection_score}/100")
-        print(f"   → Confidence: {intersection_confidence}")
-        print(f"   → Semantic rationale: {intersection_semantic_rationale[:150]}...")
+        GUIDANCE TEXT:
+        {guidance_text}
         
-        if intersection_approved:
-            # USE INTERSECTION MATCH
-            state['object_name'] = top_matches[0]['object']
-            state['property_name'] = top_matches[0]['property']
-            state['mapping_strategy'] = 'intersection_approved'
-            state['mapping_rationale'] = intersection_semantic_rationale
-            state['object_reasoning'] = intersection_object_reasoning
-            state['property_reasoning'] = intersection_property_reasoning
-            state['comparison_note'] = 'Intersection match approved without need for separate search.'
-            print(f"   ✓ USING: {state['object_name']}.{state['property_name']}")
-            
-        else:
-            print(f"   → Intersection rejected (score: {intersection_score}). Trying separate search...")
-            
-            # Store intersection details for comparison
-            intersection_details = {
-                'object': top_matches[0]['object'],
-                'property': top_matches[0]['property'],
-                'score': intersection_score,
-                'semantic_rationale': intersection_semantic_rationale,
-                'object_reasoning': intersection_object_reasoning,
-                'property_reasoning': intersection_property_reasoning
-            }
-            
-            # ================================================================
-            # STEP 5-6: SEPARATE OBJECT & PROPERTY SEARCH
-            # ================================================================
-            print("\n[STEP 5] Separate Object Search...")
-            object_results = hybrid_similarity_search(query, state['object_vector_store'], state['all_objects'], top_k=5)
-            print(f"   → Top 3 objects:")
-            for i, (obj, score, breakdown) in enumerate(object_results[:3], 1):
-                print(f"      {i}. {obj} (score: {score:.3f})")
-            
-            print("\n[STEP 6] Separate Property Search...")
-            property_results = hybrid_similarity_search(query, state['property_vector_store'], state['all_properties'], top_k=5)
-            print(f"   → Top 3 properties:")
-            for i, (prop, score, breakdown) in enumerate(property_results[:3], 1):
-                print(f"      {i}. {prop} (score: {score:.3f})")
-            
-            # ================================================================
-            # STEP 7: SUPERVISOR VALIDATES SEPARATE MATCH
-            # ================================================================
-            print("\n[STEP 7] Supervisor Validates Separate Combo...")
-            
-            proposed_object = object_results[0][0]
-            proposed_property = property_results[0][0]
-            
-            supervisor_separate_prompt = f"""You are a SUPERVISOR validating semantic mapping. BE EXTREMELY CRITICAL.
+        RULE: {rule_name}
+        FRAMEWORK: {framework_type} 
+        TYPE: {restriction_condition}
 
-ENRICHED FIELD: {state['enriched_name']}
-DEFINITION: {state['enriched_description']}
+        IMPORTANT HANDLING INSTRUCTIONS:
 
-INTERSECTION MATCH (REJECTED with score {intersection_details['score']}/100):
-- {intersection_details['object']}.{intersection_details['property']}
-- Rejection reason: {intersection_details['semantic_rationale'][:200]}
+        1. LEGAL REFERENCES:
+        - If you encounter references to legal articles, regulations, or documents, use your knowledge to understand them
+        - DO NOT include article numbers or legal citations in your analysis
+        - Convert legal requirements into plain, actionable language
+        - Focus on WHAT is required, not WHERE it's written
 
-SEPARATE SEARCH RESULTS (found independently):
-- Object: {proposed_object}
-- Property: {proposed_property}
+        2. ACTION TAXONOMY (CRITICAL):
+        ALL actions must be mapped to this standard taxonomy:
+        - SHARE: transfer, distribute, disclose, transmit to third parties
+        - STORE: retain, archive, maintain, keep data
+        - PROCESS: use, analyze, transform, handle, execute operations on data
+        - UPDATE: change, amend, correct, revise data
+        - CREATE: collect, generate, obtain, derive new data
 
-⚠️ CRITICAL WARNING: These were found SEPARATELY (HIGH RISK of nonsensical combination)
+        When identifying actions, you MUST:
+        - Identify what action is described
+        - Map it to ONE of the five standard actions
+        - Use ONLY the standard action name in your analysis
 
-YOUR TASK: Provide TWO types of analysis:
+        3. DATAVISA REFERENCES:
+        - If "DataVisa" is mentioned, note it's HSBC's internal data privacy governance tool
+        - Convert DataVisa-specific requirements into general data governance principles
+        - Don't assume familiarity with DataVisa in your output
 
-1. SEMANTIC ANALYSIS (focus on meaning, not method):
-   - Does {proposed_object} semantically represent the correct entity/concept for this field?
-   - Does {proposed_property} semantically represent the correct characteristic?
-   - Does the combination make conceptual sense?
+        4. PARTIES AND ROLES:
+        - DO NOT extract or reference "assigner" or "assignee"
+        - Focus on who performs actions (controller, processor, data subject)
+        - Ignore permission-granting party concepts
 
-2. COMPARISON ANALYSIS:
-   - Is this semantically better/worse than intersection?
-   - Which mapping is more accurate conceptually?
+        COMPREHENSIVE ANALYSIS REQUIREMENTS:
 
-OUTPUT (JSON only):
-{{
-    "approved": <true/false>,
-    "semantic_rationale": "<WHY this object.property semantically matches - explain conceptual fit, not method>",
-    "object_reasoning": "<Why this OBJECT represents the correct entity/concept>",
-    "property_reasoning": "<Why this PROPERTY represents the correct characteristic>",
-    "is_worse_than_intersection": <true/false>,
-    "is_significantly_better": <true/false>,
-    "comparison_rationale": "<Compare semantic accuracy of both mappings>",
-    "semantic_correctness_score": <0-100>,
-    "recommendation": "<use_separate | use_intersection | flag_for_review>"
-}}"""
+        1. IDENTIFY ALL ACTIONS:
+        - What actions/operations are mentioned in the guidance?
+        - Map EACH action to standard taxonomy (share, store, process, update, create)
+        - What is being acted upon (target/asset)?
+        - Be comprehensive but use ONLY standard action names
 
-            try:
-                supervisor_response2 = call_openai_with_retry([{"role": "user", "content": supervisor_separate_prompt}])
-                if '```json' in supervisor_response2:
-                    supervisor_response2 = supervisor_response2.split('```json')[1].split('```')[0]
-                supervisor_data2 = json.loads(supervisor_response2.strip())
-                
-                separate_approved = supervisor_data2.get('approved', False)
-                separate_semantic_rationale = supervisor_data2.get('semantic_rationale', '')
-                separate_object_reasoning = supervisor_data2.get('object_reasoning', '')
-                separate_property_reasoning = supervisor_data2.get('property_reasoning', '')
-                is_worse_than_intersection = supervisor_data2.get('is_worse_than_intersection', False)
-                is_significantly_better = supervisor_data2.get('is_significantly_better', False)
-                comparison_rationale = supervisor_data2.get('comparison_rationale', '')
-                separate_score = supervisor_data2.get('semantic_correctness_score', 0)
-                recommendation = supervisor_data2.get('recommendation', 'use_separate')
-                
-                print(f"   → Supervisor: {'✓ APPROVED' if separate_approved else '✗ REJECTED'}")
-                print(f"   → Score: {separate_score}/100 vs Intersection: {intersection_details['score']}/100")
-                print(f"   → Worse than intersection: {is_worse_than_intersection}")
-                print(f"   → Significantly better: {is_significantly_better}")
-                print(f"   → Recommendation: {recommendation}")
-                
-                # DECISION LOGIC with comparison to intersection
-                if recommendation == 'use_intersection' or is_worse_than_intersection:
-                    print(f"   → REVERTING to intersection match (separate was worse)")
-                    state['object_name'] = intersection_details['object']
-                    state['property_name'] = intersection_details['property']
-                    state['mapping_strategy'] = 'intersection_fallback'
-                    state['mapping_rationale'] = intersection_details['semantic_rationale']
-                    state['object_reasoning'] = intersection_details['object_reasoning']
-                    state['property_reasoning'] = intersection_details['property_reasoning']
-                    state['comparison_note'] = f"Separate search explored but intersection was semantically more accurate. {comparison_rationale}"
-                    print(f"   ✓ USING INTERSECTION: {state['object_name']}.{state['property_name']}")
-                    
-                elif separate_approved and is_significantly_better:
-                    state['object_name'] = proposed_object
-                    state['property_name'] = proposed_property
-                    state['mapping_strategy'] = 'separate_search_approved'
-                    state['mapping_rationale'] = separate_semantic_rationale
-                    state['object_reasoning'] = separate_object_reasoning
-                    state['property_reasoning'] = separate_property_reasoning
-                    state['comparison_note'] = f"Separate search produced significantly better semantic match than intersection. {comparison_rationale}"
-                    print(f"   ✓ USING SEPARATE (SIGNIFICANTLY BETTER): {state['object_name']}.{state['property_name']}")
-                    
-                elif separate_approved and not is_significantly_better:
-                    state['object_name'] = proposed_object
-                    state['property_name'] = proposed_property  
-                    state['mapping_strategy'] = 'separate_search_cautious'
-                    state['mapping_rationale'] = separate_semantic_rationale
-                    state['object_reasoning'] = separate_object_reasoning
-                    state['property_reasoning'] = separate_property_reasoning
-                    state['comparison_note'] = f"Separate search marginally better but with caution due to separate construction risk. {comparison_rationale}"
-                    print(f"   ⚠ USING SEPARATE (CAUTIOUSLY): {state['object_name']}.{state['property_name']}")
-                    
-                else:
-                    # Not approved - use intersection as safer fallback
-                    print(f"   → Separate not approved, reverting to intersection")
-                    state['object_name'] = intersection_details['object']
-                    state['property_name'] = intersection_details['property']
-                    state['mapping_strategy'] = 'intersection_safer_fallback'
-                    state['mapping_rationale'] = intersection_details['semantic_rationale']
-                    state['object_reasoning'] = intersection_details['object_reasoning']
-                    state['property_reasoning'] = intersection_details['property_reasoning']
-                    state['comparison_note'] = f"Separate search not validated. Using intersection as safer semantic choice. {comparison_rationale}"
-                    print(f"   ✓ USING INTERSECTION (SAFER): {state['object_name']}.{state['property_name']}")
-                
-            except Exception as e:
-                print(f"   ❌ Error: {e}")
-                # On error, fall back to intersection (safer than using unvalidated separate result)
-                state['object_name'] = intersection_details['object']
-                state['property_name'] = intersection_details['property']
-                state['mapping_strategy'] = 'error_fallback_to_intersection'
-                state['mapping_rationale'] = f"Error during validation, using intersection as safer fallback: {str(e)}"
-                print(f"   ✓ USING INTERSECTION (ERROR FALLBACK): {state['object_name']}.{state['property_name']}")
-    
-    except Exception as e:
-        print(f"   ❌ Error: {e}")
-        state['object_name'] = top_matches[0]['object'] if top_matches else 'Unknown'
-        state['property_name'] = top_matches[0]['property'] if top_matches else 'Unknown'
-        state['mapping_strategy'] = 'error'
-        state['mapping_rationale'] = f"Error: {str(e)}"
-    
-    # ========================================================================
-    # STEP 8: PII CLASSIFICATION
-    # ========================================================================
-    print("\n[STEP 8] PII Classification...")
-    try:
-        pii_prompt = f"""Classify PII: {state['enriched_name']}
-CATEGORIES: NON PERSONAL DATA, PERSONAL DATA, SENSITIVE PERSONAL DATA
-OUTPUT (JSON): {{"pii_category": "<category>", "is_pii": <bool>, "regulatory_considerations": ["<regs>"], "detailed_rationale": "<why>"}}"""
+        2. DETERMINE PERMISSIONS (what is ALLOWED):
+        - What actions are explicitly permitted?
+        - Under what conditions?
+        - What duties must be fulfilled to exercise permission?
+        - Use standard action taxonomy
+        - NO assigner/assignee fields
+
+        3. DETERMINE PROHIBITIONS (what is FORBIDDEN):
+        - What actions are explicitly prohibited?
+        - Under what circumstances?
+        - Use standard action taxonomy
+        - NO assigner/assignee fields
+
+        4. EXTRACT CONDITIONS:
+        - What conditions determine whether actions are allowed/forbidden?
+        - What must be true for permissions to apply?
+        - What triggers prohibitions?
+        - Express in plain, testable language
+
+        5. IDENTIFY DATA CONTEXT:
+        - What data categories are involved?
+        - Who are the data subjects?
+        - What is the purpose of processing?
+        - What is the legal basis (in plain language, no article citations)?
+
+        6. IDENTIFY GEOGRAPHIC SCOPE:
+        - What jurisdictions are mentioned?
+        - Are there cross-border implications?
+        - Use plain language, not legal references
+
+        7. IDENTIFY EVIDENCE REQUIREMENTS:
+        - What evidence is needed for compliance?
+        - What documentation must be maintained?
+        - What records are required?
+
+        OUTPUT REQUIREMENTS:
+        - Comprehensive analysis in clear, plain English
+        - ALL actions using standard taxonomy (share, store, process, update, create) ONLY
+        - NO legal citations or article references
+        - NO assigner/assignee fields
+        - Convert DataVisa references to general principles
+        - Clear distinction between permissions and prohibitions
+        - Detailed, specific conditions
+        - Language accessible to non-lawyers
         
-        pii_response = call_openai_with_retry([{"role": "user", "content": pii_prompt}])
-        if '```json' in pii_response:
-            pii_response = pii_response.split('```json')[1].split('```')[0]
-        pii_data = json.loads(pii_response.strip())
-        state['pii_classification'] = pii_data
-        print(f"   ✓ PII: {pii_data.get('pii_category', 'UNKNOWN')}")
-    except:
-        state['pii_classification'] = {"pii_category": "NON PERSONAL DATA", "is_pii": False, "regulatory_considerations": [], "detailed_rationale": "Failed"}
-    
-    # ========================================================================
-    # STEP 9: FINAL CONFIDENCE SCORING
-    # ========================================================================
-    print("\n[STEP 9] Final Confidence Scoring...")
-    
-    # Apply confidence penalties based on mapping strategy
-    strategy_context = ""
-    if state.get('mapping_strategy') == 'intersection_approved':
-        strategy_context = "STRATEGY: Intersection match was approved (highest confidence scenario). Target score: 85-95."
-    elif state.get('mapping_strategy') == 'intersection_fallback':
-        strategy_context = "STRATEGY: Reverted to intersection because separate search was worse (medium-high confidence). Target score: 75-85."
-    elif state.get('mapping_strategy') == 'intersection_safer_fallback':
-        strategy_context = "STRATEGY: Used intersection as safer fallback when separate wasn't validated (medium confidence). Target score: 65-80."
-    elif state.get('mapping_strategy') == 'separate_search_approved':
-        strategy_context = "STRATEGY: Separate search significantly better than intersection (medium confidence due to separate risk). Target score: 65-75. APPLY PENALTY: -10 points."
-    elif state.get('mapping_strategy') == 'separate_search_cautious':
-        strategy_context = "STRATEGY: Separate search only slightly better (low-medium confidence). Target score: 50-65. APPLY PENALTY: -20 points."
-    elif state.get('mapping_strategy') == 'low_confidence_match':
-        strategy_context = "STRATEGY: Low confidence - neither validated properly (low confidence). Target score: 30-50. APPLY PENALTY: -30 points."
-    else:
-        strategy_context = "STRATEGY: Unknown or error scenario (very low confidence). Target score: 20-40. APPLY PENALTY: -40 points."
-    
-    final_prompt = f"""Final SUPERVISOR confidence scoring.
+        Provide thorough analysis that enables precise ODRL policy creation.
+        """
 
-MAPPING RESULT:
-- Field: {state['enriched_name']}
-- Description: {state['enriched_description']}
-- Mapped to: {state['object_name']}.{state['property_name']}
-
-SEMANTIC REASONING (from validation):
-- Mapping Rationale: {state.get('mapping_rationale', '')}
-- Object Reasoning: {state.get('object_reasoning', '')}
-- Property Reasoning: {state.get('property_reasoning', '')}
-
-{strategy_context}
-
-IMPORTANT: Focus on SEMANTIC CORRECTNESS, not methodology.
-
-Your supporting and contradicting reasons should explain:
-✓ WHY the object semantically represents the correct entity/concept
-✓ WHY the property semantically captures the correct characteristic  
-✓ WHY the combination makes conceptual sense (or doesn't)
-✓ Specific evidence from the field name/description that supports/contradicts the mapping
-
-❌ DON'T just say "intersection was used" or "separate search found this"
-✓ DO explain the semantic/conceptual fit
-
-EXAMPLE GOOD REASONS:
-- Supporting: "Field name contains 'party' which directly indicates this is an entity characteristic, matching the Party object"
-- Supporting: "The term 'identifier' in the field clearly represents a unique reference, aligning with Identifier property"
-- Contradicting: "Field might represent a code rather than pure identifier, introducing some ambiguity"
-- Contradicting: "The Account object might be more specific than Party for this banking context"
-
-CONFIDENCE SCORING (follow strictly):
-- Intersection-based: 85-95 (pre-validated combo) or 75-85 (fallback) or 65-80 (safer default)
-- Separate search: 60-70 (significantly better) or 40-55 (cautious) with penalties applied
-
-OUTPUT (JSON):
-{{
-    "enrichment_rationale": "<why the enriched name is accurate>",
-    "enrichment_confidence": {{
-        "supporting_reasons": [
-            {{"reason": "<specific semantic evidence>", "weight": <0.0-1.0>}},
-            {{"reason": "<specific semantic evidence>", "weight": <0.0-1.0>}},
-            {{"reason": "<specific semantic evidence>", "weight": <0.0-1.0>}}
-        ],
-        "contradictory_reasons": [
-            {{"reason": "<specific semantic concern>", "weight": <0.0-1.0>}},
-            {{"reason": "<specific semantic concern>", "weight": <0.0-1.0>}}
-        ],
-        "confidence_score": <0-100>,
-        "confidence_rationale": "<overall assessment of enrichment quality>"
-    }},
-    "mapping_confidence": {{
-        "supporting_reasons": [
-            {{"reason": "<WHY object semantically fits - specific evidence>", "weight": <0.0-1.0>}},
-            {{"reason": "<WHY property semantically fits - specific evidence>", "weight": <0.0-1.0>}},
-            {{"reason": "<WHY combination makes conceptual sense - specific evidence>", "weight": <0.0-1.0>}}
-        ],
-        "contradictory_reasons": [
-            {{"reason": "<semantic concern or alternative interpretation>", "weight": <0.0-1.0>}},
-            {{"reason": "<semantic ambiguity or limitation>", "weight": <0.0-1.0>}}
-        ],
-        "base_confidence_score": <0-100>,
-        "strategy_penalty": <0 to -40>,
-        "final_confidence_score": <0-100>,
-        "confidence_rationale": "<focus on semantic correctness, mention strategy impact briefly>"
-    }},
-    "pii_confidence": {{
-        "supporting_reasons": [
-            {{"reason": "<specific PII indicator>", "weight": <0.0-1.0>}},
-            {{"reason": "<specific PII indicator>", "weight": <0.0-1.0>}},
-            {{"reason": "<specific PII indicator>", "weight": <0.0-1.0>}}
-        ],
-        "contradictory_reasons": [
-            {{"reason": "<reason it might not be PII>", "weight": <0.0-1.0>}},
-            {{"reason": "<reason it might not be PII>", "weight": <0.0-1.0>}}
-        ],
-        "confidence_score": <0-100>,
-        "confidence_rationale": "<PII classification reasoning>"
-    }}
-}}"""
-
-    try:
-        final_response = call_openai_with_retry([{"role": "user", "content": final_prompt}])
-        if '```json' in final_response:
-            final_response = final_response.split('```json')[1].split('```')[0]
-        final_data = json.loads(final_response.strip())
+    @staticmethod
+    def odrl_component_extraction(
+        guidance_text: str,
+        rule_name: str,
+        initial_analysis: str
+    ) -> str:
+        """
+        Extract ODRL-specific components with action taxonomy and enhanced comments.
+        """
+        return f"""
+        Based on the guidance text and comprehensive analysis, extract ODRL policy components.
         
-        state['enrichment_rationale'] = final_data.get('enrichment_rationale', '')
-        state['enrichment_confidence'] = final_data.get('enrichment_confidence', {})
+        RULE: {rule_name}
         
-        # Handle mapping confidence with penalty
-        mapping_conf = final_data.get('mapping_confidence', {})
-        base_score = mapping_conf.get('base_confidence_score', mapping_conf.get('final_confidence_score', 0))
-        penalty = mapping_conf.get('strategy_penalty', 0)
-        final_score = mapping_conf.get('final_confidence_score', base_score + penalty)
+        INITIAL COMPREHENSIVE ANALYSIS:
+        {initial_analysis}
         
-        # Ensure final score is within bounds
-        final_score = max(0, min(100, final_score))
+        ORIGINAL GUIDANCE TEXT (reference as needed):
+        {guidance_text}
         
-        mapping_conf['confidence_score'] = final_score
-        state['mapping_confidence'] = mapping_conf
+        CRITICAL REQUIREMENTS:
+
+        1. ACTION TAXONOMY (MANDATORY):
+        Use ONLY these standard actions:
+        - share: for any transfer, distribution, disclosure, transmission
+        - store: for retention, archiving, maintaining data
+        - process: for using, analyzing, transforming data
+        - update: for changing, amending, correcting data
+        - create: for collecting, generating, obtaining data
         
-        state['pii_confidence'] = final_data.get('pii_confidence', {})
+        Map all actions in the guidance to these five categories.
+
+        2. LEGAL REFERENCES:
+        - DO NOT include article numbers or legal citations
+        - Convert legal requirements to plain language
+        - Focus on actionable requirements
+
+        3. NO ASSIGNER/ASSIGNEE:
+        - Do NOT extract assigner or assignee information
+        - Focus on the party performing the action
+        - Use controller/processor/data_subject roles
+
+        4. DETAILED COMMENTS:
+        - Every permission, prohibition, duty needs a detailed comment
+        - Minimum 2-3 sentences per comment
+        - Explain WHAT, WHY, WHEN, and HOW
+        - Make it understandable to non-lawyers
+
+        ODRL COMPONENT EXTRACTION:
         
-        print(f"   ✓ Confidence: E={state['enrichment_confidence'].get('confidence_score', 0)}, M={final_score} (base: {base_score}, penalty: {penalty}), P={state['pii_confidence'].get('confidence_score', 0)}")
-    except Exception as e:
-        print(f"   ⚠ Scoring failed: {e}")
-        state['enrichment_rationale'] = 'Failed'
-        state['enrichment_confidence'] = {'confidence_score': 0, 'supporting_reasons': [], 'contradictory_reasons': [], 'confidence_rationale': 'Failed'}
-        state['mapping_confidence'] = {'confidence_score': 0, 'supporting_reasons': [], 'contradictory_reasons': [], 'confidence_rationale': 'Failed'}
-        state['pii_confidence'] = {'confidence_score': 0, 'supporting_reasons': [], 'contradictory_reasons': [], 'confidence_rationale': 'Failed'}
-    
-    # UPDATE MEMORY
-    print("\n[STEP 10] Updating Memory...")
-    try:
-        update_all_memory(field_name, state['enriched_name'], state['object_name'], state['property_name'], state['mapping_strategy'], state['mapping_confidence'].get('confidence_score', 0), state['pii_classification'].get('pii_category', 'NON PERSONAL DATA'), app_name, state['current_field'].get('EIM ID', ''))
-    except Exception as e:
-        print(f"   ⚠ Memory update failed: {e}")
-    
-    print(f"{'='*80}\n")
-    return state
-
-
-def should_continue(state: EnrichmentState) -> Literal["end"]:
-    return "end"
-
-
-def create_enrichment_graph():
-    workflow = StateGraph(EnrichmentState)
-    workflow.add_node("enrichment_coordinator", enrichment_coordinator_node)
-    workflow.set_entry_point("enrichment_coordinator")
-    workflow.add_conditional_edges("enrichment_coordinator", should_continue, {"end": END})
-    return workflow.compile()
-
-
-# ============================================================================
-# MAIN PROCESSING
-# ============================================================================
-
-def process_data_enrichment_and_mapping():
-    print("="*80)
-    print("ISO 11179 WITH INTELLIGENT CONTEXT USAGE (NO MODELLING)")
-    print("Strict Validation + Intersection Fallback")
-    print("Persistent ChromaDB Embeddings")
-    print("="*80)
-    
-    print("\n[1] Loading Memory...")
-    load_all_memory()
-    
-    print("\n[2] Loading Input...")
-    with open(INPUT_JSON_PATH, 'r') as f:
-        input_data = json.load(f)
-    print(f"   → {len(input_data)} records")
-    
-    # Load acronyms
-    print("\n[2.5] Loading Acronym Reference...")
-    acronym_dict = {}
-    if os.path.exists(ACRONYM_CSV_PATH):
-        try:
-            acronym_df = pd.read_csv(ACRONYM_CSV_PATH)
-            for _, row in acronym_df.iterrows():
-                acronym = str(row['acronym']).strip().upper()
-                expansion = str(row['expansion']).strip()
-                acronym_dict[acronym] = expansion
-            print(f"   → Loaded {len(acronym_dict)} acronyms")
-            if acronym_dict:
-                sample = list(acronym_dict.items())[:5]
-                for acr, exp in sample:
-                    print(f"      • {acr} = {exp}")
-                if len(acronym_dict) > 5:
-                    print(f"      • ... and {len(acronym_dict) - 5} more")
-        except Exception as e:
-            print(f"   ⚠ Error loading acronyms: {e}")
-            print(f"   → Expected CSV format: columns 'acronym' and 'expansion'")
-            acronym_dict = {}
-    else:
-        print(f"   → Acronym file not found: {ACRONYM_CSV_PATH}")
-        print(f"   → Continuing without acronym reference")
-    
-    print("\n[3] Initializing ChromaDB...")
-    initialize_chromadb()
-    
-    print("\n[4] Loading PBT Excel...")
-    excel_df = pd.read_excel(EXCEL_PATH)
-    
-    objects_dict = {}
-    all_objects = []
-    all_properties = []
-    
-    for _, row in excel_df.iterrows():
-        obj = str(row['Object name']).strip()
-        prop = str(row['Property name']).strip()
+        1. ACTIONS (use standard taxonomy ONLY):
+           List all actions identified from guidance:
+           - Map each action to: share, store, process, update, or create
+           - Use ONLY the standard action names
+           - No synonyms or variations
         
-        if obj not in objects_dict:
-            objects_dict[obj] = []
-            all_objects.append(obj)
-        if prop not in objects_dict[obj]:
-            objects_dict[obj].append(prop)
-        if prop not in all_properties:
-            all_properties.append(prop)
-    
-    print(f"   → {len(all_objects)} objects, {len(all_properties)} properties")
-    
-    print("\n[5] Creating/Loading Vector Stores with ChromaDB...")
-    embeddings = OpenAIEmbeddings()
-    
-    intersection_store, object_store, property_store = create_or_load_vector_stores(
-        objects_dict, all_objects, all_properties, embeddings
-    )
-    
-    print(f"\n   ✓ All vector stores ready!")
-    
-    print("\n[6] Initializing Workflow...")
-    app = create_enrichment_graph()
-    
-    print(f"\n[7] Processing Records...")
-    
-    successful = 0
-    failed = 0
-    strategy_stats = defaultdict(int)
-    
-    for idx, record in enumerate(input_data):
-        eim_id = record.get("EIM ID", "")
+        2. PERMISSIONS (what is ALLOWED):
+           For each permission, extract:
+           - action: Use standard taxonomy (share/store/process/update/create)
+           - target: What the action applies to (data/asset description)
+           - constraints: Conditions that must be met (plain language, no legal citations)
+           - duties: Obligations to fulfill to exercise the permission
+           - description: Detailed comment (2-3+ sentences) explaining WHAT is permitted, 
+             WHY it's allowed, WHEN it applies, and HOW to comply
+           
+           DO NOT include:
+           - assigner field
+           - assignee field
+           - legal article references in descriptions
         
-        try:
-            initial_state = {
-                "messages": [], "current_field": record, "enriched_name": "", "enriched_description": "",
-                "object_name": "", "property_name": "",
-                "pii_classification": {}, "enrichment_rationale": "", "mapping_rationale": "",
-                "object_reasoning": "", "property_reasoning": "", "comparison_note": "",
-                "enrichment_confidence": {}, "mapping_confidence": {}, "pii_confidence": {},
-                "intersection_vector_store": intersection_store, "object_vector_store": object_store,
-                "property_vector_store": property_store, "all_objects": all_objects, "all_properties": all_properties,
-                "objects_dict": objects_dict, "acronym_dict": acronym_dict, "mapping_strategy": "unknown"
-            }
-            
-            final_state = app.invoke(initial_state)
-            
-            def fmt_reasons(reasons):
-                if not reasons:
-                    return ""
-                return " | ".join([f"{i+1}. {r.get('reason', 'N/A')} (w:{r.get('weight', 0.0):.2f})" for i, r in enumerate(reasons)])
-            
-            pii = final_state['pii_classification']
-            ec = final_state.get('enrichment_confidence', {})
-            mc = final_state.get('mapping_confidence', {})
-            pc = final_state.get('pii_confidence', {})
-            
-            result = {
-                "EIM ID": eim_id,
-                "Application Name": record.get("Application Name", ""),
-                "Original Field Name": record.get("Field Name", ""),
-                "Enriched Field Name": final_state['enriched_name'],
-                "Enriched Description": final_state['enriched_description'],
-                "Mapped Object": final_state['object_name'],
-                "Mapped Property": final_state['property_name'],
-                "Mapping Strategy": final_state.get('mapping_strategy', 'unknown'),
-                "Mapping Rationale": final_state.get('mapping_rationale', ''),
-                "Object Reasoning": final_state.get('object_reasoning', ''),
-                "Property Reasoning": final_state.get('property_reasoning', ''),
-                "Comparison Note": final_state.get('comparison_note', ''),
-                "PII Category": pii.get('pii_category', ''),
-                "Is PII": pii.get('is_pii', False),
-                "Regulatory Considerations": ", ".join(pii.get('regulatory_considerations', [])),
-                "PII Rationale": pii.get('detailed_rationale', ''),
-                "Enrichment Rationale": final_state.get('enrichment_rationale', ''),
-                "Enrichment Confidence Score": ec.get('confidence_score', 0),
-                "Enrichment Supporting Reasons": fmt_reasons(ec.get('supporting_reasons', [])),
-                "Enrichment Contradictory Reasons": fmt_reasons(ec.get('contradictory_reasons', [])),
-                "Enrichment Confidence Rationale": ec.get('confidence_rationale', ''),
-                "Mapping Confidence Score": mc.get('confidence_score', 0),
-                "Mapping Supporting Reasons": fmt_reasons(mc.get('supporting_reasons', [])),
-                "Mapping Contradictory Reasons": fmt_reasons(mc.get('contradictory_reasons', [])),
-                "Mapping Confidence Rationale": mc.get('confidence_rationale', ''),
-                "PII Confidence Score": pc.get('confidence_score', 0),
-                "PII Supporting Reasons": fmt_reasons(pc.get('supporting_reasons', [])),
-                "PII Contradictory Reasons": fmt_reasons(pc.get('contradictory_reasons', [])),
-                "PII Confidence Rationale": pc.get('confidence_rationale', ''),
-                "Status": "SUCCESS"
-            }
-            
-            successful += 1
-            strategy_stats[result["Mapping Strategy"]] += 1
-            
-        except Exception as e:
-            print(f"❌ Error: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            result = {
-                "EIM ID": eim_id, "Application Name": record.get("Application Name", ""),
-                "Original Field Name": record.get("Field Name", ""),
-                "Enriched Field Name": record.get("Field Name", ""),
-                "Enriched Description": f"Error: {str(e)[:200]}",
-                "Mapped Object": "Unknown", "Mapped Property": "Unknown",
-                "Mapping Strategy": "error",
-                "Mapping Rationale": "Error in processing",
-                "Object Reasoning": "Error in processing",
-                "Property Reasoning": "Error in processing",
-                "Comparison Note": "Error prevented normal processing",
-                "PII Category": "NON PERSONAL DATA", "Is PII": False,
-                "Regulatory Considerations": "", "PII Rationale": "",
-                "Enrichment Rationale": "Error", 
-                "Enrichment Confidence Score": 0, "Enrichment Supporting Reasons": "",
-                "Enrichment Contradictory Reasons": "", "Enrichment Confidence Rationale": "",
-                "Mapping Confidence Score": 0, "Mapping Supporting Reasons": "",
-                "Mapping Contradictory Reasons": "", "Mapping Confidence Rationale": "",
-                "PII Confidence Score": 0, "PII Supporting Reasons": "",
-                "PII Contradictory Reasons": "", "PII Confidence Rationale": "",
-                "Status": "FAILED"
-            }
-            failed += 1
+        3. PROHIBITIONS (what is FORBIDDEN):
+           For each prohibition, extract:
+           - action: Use standard taxonomy (share/store/process/update/create)
+           - target: What the action applies to
+           - constraints: Conditions under which prohibition applies (plain language)
+           - description: Detailed comment (2-3+ sentences) explaining WHAT is forbidden,
+             WHY it's prohibited, WHEN it applies, and consequences
+           
+           DO NOT include:
+           - assigner field
+           - assignee field
+           - legal citations
         
-        # Write incrementally
-        pd.DataFrame([result]).to_csv(OUTPUT_CSV_PATH, mode='a', header=(successful+failed==1), index=False)
-    
-    print("\n[8] Saving Memory...")
-    save_all_memory()
-    
-    print(f"\n{'='*80}")
-    print("COMPLETE!")
-    print(f"{'='*80}")
-    print(f"Success: {successful}, Failed: {failed}")
-    print(f"\n📊 Mapping Strategy Breakdown:")
-    for strategy, count in sorted(strategy_stats.items(), key=lambda x: x[1], reverse=True):
-        percentage = (count / successful * 100) if successful > 0 else 0
-        print(f"   • {strategy}: {count} ({percentage:.1f}%)")
-    print(f"\n💾 ChromaDB Collections:")
-    try:
-        for collection in CHROMA_CLIENT.list_collections():
-            print(f"   • {collection.name}: {collection.count()} embeddings")
-    except:
-        pass
-    print(f"\nOutput: {OUTPUT_CSV_PATH}")
+        4. DUTIES (what MUST be done):
+           For each duty, extract:
+           - action: Use standard taxonomy
+           - target: What the action applies to
+           - constraints: Conditions and timing (plain language)
+           - description: Detailed comment (2-3+ sentences) explaining the obligation,
+             why it's required, when it must be fulfilled, and how to comply
+           
+           DO NOT include:
+           - assigner field
+           - assignee field
+        
+        5. CONSTRAINTS (conditions and limitations):
+           For each constraint, identify:
+           - leftOperand: What is being constrained
+           - operator: Comparison operator (eq, isAnyOf, gt, lt, etc.)
+           - rightOperand: Constraint value
+           - description: Plain English explanation (no legal citations)
+           - scope: permission|prohibition|duty
+        
+        6. DATA CONTEXT:
+           - data_categories: All data categories from guidance
+           - data_subjects: Who the data is about
+           - purpose: Purpose of processing (plain language)
+           - legal_basis: Legal basis without article citations
+        
+        7. PARTIES AND ROLES:
+           - Identify: controller, processor, data_subject, joint_controller
+           - DO NOT use: assigner, assignee
+           - Focus on who performs the action
+        
+        8. GEOGRAPHIC AND EVIDENCE:
+           - geographic_scope: Jurisdictions involved
+           - evidence_requirements: What evidence is needed
+           - verification_methods: How to verify compliance
+        
+        OUTPUT FORMAT:
+        Provide structured extraction with:
+        - All actions using standard taxonomy only
+        - Detailed comments (2-3+ sentences) for all rules
+        - No assigner/assignee fields
+        - No legal citations
+        - Plain language throughout
+        - Clear, testable conditions
+        
+        Extract comprehensively and precisely using ONLY the standard action taxonomy.
+        """
 
+    @staticmethod
+    def odrl_constraint_analysis(
+        guidance_text: str,
+        rule_name: str,
+        odrl_extraction: str
+    ) -> str:
+        """
+        Detailed constraint analysis for ODRL with plain language requirements.
+        """
+        return f"""
+        Perform detailed constraint analysis for ODRL policy creation.
+        
+        RULE: {rule_name}
+        
+        ODRL COMPONENT EXTRACTION:
+        {odrl_extraction}
+        
+        ORIGINAL GUIDANCE TEXT (verify against):
+        {guidance_text}
+        
+        CONSTRAINT ANALYSIS REQUIREMENTS:
 
-if __name__ == "__main__":
-    process_data_enrichment_and_mapping()
+        For EACH constraint identified, create precise, machine-readable structure:
+        
+        1. CONSTRAINT IDENTIFICATION:
+           - leftOperand: What is being constrained (use ODRL terms)
+           - operator: Comparison/test (eq, isAnyOf, gt, lt, etc.)
+           - rightOperand: Constraint value
+           - description: Plain English explanation (NO legal citations)
+        
+        2. CONSTRAINT CATEGORIES:
+           Identify and structure by type:
+           - Temporal: Time-based restrictions (dates, durations)
+           - Spatial: Location/jurisdiction restrictions  
+           - Purpose: Purpose-based limitations
+           - Party: Recipient/controller restrictions
+           - Quantitative: Count/amount limits
+           - Qualitative: Type/quality restrictions
+        
+        3. LOGICAL CONSISTENCY:
+           - Ensure no duplicate constraints
+           - Avoid inverse operator pairs (e.g., "eq X" and "neq X")
+           - Each constraint should appear once
+           - Use appropriate positive/negative operators
+        
+        4. PLAIN LANGUAGE DESCRIPTIONS:
+           For each constraint, provide detailed description that explains:
+           - WHAT is being constrained
+           - WHY the constraint exists
+           - WHEN it applies
+           - HOW to evaluate it
+           - Understandable by non-lawyers
+           - No legal article references
+        
+        5. SCOPE CLASSIFICATION:
+           Mark each constraint with:
+           - permission: Applies to what's allowed
+           - prohibition: Applies to what's forbidden
+           - duty: Applies to obligations
+        
+        OUTPUT:
+        Provide comprehensive constraint analysis with:
+        - Precise ODRL-compliant structure
+        - Plain language descriptions
+        - Logical consistency verified
+        - No legal citations
+        - Clear scope classifications
+        
+        Make constraints testable and implementable in code.
+        """
+
+    @staticmethod
+    def odrl_synthesis_prompt(
+        guidance_text: str,
+        rule_name: str,
+        framework_type: str,
+        restriction_condition: str,
+        initial_analysis: str,
+        odrl_extraction: str,
+        constraint_analysis: str,
+        data_categories: str
+    ) -> str:
+        """
+        Final synthesis of ODRL components with supervisor validation requirements.
+        """
+        return f"""
+        Synthesize all analyses into final ODRL components for the policy.
+        This is the FINAL OUTPUT that will be used to generate machine-readable policies.
+        
+        RULE: {rule_name}
+        FRAMEWORK: {framework_type}
+        TYPE: {restriction_condition}
+        
+        ALL ANALYSIS INPUTS:
+        
+        Initial Analysis:
+        {initial_analysis}
+        
+        ODRL Extraction:
+        {odrl_extraction}
+        
+        Constraint Analysis:
+        {constraint_analysis}
+        
+        Data Categories:
+        {data_categories}
+        
+        Original Guidance:
+        {guidance_text}
+        
+        FINAL OUTPUT REQUIREMENTS (CRITICAL):
+
+        1. ACTION TAXONOMY (MANDATORY):
+        - ALL actions MUST use: share, store, process, update, create
+        - NO other action names permitted
+        - Verify all synonyms have been mapped correctly
+        
+        2. NO ASSIGNER/ASSIGNEE:
+        - Completely remove assigner and assignee fields
+        - Do NOT include them in any output structure
+        - Focus only on the performing party
+        
+        3. DETAILED COMMENTS (MANDATORY):
+        - EVERY permission must have detailed description (2-3+ sentences)
+        - EVERY prohibition must have detailed description (2-3+ sentences)
+        - EVERY duty must have detailed description (2-3+ sentences)
+        - Comments must explain: WHAT, WHY, WHEN, HOW
+        - Must be understandable by both lawyers and non-lawyers
+        
+        4. NO LEGAL CITATIONS:
+        - Remove all article numbers and legal references
+        - Use plain, actionable language
+        - Focus on requirements, not legal sources
+        
+        5. SUPERVISOR VALIDATION:
+        The output will be reviewed by a supervisor agent to ensure:
+        - Correct action taxonomy usage
+        - No assigner/assignee fields present
+        - All comments are sufficiently detailed
+        - All conditions are clear and testable
+        - Logical consistency is maintained
+        
+        SYNTHESIS STRUCTURE:
+        
+        Return a JSON object with this exact structure:
+        {{
+          "analysis_reasoning": "Brief explanation of the synthesis process",
+          "confidence_score": 0.0-1.0,
+          
+          "actions": [
+            "List of standard actions: share, store, process, update, create"
+          ],
+          
+          "permissions": [
+            {{
+              "action": "standard action (share/store/process/update/create)",
+              "target": "what the action applies to",
+              "constraints": [
+                {{
+                  "leftOperand": "constraint type",
+                  "operator": "comparison operator",
+                  "rightOperand": "value",
+                  "description": "Detailed plain language explanation (2-3+ sentences)"
+                }}
+              ],
+              "duties": ["obligations to fulfill"],
+              "description": "DETAILED explanation (2-3+ sentences): what is permitted, why it's allowed, when it applies, how to comply"
+            }}
+          ],
+          
+          "prohibitions": [
+            {{
+              "action": "standard action (share/store/process/update/create)",
+              "target": "what the action applies to",
+              "constraints": [
+                {{
+                  "leftOperand": "constraint type",
+                  "operator": "operator",
+                  "rightOperand": "value",
+                  "description": "Detailed plain language explanation (2-3+ sentences)"
+                }}
+              ],
+              "description": "DETAILED explanation (2-3+ sentences): what is prohibited, why, when, and consequences"
+            }}
+          ],
+          
+          "duties": [
+            {{
+              "action": "standard action (share/store/process/update/create)",
+              "target": "what the action applies to",
+              "constraints": [],
+              "description": "DETAILED explanation (2-3+ sentences): what must be done, why, when, how"
+            }}
+          ],
+          
+          "constraints": [
+            {{
+              "leftOperand": "what is constrained",
+              "operator": "operator",
+              "rightOperand": "value",
+              "description": "detailed explanation",
+              "scope": "permission|prohibition|duty"
+            }}
+          ],
+          
+          "data_categories": ["all identified data categories"],
+          "data_subjects": ["who data is about"],
+          "parties": {{
+            "controller": ["controllers"],
+            "processor": ["processors"],
+            "data_subject": ["data subjects"]
+          }},
+          
+          "purpose": "purpose in plain language",
+          "legal_basis": "legal basis without article citations",
+          "geographic_scope": ["jurisdictions"],
+          "evidence_requirements": ["evidence needed"],
+          "verification_methods": ["how to verify"]
+        }}
+        
+        CRITICAL VALIDATION BEFORE OUTPUT:
+        ✓ All actions use standard taxonomy (share/store/process/update/create)
+        ✓ NO assigner or assignee fields anywhere
+        ✓ ALL permissions/prohibitions/duties have detailed descriptions (2-3+ sentences)
+        ✓ NO legal article citations
+        ✓ All conditions in plain, testable language
+        ✓ Comments understandable by non-lawyers
+        ✓ DataVisa references converted to general principles if present
+        
+        Return ONLY valid JSON. The supervisor agent will verify all requirements are met.
+        """
+
+    @staticmethod
+    def supervisor_review_prompt(
+        extracted_components: str,
+        original_guidance: str,
+        rule_name: str
+    ) -> str:
+        """
+        Supervisor agent review to validate and correct extracted ODRL components.
+        Ensures action taxonomy compliance, detailed comments, and no assigner/assignee.
+        """
+        return f"""
+        You are a SUPERVISOR AGENT reviewing extracted ODRL components for correctness and completeness.
+        Your role is to validate and correct the extraction to ensure it meets all requirements.
+        
+        RULE: {rule_name}
+        
+        ORIGINAL GUIDANCE:
+        {original_guidance}
+        
+        EXTRACTED COMPONENTS TO REVIEW:
+        {extracted_components}
+        
+        MANDATORY VALIDATION CHECKLIST:
+
+        1. ACTION TAXONOMY COMPLIANCE:
+        ✓ ALL actions must be EXACTLY one of: share, store, process, update, create
+        ✓ NO synonyms or variations (transfer→share, use→process, collect→create, etc.)
+        ✓ Check permissions, prohibitions, and duties
+        ✓ If incorrect actions found, map them to correct standard action
+        
+        CORRECTIONS NEEDED:
+        - List any incorrect actions found
+        - Provide correct mappings
+        - Update all instances
+        
+        2. ASSIGNER/ASSIGNEE REMOVAL:
+        ✓ NO "assigner" fields anywhere
+        ✓ NO "assignee" fields anywhere
+        ✓ Check all permissions, prohibitions, duties
+        ✓ If found, remove completely
+        
+        CORRECTIONS NEEDED:
+        - List where assigner/assignee fields were found
+        - Confirm removal
+        
+        3. DETAILED COMMENTS VALIDATION:
+        ✓ Every permission has 2-3+ sentence description
+        ✓ Every prohibition has 2-3+ sentence description
+        ✓ Every duty has 2-3+ sentence description
+        ✓ Comments explain: WHAT, WHY, WHEN, HOW
+        ✓ Language accessible to non-lawyers
+        
+        CORRECTIONS NEEDED:
+        - List any insufficient comments
+        - Provide enhanced versions (2-3+ sentences each)
+        - Ensure clarity for both lawyers and non-lawyers
+        
+        4. LEGAL CITATION REMOVAL:
+        ✓ NO article numbers (Article X, Section Y, etc.)
+        ✓ NO legal document references
+        ✓ All requirements in plain language
+        ✓ Check descriptions, comments, conditions
+        
+        CORRECTIONS NEEDED:
+        - List any legal citations found
+        - Provide plain language alternatives
+        
+        5. CONDITION CLARITY:
+        ✓ All constraints have clear descriptions
+        ✓ Conditions are testable and concrete
+        ✓ No ambiguous or vague conditions
+        ✓ Plain language explanations present
+        
+        CORRECTIONS NEEDED:
+        - List any unclear conditions
+        - Provide clarified versions
+        
+        6. LOGICAL CONSISTENCY:
+        ✓ No duplicate constraints
+        ✓ No inverse operator pairs
+        ✓ Each constraint appears exactly once
+        ✓ Operators are semantically correct
+        
+        CORRECTIONS NEEDED:
+        - List any logical inconsistencies
+        - Provide corrections
+        
+        SUPERVISOR OUTPUT STRUCTURE:
+        {{
+          "validation_summary": {{
+            "action_taxonomy_compliant": true/false,
+            "assigner_assignee_removed": true/false,
+            "comments_detailed": true/false,
+            "legal_citations_removed": true/false,
+            "conditions_clear": true/false,
+            "logically_consistent": true/false
+          }},
+          
+          "corrections_made": {{
+            "action_corrections": ["list of action mappings corrected"],
+            "fields_removed": ["assigner", "assignee"] or [],
+            "comments_enhanced": ["list of elements where comments were improved"],
+            "citations_removed": ["list of legal references converted to plain language"],
+            "conditions_clarified": ["list of conditions improved"],
+            "logical_fixes": ["list of logical inconsistencies resolved"]
+          }},
+          
+          "corrected_components": {{
+            // Full corrected ODRL components structure
+            // With ALL corrections applied
+            // Same structure as input but validated and corrected
+          }},
+          
+          "supervisor_notes": "Summary of all changes made and why"
+        }}
+        
+        VALIDATION RULES:
+        - Be thorough and strict in validation
+        - Make all necessary corrections
+        - Enhance insufficient comments to 2-3+ sentences
+        - Ensure action taxonomy compliance
+        - Remove all assigner/assignee references
+        - Convert all legal citations to plain language
+        - Make all conditions clear and testable
+        
+        Return ONLY valid JSON with complete validation results and corrected components.
+        The corrected components will be used as the final ODRL policy.
+        """
