@@ -11,6 +11,8 @@ from typing import Dict, List, Optional, Any
 from enum import Enum
 import json
 from dataclasses import dataclass, field
+import logging
+import re
 
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
@@ -22,8 +24,10 @@ from src.prompting.advanced_strategies import (
     ReasoningMode
 )
 from src.services.openai_service import OpenAIService
-from src.utils.document_chunker import DocumentChunker  # CORRECTED IMPORT PATH
+from src.utils.document_chunker import DocumentChunker
 from src.config import Config
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -61,8 +65,8 @@ class AnalysisState:
     completed: bool = False
     iteration: int = 0
     max_iterations: int = 5
-    refinement_count: int = 0  # Track refinement attempts
-    max_refinements: int = 1   # Limit refinements
+    refinement_count: int = 0
+    max_refinements: int = 1
     
     # Final output
     final_analysis: Dict[str, Any] = field(default_factory=dict)
@@ -96,10 +100,13 @@ class LegalDocumentAnalyzer:
         )
         self.strategies = None  # Will be initialized per document
         
-        # OPTIMIZED: Use smaller chunk size from Config
+        # OPTIMIZED: Use chunk size from Config or default
+        chunk_size = getattr(self.config, 'CHUNK_SIZE', 4000)
+        overlap_size = getattr(self.config, 'OVERLAP_SIZE', 300)
+        
         self.chunker = DocumentChunker(
-            chunk_size=self.config.CHUNK_SIZE,  # Now 4000 instead of 8000
-            chunk_overlap=self.config.OVERLAP_SIZE,  # Now 300 instead of 500
+            chunk_size=chunk_size,
+            chunk_overlap=overlap_size,
             respect_boundaries=True
         )
         
@@ -181,31 +188,24 @@ class LegalDocumentAnalyzer:
         system_prompt = self.strategies.get_react_agent_system_prompt()
         state.messages = [SystemMessage(content=system_prompt)]
         
-        # Add context message (OPTIMIZED: Brief)
-        context_parts = [
-            f"Analyzing Level {state.level} document",
-            f"Chunks: {len(state.chunks)}",
-            f"Length: {len(state.document_text)} chars"
-        ]
-        
-        if state.enterprise_context:
-            org = state.enterprise_context.get('organization', 'N/A')
-            context_parts.append(f"Enterprise: {org}")
-        
-        if state.previous_level_analysis:
-            context_parts.append("Previous level context available")
-        
-        context_msg = "\n".join(context_parts)
-        state.messages.append(HumanMessage(content=context_msg))
-        
-        # Reset chunk index
-        state.current_chunk_index = 0
-        
         return state
     
     def prepare_chunk(self, state: AnalysisState) -> AnalysisState:
-        """Prepare next chunk for analysis"""
-        # Reset per-chunk state
+        """Prepare to analyze the current chunk"""
+        # CRITICAL: Bounds checking
+        if state.current_chunk_index >= len(state.chunks):
+            print(f"    All chunks processed")
+            state.completed = True
+            return state
+        
+        chunk = state.chunks[state.current_chunk_index]
+        chunk_id = chunk.get("chunk_id", state.current_chunk_index)
+        total_chunks = len(state.chunks)
+        
+        print(f"\n  Analyzing chunk {chunk_id + 1}/{total_chunks}")
+        
+        # Reset iteration and extraction for new chunk
+        state.iteration = 0
         state.rule_description = ""
         state.user_actions = []
         state.system_actions = []
@@ -213,33 +213,18 @@ class LegalDocumentAnalyzer:
         state.system_duties = []
         state.constraints = []
         state.rule_type = ""
-        state.iteration = 0
         state.completed = False
-        state.thoughts = []
-        state.actions_taken = []
-        state.observations = []
         
-        chunk = state.chunks[state.current_chunk_index]
-        chunk_context = self.chunker.get_chunk_context(chunk)
-        
-        print(f"\n  Processing chunk {state.current_chunk_index + 1}/{len(state.chunks)}")
-        print(f"    {chunk_context}")
-        print(f"    Chunk size: {len(chunk['text'])} chars")
-        
-        # Add chunk to messages (OPTIMIZED: Concise format)
-        chunk_msg = f"""{chunk_context}
-
-TEXT:
-{chunk['text']}
-
-Analyze this chunk thoroughly for rules, actions, duties, and constraints."""
-        
+        # Add chunk context message (OPTIMIZED)
+        chunk_ctx = self.chunker.get_chunk_context(chunk)
+        chunk_msg = f"Analyzing {chunk_ctx}"
         state.messages.append(HumanMessage(content=chunk_msg))
         
         # OPTIMIZATION: Trim message history to prevent context overflow
-        if len(state.messages) > Config.MAX_MESSAGE_HISTORY:
+        max_history = getattr(self.config, 'MAX_MESSAGE_HISTORY', 20)
+        if len(state.messages) > max_history:
             system_msg = state.messages[0]
-            recent_msgs = state.messages[-Config.MAX_MESSAGE_HISTORY+1:]
+            recent_msgs = state.messages[-max_history+1:]
             state.messages = [system_msg] + recent_msgs
         
         return state
@@ -462,37 +447,26 @@ Findings:
 - System actions: {len(state.final_analysis.get('system_actions', []))}
 - Constraints: {len(state.final_analysis.get('constraints', []))}
 
-Is this complete and comprehensive? Respond with JSON:
-{{"complete": true/false, "issues": ["..."], "improvements": {{...}}}}"""
-        
-        reflection_messages = [
-            SystemMessage(content=self.strategies.get_react_agent_system_prompt()),
-            HumanMessage(content=reflection_prompt)
-        ]
-        
-        response = self.llm.invoke(reflection_messages)
+Is this complete and comprehensive? If improvements needed, provide JSON with enhanced fields."""
         
         try:
-            reflection = self._parse_json_response(response.content)
+            state.messages.append(HumanMessage(content=reflection_prompt))
+            response = self.llm.invoke(state.messages)
+            state.messages.append(response)
             
-            if reflection.get("complete") is False and reflection.get("improvements"):
-                print(f"  Reflection identified improvements (attempt {state.refinement_count + 1}/{state.max_refinements})...")
-                state.completed = False
-                state.refinement_count += 1
-                
-                # Apply improvements
-                improvements = reflection.get("improvements", {})
-                for key, value in improvements.items():
-                    if key in state.final_analysis and value:
-                        if isinstance(value, list):
-                            state.final_analysis[key].extend(value)
-                            state.final_analysis[key] = sorted(list(set(state.final_analysis[key])))
-                        elif key == "description" and value:
-                            state.final_analysis["description"] = value
-            else:
-                print(f"  ✓ Reflection confirms analysis is complete")
-                state.completed = True
-                
+            # Check if refinements suggested
+            if "json" in response.content.lower() or "{" in response.content:
+                try:
+                    refinements = self._parse_json_response(response.content)
+                    if refinements and len(refinements) > 2:
+                        state.final_analysis.update(refinements)
+                        state.refinement_count += 1
+                        print(f"    Applied refinements")
+                except:
+                    pass
+            
+            state.completed = True
+            
         except Exception as e:
             print(f"    Note: Reflection issue: {str(e)}, proceeding")
             state.completed = True
@@ -565,7 +539,6 @@ Is this complete and comprehensive? Respond with JSON:
         
         try:
             # Strategy 2: Extract from markdown code blocks
-            import re
             json_match = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL)
             if json_match:
                 return json.loads(json_match.group(1))
@@ -573,34 +546,18 @@ Is this complete and comprehensive? Respond with JSON:
             pass
         
         try:
-            # Strategy 3: Extract from plain code blocks
-            import re
-            json_match = re.search(r'```\s*(.*?)\s*```', text, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group(1))
-        except:
-            pass
-        
-        try:
-            # Strategy 4: Find first JSON object
-            import re
+            # Strategy 3: Find JSON object
             json_match = re.search(r'\{.*\}', text, re.DOTALL)
             if json_match:
                 return json.loads(json_match.group(0))
         except:
             pass
         
-        raise ValueError("No valid JSON found in response")
+        # Fallback: empty dict
+        return {}
     
     def _extract_structured_info(self, text: str) -> Dict[str, Any]:
-        """Extract structured information from text with pattern matching fallback"""
-        try:
-            # Try JSON parsing first
-            return self._parse_json_response(text)
-        except:
-            pass
-        
-        # Fallback: Pattern matching extraction
+        """Extract structured information from LLM response"""
         result = {
             "description": "",
             "user_actions": [],
@@ -608,10 +565,15 @@ Is this complete and comprehensive? Respond with JSON:
             "user_duties": [],
             "system_duties": [],
             "constraints": [],
-            "rule_type": "",
-            "confidence": "medium"
+            "rule_type": ""
         }
         
+        # Try to parse as JSON first
+        parsed = self._parse_json_response(text)
+        if parsed:
+            return {**result, **parsed}
+        
+        # Fallback: Extract from structured text
         lines = text.split('\n')
         current_section = None
         
@@ -620,31 +582,29 @@ Is this complete and comprehensive? Respond with JSON:
             if not line:
                 continue
             
-            # Detect sections
-            if "description" in line.lower() and ":" in line:
+            # Identify sections
+            if "description:" in line.lower():
                 current_section = "description"
-                result["description"] = line.split(":", 1)[1].strip()
+                desc = line.split(":", 1)[1].strip()
+                if desc:
+                    result["description"] = desc
             elif "user action" in line.lower():
                 current_section = "user_actions"
-                result["user_actions"] = []
             elif "system action" in line.lower():
                 current_section = "system_actions"
-                result["system_actions"] = []
             elif "user dut" in line.lower():
                 current_section = "user_duties"
-                result["user_duties"] = []
             elif "system dut" in line.lower():
                 current_section = "system_duties"
-                result["system_duties"] = []
-            elif "constraint" in line.lower() or "condition" in line.lower():
+            elif "constraint" in line.lower():
                 current_section = "constraints"
-                result["constraints"] = []
-            elif "rule type" in line.lower() or "classification" in line.lower():
-                if "permission" in line.lower():
+            elif "rule type:" in line.lower():
+                rule_type = line.split(":", 1)[1].strip().lower()
+                if "permission" in rule_type:
                     result["rule_type"] = "permission"
-                elif "prohibition" in line.lower():
+                elif "prohibition" in rule_type:
                     result["rule_type"] = "prohibition"
-                elif "obligation" in line.lower():
+                elif "obligation" in rule_type:
                     result["rule_type"] = "obligation"
             elif current_section and (line.startswith("-") or line.startswith("•") or line.startswith("*")):
                 # List item
@@ -672,15 +632,6 @@ Is this complete and comprehensive? Respond with JSON:
         CRITICAL: Complete document processed via chunking, no truncation
         OPTIMIZED: Token-efficient processing
         """
-        # OPTIMIZATION: Summarize previous level if provided
-        prev_summary = None
-        if previous_level_analysis:
-            try:
-                prev_dict = json.loads(previous_level_analysis)
-                prev_summary = self.chunker.summarize_analysis(prev_dict, Config.MAX_SYNTHESIS_CONTEXT)
-            except:
-                prev_summary = previous_level_analysis[:Config.MAX_SYNTHESIS_CONTEXT]
-        
         # Create initial state
         state = AnalysisState(
             rule_name=rule_name,
@@ -688,7 +639,7 @@ Is this complete and comprehensive? Respond with JSON:
             document_text=document_text,
             level=level,
             enterprise_context=enterprise_context,
-            previous_level_analysis=prev_summary
+            previous_level_analysis=previous_level_analysis
         )
         
         # Create and run workflow
@@ -728,8 +679,11 @@ Is this complete and comprehensive? Respond with JSON:
             enterprise_context=enterprise_context
         )
         
-        # OPTIMIZATION: Pass only summary to level 2
-        level_1_summary = self.chunker.summarize_analysis(level_1_analysis)
+        # OPTIMIZATION: Summarize for level 2
+        level_1_summary = json.dumps({
+            "description": level_1_analysis.get("description", "")[:500],
+            "key_actions": level_1_analysis.get("user_actions", [])[:5]
+        })
         
         print(f"\n{'='*80}")
         print(f"Analyzing Level 2 document (length: {len(level_2_text)} chars)...")
@@ -740,11 +694,14 @@ Is this complete and comprehensive? Respond with JSON:
             document_text=level_2_text,
             level=2,
             enterprise_context=enterprise_context,
-            previous_level_analysis=json.dumps({"level_1_summary": level_1_summary})
+            previous_level_analysis=level_1_summary
         )
         
-        # OPTIMIZATION: Pass only summary to level 3
-        level_2_summary = self.chunker.summarize_analysis(level_2_analysis)
+        # OPTIMIZATION: Summarize for level 3
+        level_2_summary = json.dumps({
+            "description": level_2_analysis.get("description", "")[:500],
+            "key_actions": level_2_analysis.get("user_actions", [])[:5]
+        })
         
         print(f"\n{'='*80}")
         print(f"Analyzing Level 3 document (length: {len(level_3_text)} chars)...")
@@ -755,10 +712,7 @@ Is this complete and comprehensive? Respond with JSON:
             document_text=level_3_text,
             level=3,
             enterprise_context=enterprise_context,
-            previous_level_analysis=json.dumps({
-                "level_1_summary": level_1_summary,
-                "level_2_summary": level_2_summary
-            })
+            previous_level_analysis=level_2_summary
         )
         
         # Synthesize all levels with OPTIMIZED prompt
@@ -769,7 +723,10 @@ Is this complete and comprehensive? Respond with JSON:
         synthesis_prompt = self.strategies.get_multi_level_synthesis_prompt(
             level_1_analysis=level_1_summary,
             level_2_analysis=level_2_summary,
-            level_3_analysis=self.chunker.summarize_analysis(level_3_analysis)
+            level_3_analysis=json.dumps({
+                "description": level_3_analysis.get("description", "")[:500],
+                "key_actions": level_3_analysis.get("user_actions", [])[:5]
+            })
         )
         
         messages = [
