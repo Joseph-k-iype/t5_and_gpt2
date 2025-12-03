@@ -1,365 +1,781 @@
 """
-Legal Summary Pipeline
-Main orchestrator for generating legal summary Word documents from legislation PDFs
+Legal Document Analyzer using ReAct Agents
+Processes legal documents with advanced reasoning and action patterns
+CRITICAL: No document truncation - uses intelligent chunking for complete coverage
 """
 
+from typing import Dict, List, Optional, Any, Annotated
+from enum import Enum
 import json
-import os
-from typing import Dict, List, Any, Optional
-from pathlib import Path
-import argparse
+from dataclasses import dataclass, field
 
-from src.processors.pdf_processor import PDFProcessor
-from src.analyzers.legal_document_analyzer import LegalDocumentAnalyzer
-from src.generators.legal_summary_generator import LegalSummaryGenerator
+from langgraph.graph import StateGraph, END
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+
+from src.prompting.advanced_strategies import (
+    AdvancedPromptingStrategies,
+    ExpertRole,
+    ReasoningMode
+)
+from src.services.openai_service import OpenAIService
+from src.utils.document_chunker import DocumentChunker
 from src.config import Config
 
-import sys
+
+@dataclass
+class AnalysisState:
+    """State for the legal document analysis workflow"""
+    rule_name: str
+    jurisdiction: str
+    document_text: str
+    level: int  # 1, 2, or 3
+    
+    # Chunking
+    chunks: List[Dict[str, Any]] = field(default_factory=list)
+    current_chunk_index: int = 0
+    chunk_analyses: List[Dict[str, Any]] = field(default_factory=list)
+    
+    # Context
+    enterprise_context: Optional[Dict[str, Any]] = None
+    previous_level_analysis: Optional[str] = None
+    
+    # Analysis components
+    thoughts: List[str] = field(default_factory=list)
+    actions_taken: List[str] = field(default_factory=list)
+    observations: List[str] = field(default_factory=list)
+    
+    # Extracted information (for current chunk)
+    rule_description: str = ""
+    user_actions: List[str] = field(default_factory=list)
+    system_actions: List[str] = field(default_factory=list)
+    user_duties: List[str] = field(default_factory=list)
+    system_duties: List[str] = field(default_factory=list)
+    constraints: List[Dict[str, Any]] = field(default_factory=list)
+    rule_type: str = ""
+    
+    # Processing flags
+    completed: bool = False
+    iteration: int = 0
+    max_iterations: int = 5
+    
+    # Final output
+    final_analysis: Dict[str, Any] = field(default_factory=dict)
+    
+    # Messages for LangGraph
+    messages: List[BaseMessage] = field(default_factory=list)
 
 
-class LegalSummaryPipeline:
+class LegalDocumentAnalyzer:
     """
-    End-to-end pipeline for legal document analysis and Word document generation
+    Sophisticated legal document analyzer using ReAct pattern with LangGraph
+    CRITICAL: Uses document chunking to ensure complete coverage without truncation
     """
     
-    def __init__(
-        self,
-        metadata_file: str = "config/legislation_metadata.json",
-        output_dir: str = "output/legal_summaries",
-        config: Optional[Config] = None
-    ):
-        self.metadata_file = metadata_file
-        self.output_dir = output_dir
+    def __init__(self, config: Config = None):
         self.config = config or Config()
         
-        # Initialize components
-        self.pdf_processor = PDFProcessor()
-        self.analyzer = LegalDocumentAnalyzer(config=self.config)
-        self.generator = LegalSummaryGenerator(output_dir=output_dir)
+        # Validate API key
+        if not self.config.API_KEY:
+            raise ValueError(
+                "OPENAI_API_KEY environment variable is required. "
+                "Please set it using: export OPENAI_API_KEY='your-api-key'"
+            )
         
-        # Load metadata
-        self.metadata = self._load_metadata()
+        self.openai_service = OpenAIService()
+        self.llm = ChatOpenAI(
+            model=self.config.CHAT_MODEL,
+            openai_api_key=self.config.API_KEY,
+            openai_api_base=self.config.BASE_URL
+        )
+        self.strategies = None  # Will be initialized per document
+        self.chunker = DocumentChunker(
+            chunk_size=8000,
+            chunk_overlap=500,
+            respect_boundaries=True
+        )
         
-        print(f"Initialized Legal Summary Pipeline")
-        print(f"Loaded {len(self.metadata)} rules from metadata")
+    def create_workflow(self) -> StateGraph:
+        """Create the ReAct workflow graph"""
+        workflow = StateGraph(AnalysisState)
+        
+        # Add nodes
+        workflow.add_node("initialize", self.initialize_analysis)
+        workflow.add_node("prepare_chunk", self.prepare_chunk)
+        workflow.add_node("reason", self.reason_step)
+        workflow.add_node("act", self.act_step)
+        workflow.add_node("observe", self.observe_step)
+        workflow.add_node("synthesize_chunk", self.synthesize_chunk_step)
+        workflow.add_node("merge_chunks", self.merge_chunks_step)
+        workflow.add_node("reflect", self.reflect_step)
+        workflow.add_node("finalize", self.finalize_step)
+        
+        # Add edges
+        workflow.set_entry_point("initialize")
+        workflow.add_edge("initialize", "prepare_chunk")
+        workflow.add_edge("prepare_chunk", "reason")
+        workflow.add_conditional_edges(
+            "reason",
+            self.should_continue_reasoning,
+            {
+                "act": "act",
+                "synthesize_chunk": "synthesize_chunk"
+            }
+        )
+        workflow.add_edge("act", "observe")
+        workflow.add_edge("observe", "reason")
+        workflow.add_conditional_edges(
+            "synthesize_chunk",
+            self.should_process_next_chunk,
+            {
+                "prepare_chunk": "prepare_chunk",
+                "merge_chunks": "merge_chunks"
+            }
+        )
+        workflow.add_edge("merge_chunks", "reflect")
+        workflow.add_conditional_edges(
+            "reflect",
+            self.should_refine,
+            {
+                "prepare_chunk": "prepare_chunk",
+                "finalize": "finalize"
+            }
+        )
+        workflow.add_edge("finalize", END)
+        
+        return workflow.compile()
     
-    def _load_metadata(self) -> Dict[str, Any]:
-        """Load legislation metadata from JSON file"""
+    def initialize_analysis(self, state: AnalysisState) -> AnalysisState:
+        """Initialize the analysis with system prompt and chunk the document"""
+        self.strategies = AdvancedPromptingStrategies(
+            rule_name=state.rule_name,
+            jurisdiction=state.jurisdiction
+        )
+        
+        # Chunk the document (CRITICAL: No truncation)
+        print(f"  Chunking document (length: {len(state.document_text)} chars)...")
+        state.chunks = self.chunker.chunk_document(
+            text=state.document_text,
+            metadata={
+                "rule_name": state.rule_name,
+                "jurisdiction": state.jurisdiction,
+                "level": state.level
+            }
+        )
+        
+        print(f"  Created {len(state.chunks)} chunks for complete coverage")
+        
+        system_prompt = self.strategies.get_react_agent_system_prompt()
+        state.messages = [SystemMessage(content=system_prompt)]
+        
+        # Add document context
+        context_msg = f"""Beginning analysis of Level {state.level} document for rule: "{state.rule_name}"
+Jurisdiction: {state.jurisdiction}
+Document length: {len(state.document_text)} characters
+Total chunks: {len(state.chunks)} (complete coverage, no truncation)"""
+        
+        if state.enterprise_context:
+            context_msg += f"\nEnterprise context: {json.dumps(state.enterprise_context, indent=2)}"
+        
+        if state.previous_level_analysis:
+            context_msg += f"\n\nPrevious level analysis available for reference."
+        
+        state.messages.append(HumanMessage(content=context_msg))
+        state.current_chunk_index = 0
+        
+        return state
+    
+    def prepare_chunk(self, state: AnalysisState) -> AnalysisState:
+        """Prepare the next chunk for analysis"""
+        # Reset per-chunk state
+        state.rule_description = ""
+        state.user_actions = []
+        state.system_actions = []
+        state.user_duties = []
+        state.system_duties = []
+        state.constraints = []
+        state.rule_type = ""
+        state.iteration = 0
+        state.completed = False
+        state.thoughts = []
+        state.actions_taken = []
+        state.observations = []
+        
+        chunk = state.chunks[state.current_chunk_index]
+        chunk_context = self.chunker.get_chunk_context(chunk)
+        
+        print(f"\n  Processing chunk {state.current_chunk_index + 1}/{len(state.chunks)}")
+        print(f"    {chunk_context}")
+        print(f"    Chunk size: {len(chunk['text'])} chars")
+        
+        # Add chunk context to messages
+        chunk_msg = f"""
+{chunk_context}
+
+CHUNK TEXT:
+{chunk['text']}
+
+Analyze this chunk thoroughly. Remember that this is part of a larger document, 
+so focus on extracting complete information from this section."""
+        
+        state.messages.append(HumanMessage(content=chunk_msg))
+        
+        return state
+    
+    def reason_step(self, state: AnalysisState) -> AnalysisState:
+        """Reasoning step - decide what to analyze next"""
+        state.iteration += 1
+        
+        if state.iteration > state.max_iterations:
+            state.completed = True
+            return state
+        
+        # Get current chunk
+        chunk = state.chunks[state.current_chunk_index]
+        
+        # Determine what aspect to analyze based on what's missing
+        missing_components = []
+        if not state.rule_description:
+            missing_components.append("rule description")
+        if not state.user_actions:
+            missing_components.append("user actions")
+        if not state.system_actions:
+            missing_components.append("system actions")
+        if not state.constraints:
+            missing_components.append("constraints")
+        if not state.rule_type:
+            missing_components.append("rule type classification")
+        
+        if not missing_components:
+            state.completed = True
+            return state
+        
+        # Use different prompting strategies based on iteration
+        chunk_text = chunk['text']
+        chunk_context = self.chunker.get_chunk_context(chunk)
+        
+        # Add information about previous chunks if applicable
+        previous_chunk_info = ""
+        if state.chunk_analyses:
+            previous_chunk_info = f"\n\nPrevious chunks have identified:\n"
+            if state.chunk_analyses[-1].get("user_actions"):
+                previous_chunk_info += f"- User actions: {len(state.chunk_analyses[-1]['user_actions'])} found\n"
+            if state.chunk_analyses[-1].get("constraints"):
+                previous_chunk_info += f"- Constraints: {len(state.chunk_analyses[-1]['constraints'])} found\n"
+            previous_chunk_info += "Build upon these findings with any new information from this chunk."
+        
+        if state.iteration == 1:
+            # First iteration: Chain of Thought
+            prompt = self.strategies.get_chain_of_thought_prompt(
+                document_text=chunk_text,
+                analysis_type=f"Extract {', '.join(missing_components)}",
+                context=state.enterprise_context,
+                chunk_info=chunk_context
+            )
+            prompt = f"{prompt}{previous_chunk_info}"
+        elif state.iteration == 2:
+            # Second iteration: Mixture of Experts
+            prompt = self.strategies.get_mixture_of_experts_prompt(
+                document_text=chunk_text,
+                expert_roles=[ExpertRole.LEGAL_EXPERT, ExpertRole.COMPLIANCE_OFFICER, ExpertRole.DATA_PRIVACY_SPECIALIST],
+                chunk_info=chunk_context
+            )
+            prompt = f"{prompt}{previous_chunk_info}"
+        else:
+            # Later iterations: Dynamic contextualized
+            prompt = self.strategies.get_dynamic_contextualized_prompt(
+                document_text=chunk_text,
+                previous_analyses=[state.previous_level_analysis] if state.previous_level_analysis else None,
+                enterprise_context=state.enterprise_context,
+                chunk_info=chunk_context
+            )
+            prompt = f"{prompt}{previous_chunk_info}"
+        
+        state.messages.append(HumanMessage(content=prompt))
+        
+        # Get LLM response
+        response = self.llm.invoke(state.messages)
+        state.messages.append(response)
+        
+        # Store thought
+        state.thoughts.append(response.content)
+        
+        return state
+    
+    def act_step(self, state: AnalysisState) -> AnalysisState:
+        """Action step - extract specific information"""
+        action = "extract_comprehensive_analysis"
+        state.actions_taken.append(action)
+        return state
+    
+    def observe_step(self, state: AnalysisState) -> AnalysisState:
+        """Observation step - process and store extracted information"""
+        last_response = state.messages[-1].content if state.messages else ""
+        
+        # Extract structured information from the response
+        extracted = self._extract_structured_info(last_response)
+        
+        if extracted.get("description"):
+            state.rule_description = extracted["description"]
+        
+        if extracted.get("user_actions"):
+            state.user_actions.extend(extracted["user_actions"])
+        
+        if extracted.get("system_actions"):
+            state.system_actions.extend(extracted["system_actions"])
+        
+        if extracted.get("user_duties"):
+            state.user_duties.extend(extracted["user_duties"])
+        
+        if extracted.get("system_duties"):
+            state.system_duties.extend(extracted["system_duties"])
+        
+        if extracted.get("constraints"):
+            state.constraints.extend(extracted["constraints"])
+        
+        if extracted.get("rule_type"):
+            state.rule_type = extracted["rule_type"]
+        
+        state.observations.append(f"Extracted information: {json.dumps(extracted, indent=2)}")
+        
+        return state
+    
+    def synthesize_chunk_step(self, state: AnalysisState) -> AnalysisState:
+        """Synthesize current chunk analysis"""
+        chunk = state.chunks[state.current_chunk_index]
+        
+        synthesis_prompt = f"""Based on your analysis of chunk {state.current_chunk_index + 1}/{len(state.chunks)}, 
+provide a structured summary of what you found in THIS chunk:
+
+RULE: {state.rule_name}
+JURISDICTION: {state.jurisdiction}
+LEVEL: {state.level}
+CHUNK: {state.current_chunk_index + 1} of {len(state.chunks)}
+
+Provide a JSON-formatted response with what you found in this chunk:
+{{
+    "description": "Any rule description or explanation found in this chunk",
+    "user_actions": ["actions found in this chunk"],
+    "system_actions": ["actions found in this chunk"],
+    "user_duties": ["duties found in this chunk"],
+    "system_duties": ["duties found in this chunk"],
+    "constraints": [
+        {{"type": "constraint_type", "description": "constraint detail"}},
+        ...
+    ],
+    "rule_type": "permission/prohibition/obligation/combination if determinable",
+    "confidence": "high/medium/low",
+    "chunk_summary": "Brief summary of this chunk's contribution"
+}}
+
+Be specific to this chunk's content."""
+        
+        state.messages.append(HumanMessage(content=synthesis_prompt))
+        response = self.llm.invoke(state.messages)
+        state.messages.append(response)
+        
+        # Parse the synthesis
         try:
-            with open(self.metadata_file, 'r', encoding='utf-8') as f:
-                metadata = json.load(f)
-            return metadata
-        except FileNotFoundError:
-            print(f"Warning: Metadata file not found: {self.metadata_file}")
-            return {}
-        except json.JSONDecodeError as e:
-            print(f"Error parsing metadata JSON: {str(e)}")
-            return {}
-    
-    def _detect_enterprise_context(self, text: str) -> Optional[Dict[str, Any]]:
-        """
-        Detect enterprise-specific context from document text
-        """
-        context = {}
-        
-        # Detect organization
-        if "HSBC" in text or "hsbc" in text.lower():
-            context["organization"] = "HSBC"
-        
-        # Detect internal tools
-        tools = []
-        if "DataVisa" in text or "datavisa" in text.lower():
-            tools.append("DataVisa")
-        if "DataHub" in text or "datahub" in text.lower():
-            tools.append("DataHub")
-        if "PrivacyHub" in text or "privacyhub" in text.lower():
-            tools.append("PrivacyHub")
-        
-        if tools:
-            context["internal_tools"] = tools
-        
-        # Detect if this is an enterprise policy
-        if context.get("organization"):
-            context["is_enterprise_policy"] = True
-        
-        return context if context else None
-    
-    def _extract_pdf_text(self, pdf_path: str) -> str:
-        """Extract text from a PDF file"""
-        try:
-            if not os.path.exists(pdf_path):
-                print(f"Warning: PDF file not found: {pdf_path}")
-                return ""
-            
-            # Use the correct method name from PDFProcessor
-            text = self.pdf_processor.extract_text_from_pdf(pdf_path)
-            return text
+            chunk_analysis = self._parse_json_response(response.content)
         except Exception as e:
-            print(f"Error extracting text from {pdf_path}: {str(e)}")
-            return ""
+            # Fallback: structure what we have
+            chunk_analysis = {
+                "description": state.rule_description,
+                "user_actions": list(set(state.user_actions)),
+                "system_actions": list(set(state.system_actions)),
+                "user_duties": list(set(state.user_duties)),
+                "system_duties": list(set(state.system_duties)),
+                "constraints": state.constraints,
+                "rule_type": state.rule_type,
+                "confidence": "medium",
+                "chunk_summary": f"Chunk {state.current_chunk_index + 1} analysis"
+            }
+        
+        # Add chunk metadata
+        chunk_analysis["chunk_id"] = state.current_chunk_index
+        chunk_analysis["chunk_position"] = f"{state.current_chunk_index + 1}/{len(state.chunks)}"
+        
+        state.chunk_analyses.append(chunk_analysis)
+        
+        print(f"    ✓ Chunk {state.current_chunk_index + 1} analysis complete")
+        if chunk_analysis.get("user_actions"):
+            print(f"      Found {len(chunk_analysis['user_actions'])} user actions")
+        if chunk_analysis.get("constraints"):
+            print(f"      Found {len(chunk_analysis['constraints'])} constraints")
+        
+        return state
     
-    def process_rule(
+    def merge_chunks_step(self, state: AnalysisState) -> AnalysisState:
+        """Merge analyses from all chunks"""
+        print(f"\n  Merging analyses from {len(state.chunk_analyses)} chunks...")
+        
+        # Use chunker's merge method
+        merged_analysis = self.chunker.merge_chunk_analyses(state.chunk_analyses)
+        
+        # Add comprehensive synthesis using LLM
+        synthesis_prompt = f"""You have analyzed {len(state.chunks)} chunks of a document. 
+Here are the findings from each chunk:
+
+"""
+        for i, chunk_analysis in enumerate(state.chunk_analyses, 1):
+            synthesis_prompt += f"\nCHUNK {i}:\n{json.dumps(chunk_analysis, indent=2)}\n"
+        
+        synthesis_prompt += f"""
+
+Now provide a COMPREHENSIVE synthesis that combines all chunks into a single coherent analysis:
+
+{{
+    "description": "Complete, comprehensive description synthesizing all chunks",
+    "user_actions": ["all unique user actions from all chunks"],
+    "system_actions": ["all unique system actions from all chunks"],
+    "user_duties": ["all unique user duties from all chunks"],
+    "system_duties": ["all unique system duties from all chunks"],
+    "constraints": [
+        {{"type": "type", "description": "all unique constraints"}},
+        ...
+    ],
+    "rule_type": "overall classification",
+    "confidence": "overall confidence level",
+    "synthesis_notes": "How the chunks fit together and any patterns observed"
+}}"""
+        
+        # Use fresh message context for synthesis
+        synthesis_messages = [
+            SystemMessage(content=self.strategies.get_react_agent_system_prompt()),
+            HumanMessage(content=synthesis_prompt)
+        ]
+        
+        response = self.llm.invoke(synthesis_messages)
+        
+        try:
+            llm_synthesis = self._parse_json_response(response.content)
+            # Prefer LLM synthesis for description and notes
+            merged_analysis["description"] = llm_synthesis.get("description", merged_analysis.get("description"))
+            merged_analysis["synthesis_notes"] = llm_synthesis.get("synthesis_notes", "")
+            
+            # Merge lists from LLM with chunker merge (union)
+            for key in ["user_actions", "system_actions", "user_duties", "system_duties"]:
+                llm_items = set(llm_synthesis.get(key, []))
+                chunker_items = set(merged_analysis.get(key, []))
+                merged_analysis[key] = sorted(list(llm_items.union(chunker_items)))
+            
+        except Exception as e:
+            print(f"    Note: Using automatic merge (LLM synthesis parsing failed: {str(e)})")
+        
+        state.final_analysis = merged_analysis
+        
+        print(f"  ✓ Merge complete:")
+        print(f"    Total user actions: {len(merged_analysis.get('user_actions', []))}")
+        print(f"    Total system actions: {len(merged_analysis.get('system_actions', []))}")
+        print(f"    Total constraints: {len(merged_analysis.get('constraints', []))}")
+        
+        return state
+    
+    def reflect_step(self, state: AnalysisState) -> AnalysisState:
+        """Reflect on the complete analysis"""
+        # For chunked documents, we do a lighter reflection focused on completeness
+        reflection_prompt = f"""You have analyzed a document in {len(state.chunks)} chunks and merged the results.
+
+MERGED ANALYSIS:
+{json.dumps(state.final_analysis, indent=2)}
+
+Reflection questions:
+1. COMPLETENESS: Do we have a comprehensive understanding across all chunks?
+2. CONSISTENCY: Are there any contradictions between chunks?
+3. CLARITY: Is the merged description clear and complete?
+4. COVERAGE: Did we capture all important elements?
+
+If the analysis is complete and comprehensive, confirm it.
+If something is missing or needs refinement, explain what and we'll refine.
+
+Respond with:
+{{
+    "complete": true/false,
+    "issues": ["any issues found"],
+    "improvements": {{
+        "description": "improved description if needed",
+        "additional_actions": ["any missed actions"],
+        ...
+    }}
+}}"""
+        
+        # Use fresh context for reflection
+        reflection_messages = [
+            SystemMessage(content=self.strategies.get_react_agent_system_prompt()),
+            HumanMessage(content=reflection_prompt)
+        ]
+        
+        response = self.llm.invoke(reflection_messages)
+        
+        try:
+            reflection = self._parse_json_response(response.content)
+            
+            if reflection.get("complete") is False and reflection.get("improvements"):
+                print(f"  Reflection identified improvements, refining...")
+                state.completed = False
+                
+                # Apply improvements
+                improvements = reflection.get("improvements", {})
+                for key, value in improvements.items():
+                    if key in state.final_analysis and value:
+                        if isinstance(value, list):
+                            state.final_analysis[key].extend(value)
+                            state.final_analysis[key] = sorted(list(set(state.final_analysis[key])))
+                        elif key == "description" and value:
+                            state.final_analysis["description"] = value
+            else:
+                print(f"  ✓ Reflection confirms analysis is complete")
+                state.completed = True
+                
+        except Exception as e:
+            print(f"    Note: Reflection parsing issue: {str(e)}, proceeding with current analysis")
+            state.completed = True
+        
+        return state
+    
+    def finalize_step(self, state: AnalysisState) -> AnalysisState:
+        """Finalize the analysis"""
+        # Ensure all lists are unique and sorted
+        for key in ["user_actions", "system_actions", "user_duties", "system_duties"]:
+            if state.final_analysis.get(key):
+                state.final_analysis[key] = sorted(list(set(state.final_analysis[key])))
+        
+        # Add metadata
+        state.final_analysis["metadata"] = {
+            "rule_name": state.rule_name,
+            "jurisdiction": state.jurisdiction,
+            "level": state.level,
+            "document_length": len(state.document_text),
+            "chunks_processed": len(state.chunks),
+            "enterprise_context": state.enterprise_context,
+            "processing_note": f"Complete document processed in {len(state.chunks)} chunks with no truncation"
+        }
+        
+        return state
+    
+    def should_continue_reasoning(self, state: AnalysisState) -> str:
+        """Decide whether to continue reasoning or synthesize chunk"""
+        if state.completed or state.iteration >= state.max_iterations:
+            return "synthesize_chunk"
+        return "act"
+    
+    def should_process_next_chunk(self, state: AnalysisState) -> str:
+        """Decide whether to process next chunk or merge all chunks"""
+        state.current_chunk_index += 1
+        
+        if state.current_chunk_index < len(state.chunks):
+            return "prepare_chunk"
+        else:
+            return "merge_chunks"
+    
+    def should_refine(self, state: AnalysisState) -> str:
+        """Decide whether to refine or finalize"""
+        if state.completed:
+            return "finalize"
+        # If not complete, we would need to reprocess, but for now finalize
+        return "finalize"
+    
+    def _extract_structured_info(self, text: str) -> Dict[str, Any]:
+        """Extract structured information from text response"""
+        result = {}
+        
+        # Try to parse as JSON first
+        try:
+            return self._parse_json_response(text)
+        except:
+            pass
+        
+        # Fallback: Extract using patterns
+        lines = text.split('\n')
+        current_section = None
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Detect sections
+            if "description" in line.lower() and ":" in line:
+                current_section = "description"
+                result["description"] = line.split(":", 1)[1].strip()
+            elif "user action" in line.lower():
+                current_section = "user_actions"
+                result["user_actions"] = []
+            elif "system action" in line.lower():
+                current_section = "system_actions"
+                result["system_actions"] = []
+            elif "user dut" in line.lower():
+                current_section = "user_duties"
+                result["user_duties"] = []
+            elif "system dut" in line.lower():
+                current_section = "system_duties"
+                result["system_duties"] = []
+            elif "constraint" in line.lower() or "condition" in line.lower():
+                current_section = "constraints"
+                result["constraints"] = []
+            elif "rule type" in line.lower() or "classification" in line.lower():
+                if "permission" in line.lower():
+                    result["rule_type"] = "permission"
+                elif "prohibition" in line.lower():
+                    result["rule_type"] = "prohibition"
+                elif "obligation" in line.lower():
+                    result["rule_type"] = "obligation"
+            elif current_section and (line.startswith("-") or line.startswith("•") or line.startswith("*")):
+                # List item
+                item = line.lstrip("-•* ").strip()
+                if item and current_section in result:
+                    if isinstance(result[current_section], list):
+                        if current_section == "constraints":
+                            result[current_section].append({"type": "general", "description": item})
+                        else:
+                            result[current_section].append(item)
+        
+        return result
+    
+    def _parse_json_response(self, text: str) -> Dict[str, Any]:
+        """Parse JSON from response text"""
+        # Find JSON block
+        start = text.find('{')
+        end = text.rfind('}')
+        
+        if start != -1 and end != -1:
+            json_str = text[start:end+1]
+            return json.loads(json_str)
+        
+        raise ValueError("No JSON found in response")
+    
+    def analyze_document(
         self,
         rule_name: str,
-        rule_config: Dict[str, Any],
-        generate_doc: bool = True
-    ) -> Optional[Dict[str, Any]]:
+        jurisdiction: str,
+        document_text: str,
+        level: int,
+        enterprise_context: Optional[Dict[str, Any]] = None,
+        previous_level_analysis: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
-        Process a single rule: extract text, analyze, and optionally generate Word doc
+        Main method to analyze a legal document
+        CRITICAL: Complete document is processed via chunking, no truncation
+        """
+        # Create initial state
+        state = AnalysisState(
+            rule_name=rule_name,
+            jurisdiction=jurisdiction,
+            document_text=document_text,
+            level=level,
+            enterprise_context=enterprise_context,
+            previous_level_analysis=previous_level_analysis
+        )
         
-        Args:
-            rule_name: Name of the rule
-            rule_config: Configuration dictionary for the rule
-            generate_doc: Whether to generate Word document
-            
-        Returns:
-            Analysis dictionary or None if processing fails
+        # Create and run workflow
+        workflow = self.create_workflow()
+        final_state = workflow.invoke(state)
+        
+        return final_state["final_analysis"]
+    
+    def analyze_multi_level(
+        self,
+        rule_name: str,
+        jurisdiction: str,
+        level_1_text: str,
+        level_2_text: str,
+        level_3_text: str,
+        enterprise_context: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         """
+        Analyze all three levels and synthesize
+        CRITICAL: Each level fully processed via chunking, no truncation
+        """
+        # Analyze each level
         print(f"\n{'='*80}")
-        print(f"Processing Rule: {rule_name}")
+        print(f"Analyzing Level 1 document (length: {len(level_1_text)} chars)...")
+        print(f"{'='*80}")
+        level_1_analysis = self.analyze_document(
+            rule_name=rule_name,
+            jurisdiction=jurisdiction,
+            document_text=level_1_text,
+            level=1,
+            enterprise_context=enterprise_context
+        )
+        
+        print(f"\n{'='*80}")
+        print(f"Analyzing Level 2 document (length: {len(level_2_text)} chars)...")
+        print(f"{'='*80}")
+        level_2_analysis = self.analyze_document(
+            rule_name=rule_name,
+            jurisdiction=jurisdiction,
+            document_text=level_2_text,
+            level=2,
+            enterprise_context=enterprise_context,
+            previous_level_analysis=json.dumps(level_1_analysis, indent=2)
+        )
+        
+        print(f"\n{'='*80}")
+        print(f"Analyzing Level 3 document (length: {len(level_3_text)} chars)...")
+        print(f"{'='*80}")
+        level_3_analysis = self.analyze_document(
+            rule_name=rule_name,
+            jurisdiction=jurisdiction,
+            document_text=level_3_text,
+            level=3,
+            enterprise_context=enterprise_context,
+            previous_level_analysis=json.dumps(level_2_analysis, indent=2)
+        )
+        
+        # Synthesize all levels
+        print(f"\n{'='*80}")
+        print(f"Synthesizing all levels...")
         print(f"{'='*80}")
         
-        # Extract configuration
-        countries = rule_config.get("country", [])
-        adequacy_countries = rule_config.get("adequacy_country", [])
+        synthesis_prompt = self.strategies.get_multi_level_synthesis_prompt(
+            level_1_analysis=json.dumps(level_1_analysis, indent=2),
+            level_2_analysis=json.dumps(level_2_analysis, indent=2),
+            level_3_analysis=json.dumps(level_3_analysis, indent=2)
+        )
         
-        jurisdiction = ", ".join(countries) if countries else "General"
-        print(f"Jurisdiction: {jurisdiction}")
+        messages = [
+            SystemMessage(content=self.strategies.get_react_agent_system_prompt()),
+            HumanMessage(content=synthesis_prompt)
+        ]
         
-        if adequacy_countries:
-            print(f"Adequacy Countries: {', '.join(adequacy_countries)}")
-        
-        # Get file paths
-        level_1_file = rule_config.get("file_level_1")
-        level_2_file = rule_config.get("file_level_2")
-        level_3_file = rule_config.get("file_level_3")
-        
-        if not all([level_1_file, level_2_file, level_3_file]):
-            print(f"Error: Missing file paths for rule '{rule_name}'")
-            return None
-        
-        # Extract text from all levels
-        print(f"\nExtracting text from PDFs...")
-        print(f"  Level 1: {level_1_file}")
-        level_1_text = self._extract_pdf_text(level_1_file)
-        
-        print(f"  Level 2: {level_2_file}")
-        level_2_text = self._extract_pdf_text(level_2_file)
-        
-        print(f"  Level 3: {level_3_file}")
-        level_3_text = self._extract_pdf_text(level_3_file)
-        
-        if not (level_1_text or level_2_text or level_3_text):
-            print(f"Error: No text could be extracted from any PDF")
-            return None
-        
-        # Detect enterprise context from all texts
-        all_text = f"{level_1_text} {level_2_text} {level_3_text}"
-        enterprise_context = self._detect_enterprise_context(all_text)
-        
-        if enterprise_context:
-            print(f"\nDetected enterprise context:")
-            if enterprise_context.get("organization"):
-                print(f"  Organization: {enterprise_context['organization']}")
-            if enterprise_context.get("internal_tools"):
-                print(f"  Internal Tools: {', '.join(enterprise_context['internal_tools'])}")
-        
-        # Analyze documents
-        print(f"\nAnalyzing documents using ReAct agents...")
-        print(f"  This may take several minutes...")
+        response = self.llm.invoke(messages)
         
         try:
-            analysis = self.analyzer.analyze_multi_level(
-                rule_name=rule_name,
-                jurisdiction=jurisdiction,
-                level_1_text=level_1_text,
-                level_2_text=level_2_text,
-                level_3_text=level_3_text,
-                enterprise_context=enterprise_context
-            )
-            
-            # Add adequacy countries to metadata
-            if not analysis.get("metadata"):
-                analysis["metadata"] = {}
-            
-            analysis["metadata"]["adequacy_countries"] = adequacy_countries
-            analysis["metadata"]["countries"] = countries
-            
-            print(f"\n✓ Analysis complete")
-            print(f"  Rule Type: {analysis.get('rule_type', 'N/A').upper()}")
-            print(f"  Confidence: {analysis.get('confidence', 'N/A').upper()}")
-            print(f"  User Actions: {len(analysis.get('user_actions', []))}")
-            print(f"  System Actions: {len(analysis.get('system_actions', []))}")
-            print(f"  Constraints: {len(analysis.get('constraints', []))}")
-            
-        except Exception as e:
-            print(f"✗ Error during analysis: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return None
+            final_synthesis = self._parse_json_response(response.content)
+        except:
+            # Fallback: merge all analyses using chunker merge logic
+            print("  Using automatic merge for level synthesis...")
+            combined_analyses = [level_1_analysis, level_2_analysis, level_3_analysis]
+            final_synthesis = self.chunker.merge_chunk_analyses(combined_analyses)
+            final_synthesis["synthesis_method"] = "automatic_merge"
         
-        # Generate Word document
-        if generate_doc:
-            print(f"\nGenerating Word document...")
-            try:
-                doc_path = self.generator.generate_legal_summary(analysis)
-                print(f"✓ Document saved: {doc_path}")
-                
-                # Save JSON analysis as well
-                json_path = doc_path.replace('.docx', '.json')
-                with open(json_path, 'w', encoding='utf-8') as f:
-                    json.dump(analysis, f, indent=2, ensure_ascii=False)
-                print(f"✓ JSON analysis saved: {json_path}")
-                
-            except Exception as e:
-                print(f"✗ Error generating document: {str(e)}")
-                import traceback
-                traceback.print_exc()
+        # Add level-specific analyses for reference
+        final_synthesis["level_analyses"] = {
+            "level_1": level_1_analysis,
+            "level_2": level_2_analysis,
+            "level_3": level_3_analysis
+        }
         
-        return analysis
-    
-    def process_all_rules(
-        self,
-        generate_docs: bool = True,
-        generate_index: bool = True
-    ) -> Dict[str, Dict[str, Any]]:
-        """
-        Process all rules in the metadata file
+        # Add comprehensive metadata
+        final_synthesis["metadata"] = {
+            "rule_name": rule_name,
+            "jurisdiction": jurisdiction,
+            "total_document_length": len(level_1_text) + len(level_2_text) + len(level_3_text),
+            "level_1_chunks": level_1_analysis.get("metadata", {}).get("chunks_processed", 0),
+            "level_2_chunks": level_2_analysis.get("metadata", {}).get("chunks_processed", 0),
+            "level_3_chunks": level_3_analysis.get("metadata", {}).get("chunks_processed", 0),
+            "enterprise_context": enterprise_context,
+            "processing_note": "Complete analysis of all three document levels with no truncation"
+        }
         
-        Args:
-            generate_docs: Whether to generate Word documents
-            generate_index: Whether to generate an index document
-            
-        Returns:
-            Dictionary mapping rule names to their analyses
-        """
-        if not self.metadata:
-            print("No metadata loaded. Cannot process rules.")
-            return {}
-        
-        all_analyses = {}
-        
-        print(f"\n{'#'*80}")
-        print(f"# Processing {len(self.metadata)} rules")
-        print(f"{'#'*80}")
-        
-        for i, (rule_name, rule_config) in enumerate(self.metadata.items(), 1):
-            print(f"\n[{i}/{len(self.metadata)}] Processing: {rule_name}")
-            
-            analysis = self.process_rule(
-                rule_name=rule_name,
-                rule_config=rule_config,
-                generate_doc=generate_docs
-            )
-            
-            if analysis:
-                all_analyses[rule_name] = analysis
-            else:
-                print(f"⚠ Skipping {rule_name} due to errors")
-        
-        # Generate index document
-        if generate_index and all_analyses:
-            print(f"\n{'='*80}")
-            print(f"Generating Index Document")
-            print(f"{'='*80}")
-            
-            try:
-                index_path = self.generator.create_index_document(all_analyses)
-                print(f"✓ Index document saved: {index_path}")
-            except Exception as e:
-                print(f"✗ Error generating index: {str(e)}")
-        
-        # Print summary
-        print(f"\n{'#'*80}")
-        print(f"# Processing Complete")
-        print(f"{'#'*80}")
-        print(f"Successfully processed: {len(all_analyses)}/{len(self.metadata)} rules")
-        print(f"Output directory: {self.output_dir}")
-        
-        return all_analyses
-    
-    def process_single_rule(
-        self,
-        rule_name: str,
-        generate_doc: bool = True
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Process a single rule by name
-        
-        Args:
-            rule_name: Name of the rule to process
-            generate_doc: Whether to generate Word document
-            
-        Returns:
-            Analysis dictionary or None if rule not found
-        """
-        if rule_name not in self.metadata:
-            print(f"Error: Rule '{rule_name}' not found in metadata")
-            print(f"Available rules: {', '.join(self.metadata.keys())}")
-            return None
-        
-        return self.process_rule(
-            rule_name=rule_name,
-            rule_config=self.metadata[rule_name],
-            generate_doc=generate_doc
+        total_chunks = (
+            level_1_analysis.get("metadata", {}).get("chunks_processed", 0) +
+            level_2_analysis.get("metadata", {}).get("chunks_processed", 0) +
+            level_3_analysis.get("metadata", {}).get("chunks_processed", 0)
         )
-
-
-def main():
-    """Main entry point for the pipeline"""
-    parser = argparse.ArgumentParser(
-        description="Legal Summary Pipeline - Generate Word documents from legislation PDFs"
-    )
-    parser.add_argument(
-        "--metadata",
-        type=str,
-        default="config/legislation_metadata.json",
-        help="Path to legislation metadata JSON file"
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default="output/legal_summaries",
-        help="Output directory for generated documents"
-    )
-    parser.add_argument(
-        "--rule",
-        type=str,
-        help="Process only a specific rule (by name)"
-    )
-    parser.add_argument(
-        "--no-docs",
-        action="store_true",
-        help="Skip Word document generation (analysis only)"
-    )
-    parser.add_argument(
-        "--no-index",
-        action="store_true",
-        help="Skip index document generation"
-    )
-    
-    args = parser.parse_args()
-    
-    # Initialize pipeline
-    pipeline = LegalSummaryPipeline(
-        metadata_file=args.metadata,
-        output_dir=args.output
-    )
-    
-    # Process rules
-    if args.rule:
-        # Process single rule
-        pipeline.process_single_rule(
-            rule_name=args.rule,
-            generate_doc=not args.no_docs
-        )
-    else:
-        # Process all rules
-        pipeline.process_all_rules(
-            generate_docs=not args.no_docs,
-            generate_index=not args.no_index
-        )
-
-
-if __name__ == "__main__":
-    main()
+        
+        print(f"\n✓ Multi-level synthesis complete")
+        print(f"  Total chunks processed across all levels: {total_chunks}")
+        print(f"  Total document length: {final_synthesis['metadata']['total_document_length']} chars")
+        
+        return final_synthesis
