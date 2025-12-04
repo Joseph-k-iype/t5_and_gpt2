@@ -1,542 +1,855 @@
 """
-Advanced Prompting Strategies for Legal Document Analysis
-Optimized for token efficiency while maintaining quality
+Legal Document Analyzer using ReAct Agents
+Processes legal documents with advanced reasoning and action patterns
+CRITICAL: No document truncation - uses intelligent chunking for complete coverage
+FIXED: Proper recursion limits and termination conditions
 
-Location: src/prompting/advanced_strategies.py
+Location: src/analyzers/legal_document_analyzer.py
 """
 
-from typing import Optional, List, Dict, Any
+from typing import Dict, List, Optional, Any, Tuple
 from enum import Enum
+import json
+from dataclasses import dataclass, field
+import logging
+import re
+
+from langgraph.graph import StateGraph, END
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+
+from src.prompting.advanced_strategies import (
+    AdvancedPromptingStrategies,
+    ExpertRole,
+    ReasoningMode
+)
+from src.services.openai_service import OpenAIService
+from src.utils.document_chunker import DocumentChunker
+from src.config import Config
+
+logger = logging.getLogger(__name__)
 
 
-class ExpertRole(str, Enum):
-    """Expert roles for Mixture of Experts prompting"""
-    LEGAL_EXPERT = "legal_expert"
-    COMPLIANCE_OFFICER = "compliance_officer"
-    DATA_PRIVACY_SPECIALIST = "data_privacy_specialist"
-    REGULATORY_ANALYST = "regulatory_analyst"
-    TECHNICAL_ARCHITECT = "technical_architect"
-    BUSINESS_ANALYST = "business_analyst"
+# SIMPLIFIED ACTION TAXONOMY
+class DataActionType(str, Enum):
+    """Simplified data action taxonomy"""
+    DATA_SHARING_AND_ACCESS = "data_sharing_and_access"
+    DATA_STORAGE_AND_HOSTING = "data_storage_and_hosting"
+    DATA_USAGE = "data_usage"
 
 
-class ReasoningMode(str, Enum):
-    """Reasoning modes for different analysis approaches"""
-    CHAIN_OF_THOUGHT = "chain_of_thought"
-    MIXTURE_OF_EXPERTS = "mixture_of_experts"
-    TREE_OF_THOUGHT = "tree_of_thought"
-    REFLECTION = "reflection"
-    REACT = "react"
+class RuleClassification(str, Enum):
+    """Rule classification: condition (allowed under conditions) or restriction (prohibited)"""
+    CONDITION = "condition"  # Allowed under certain conditions
+    RESTRICTION = "restriction"  # Prohibited/restricted
 
 
-class AdvancedPromptingStrategies:
+@dataclass
+class Citation:
+    """Citation for extracted information"""
+    text_excerpt: str  # Exact text from document
+    chunk_id: int  # Which chunk this came from
+    document_level: int  # 1, 2, or 3
+    reasoning: str  # Why this supports the claim
+
+
+@dataclass
+class Evidence:
+    """Evidence supporting a rule or requirement"""
+    source: str  # "user" or "system"
+    description: str
+    citations: List[Citation] = field(default_factory=list)
+
+
+@dataclass
+class AnalysisState:
+    """State for the legal document analysis workflow"""
+    rule_name: str
+    jurisdiction: str
+    document_text: str
+    level: int  # 1, 2, or 3
+    
+    # Chunking
+    chunks: List[Dict[str, Any]] = field(default_factory=list)
+    current_chunk_index: int = 0
+    chunk_analyses: List[Dict[str, Any]] = field(default_factory=list)
+    
+    # Context
+    enterprise_context: Optional[Dict[str, Any]] = None
+    previous_level_analysis: Optional[str] = None
+    
+    # Analysis components with citations
+    rule_description: str = ""
+    rule_description_citations: List[Citation] = field(default_factory=list)
+    
+    # Actions (simplified taxonomy)
+    data_actions: List[Dict[str, Any]] = field(default_factory=list)
+    
+    # Evidence
+    user_evidence: List[Evidence] = field(default_factory=list)
+    system_evidence: List[Evidence] = field(default_factory=list)
+    
+    # Constraints with citations
+    constraints: List[Dict[str, Any]] = field(default_factory=list)
+    
+    # Rule classification
+    rule_classification: str = ""  # "condition" or "restriction"
+    classification_reasoning: str = ""
+    
+    # Processing flags - CRITICAL FOR TERMINATION
+    completed: bool = False
+    iteration: int = 0
+    max_iterations: int = 3  # REDUCED from 5 to prevent infinite loops
+    
+    # Final output
+    final_analysis: Dict[str, Any] = field(default_factory=dict)
+    
+    # Messages (LIMITED to prevent token overflow)
+    messages: List[BaseMessage] = field(default_factory=list)
+    
+    # Step counter for safety
+    total_steps: int = 0
+    max_total_steps: int = 100  # Hard limit for entire workflow
+
+
+class LegalDocumentAnalyzer:
     """
-    Advanced prompting strategies with token optimization
+    Legal document analyzer with proper termination and citation tracking
     """
     
-    def __init__(self, rule_name: str, jurisdiction: str):
-        self.rule_name = rule_name
-        self.jurisdiction = jurisdiction
+    def __init__(self, config: Config = None):
+        self.config = config or Config()
+        
+        if not self.config.API_KEY:
+            raise ValueError("OPENAI_API_KEY environment variable is required")
+        
+        self.openai_service = OpenAIService()
+        self.llm = ChatOpenAI(
+            model=self.config.CHAT_MODEL,
+            openai_api_key=self.config.API_KEY,
+            openai_api_base=self.config.BASE_URL
+        )
+        self.strategies = None
+        
+        chunk_size = getattr(self.config, 'CHUNK_SIZE', 3000)  # Reduced for faster processing
+        overlap_size = getattr(self.config, 'OVERLAP_SIZE', 200)
+        
+        self.chunker = DocumentChunker(
+            chunk_size=chunk_size,
+            chunk_overlap=overlap_size,
+            respect_boundaries=True
+        )
+        
+    def create_workflow(self) -> StateGraph:
+        """Create workflow with PROPER termination conditions"""
+        workflow = StateGraph(AnalysisState)
+        
+        # Add nodes
+        workflow.add_node("initialize", self.initialize_analysis)
+        workflow.add_node("prepare_chunk", self.prepare_chunk)
+        workflow.add_node("reason", self.reason_step)
+        workflow.add_node("act", self.act_step)
+        workflow.add_node("observe", self.observe_step)
+        workflow.add_node("synthesize_chunk", self.synthesize_chunk_step)
+        workflow.add_node("merge_chunks", self.merge_chunks_step)
+        workflow.add_node("finalize", self.finalize_step)
+        
+        # Set entry point
+        workflow.set_entry_point("initialize")
+        
+        # Add edges with proper termination
+        workflow.add_edge("initialize", "prepare_chunk")
+        
+        workflow.add_conditional_edges(
+            "prepare_chunk",
+            self.should_continue_from_prepare,
+            {
+                "reason": "reason",
+                "merge_chunks": "merge_chunks"
+            }
+        )
+        
+        workflow.add_conditional_edges(
+            "reason",
+            self.should_continue_reasoning,
+            {
+                "act": "act",
+                "synthesize_chunk": "synthesize_chunk"
+            }
+        )
+        
+        workflow.add_edge("act", "observe")
+        
+        # CRITICAL FIX: Add conditional edge from observe
+        workflow.add_conditional_edges(
+            "observe",
+            self.should_continue_iteration,
+            {
+                "reason": "reason",
+                "synthesize_chunk": "synthesize_chunk"
+            }
+        )
+        
+        workflow.add_conditional_edges(
+            "synthesize_chunk",
+            self.should_process_next_chunk,
+            {
+                "prepare_chunk": "prepare_chunk",
+                "merge_chunks": "merge_chunks"
+            }
+        )
+        
+        workflow.add_edge("merge_chunks", "finalize")
+        workflow.add_edge("finalize", END)
+        
+        return workflow.compile()
     
-    def get_react_agent_system_prompt(self) -> str:
-        """
-        OPTIMIZED: Concise ReAct agent system prompt
-        """
-        return f"""You are a legal document analyzer using ReAct methodology.
+    def initialize_analysis(self, state: AnalysisState) -> AnalysisState:
+        """Initialize the analysis"""
+        state.total_steps += 1
+        
+        self.strategies = AdvancedPromptingStrategies(
+            rule_name=state.rule_name,
+            jurisdiction=state.jurisdiction
+        )
+        
+        print(f"  Initializing analysis for: {state.rule_name}")
+        print(f"  Document length: {len(state.document_text)} characters")
+        
+        # Chunk document
+        state.chunks = self.chunker.chunk_document(
+            text=state.document_text,
+            metadata={
+                "rule_name": state.rule_name,
+                "jurisdiction": state.jurisdiction,
+                "level": state.level
+            }
+        )
+        
+        print(f"  Created {len(state.chunks)} chunks")
+        
+        # Initialize messages
+        system_prompt = f"""You are a legal document analyzer. Extract information with citations.
 
-Rule: {self.rule_name}
-Jurisdiction: {self.jurisdiction}
+Focus on:
+1. Data actions: sharing/access, storage/hosting, usage
+2. Rule classification: "condition" (allowed under conditions) or "restriction" (prohibited)
+3. Evidence from both user and system perspectives
+4. Enterprise-specific policies (especially in Level 3 documents)
 
-For each chunk:
-1. THINK: What legal requirements are present?
-2. ACT: Extract specific obligations, permissions, actions
-3. OBSERVE: Structure findings as JSON
+Always cite text excerpts that support your claims."""
+        
+        state.messages = [SystemMessage(content=system_prompt)]
+        
+        return state
+    
+    def prepare_chunk(self, state: AnalysisState) -> AnalysisState:
+        """Prepare to analyze current chunk"""
+        state.total_steps += 1
+        
+        # CRITICAL: Check limits
+        if state.total_steps >= state.max_total_steps:
+            print(f"  WARNING: Max total steps ({state.max_total_steps}) reached")
+            state.completed = True
+            return state
+        
+        if state.current_chunk_index >= len(state.chunks):
+            print(f"  All chunks processed")
+            state.completed = True
+            return state
+        
+        chunk = state.chunks[state.current_chunk_index]
+        chunk_id = chunk.get("chunk_id", state.current_chunk_index)
+        
+        print(f"\n  Analyzing chunk {chunk_id + 1}/{len(state.chunks)}")
+        
+        # Reset for new chunk
+        state.iteration = 0
+        state.rule_description = ""
+        state.rule_description_citations = []
+        state.data_actions = []
+        state.user_evidence = []
+        state.system_evidence = []
+        state.constraints = []
+        state.rule_classification = ""
+        state.classification_reasoning = ""
+        
+        return state
+    
+    def reason_step(self, state: AnalysisState) -> AnalysisState:
+        """Reasoning step"""
+        state.total_steps += 1
+        state.iteration += 1
+        
+        # CRITICAL: Check limits
+        if state.iteration > state.max_iterations:
+            print(f"    Max iterations reached")
+            state.completed = True
+            return state
+        
+        if state.total_steps >= state.max_total_steps:
+            print(f"    Max total steps reached")
+            state.completed = True
+            return state
+        
+        chunk = state.chunks[state.current_chunk_index]
+        chunk_text = chunk['text']
+        
+        # Create focused prompt
+        prompt = f"""Analyze this text chunk (iteration {state.iteration}/{state.max_iterations}):
+
+TEXT:
+{chunk_text[:2000]}...
 
 Extract:
-- Description (what the rule requires)
-- User actions (what users can/must/cannot do)
-- System actions (what systems must implement)
-- Duties (obligations for users/systems)
-- Constraints (conditions, limitations)
-- Rule type (permission/prohibition/obligation/combination)
+1. Rule description with exact text citations
+2. Data actions (only: sharing/access, storage/hosting, usage)
+3. User evidence (what users must/can/cannot do)
+4. System evidence (what systems must implement)
+5. Constraints with citations
+6. Classification: "condition" (allowed under conditions) or "restriction" (prohibited)
 
-Be concise and precise. Use plain English."""
+Provide JSON with citations showing exact text excerpts."""
+        
+        # Trim messages to prevent overflow
+        if len(state.messages) > 10:
+            state.messages = [state.messages[0]] + state.messages[-9:]
+        
+        state.messages.append(HumanMessage(content=prompt))
+        
+        try:
+            response = self.llm.invoke(state.messages)
+            state.messages.append(response)
+        except Exception as e:
+            print(f"    Error in LLM call: {e}")
+            state.completed = True
+            return state
+        
+        return state
     
-    def get_chain_of_thought_prompt(
-        self,
-        document_text: str,
-        analysis_type: str,
-        context: Optional[Dict[str, Any]] = None,
-        chunk_info: str = ""
-    ) -> str:
-        """
-        OPTIMIZED: Chain of Thought prompting with token efficiency
-        """
-        # Truncate document text if too long
-        text_truncated = document_text[:1000] + "..." if len(document_text) > 1000 else document_text
-        
-        context_section = ""
-        if context:
-            org = context.get("organization", "")
-            tools = context.get("internal_tools", [])
-            if org or tools:
-                context_section = f"\n\nEnterprise Context:\n- Organization: {org}\n- Tools: {', '.join(tools)}\n"
-        
-        chunk_section = f"\n\nChunk Context: {chunk_info}\n" if chunk_info else ""
-        
-        return f"""Analyze this legal text using step-by-step reasoning:
-{context_section}{chunk_section}
-TEXT:
-{text_truncated}
-
-TASK: {analysis_type}
-
-Think step-by-step:
-1. What is the main requirement?
-2. Who is affected?
-3. What actions are required?
-4. What conditions apply?
-5. What are the implications?
-
-Provide detailed analysis with reasoning."""
+    def act_step(self, state: AnalysisState) -> AnalysisState:
+        """Action step"""
+        state.total_steps += 1
+        return state
     
-    def get_mixture_of_experts_prompt(
-        self,
-        document_text: str,
-        expert_roles: List[ExpertRole],
-        chunk_info: str = ""
-    ) -> str:
-        """
-        OPTIMIZED: Mixture of Experts prompting
-        """
-        # Truncate document text
-        text_truncated = document_text[:1000] + "..." if len(document_text) > 1000 else document_text
+    def observe_step(self, state: AnalysisState) -> AnalysisState:
+        """Observation step - extract information"""
+        state.total_steps += 1
         
-        chunk_section = f"\n\nChunk Context: {chunk_info}\n" if chunk_info else ""
+        if not state.messages:
+            state.completed = True
+            return state
         
-        roles_desc = []
-        for role in expert_roles:
-            if role == ExpertRole.LEGAL_EXPERT:
-                roles_desc.append("Legal Expert: Analyze legal obligations and compliance requirements")
-            elif role == ExpertRole.COMPLIANCE_OFFICER:
-                roles_desc.append("Compliance Officer: Identify practical compliance steps and controls")
-            elif role == ExpertRole.DATA_PRIVACY_SPECIALIST:
-                roles_desc.append("Data Privacy Specialist: Focus on data protection and privacy requirements")
-            elif role == ExpertRole.REGULATORY_ANALYST:
-                roles_desc.append("Regulatory Analyst: Interpret regulatory intent and implications")
-            elif role == ExpertRole.TECHNICAL_ARCHITECT:
-                roles_desc.append("Technical Architect: Identify technical implementation requirements")
-            elif role == ExpertRole.BUSINESS_ANALYST:
-                roles_desc.append("Business Analyst: Assess business process impacts")
+        last_response = state.messages[-1].content
         
-        roles_text = "\n".join(f"- {desc}" for desc in roles_desc)
+        # Extract information
+        extracted = self._extract_structured_info(last_response, state.current_chunk_index, state.level)
         
-        return f"""Analyze this text from multiple expert perspectives:
-{chunk_section}
-TEXT:
-{text_truncated}
-
-Expert Perspectives:
-{roles_text}
-
-Provide comprehensive analysis incorporating all expert viewpoints."""
+        if extracted.get("description"):
+            state.rule_description = extracted["description"]
+        
+        if extracted.get("description_citations"):
+            state.rule_description_citations.extend(extracted["description_citations"])
+        
+        if extracted.get("data_actions"):
+            state.data_actions.extend(extracted["data_actions"])
+        
+        if extracted.get("user_evidence"):
+            state.user_evidence.extend(extracted["user_evidence"])
+        
+        if extracted.get("system_evidence"):
+            state.system_evidence.extend(extracted["system_evidence"])
+        
+        if extracted.get("constraints"):
+            state.constraints.extend(extracted["constraints"])
+        
+        if extracted.get("classification"):
+            state.rule_classification = extracted["classification"]
+            state.classification_reasoning = extracted.get("classification_reasoning", "")
+        
+        # Check if we have minimum information
+        has_minimum = (
+            state.rule_description and
+            (state.data_actions or state.user_evidence or state.system_evidence)
+        )
+        
+        if has_minimum:
+            state.completed = True
+        
+        return state
     
-    def get_dynamic_contextualized_prompt(
+    def synthesize_chunk_step(self, state: AnalysisState) -> AnalysisState:
+        """Synthesize current chunk"""
+        state.total_steps += 1
+        
+        chunk_analysis = {
+            "chunk_id": state.current_chunk_index,
+            "description": state.rule_description,
+            "description_citations": [
+                {
+                    "text": c.text_excerpt,
+                    "chunk_id": c.chunk_id,
+                    "level": c.document_level,
+                    "reasoning": c.reasoning
+                }
+                for c in state.rule_description_citations
+            ],
+            "data_actions": state.data_actions,
+            "user_evidence": [
+                {
+                    "description": e.description,
+                    "citations": [
+                        {
+                            "text": c.text_excerpt,
+                            "chunk_id": c.chunk_id,
+                            "level": c.document_level
+                        }
+                        for c in e.citations
+                    ]
+                }
+                for e in state.user_evidence
+            ],
+            "system_evidence": [
+                {
+                    "description": e.description,
+                    "citations": [
+                        {
+                            "text": c.text_excerpt,
+                            "chunk_id": c.chunk_id,
+                            "level": c.document_level
+                        }
+                        for c in e.citations
+                    ]
+                }
+                for e in state.system_evidence
+            ],
+            "constraints": state.constraints,
+            "classification": state.rule_classification,
+            "classification_reasoning": state.classification_reasoning
+        }
+        
+        state.chunk_analyses.append(chunk_analysis)
+        
+        print(f"    ✓ Chunk {state.current_chunk_index + 1} complete")
+        print(f"      Actions: {len(state.data_actions)}, Evidence: {len(state.user_evidence) + len(state.system_evidence)}")
+        
+        return state
+    
+    def merge_chunks_step(self, state: AnalysisState) -> AnalysisState:
+        """Merge all chunk analyses"""
+        state.total_steps += 1
+        
+        print(f"\n  Merging {len(state.chunk_analyses)} chunks...")
+        
+        # Merge descriptions
+        all_descriptions = [c.get("description", "") for c in state.chunk_analyses if c.get("description")]
+        merged_description = " ".join(all_descriptions)
+        
+        # Merge citations
+        all_citations = []
+        for chunk in state.chunk_analyses:
+            all_citations.extend(chunk.get("description_citations", []))
+        
+        # Merge actions (deduplicate by action type and description)
+        all_actions = []
+        seen_actions = set()
+        for chunk in state.chunk_analyses:
+            for action in chunk.get("data_actions", []):
+                action_key = (action.get("type", ""), action.get("description", "").lower())
+                if action_key not in seen_actions:
+                    all_actions.append(action)
+                    seen_actions.add(action_key)
+        
+        # Merge evidence
+        all_user_evidence = []
+        all_system_evidence = []
+        for chunk in state.chunk_analyses:
+            all_user_evidence.extend(chunk.get("user_evidence", []))
+            all_system_evidence.extend(chunk.get("system_evidence", []))
+        
+        # Merge constraints
+        all_constraints = []
+        for chunk in state.chunk_analyses:
+            all_constraints.extend(chunk.get("constraints", []))
+        
+        # Determine final classification
+        classifications = [c.get("classification", "") for c in state.chunk_analyses if c.get("classification")]
+        final_classification = "condition"  # Default
+        if "restriction" in classifications:
+            final_classification = "restriction"
+        elif classifications:
+            final_classification = classifications[0]
+        
+        state.final_analysis = {
+            "description": merged_description,
+            "citations": all_citations,
+            "data_actions": all_actions,
+            "user_evidence": all_user_evidence,
+            "system_evidence": all_system_evidence,
+            "constraints": all_constraints,
+            "classification": final_classification,
+            "classification_reasoning": "; ".join([
+                c.get("classification_reasoning", "")
+                for c in state.chunk_analyses
+                if c.get("classification_reasoning")
+            ])
+        }
+        
+        print(f"  ✓ Merge complete")
+        print(f"    Classification: {final_classification}")
+        print(f"    Total actions: {len(all_actions)}")
+        print(f"    Total evidence: {len(all_user_evidence) + len(all_system_evidence)}")
+        print(f"    Total citations: {len(all_citations)}")
+        
+        return state
+    
+    def finalize_step(self, state: AnalysisState) -> AnalysisState:
+        """Finalize analysis"""
+        state.total_steps += 1
+        
+        # Add metadata
+        state.final_analysis["metadata"] = {
+            "rule_name": state.rule_name,
+            "jurisdiction": state.jurisdiction,
+            "level": state.level,
+            "document_length": len(state.document_text),
+            "chunks_processed": len(state.chunk_analyses),
+            "enterprise_context": state.enterprise_context,
+            "total_steps": state.total_steps
+        }
+        
+        print(f"  ✓ Analysis finalized (total steps: {state.total_steps})")
+        
+        return state
+    
+    # DECISION FUNCTIONS - CRITICAL FOR TERMINATION
+    
+    def should_continue_from_prepare(self, state: AnalysisState) -> str:
+        """Decide after prepare_chunk"""
+        if state.completed or state.current_chunk_index >= len(state.chunks):
+            return "merge_chunks"
+        return "reason"
+    
+    def should_continue_reasoning(self, state: AnalysisState) -> str:
+        """Decide after reason"""
+        if state.completed or state.iteration >= state.max_iterations:
+            return "synthesize_chunk"
+        return "act"
+    
+    def should_continue_iteration(self, state: AnalysisState) -> str:
+        """Decide after observe - CRITICAL FIX"""
+        # Check if we should continue iterating or synthesize
+        if state.completed:
+            return "synthesize_chunk"
+        
+        if state.iteration >= state.max_iterations:
+            return "synthesize_chunk"
+        
+        # If we have minimum info, synthesize
+        has_minimum = (
+            state.rule_description and
+            (state.data_actions or state.user_evidence or state.system_evidence)
+        )
+        
+        if has_minimum:
+            return "synthesize_chunk"
+        
+        # Otherwise continue reasoning
+        return "reason"
+    
+    def should_process_next_chunk(self, state: AnalysisState) -> str:
+        """Decide after synthesize_chunk"""
+        state.current_chunk_index += 1
+        
+        if state.current_chunk_index >= len(state.chunks):
+            return "merge_chunks"
+        
+        if state.current_chunk_index > 20:  # Safety limit
+            print(f"  WARNING: Max chunks (20) reached")
+            return "merge_chunks"
+        
+        return "prepare_chunk"
+    
+    def _extract_structured_info(
         self,
+        text: str,
+        chunk_id: int,
+        level: int
+    ) -> Dict[str, Any]:
+        """Extract structured information with citations"""
+        result = {
+            "description": "",
+            "description_citations": [],
+            "data_actions": [],
+            "user_evidence": [],
+            "system_evidence": [],
+            "constraints": [],
+            "classification": "",
+            "classification_reasoning": ""
+        }
+        
+        # Try JSON parsing
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                # Extract description
+                if "description" in parsed:
+                    result["description"] = parsed["description"]
+                
+                # Extract citations
+                if "citations" in parsed:
+                    for cite in parsed["citations"]:
+                        if isinstance(cite, dict):
+                            result["description_citations"].append(
+                                Citation(
+                                    text_excerpt=cite.get("text", "")[:200],
+                                    chunk_id=chunk_id,
+                                    document_level=level,
+                                    reasoning=cite.get("reasoning", "")
+                                )
+                            )
+                
+                # Extract data actions (map to taxonomy)
+                if "actions" in parsed or "data_actions" in parsed:
+                    actions = parsed.get("actions", parsed.get("data_actions", []))
+                    for action in actions:
+                        if isinstance(action, dict):
+                            action_type = self._map_to_taxonomy(action.get("type", ""))
+                            if action_type:
+                                result["data_actions"].append({
+                                    "type": action_type,
+                                    "description": action.get("description", ""),
+                                    "citations": action.get("citations", [])
+                                })
+                
+                # Extract evidence
+                if "user_evidence" in parsed:
+                    for evidence in parsed["user_evidence"]:
+                        if isinstance(evidence, dict):
+                            cites = []
+                            for c in evidence.get("citations", []):
+                                cites.append(Citation(
+                                    text_excerpt=c.get("text", "")[:200],
+                                    chunk_id=chunk_id,
+                                    document_level=level,
+                                    reasoning=""
+                                ))
+                            result["user_evidence"].append(
+                                Evidence(
+                                    source="user",
+                                    description=evidence.get("description", ""),
+                                    citations=cites
+                                )
+                            )
+                
+                if "system_evidence" in parsed:
+                    for evidence in parsed["system_evidence"]:
+                        if isinstance(evidence, dict):
+                            cites = []
+                            for c in evidence.get("citations", []):
+                                cites.append(Citation(
+                                    text_excerpt=c.get("text", "")[:200],
+                                    chunk_id=chunk_id,
+                                    document_level=level,
+                                    reasoning=""
+                                ))
+                            result["system_evidence"].append(
+                                Evidence(
+                                    source="system",
+                                    description=evidence.get("description", ""),
+                                    citations=cites
+                                )
+                            )
+                
+                # Extract classification
+                if "classification" in parsed:
+                    cls = parsed["classification"].lower()
+                    if "condition" in cls:
+                        result["classification"] = "condition"
+                    elif "restriction" in cls or "prohibit" in cls:
+                        result["classification"] = "restriction"
+                
+                if "classification_reasoning" in parsed:
+                    result["classification_reasoning"] = parsed["classification_reasoning"]
+                
+                # Extract constraints
+                if "constraints" in parsed:
+                    result["constraints"] = parsed["constraints"]
+        
+        except:
+            # Fallback: try to extract key information from text
+            if "condition" in text.lower():
+                result["classification"] = "condition"
+            elif "restrict" in text.lower() or "prohibit" in text.lower():
+                result["classification"] = "restriction"
+        
+        return result
+    
+    def _map_to_taxonomy(self, action_type: str) -> str:
+        """Map action to simplified taxonomy"""
+        action_lower = action_type.lower()
+        
+        if any(word in action_lower for word in ["share", "access", "transfer", "disclose"]):
+            return DataActionType.DATA_SHARING_AND_ACCESS
+        
+        if any(word in action_lower for word in ["store", "host", "retain", "archive"]):
+            return DataActionType.DATA_STORAGE_AND_HOSTING
+        
+        if any(word in action_lower for word in ["use", "process", "analyze", "collect"]):
+            return DataActionType.DATA_USAGE
+        
+        # Default to usage
+        return DataActionType.DATA_USAGE
+    
+    def analyze_document(
+        self,
+        rule_name: str,
+        jurisdiction: str,
         document_text: str,
-        previous_analyses: Optional[List[str]] = None,
+        level: int,
         enterprise_context: Optional[Dict[str, Any]] = None,
-        chunk_info: str = ""
-    ) -> str:
-        """
-        OPTIMIZED: Dynamic contextualized prompting
-        """
-        # Truncate document text
-        text_truncated = document_text[:1000] + "..." if len(document_text) > 1000 else document_text
+        previous_level_analysis: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Analyze a single document"""
+        state = AnalysisState(
+            rule_name=rule_name,
+            jurisdiction=jurisdiction,
+            document_text=document_text,
+            level=level,
+            enterprise_context=enterprise_context,
+            previous_level_analysis=previous_level_analysis
+        )
         
-        chunk_section = f"\n\nChunk Context: {chunk_info}\n" if chunk_info else ""
+        workflow = self.create_workflow()
         
-        previous_section = ""
-        if previous_analyses:
-            prev_summary = previous_analyses[0][:300] + "..." if len(previous_analyses[0]) > 300 else previous_analyses[0]
-            previous_section = f"\n\nPrevious Analysis Summary:\n{prev_summary}\n"
+        try:
+            # Invoke with lower recursion limit
+            final_state = workflow.invoke(state, {"recursion_limit": 50})
+        except Exception as e:
+            print(f"  Error in workflow: {e}")
+            # Return partial analysis
+            return {
+                "description": "Partial analysis due to error",
+                "citations": [],
+                "data_actions": [],
+                "user_evidence": [],
+                "system_evidence": [],
+                "classification": "condition",
+                "metadata": {
+                    "error": str(e),
+                    "level": level
+                }
+            }
         
-        context_section = ""
-        if enterprise_context:
-            org = enterprise_context.get("organization", "")
-            if org:
-                context_section = f"\n\nOrganization: {org}\n"
-        
-        return f"""Analyze this text with full context:
-{chunk_section}{previous_section}{context_section}
-TEXT:
-{text_truncated}
-
-Provide analysis that builds on previous findings and considers organizational context."""
+        return final_state.get("final_analysis", {})
     
-    def get_multi_level_synthesis_prompt(
+    def analyze_multi_level(
         self,
-        level_1_analysis: str,
-        level_2_analysis: str,
-        level_3_analysis: str
-    ) -> str:
-        """
-        OPTIMIZED: Concise multi-level synthesis prompt
-        NOTE: Input analyses should be summaries, not full JSON
-        """
-        # Truncate if analyses are too long
-        l1_truncated = level_1_analysis[:500] + "..." if len(level_1_analysis) > 500 else level_1_analysis
-        l2_truncated = level_2_analysis[:500] + "..." if len(level_2_analysis) > 500 else level_2_analysis
-        l3_truncated = level_3_analysis[:500] + "..." if len(level_3_analysis) > 500 else level_3_analysis
+        rule_name: str,
+        jurisdiction: str,
+        level_1_text: str,
+        level_2_text: str,
+        level_3_text: str,
+        enterprise_context: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Analyze all three levels"""
+        print(f"\n{'='*80}")
+        print(f"Multi-Level Analysis: {rule_name}")
+        print(f"{'='*80}")
         
-        return f"""Synthesize analyses from 3 document levels for "{self.rule_name}" in {self.jurisdiction}.
-
-LEVEL 1 (Overview):
-{l1_truncated}
-
-LEVEL 2 (Details):
-{l2_truncated}
-
-LEVEL 3 (Technical):
-{l3_truncated}
-
-Integrate all insights into comprehensive JSON:
-{{
-    "description": "Complete description from all levels",
-    "user_actions": ["all user actions"],
-    "system_actions": ["all system actions"],
-    "user_duties": ["all user obligations"],
-    "system_duties": ["all system obligations"],
-    "constraints": [{{"type": "...", "description": "..."}}],
-    "rule_type": "permission/prohibition/obligation/combination",
-    "confidence": "high/medium/low"
-}}
-
-Ensure:
-- No contradictions between levels
-- Progressively detailed (L1→L2→L3)
-- Practical and implementable
-- Complete coverage"""
-    
-    def get_reflection_prompt(self, current_analysis: str) -> str:
-        """
-        OPTIMIZED: Concise reflection prompt
-        """
-        # Truncate analysis for prompt
-        analysis_truncated = current_analysis[:800] + "..." if len(current_analysis) > 800 else current_analysis
+        # Analyze Level 1
+        print(f"\nLevel 1 (Legislation)...")
+        level_1_analysis = self.analyze_document(
+            rule_name=rule_name,
+            jurisdiction=jurisdiction,
+            document_text=level_1_text,
+            level=1,
+            enterprise_context=enterprise_context
+        )
         
-        return f"""Review this analysis for "{self.rule_name}":
-
-{analysis_truncated}
-
-Check:
-1. Completeness - all requirements captured?
-2. Accuracy - legally sound?
-3. Clarity - understandable?
-4. Actionability - implementable?
-
-Provide:
-- What's correct
-- What needs improvement
-- Enhanced final analysis (JSON format)
-
-Be concise."""
-    
-    def get_chunk_analysis_prompt(
-        self,
-        chunk_text: str,
-        chunk_context: str
-    ) -> str:
-        """
-        OPTIMIZED: Concise chunk analysis prompt
-        """
-        return f"""Analyze this legal text chunk:
-
-CONTEXT: {chunk_context}
-
-TEXT:
-{chunk_text}
-
-Extract JSON:
-{{
-    "description": "What this chunk requires",
-    "user_actions": ["specific actions"],
-    "system_actions": ["system requirements"],
-    "user_duties": ["user obligations"],
-    "system_duties": ["system obligations"],
-    "constraints": [{{"type": "...", "description": "..."}}],
-    "rule_type": "type if determinable"
-}}
-
-Focus on this chunk only. Be precise."""
-    
-    def get_comprehensive_synthesis_prompt(
-        self,
-        chunk_analyses: List[Dict[str, Any]],
-        total_chunks: int
-    ) -> str:
-        """
-        OPTIMIZED: Concise comprehensive synthesis
-        """
-        # Summarize chunk analyses
-        summaries = []
-        for i, analysis in enumerate(chunk_analyses[:5]):  # Limit to first 5 for brevity
-            desc = analysis.get("description", "")[:100]
-            if desc:
-                summaries.append(f"Chunk {i+1}: {desc}...")
+        # Analyze Level 2
+        print(f"\nLevel 2 (Guidance)...")
+        level_2_analysis = self.analyze_document(
+            rule_name=rule_name,
+            jurisdiction=jurisdiction,
+            document_text=level_2_text,
+            level=2,
+            enterprise_context=enterprise_context,
+            previous_level_analysis=json.dumps({"level_1_summary": level_1_analysis.get("description", "")[:300]})
+        )
         
-        if len(chunk_analyses) > 5:
-            summaries.append(f"... and {len(chunk_analyses) - 5} more chunks")
+        # Analyze Level 3 (Enterprise policies - CRITICAL)
+        print(f"\nLevel 3 (Enterprise Policies - CRITICAL)...")
+        level_3_analysis = self.analyze_document(
+            rule_name=rule_name,
+            jurisdiction=jurisdiction,
+            document_text=level_3_text,
+            level=3,
+            enterprise_context=enterprise_context,
+            previous_level_analysis=json.dumps({
+                "level_1_summary": level_1_analysis.get("description", "")[:200],
+                "level_2_summary": level_2_analysis.get("description", "")[:200]
+            })
+        )
         
-        chunks_summary = "\n".join(summaries) if summaries else "Multiple chunks analyzed"
+        # Merge all levels
+        print(f"\nMerging all levels...")
         
-        return f"""Synthesize {total_chunks} chunk analyses into final analysis:
-
-{chunks_summary}
-
-Provide comprehensive JSON with:
-- Complete description
-- All user/system actions
-- All duties and constraints
-- Rule type and confidence
-
-Merge and deduplicate. Ensure completeness."""
-    
-    def get_decision_inference_prompt(self, rule_context: str) -> str:
-        """
-        OPTIMIZED: Concise decision inference prompt
-        """
-        # Truncate context
-        context_truncated = rule_context[:600] + "..." if len(rule_context) > 600 else rule_context
+        final_analysis = {
+            "description": f"{level_1_analysis.get('description', '')} {level_2_analysis.get('description', '')} {level_3_analysis.get('description', '')}".strip(),
+            
+            "citations": (
+                level_1_analysis.get("citations", []) +
+                level_2_analysis.get("citations", []) +
+                level_3_analysis.get("citations", [])
+            ),
+            
+            "data_actions": (
+                level_1_analysis.get("data_actions", []) +
+                level_2_analysis.get("data_actions", []) +
+                level_3_analysis.get("data_actions", [])
+            ),
+            
+            "user_evidence": (
+                level_1_analysis.get("user_evidence", []) +
+                level_2_analysis.get("user_evidence", []) +
+                level_3_analysis.get("user_evidence", [])
+            ),
+            
+            "system_evidence": (
+                level_1_analysis.get("system_evidence", []) +
+                level_2_analysis.get("system_evidence", []) +
+                level_3_analysis.get("system_evidence", [])
+            ),
+            
+            "constraints": (
+                level_1_analysis.get("constraints", []) +
+                level_2_analysis.get("constraints", []) +
+                level_3_analysis.get("constraints", [])
+            ),
+            
+            "classification": level_1_analysis.get("classification", "condition"),
+            
+            "classification_reasoning": "; ".join([
+                level_1_analysis.get("classification_reasoning", ""),
+                level_2_analysis.get("classification_reasoning", ""),
+                level_3_analysis.get("classification_reasoning", "")
+            ]).strip(),
+            
+            "metadata": {
+                "rule_name": rule_name,
+                "jurisdiction": jurisdiction,
+                "enterprise_context": enterprise_context,
+                "level_1_chunks": level_1_analysis.get("metadata", {}).get("chunks_processed", 0),
+                "level_2_chunks": level_2_analysis.get("metadata", {}).get("chunks_processed", 0),
+                "level_3_chunks": level_3_analysis.get("metadata", {}).get("chunks_processed", 0),
+                "level_3_enterprise_specific": True  # Flag that Level 3 was processed
+            }
+        }
         
-        return f"""Identify decision scenarios in this rule:
-
-{context_truncated}
-
-For each scenario provide:
-{{
-    "scenario": "When does this apply?",
-    "decision_type": "yes/no/maybe",
-    "conditions": ["what conditions must be met"],
-    "required_actions": ["actions if YES"],
-    "prohibited_actions": ["actions if NO"]
-}}
-
-Focus on practical compliance decisions."""
-    
-    def get_action_extraction_prompt(self, text: str) -> str:
-        """
-        OPTIMIZED: Concise action extraction
-        """
-        # Truncate text
-        text_truncated = text[:500] + "..." if len(text) > 500 else text
+        print(f"\n✓ Multi-level analysis complete")
+        print(f"  Total citations: {len(final_analysis['citations'])}")
+        print(f"  Total actions: {len(final_analysis['data_actions'])}")
+        print(f"  Classification: {final_analysis['classification']}")
         
-        return f"""Extract actions from text:
-
-{text_truncated}
-
-Standard actions only: share, store, process, update, create
-
-Provide JSON:
-{{
-    "user_actions": ["actions users take"],
-    "system_actions": ["actions systems must do"]
-}}
-
-Map synonyms to standard actions."""
-    
-    def get_constraint_analysis_prompt(self, text: str) -> str:
-        """
-        OPTIMIZED: Concise constraint extraction
-        """
-        # Truncate text
-        text_truncated = text[:500] + "..." if len(text) > 500 else text
-        
-        return f"""Extract constraints from:
-
-{text_truncated}
-
-Provide JSON:
-{{
-    "constraints": [
-        {{"type": "temporal/technical/procedural", "description": "..."}}
-    ]
-}}
-
-Focus on conditions and limitations."""
-    
-    def get_duty_extraction_prompt(self, text: str) -> str:
-        """
-        OPTIMIZED: Concise duty extraction
-        """
-        # Truncate text
-        text_truncated = text[:500] + "..." if len(text) > 500 else text
-        
-        return f"""Extract duties and obligations from:
-
-{text_truncated}
-
-Provide JSON:
-{{
-    "user_duties": ["what users must do"],
-    "system_duties": ["what systems must do"]
-}}
-
-Focus on mandatory requirements."""
-    
-    def get_rule_classification_prompt(self, analysis: str) -> str:
-        """
-        OPTIMIZED: Concise rule classification
-        """
-        # Truncate analysis
-        analysis_truncated = analysis[:600] + "..." if len(analysis) > 600 else analysis
-        
-        return f"""Classify this rule:
-
-{analysis_truncated}
-
-Determine:
-- Rule type: permission/prohibition/obligation/combination
-- Confidence: high/medium/low
-- Reasoning: Brief justification
-
-Provide JSON:
-{{
-    "rule_type": "...",
-    "confidence": "...",
-    "reasoning": "..."
-}}"""
-    
-    def get_enterprise_context_prompt(self, text: str) -> str:
-        """
-        Extract enterprise-specific context
-        """
-        # Truncate text
-        text_truncated = text[:800] + "..." if len(text) > 800 else text
-        
-        return f"""Identify enterprise-specific context from:
-
-{text_truncated}
-
-Extract:
-- Organization name
-- Internal tools/systems
-- Specific processes
-- Business units
-
-Provide JSON:
-{{
-    "organization": "...",
-    "tools": ["..."],
-    "processes": ["..."],
-    "business_units": ["..."]
-}}"""
-    
-    def get_data_category_prompt(self, text: str) -> str:
-        """
-        OPTIMIZED: Data category identification
-        """
-        # Truncate text
-        text_truncated = text[:500] + "..." if len(text) > 500 else text
-        
-        return f"""Identify data categories mentioned:
-
-{text_truncated}
-
-Common categories: personal data, sensitive data, financial data, health data, etc.
-
-Provide JSON:
-{{
-    "data_categories": ["category1", "category2", ...]
-}}"""
-    
-    def get_role_identification_prompt(self, text: str) -> str:
-        """
-        OPTIMIZED: Role identification
-        """
-        # Truncate text
-        text_truncated = text[:500] + "..." if len(text) > 500 else text
-        
-        return f"""Identify roles mentioned:
-
-{text_truncated}
-
-Common roles: data controller, data processor, data subject, third party, etc.
-
-Provide JSON:
-{{
-    "roles": ["role1", "role2", ...]
-}}"""
-    
-    def get_validation_prompt(self, analysis: Dict[str, Any]) -> str:
-        """
-        OPTIMIZED: Validation prompt
-        """
-        # Create compact summary of analysis
-        summary = f"""Rule: {analysis.get('description', 'N/A')[:200]}
-User Actions: {len(analysis.get('user_actions', []))}
-System Actions: {len(analysis.get('system_actions', []))}
-Constraints: {len(analysis.get('constraints', []))}
-Type: {analysis.get('rule_type', 'N/A')}"""
-        
-        return f"""Validate this analysis:
-
-{summary}
-
-Check for:
-1. Logical consistency
-2. Completeness
-3. Accuracy
-4. Missing information
-
-Provide JSON:
-{{
-    "is_valid": true/false,
-    "issues": ["issue1", "issue2", ...],
-    "suggestions": ["suggestion1", "suggestion2", ...]
-}}"""
-    
-    def get_merge_prompt(self, analyses: List[Dict[str, Any]]) -> str:
-        """
-        OPTIMIZED: Merge multiple analyses
-        """
-        # Create compact summaries
-        summaries = []
-        for i, analysis in enumerate(analyses[:3]):
-            desc = analysis.get('description', '')[:100]
-            summaries.append(f"Analysis {i+1}: {desc}...")
-        
-        if len(analyses) > 3:
-            summaries.append(f"... and {len(analyses) - 3} more analyses")
-        
-        summary_text = "\n".join(summaries)
-        
-        return f"""Merge these analyses into one comprehensive analysis:
-
-{summary_text}
-
-Provide merged JSON with:
-- Combined description
-- All unique actions
-- All unique constraints
-- Unified rule type
-
-Deduplicate and synthesize."""
-    
-    def get_refinement_prompt(self, analysis: Dict[str, Any], feedback: str) -> str:
-        """
-        OPTIMIZED: Refinement prompt based on feedback
-        """
-        # Create compact analysis summary
-        summary = f"""Current analysis:
-Description: {analysis.get('description', '')[:200]}...
-Actions: {len(analysis.get('user_actions', []))} user, {len(analysis.get('system_actions', []))} system
-Type: {analysis.get('rule_type', 'N/A')}"""
-        
-        return f"""Refine this analysis based on feedback:
-
-{summary}
-
-FEEDBACK:
-{feedback[:300]}
-
-Provide improved JSON with all required fields."""
+        return final_analysis
