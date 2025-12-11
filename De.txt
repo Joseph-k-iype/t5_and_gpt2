@@ -1,475 +1,192 @@
 """
-FalkorDB Capability Graph Builder with OpenAI Embeddings
-Creates a hierarchical graph structure from capability CSV data
+HSBC OpenAI Client wrapper
+Creates properly configured clients for HSBC authentication
 """
-import csv
 import logging
-from typing import List, Dict, Optional
-from falkordb import FalkorDB
+import uuid
+import httpx
+from openai import OpenAI
 
-from src.services.openai_service import OpenAIService
-from src.config import Config
+from .hsbc_token_service import HSBCTokenService
+from ..config import Config
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class CapabilityGraphBuilder:
-    """Build and manage capability graph with embeddings in FalkorDB"""
+class TokenRefreshTransport(httpx.HTTPTransport):
+    """Custom transport that refreshes tokens on 401 errors"""
+    
+    def __init__(self, token_service: HSBCTokenService, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.token_service = token_service
+        self.max_retries = 1
+    
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        """Handle request with automatic token refresh on 401"""
+        response = super().handle_request(request)
+        
+        # If we get a 401, refresh token and retry once
+        if response.status_code == 401 and self.max_retries > 0:
+            logger.info("Got 401, refreshing token and retrying...")
+            
+            # Get fresh token
+            fresh_token = self.token_service.get_token(force_refresh=True)
+            
+            # Update request headers
+            request.headers["X-HSBC-E2E-Trust-Token"] = fresh_token
+            request.headers["Authorization"] = f"Bearer {fresh_token}"
+            request.headers["x-correlation-id"] = str(uuid.uuid4())
+            request.headers["x-usersession-id"] = str(uuid.uuid4())
+            
+            # Retry the request
+            self.max_retries -= 1
+            response = super().handle_request(request)
+            self.max_retries = 1  # Reset for next request
+        
+        return response
+
+
+class HSBCOpenAIClient(OpenAI):
+    """
+    Custom OpenAI client with HSBC JWT authentication.
+    Uses httpx with http2 and truststore for SSL.
+    """
     
     def __init__(
         self,
-        graph_name: str = "capability_graph",
-        host: str = None,
-        port: int = None
+        token_service: HSBCTokenService,
+        user_id: str,
+        base_url: str,
+        **kwargs
     ):
         """
-        Initialize the capability graph builder
+        Initialize HSBC OpenAI Client
         
         Args:
-            graph_name: Name of the graph to create
-            host: FalkorDB host (defaults to Config.FALKORDB_HOST)
-            port: FalkorDB port (defaults to Config.FALKORDB_PORT)
+            token_service: HSBCTokenService instance for token management
+            user_id: HSBC user ID to include in requests
+            base_url: Base URL for OpenAI-compatible API
+            **kwargs: Additional arguments for OpenAI client
         """
-        self.graph_name = graph_name
-        self.host = host or Config.FALKORDB_HOST
-        self.port = port or Config.FALKORDB_PORT
+        self.token_service = token_service
+        self.user_id = user_id
         
-        # Connect to FalkorDB
-        logger.info(f"Connecting to FalkorDB at {self.host}:{self.port}")
-        self.db = FalkorDB(host=self.host, port=self.port)
-        self.graph = self.db.select_graph(self.graph_name)
+        initial_token = token_service.get_token()
+        httpx_client = token_service.get_httpx_client()
         
-        # Initialize OpenAI service with HSBC auth
-        logger.info("Initializing OpenAI service for embeddings...")
-        self.openai_service = OpenAIService()
+        correlation_id = str(uuid.uuid4())
+        session_id = str(uuid.uuid4())
         
-        # Embedding dimension for text-embedding-3-large
-        self.embedding_dimension = 3072
+        default_headers = {
+            "X-HSBC-E2E-Trust-Token": initial_token,
+            "Token_Type": "SESSION_TOKEN",
+            "x-correlation-id": correlation_id,
+            "x-usersession-id": session_id,
+            "Content-Type": "application/json"
+        }
         
-        logger.info("✓ Capability graph builder initialized")
-    
-    def clear_graph(self):
-        """Clear all data from the graph"""
-        try:
-            logger.info(f"Clearing graph '{self.graph_name}'...")
-            self.graph.delete()
-            self.graph = self.db.select_graph(self.graph_name)
-            logger.info("✓ Graph cleared")
-        except Exception as e:
-            logger.warning(f"Error clearing graph (may not exist yet): {e}")
-    
-    def check_vector_index_exists(self) -> bool:
-        """Check if vector index already exists"""
-        try:
-            result = self.graph.query("CALL db.indexes()")
-            for record in result.result_set:
-                # Check if there's a VECTOR index on Capability.embedding
-                if len(record) >= 4:
-                    if (record[2] == 'VECTOR' and 
-                        'Capability' in str(record) and 
-                        'embedding' in str(record)):
-                        return True
-            return False
-        except Exception as e:
-            logger.warning(f"Error checking indices: {e}")
-            return False
-    
-    def drop_vector_index(self):
-        """Drop existing vector index if it exists"""
-        logger.info("Dropping existing vector index...")
-        
-        query = "DROP VECTOR INDEX FOR (c:Capability) ON (c.embedding)"
-        
-        try:
-            self.graph.query(query)
-            logger.info("✓ Vector index dropped successfully")
-        except Exception as e:
-            logger.warning(f"Could not drop vector index (may not exist): {e}")
-    
-    def create_vector_index(self, drop_if_exists: bool = True):
-        """
-        Create vector index on capability nodes
-        
-        Args:
-            drop_if_exists: If True, drop existing index before creating new one
-        """
-        if drop_if_exists and self.check_vector_index_exists():
-            logger.info("Vector index already exists, dropping it first...")
-            self.drop_vector_index()
-        
-        logger.info("Creating vector index for embeddings...")
-        
-        query = f"""
-        CREATE VECTOR INDEX FOR (c:Capability) ON (c.embedding) 
-        OPTIONS {{
-            dimension: {self.embedding_dimension}, 
-            similarityFunction: 'cosine'
-        }}
-        """
-        
-        try:
-            self.graph.query(query)
-            logger.info("✓ Vector index created successfully")
-        except Exception as e:
-            if "already indexed" in str(e).lower():
-                logger.warning("Vector index already exists - skipping creation")
-            else:
-                logger.error(f"Error creating vector index: {e}")
-                raise
-    
-    async def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """
-        Generate embeddings for texts using OpenAI
-        
-        Args:
-            texts: List of texts to embed
-            
-        Returns:
-            List of embedding vectors
-        """
-        logger.info(f"Generating embeddings for {len(texts)} texts...")
-        embeddings = await self.openai_service.get_embeddings(texts)
-        logger.info("✓ Embeddings generated")
-        return embeddings
-    
-    def read_capabilities_csv(self, csv_path: str) -> List[Dict]:
-        """
-        Read capabilities from CSV file
-        
-        Args:
-            csv_path: Path to CSV file
-            
-        Returns:
-            List of capability dictionaries
-        """
-        logger.info(f"Reading capabilities from {csv_path}")
-        capabilities = []
-        
-        with open(csv_path, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                capabilities.append({
-                    'name': row['Capability Name'].strip(),
-                    'guid': row['Capability GUID'].strip(),
-                    'level': int(row['Capability Level']),
-                    'index': row['Capability Index'].strip(),
-                    'l0': row['Capability L0'].strip() if row['Capability L0'] else None,
-                    'l1': row['Capability L1'].strip() if row['Capability L1'] else None,
-                    'l2': row['Capability L2'].strip() if row['Capability L2'] else None,
-                    'l3': row['Capability L3'].strip() if row['Capability L3'] else None,
-                    'description': row['Description'].strip()
-                })
-        
-        logger.info(f"✓ Read {len(capabilities)} capabilities")
-        return capabilities
-    
-    async def load_capabilities(self, csv_path: str, batch_size: int = 50):
-        """
-        Load capabilities from CSV and create graph with embeddings
-        
-        Args:
-            csv_path: Path to CSV file
-            batch_size: Number of capabilities to process at once
-        """
-        capabilities = self.read_capabilities_csv(csv_path)
-        
-        # Generate text for embeddings (name + description)
-        texts_for_embedding = [
-            f"{cap['name']}: {cap['description']}" 
-            for cap in capabilities
-        ]
-        
-        # Generate embeddings in batches
-        all_embeddings = []
-        for i in range(0, len(texts_for_embedding), batch_size):
-            batch = texts_for_embedding[i:i + batch_size]
-            batch_embeddings = await self.generate_embeddings(batch)
-            all_embeddings.extend(batch_embeddings)
-        
-        # Create nodes with embeddings and relationships
-        logger.info("Creating capability nodes with embeddings...")
-        
-        for cap, embedding in zip(capabilities, all_embeddings):
-            # Escape single quotes in strings
-            name_escaped = cap['name'].replace("'", "\\'")
-            desc_escaped = cap['description'].replace("'", "\\'")
-            guid_escaped = cap['guid'].replace("'", "\\'")
-            index_escaped = cap['index'].replace("'", "\\'")
-            
-            # Create the capability node with embedding
-            create_query = f"""
-            CREATE (c:Capability {{
-                name: '{name_escaped}',
-                guid: '{guid_escaped}',
-                level: {cap['level']},
-                index: '{index_escaped}',
-                description: '{desc_escaped}',
-                embedding: vecf32({embedding})
-            }})
-            """
-            
-            try:
-                self.graph.query(create_query)
-            except Exception as e:
-                logger.error(f"Error creating node for {cap['name']}: {e}")
-                continue
-        
-        logger.info("✓ Capability nodes created")
-        
-        # Create hierarchical relationships
-        self._create_relationships(capabilities)
-    
-    def _create_relationships(self, capabilities: List[Dict]):
-        """
-        Create hierarchical relationships between capabilities
-        
-        Data structure:
-        - L0: Has L0, L1, L2 (but L1 and L2 are same as L0 or empty)
-        - L1: Has L0, L1 (parent in L0, self in L1, NO L2)
-        - L2: Has L0, L1, L2 (NO L3)
-        - L3: Has L0, L1, L2, L3
-        
-        Args:
-            capabilities: List of capability dictionaries
-        """
-        logger.info("Creating hierarchical relationships...")
-        
-        relationships_created = 0
-        
-        for cap in capabilities:
-            level = cap['level']
-            current_name = cap['name'].replace("'", "\\'")
-            
-            # Level 1: Parent is in L0
-            if level == 1 and cap['l0']:
-                parent_name = cap['l0'].replace("'", "\\'")
-                # Only create relationship if parent is different from current
-                if cap['l0'] != cap['name']:
-                    rel_query = f"""
-                    MATCH (parent:Capability {{name: '{parent_name}', level: 0}}),
-                          (child:Capability {{name: '{current_name}', level: 1}})
-                    CREATE (parent)-[:HAS_SUBCAPABILITY]->(child)
-                    """
-                    try:
-                        self.graph.query(rel_query)
-                        relationships_created += 1
-                    except Exception as e:
-                        logger.warning(f"Could not create L0->L1 relationship for {current_name}: {e}")
-            
-            # Level 2: Parent is in L1 (L1 should exist, no L2 for L1 capabilities)
-            elif level == 2 and cap['l1']:
-                parent_name = cap['l1'].replace("'", "\\'")
-                # Only create relationship if parent is different from current
-                if cap['l1'] != cap['name']:
-                    rel_query = f"""
-                    MATCH (parent:Capability {{name: '{parent_name}', level: 1}}),
-                          (child:Capability {{name: '{current_name}', level: 2}})
-                    CREATE (parent)-[:HAS_SUBCAPABILITY]->(child)
-                    """
-                    try:
-                        self.graph.query(rel_query)
-                        relationships_created += 1
-                    except Exception as e:
-                        logger.warning(f"Could not create L1->L2 relationship for {current_name}: {e}")
-            
-            # Level 3: Parent is in L2 (L2 should exist, no L3 for L2 capabilities)
-            elif level == 3 and cap['l2']:
-                parent_name = cap['l2'].replace("'", "\\'")
-                # Only create relationship if parent is different from current
-                if cap['l2'] != cap['name']:
-                    rel_query = f"""
-                    MATCH (parent:Capability {{name: '{parent_name}', level: 2}}),
-                          (child:Capability {{name: '{current_name}', level: 3}})
-                    CREATE (parent)-[:HAS_SUBCAPABILITY]->(child)
-                    """
-                    try:
-                        self.graph.query(rel_query)
-                        relationships_created += 1
-                    except Exception as e:
-                        logger.warning(f"Could not create L2->L3 relationship for {current_name}: {e}")
-        
-        logger.info(f"✓ Created {relationships_created} relationships")
-    
-    async def find_similar_capabilities(
-        self, 
-        query_text: str, 
-        top_k: int = 5
-    ) -> List[Dict]:
-        """
-        Find capabilities similar to the query text
-        
-        Args:
-            query_text: Text to search for
-            top_k: Number of results to return
-            
-        Returns:
-            List of similar capabilities with scores
-        """
-        # Generate embedding for query
-        query_embeddings = await self.generate_embeddings([query_text])
-        query_embedding = query_embeddings[0]
-        
-        # Vector search query
-        search_query = f"""
-        CALL db.idx.vector.queryNodes(
-            'Capability',
-            'embedding',
-            {top_k},
-            vecf32({query_embedding})
+        super().__init__(
+            api_key=initial_token,
+            base_url=base_url,
+            http_client=httpx_client,
+            default_headers=default_headers,
+            **kwargs
         )
-        YIELD node, score
-        RETURN 
-            node.name AS name,
-            node.description AS description,
-            node.level AS level,
-            node.guid AS guid,
-            score
-        ORDER BY score DESC
-        """
         
-        result = self.graph.query(search_query)
-        
-        similar_capabilities = []
-        for record in result.result_set:
-            similar_capabilities.append({
-                'name': record[0],
-                'description': record[1],
-                'level': record[2],
-                'guid': record[3],
-                'similarity_score': record[4]
-            })
-        
-        return similar_capabilities
+        logger.info(f"HSBC OpenAI Client initialized")
+        logger.info(f"  Base URL: {base_url}")
+        logger.info(f"  User ID: {user_id}")
     
-    def get_capability_hierarchy(self, capability_name: str) -> Dict:
+    def _refresh_token_and_headers(self):
         """
-        Get the full hierarchy for a capability
-        
-        Args:
-            capability_name: Name of the capability
-            
-        Returns:
-            Dictionary with capability and its hierarchy
+        Refresh token - simplified version.
+        Note: The httpx client handles most of the refresh logic automatically.
         """
-        name_escaped = capability_name.replace("'", "\\'")
-        
-        query = f"""
-        MATCH path = (root:Capability)-[:HAS_SUBCAPABILITY*0..]->(c:Capability {{name: '{name_escaped}'}})
-        WHERE NOT (()-[:HAS_SUBCAPABILITY]->(root))
-        RETURN 
-            [node IN nodes(path) | {{
-                name: node.name, 
-                level: node.level,
-                description: node.description
-            }}] AS hierarchy_path
-        LIMIT 1
-        """
-        
-        result = self.graph.query(query)
-        
-        if result.result_set:
-            return {'hierarchy': result.result_set[0][0]}
-        return {'hierarchy': []}
-    
-    def get_subcapabilities(self, capability_name: str) -> List[Dict]:
-        """
-        Get all direct subcapabilities of a capability
-        
-        Args:
-            capability_name: Name of the capability
-            
-        Returns:
-            List of subcapabilities
-        """
-        name_escaped = capability_name.replace("'", "\\'")
-        
-        query = f"""
-        MATCH (parent:Capability {{name: '{name_escaped}'}})-[:HAS_SUBCAPABILITY]->(child:Capability)
-        RETURN 
-            child.name AS name,
-            child.level AS level,
-            child.description AS description,
-            child.guid AS guid
-        """
-        
-        result = self.graph.query(query)
-        
-        subcapabilities = []
-        for record in result.result_set:
-            subcapabilities.append({
-                'name': record[0],
-                'level': record[1],
-                'description': record[2],
-                'guid': record[3]
-            })
-        
-        return subcapabilities
-    
-    def list_all_indices(self):
-        """List all indices in the graph"""
-        result = self.graph.query("CALL db.indexes()")
-        
-        logger.info("Graph Indices:")
-        for record in result.result_set:
-            logger.info(f"  {record}")
-        
-        return result.result_set
+        fresh_token = self.token_service.get_token(force_refresh=True)
+        self.api_key = fresh_token
+        logger.info("Token refreshed")
 
 
-async def main():
-    """Example usage"""
+def create_hsbc_client() -> HSBCOpenAIClient:
+    """
+    Factory function to create HSBC OpenAI client
     
-    # Initialize graph builder
-    builder = CapabilityGraphBuilder(graph_name="hsbc_capabilities")
+    Returns:
+        HSBCOpenAIClient: Configured client instance
+    """
+    if not Config.HSBC_PASSWORD:
+        raise ValueError(
+            "HSBC_PASSWORD environment variable required for HSBC authentication. "
+            "Set it using: export HSBC_PASSWORD='your-password'"
+        )
     
-    # Option 1: Clear everything and start fresh (CAUTION: Deletes all data!)
-    # Uncomment the line below to clear the entire graph
-    # builder.clear_graph()
+    logger.info("Creating HSBC token service...")
     
-    # Option 2: Keep data but recreate the vector index
-    # This will drop and recreate the index if it already exists
-    builder.create_vector_index(drop_if_exists=True)
-    
-    # Option 3: Only create index if it doesn't exist
-    # builder.create_vector_index(drop_if_exists=False)
-    
-    # Load capabilities from CSV
-    csv_path = "./capabilities.csv"  # Update with your CSV path
-    await builder.load_capabilities(csv_path)
-    
-    # List indices to verify
-    builder.list_all_indices()
-    
-    # Example: Search for similar capabilities
-    logger.info("\n=== Testing Similarity Search ===")
-    similar = await builder.find_similar_capabilities(
-        "customer data management and privacy",
-        top_k=5
+    token_service = HSBCTokenService(
+        token_endpoint=Config.HSBC_TOKEN_ENDPOINT,
+        username=Config.HSBC_USERNAME,
+        password=Config.HSBC_PASSWORD
     )
     
-    for i, cap in enumerate(similar, 1):
-        logger.info(f"\n{i}. {cap['name']} (Level {cap['level']})")
-        logger.info(f"   Score: {cap['similarity_score']:.4f}")
-        logger.info(f"   Description: {cap['description'][:100]}...")
+    logger.info("Creating HSBC OpenAI client...")
     
-    # Example: Get hierarchy for a capability
-    if similar:
-        logger.info("\n=== Testing Hierarchy Retrieval ===")
-        hierarchy = builder.get_capability_hierarchy(similar[0]['name'])
-        logger.info(f"Hierarchy for {similar[0]['name']}:")
-        for level in hierarchy['hierarchy']:
-            logger.info(f"  L{level['level']}: {level['name']}")
-    
-    # Example: Get subcapabilities
-    if similar:
-        logger.info("\n=== Testing Subcapability Retrieval ===")
-        subcaps = builder.get_subcapabilities(similar[0]['name'])
-        logger.info(f"Subcapabilities of {similar[0]['name']}:")
-        for subcap in subcaps:
-            logger.info(f"  - {subcap['name']} (L{subcap['level']})")
+    return HSBCOpenAIClient(
+        token_service=token_service,
+        user_id=Config.HSBC_USER_ID,
+        base_url=Config.BASE_URL
+    )
 
 
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+def create_langchain_client():
+    """
+    Create a properly configured ChatOpenAI instance for LangChain
+    Compatible with the working httpx + truststore approach
+    
+    Returns:
+        ChatOpenAI instance configured for HSBC
+    """
+    from langchain_openai import ChatOpenAI
+    
+    if not Config.HSBC_PASSWORD:
+        raise ValueError(
+            "HSBC_PASSWORD environment variable required for HSBC authentication. "
+            "Set it using: export HSBC_PASSWORD='your-password'"
+        )
+    
+    logger.info("Creating LangChain ChatOpenAI with HSBC authentication...")
+    
+    token_service = HSBCTokenService(
+        token_endpoint=Config.HSBC_TOKEN_ENDPOINT,
+        username=Config.HSBC_USERNAME,
+        password=Config.HSBC_PASSWORD
+    )
+    
+    jwt_token = token_service.get_token()
+    httpx_client = token_service.get_httpx_client()
+    
+    invocation_headers = {
+        'X-HSBC-E2E-Trust-Token': jwt_token,
+        'x-correlation-id': str(uuid.uuid4()),
+        'x-usersession-id': str(uuid.uuid4()),
+        'Content-Type': 'application/json'
+    }
+    
+    logger.info(f"LangChain client configured:")
+    logger.info(f"  Model: {Config.CHAT_MODEL}")
+    logger.info(f"  Base URL: {Config.BASE_URL}")
+    logger.info(f"  User: {Config.HSBC_USER_ID}")
+    
+    llm = ChatOpenAI(
+        model=Config.CHAT_MODEL,
+        api_key=jwt_token,
+        base_url=Config.BASE_URL,
+        http_client=httpx_client,
+        default_headers=invocation_headers,
+        model_kwargs={"user": Config.HSBC_USER_ID}
+    )
+    
+    llm._hsbc_token_service = token_service
+    
+    logger.info("✓ LangChain ChatOpenAI client created successfully")
+    
+    return llm
