@@ -1,252 +1,243 @@
 """
-HSBC Token Service for JWT authentication
-FIXED: Better token expiration tracking and automatic refresh
-Handles token fetching and automatic refresh using httpx + truststore
+HSBC OpenAI Client wrapper
+Creates properly configured clients for HSBC authentication
+FIXED: Dynamic token refresh on expiration - handles 401 errors automatically
 """
 import logging
-import ssl
-import httpx
-import truststore
-from typing import Optional
-from datetime import datetime, timedelta
-import threading
-import time
+import uuid
+from openai import OpenAI
+from openai._exceptions import APIStatusError
+
+from .hsbc_token_service import HSBCTokenService
+from ..config import Config
 
 logger = logging.getLogger(__name__)
 
 
-class HSBCTokenService:
-    """Service for managing HSBC JWT tokens with automatic refresh and expiration tracking."""
+class HSBCOpenAIClient(OpenAI):
+    """
+    Custom OpenAI client with HSBC JWT authentication.
+    Uses httpx with http2 and truststore for SSL.
+    Automatically refreshes tokens on expiration.
+    """
     
     def __init__(
         self,
-        token_endpoint: str,
-        username: str,
-        password: str,
-        token_buffer_seconds: int = 300,  # Refresh 5 minutes before expiry
-        token_lifetime_seconds: int = 3600  # Assume 1 hour token lifetime
+        token_service: HSBCTokenService,
+        user_id: str,
+        base_url: str,
+        **kwargs
     ):
         """
-        Initialize HSBC Token Service with dynamic token refresh
+        Initialize HSBC OpenAI Client
         
         Args:
-            token_endpoint: URL for token translation endpoint
-            username: HSBC username for authentication
-            password: HSBC password for authentication
-            token_buffer_seconds: Seconds before expiry to refresh token (default: 5 minutes)
-            token_lifetime_seconds: Expected token lifetime in seconds (default: 1 hour)
+            token_service: HSBCTokenService instance for token management
+            user_id: HSBC user ID to include in requests
+            base_url: Base URL for OpenAI-compatible API
+            **kwargs: Additional arguments for OpenAI client
         """
-        self.token_endpoint = token_endpoint
-        self.username = username
-        self.password = password
-        self.token_buffer_seconds = token_buffer_seconds
-        self.token_lifetime_seconds = token_lifetime_seconds
+        self.token_service = token_service
+        self.user_id = user_id
+        self._retry_count = 0
+        self._max_retries = 3
         
-        self._current_token: Optional[str] = None
-        self._token_expiry: Optional[datetime] = None
-        self._token_fetched_at: Optional[datetime] = None
-        self._lock = threading.Lock()
+        initial_token = token_service.get_token()
+        httpx_client = token_service.get_httpx_client()
         
-        # Create httpx client with truststore SSL context
-        ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        self.httpx_client = httpx.Client(http2=True, verify=ctx)
+        correlation_id = str(uuid.uuid4())
+        session_id = str(uuid.uuid4())
         
-        logger.info("HSBC Token Service initialized with httpx + truststore")
-        logger.info(f"  Token refresh buffer: {token_buffer_seconds} seconds")
-        logger.info(f"  Expected token lifetime: {token_lifetime_seconds} seconds")
+        default_headers = {
+            "X-HSBC-E2E-Trust-Token": initial_token,
+            "Token_Type": "SESSION_TOKEN",
+            "x-correlation-id": correlation_id,
+            "x-usersession-id": session_id,
+            "Content-Type": "application/json"
+        }
+        
+        super().__init__(
+            api_key=initial_token,
+            base_url=base_url,
+            http_client=httpx_client,
+            default_headers=default_headers,
+            **kwargs
+        )
+        
+        # Store headers dict for reference
+        self._headers_dict = default_headers
+        
+        logger.info(f"HSBC OpenAI Client initialized")
+        logger.info(f"  Base URL: {base_url}")
+        logger.info(f"  User ID: {user_id}")
     
-    def _fetch_new_token(self) -> str:
+    def _get_fresh_headers(self, force_refresh: bool = False) -> dict:
         """
-        Fetch a new JWT token from HSBC token service.
-        
-        Returns:
-            str: JWT token
-            
-        Raises:
-            Exception: If token fetch fails
-        """
-        try:
-            payload = {
-                "input_token_state": {
-                    "token_type": "CREDENTIAL",
-                    "username": self.username,
-                    "password": self.password
-                },
-                "output_token_state": {
-                    "token_type": "JWT"
-                }
-            }
-            
-            logger.info(f"Fetching new token from {self.token_endpoint}")
-            start_time = time.time()
-            
-            response = self.httpx_client.post(
-                self.token_endpoint,
-                json=payload,
-                timeout=30.0  # Add timeout
-            )
-            
-            response.raise_for_status()
-            
-            data = response.json()
-            token = data.get("issued_token")
-            
-            if not token:
-                raise ValueError(f"No issued_token in response: {data}")
-            
-            elapsed_time = time.time() - start_time
-            logger.info(f"✓ Successfully fetched new JWT token (took {elapsed_time:.2f}s)")
-            
-            return token
-            
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error fetching token: {e}")
-            logger.error(f"Status code: {e.response.status_code}")
-            logger.error(f"Response: {e.response.text if hasattr(e, 'response') else 'N/A'}")
-            raise Exception(f"Failed to fetch HSBC token (HTTP {e.response.status_code}): {e}")
-        except httpx.TimeoutException as e:
-            logger.error(f"Timeout fetching token: {e}")
-            raise Exception(f"Token fetch timeout: {e}")
-        except Exception as e:
-            logger.error(f"Error fetching token: {e}")
-            raise Exception(f"Failed to fetch HSBC token: {e}")
-    
-    def _is_token_valid(self) -> bool:
-        """
-        Check if current token is valid and not near expiry.
-        
-        Returns:
-            bool: True if token is valid and not expiring soon
-        """
-        if not self._current_token or not self._token_expiry:
-            logger.debug("Token check: No current token")
-            return False
-        
-        now = datetime.now()
-        time_until_expiry = (self._token_expiry - now).total_seconds()
-        
-        if time_until_expiry <= 0:
-            logger.warning(f"Token expired {abs(time_until_expiry):.0f} seconds ago")
-            return False
-        
-        if time_until_expiry <= self.token_buffer_seconds:
-            logger.info(f"Token expiring soon (in {time_until_expiry:.0f} seconds, buffer is {self.token_buffer_seconds})")
-            return False
-        
-        logger.debug(f"Token valid for {time_until_expiry:.0f} more seconds")
-        return True
-    
-    def _is_token_expired(self) -> bool:
-        """
-        Check if token is completely expired (past expiry time).
-        
-        Returns:
-            bool: True if token is expired
-        """
-        if not self._current_token or not self._token_expiry:
-            return True
-        
-        return datetime.now() >= self._token_expiry
-    
-    def get_token(self, force_refresh: bool = False) -> str:
-        """
-        Get current valid token, refreshing if necessary.
-        Thread-safe with automatic refresh on expiration.
+        Get fresh headers with current/refreshed token and new IDs
         
         Args:
-            force_refresh: Force token refresh even if current token is valid
-            
-        Returns:
-            str: Valid JWT token
+            force_refresh: Force token refresh even if not expired
         """
-        with self._lock:
-            # Check if we need to fetch/refresh token
-            needs_refresh = force_refresh or not self._is_token_valid()
-            
-            if needs_refresh:
-                if force_refresh:
-                    logger.info("Token refresh forced by caller")
-                elif self._is_token_expired():
-                    logger.warning("Token has EXPIRED - fetching new token immediately")
-                else:
-                    logger.info("Token expiring soon - proactive refresh")
+        # Check if token needs refresh and get current or fresh token
+        fresh_token = self.token_service.get_token(force_refresh=force_refresh)
+        
+        return {
+            "X-HSBC-E2E-Trust-Token": fresh_token,
+            "Token_Type": "SESSION_TOKEN",
+            "x-correlation-id": str(uuid.uuid4()),
+            "x-usersession-id": str(uuid.uuid4()),
+            "Content-Type": "application/json"
+        }
+    
+    def _make_request(self, *args, **kwargs):
+        """
+        Override to inject fresh headers and handle token expiration.
+        Automatically retries with token refresh on 401 errors.
+        """
+        self._retry_count = 0
+        
+        while self._retry_count < self._max_retries:
+            try:
+                # Get fresh headers (will auto-refresh if token is expiring)
+                force_refresh = self._retry_count > 0  # Force refresh on retries
+                fresh_headers = self._get_fresh_headers(force_refresh=force_refresh)
                 
-                try:
-                    # Fetch new token
-                    self._current_token = self._fetch_new_token()
-                    self._token_fetched_at = datetime.now()
+                # Update the headers dict we're tracking
+                self._headers_dict.update(fresh_headers)
+                
+                # Inject headers into the request
+                if 'extra_headers' not in kwargs:
+                    kwargs['extra_headers'] = {}
+                kwargs['extra_headers'].update(fresh_headers)
+                
+                # Update API key
+                self.api_key = fresh_headers["X-HSBC-E2E-Trust-Token"]
+                
+                if self._retry_count > 0:
+                    logger.info(f"Retrying request with fresh token (attempt {self._retry_count + 1}/{self._max_retries})")
+                
+                # Make the actual request
+                response = super()._make_request(*args, **kwargs)
+                
+                # Reset retry count on success
+                self._retry_count = 0
+                return response
+                
+            except APIStatusError as e:
+                # Check for 401 Unauthorized (token expired)
+                if e.status_code == 401:
+                    self._retry_count += 1
                     
-                    # Calculate expiry time
-                    self._token_expiry = self._token_fetched_at + timedelta(
-                        seconds=self.token_lifetime_seconds
-                    )
+                    if self._retry_count >= self._max_retries:
+                        logger.error(f"Token refresh failed after {self._max_retries} attempts")
+                        raise
                     
-                    time_until_expiry = (self._token_expiry - datetime.now()).total_seconds()
-                    refresh_at = self._token_expiry - timedelta(seconds=self.token_buffer_seconds)
+                    logger.warning(f"Got 401 Unauthorized - token expired. Refreshing... (attempt {self._retry_count}/{self._max_retries})")
                     
-                    logger.info(f"Token fetched successfully:")
-                    logger.info(f"  Fetched at: {self._token_fetched_at.strftime('%Y-%m-%d %H:%M:%S')}")
-                    logger.info(f"  Expires at: {self._token_expiry.strftime('%Y-%m-%d %H:%M:%S')}")
-                    logger.info(f"  Valid for: {time_until_expiry:.0f} seconds")
-                    logger.info(f"  Will refresh at: {refresh_at.strftime('%Y-%m-%d %H:%M:%S')}")
+                    # Force invalidate the current token
+                    self.token_service.invalidate_token()
                     
-                except Exception as e:
-                    logger.error(f"Failed to refresh token: {e}")
-                    # If we have a current token (even if expiring), return it as fallback
-                    if self._current_token:
-                        logger.warning("Using potentially expired token as fallback")
-                        return self._current_token
+                    # Continue to retry with fresh token
+                    continue
+                else:
+                    # Not a 401 error, raise immediately
                     raise
-            else:
-                time_remaining = (self._token_expiry - datetime.now()).total_seconds()
-                logger.debug(f"Using existing token (valid for {time_remaining:.0f} more seconds)")
-            
-            return self._current_token
-    
-    def invalidate_token(self):
-        """
-        Invalidate current token to force refresh on next request.
-        Thread-safe.
-        """
-        with self._lock:
-            logger.info("Invalidating current token - will fetch fresh token on next request")
-            self._current_token = None
-            self._token_expiry = None
-            self._token_fetched_at = None
-    
-    def get_token_info(self) -> dict:
-        """
-        Get information about current token status.
+                    
+            except Exception as e:
+                # For other exceptions, check if it's related to authentication
+                error_msg = str(e).lower()
+                if 'unauthorized' in error_msg or 'token' in error_msg or 'expired' in error_msg:
+                    self._retry_count += 1
+                    
+                    if self._retry_count >= self._max_retries:
+                        logger.error(f"Token refresh failed after {self._max_retries} attempts")
+                        raise
+                    
+                    logger.warning(f"Authentication error detected: {e}. Refreshing token... (attempt {self._retry_count}/{self._max_retries})")
+                    
+                    # Force invalidate the current token
+                    self.token_service.invalidate_token()
+                    
+                    # Continue to retry with fresh token
+                    continue
+                else:
+                    # Not an auth error, raise immediately
+                    raise
         
-        Returns:
-            dict: Token status information
-        """
-        with self._lock:
-            if not self._current_token:
-                return {
-                    "has_token": False,
-                    "status": "no_token"
-                }
-            
-            now = datetime.now()
-            time_until_expiry = (self._token_expiry - now).total_seconds() if self._token_expiry else 0
-            
-            if time_until_expiry <= 0:
-                status = "expired"
-            elif time_until_expiry <= self.token_buffer_seconds:
-                status = "expiring_soon"
-            else:
-                status = "valid"
-            
-            return {
-                "has_token": True,
-                "status": status,
-                "fetched_at": self._token_fetched_at.isoformat() if self._token_fetched_at else None,
-                "expires_at": self._token_expiry.isoformat() if self._token_expiry else None,
-                "seconds_until_expiry": max(0, time_until_expiry),
-                "is_valid": status == "valid"
-            }
+        raise Exception(f"Request failed after {self._max_retries} token refresh attempts")
+
+
+def create_hsbc_client() -> HSBCOpenAIClient:
+    """
+    Factory function to create HSBC OpenAI client with automatic token refresh
     
-    def get_httpx_client(self) -> httpx.Client:
-        """Get the httpx client for making requests."""
-        return self.httpx_client
+    Returns:
+        HSBCOpenAIClient: Configured client instance with token management
+    """
+    if not Config.HSBC_PASSWORD:
+        raise ValueError(
+            "HSBC_PASSWORD environment variable required for HSBC authentication. "
+            "Set it using: export HSBC_PASSWORD='your-password'"
+        )
+    
+    logger.info("Creating HSBC token service...")
+    
+    token_service = HSBCTokenService(
+        token_endpoint=Config.HSBC_TOKEN_ENDPOINT,
+        username=Config.HSBC_USERNAME,
+        password=Config.HSBC_PASSWORD,
+        token_buffer_seconds=300  # Refresh 5 minutes before expiry
+    )
+    
+    logger.info("Creating HSBC OpenAI client with automatic token refresh...")
+    
+    return HSBCOpenAIClient(
+        token_service=token_service,
+        user_id=Config.HSBC_USER_ID,
+        base_url=Config.BASE_URL
+    )
+
+
+def create_langchain_client():
+    """
+    Create a properly configured ChatOpenAI instance for LangChain
+    WITH automatic token refresh through custom client
+    
+    Returns:
+        ChatOpenAI instance configured for HSBC with token management
+    """
+    from langchain_openai import ChatOpenAI
+    
+    if not Config.HSBC_PASSWORD:
+        raise ValueError(
+            "HSBC_PASSWORD environment variable required for HSBC authentication. "
+            "Set it using: export HSBC_PASSWORD='your-password'"
+        )
+    
+    logger.info("Creating LangChain ChatOpenAI with HSBC authentication and auto token refresh...")
+    
+    # Create the HSBC client (which handles token refresh)
+    hsbc_client = create_hsbc_client()
+    
+    logger.info(f"LangChain client configured:")
+    logger.info(f"  Model: {Config.CHAT_MODEL}")
+    logger.info(f"  Base URL: {Config.BASE_URL}")
+    logger.info(f"  User: {Config.HSBC_USER_ID}")
+    logger.info(f"  Token refresh: Enabled (auto-refresh on 401)")
+    
+    # Create ChatOpenAI using our custom client
+    llm = ChatOpenAI(
+        model=Config.CHAT_MODEL,
+        api_key=hsbc_client.api_key,
+        base_url=Config.BASE_URL,
+        http_client=hsbc_client._client,  # Use the httpx client from our HSBC client
+        model_kwargs={"user": Config.HSBC_USER_ID}
+    )
+    
+    # Store the HSBC client for access to token service
+    llm._hsbc_client = hsbc_client
+    llm._hsbc_token_service = hsbc_client.token_service
+    
+    logger.info("✓ LangChain ChatOpenAI client created with automatic token refresh")
+    
+    return llm
