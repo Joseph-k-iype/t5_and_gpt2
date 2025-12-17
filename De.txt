@@ -1,9 +1,7 @@
 """
 Advanced ELDM Field Mapping System with Full Hierarchical Graph RAG
-Hierarchy: Name (Attribute) -> Entity -> Conceptual Entity (optional)
-Creates embeddings for ALL levels to fully leverage knowledge graph power
-
-FIXED: RediSearch full-text query sanitization to prevent syntax errors
+Multiple Search Methods: Keyword, BM25, TF-IDF, Fuzzy, Vector, Fulltext, Hybrid, Graph RAG
+Ensures complete ELDM ingestion: Name (with Description) -> Entity -> Conceptual Entity
 """
 
 import os
@@ -17,6 +15,8 @@ from datetime import datetime
 import logging
 from scipy.stats import zscore
 import operator
+from collections import Counter
+import math
 
 # OpenAI and LangChain imports
 import openai
@@ -28,6 +28,11 @@ from langgraph.checkpoint.memory import MemorySaver
 
 # FalkorDB
 from falkordb import FalkorDB
+
+# Additional search libraries
+from rapidfuzz import fuzz, process
+from sklearn.feature_extraction.text import TfidfVectorizer
+from rank_bm25 import BM25Okapi
 
 # Configure logging
 logging.basicConfig(
@@ -60,6 +65,7 @@ OUTPUT_FILE = "eldm_mapping_results.xlsx"
 
 # Search Configuration
 HYBRID_SEARCH_ALPHA = 0.6  # Weight for vector vs full-text
+FUZZY_THRESHOLD = 70  # Minimum fuzzy match score (0-100)
 
 # Confidence Thresholds
 HIGH_CONFIDENCE_THRESHOLD = 0.85
@@ -76,70 +82,34 @@ TOP_K_CANDIDATES = 5
 # ============================================================================
 
 def sanitize_fulltext_query(query: str, max_length: int = 200) -> str:
-    """
-    Sanitize text for RediSearch full-text queries
-    Removes/escapes special characters that cause syntax errors
-    """
+    """Sanitize text for RediSearch full-text queries"""
     if not query or not isinstance(query, str):
         return ""
     
-    # Remove or replace problematic characters
-    # RediSearch special characters: - ( ) { } [ ] ^ " ~ * : \ @ ! | & 
     query = query.strip()
     
-    # Replace common SQL and special characters
+    # Replace problematic characters
     replacements = {
-        '(': ' ',
-        ')': ' ',
-        '[': ' ',
-        ']': ' ',
-        '{': ' ',
-        '}': ' ',
-        '"': ' ',
-        "'": ' ',
-        '`': ' ',
-        '\\': ' ',
-        '/': ' ',
-        '|': ' ',
-        '&': ' ',
-        '^': ' ',
-        '~': ' ',
-        '*': ' ',
-        ':': ' ',
-        ';': ' ',
-        ',': ' ',
-        '.': ' ',
-        '!': ' ',
-        '?': ' ',
-        '<': ' ',
-        '>': ' ',
-        '=': ' ',
-        '+': ' ',
-        '%': ' ',
-        '$': ' ',
-        '#': ' ',
-        '@': ' ',
+        '(': ' ', ')': ' ', '[': ' ', ']': ' ', '{': ' ', '}': ' ',
+        '"': ' ', "'": ' ', '`': ' ', '\\': ' ', '/': ' ', '|': ' ',
+        '&': ' ', '^': ' ', '~': ' ', '*': ' ', ':': ' ', ';': ' ',
+        ',': ' ', '.': ' ', '!': ' ', '?': ' ', '<': ' ', '>': ' ',
+        '=': ' ', '+': ' ', '%': ' ', '$': ' ', '#': ' ', '@': ' ',
     }
     
     for char, replacement in replacements.items():
         query = query.replace(char, replacement)
     
-    # Replace multiple spaces with single space
     query = re.sub(r'\s+', ' ', query)
-    
-    # Remove leading/trailing hyphens from words (causes issues in RediSearch)
     words = query.split()
     words = [word.strip('-_') for word in words if word.strip('-_')]
     query = ' '.join(words)
     
-    # Limit length
     if len(query) > max_length:
         query = query[:max_length]
     
-    # Final cleanup
     query = query.strip()
     
-    # If query is empty or too short after sanitization, return a safe default
     if len(query) < 2:
         return ""
     
@@ -147,14 +117,10 @@ def sanitize_fulltext_query(query: str, max_length: int = 200) -> str:
 
 
 def extract_keywords(text: str, max_keywords: int = 10) -> str:
-    """
-    Extract meaningful keywords from text for full-text search
-    Focus on substantive terms, removing common words
-    """
+    """Extract meaningful keywords from text"""
     if not text or not isinstance(text, str):
         return ""
     
-    # Common words to filter out
     stop_words = {
         'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
         'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'been',
@@ -163,13 +129,9 @@ def extract_keywords(text: str, max_keywords: int = 10) -> str:
         'these', 'those', 'it', 'its', 'their', 'there', 'where', 'when'
     }
     
-    # Extract words (alphanumeric + underscores)
     words = re.findall(r'\b[a-zA-Z_][a-zA-Z0-9_]{1,}\b', text.lower())
-    
-    # Filter stop words and short words
     keywords = [w for w in words if w not in stop_words and len(w) >= 3]
     
-    # Remove duplicates while preserving order
     seen = set()
     unique_keywords = []
     for kw in keywords:
@@ -177,10 +139,16 @@ def extract_keywords(text: str, max_keywords: int = 10) -> str:
             seen.add(kw)
             unique_keywords.append(kw)
     
-    # Limit number of keywords
     unique_keywords = unique_keywords[:max_keywords]
-    
     return ' '.join(unique_keywords)
+
+
+def tokenize(text: str) -> List[str]:
+    """Tokenize text for BM25 and TF-IDF"""
+    if not text:
+        return []
+    words = re.findall(r'\b[a-zA-Z_][a-zA-Z0-9_]{2,}\b', text.lower())
+    return words
 
 
 # ============================================================================
@@ -216,7 +184,7 @@ Transformation: {self.transformation_sql}
         return context.strip()
 
     def get_searchable_text(self) -> str:
-        """Get text for embedding and full-text search"""
+        """Get text for embedding"""
         parts = [
             self.tt_column_name,
             self.standardised_name,
@@ -228,7 +196,6 @@ Transformation: {self.transformation_sql}
     
     def get_fulltext_keywords(self) -> str:
         """Get sanitized keywords for full-text search"""
-        # Focus on field name and standardised name - most relevant
         important_text = f"{self.tt_column_name} {self.standardised_name} {self.comment} {self.data_type}"
         keywords = extract_keywords(important_text, max_keywords=8)
         return sanitize_fulltext_query(keywords)
@@ -236,7 +203,7 @@ Transformation: {self.transformation_sql}
 
 @dataclass
 class ELDMAttribute:
-    """Represents an ELDM Attribute (Name)"""
+    """Represents an ELDM Attribute (Name with Description)"""
     name: str
     description: str
     entity: Optional[str]
@@ -245,7 +212,7 @@ class ELDMAttribute:
     embedding: Optional[np.ndarray] = None
 
     def get_searchable_text(self) -> str:
-        """Get text representation for embedding"""
+        """Get text representation for embedding and search"""
         parts = [self.name, self.description, self.entity or '', self.conceptual_entity or '']
         return " ".join([p for p in parts if p and str(p).strip()])
 
@@ -255,12 +222,11 @@ class ELDMEntity:
     """Represents an ELDM Entity with all its attributes"""
     name: str
     conceptual_entity: Optional[str]
-    attributes: List[str]  # List of attribute names belonging to this entity
+    attributes: List[str]
     embedding: Optional[np.ndarray] = None
 
     def get_searchable_text(self) -> str:
-        """Get text representation for embedding"""
-        # Include entity name, its attributes, and conceptual entity for rich context
+        """Get text representation"""
         parts = [
             self.name,
             self.conceptual_entity or '',
@@ -273,11 +239,11 @@ class ELDMEntity:
 class ELDMConceptualEntity:
     """Represents an ELDM Conceptual Entity with all its entities"""
     name: str
-    entities: List[str]  # List of entity names belonging to this conceptual entity
+    entities: List[str]
     embedding: Optional[np.ndarray] = None
 
     def get_searchable_text(self) -> str:
-        """Get text representation for embedding"""
+        """Get text representation"""
         parts = [self.name] + self.entities
         return " ".join([p for p in parts if p and str(p).strip()])
 
@@ -286,15 +252,19 @@ class ELDMConceptualEntity:
 class MappingResult:
     """Represents a mapping result with confidence scores"""
     transaction_field: str
-    mapped_node_name: str  # The actual node name mapped to
-    mapped_node_type: str  # ATTRIBUTE, ENTITY, or CONCEPTUAL_ENTITY
-    eldm_attribute_name: str  # Most granular attribute (if applicable)
+    mapped_node_name: str
+    mapped_node_type: str
+    eldm_attribute_name: str
     eldm_entity: str
     eldm_conceptual_entity: str
     eldm_description: str
     confidence_score: float
     vector_similarity: float
     fulltext_score: float
+    keyword_score: float
+    bm25_score: float
+    tfidf_score: float
+    fuzzy_score: float
     hybrid_score: float
     graph_rag_score: float
     reasoning_confidence: float
@@ -311,6 +281,10 @@ class MappingResult:
 class GraphState(TypedDict):
     """State for the LangGraph workflow"""
     transaction_field: TransactionField
+    keyword_candidates: List[Dict[str, Any]]
+    bm25_candidates: List[Dict[str, Any]]
+    tfidf_candidates: List[Dict[str, Any]]
+    fuzzy_candidates: List[Dict[str, Any]]
     vector_candidates: List[Dict[str, Any]]
     fulltext_candidates: List[Dict[str, Any]]
     hybrid_candidates: List[Dict[str, Any]]
@@ -369,15 +343,244 @@ class EmbeddingService:
 
 
 # ============================================================================
+# MULTI-METHOD SEARCH ENGINE
+# ============================================================================
+
+class MultiMethodSearchEngine:
+    """
+    Combines multiple search methods:
+    1. Keyword (exact/partial matching)
+    2. BM25 (ranking algorithm)
+    3. TF-IDF (term frequency)
+    4. Fuzzy (Levenshtein distance)
+    """
+    
+    def __init__(self):
+        self.corpus_data: List[Dict[str, Any]] = []
+        self.bm25: Optional[BM25Okapi] = None
+        self.tfidf_vectorizer: Optional[TfidfVectorizer] = None
+        self.tfidf_matrix = None
+        logger.info("Initialized MultiMethodSearchEngine")
+    
+    def index_corpus(self, attributes: List[ELDMAttribute], 
+                     entities: List[ELDMEntity], 
+                     conceptuals: List[ELDMConceptualEntity]):
+        """Index all ELDM data for search"""
+        self.corpus_data = []
+        
+        # Index attributes
+        for attr in attributes:
+            self.corpus_data.append({
+                'node_type': 'ATTRIBUTE',
+                'name': attr.name,
+                'description': attr.description,
+                'entity': attr.entity or '',
+                'conceptual_entity': attr.conceptual_entity or '',
+                'full_path': attr.full_path,
+                'searchable_text': attr.get_searchable_text()
+            })
+        
+        # Index entities
+        for entity in entities:
+            self.corpus_data.append({
+                'node_type': 'ENTITY',
+                'name': entity.name,
+                'description': f"Entity with {len(entity.attributes)} attributes",
+                'entity': entity.name,
+                'conceptual_entity': entity.conceptual_entity or '',
+                'full_path': entity.name,
+                'searchable_text': entity.get_searchable_text()
+            })
+        
+        # Index conceptual entities
+        for conceptual in conceptuals:
+            self.corpus_data.append({
+                'node_type': 'CONCEPTUAL_ENTITY',
+                'name': conceptual.name,
+                'description': f"Conceptual entity with {len(conceptual.entities)} entities",
+                'entity': '',
+                'conceptual_entity': conceptual.name,
+                'full_path': conceptual.name,
+                'searchable_text': conceptual.get_searchable_text()
+            })
+        
+        logger.info(f"Indexed {len(self.corpus_data)} items in corpus")
+        
+        # Build BM25 index
+        tokenized_corpus = [tokenize(item['searchable_text']) for item in self.corpus_data]
+        self.bm25 = BM25Okapi(tokenized_corpus)
+        logger.info("Built BM25 index")
+        
+        # Build TF-IDF index
+        corpus_texts = [item['searchable_text'] for item in self.corpus_data]
+        self.tfidf_vectorizer = TfidfVectorizer(
+            tokenizer=tokenize,
+            lowercase=True,
+            max_features=1000
+        )
+        self.tfidf_matrix = self.tfidf_vectorizer.fit_transform(corpus_texts)
+        logger.info("Built TF-IDF index")
+    
+    def keyword_search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """Simple keyword matching (exact and partial)"""
+        if not query:
+            return []
+        
+        query_lower = query.lower()
+        query_tokens = set(tokenize(query))
+        
+        results = []
+        for item in self.corpus_data:
+            score = 0.0
+            name_lower = item['name'].lower()
+            desc_lower = item['description'].lower()
+            
+            # Exact name match
+            if query_lower == name_lower:
+                score += 10.0
+            # Partial name match
+            elif query_lower in name_lower:
+                score += 5.0
+            elif name_lower in query_lower:
+                score += 3.0
+            
+            # Description match
+            if query_lower in desc_lower:
+                score += 2.0
+            
+            # Token overlap
+            item_tokens = set(tokenize(item['searchable_text']))
+            overlap = len(query_tokens & item_tokens)
+            if overlap > 0:
+                score += overlap * 0.5
+            
+            if score > 0:
+                results.append({
+                    'node_type': item['node_type'],
+                    'name': item['name'],
+                    'description': item['description'],
+                    'full_path': item['full_path'],
+                    'entity': item['entity'],
+                    'conceptual_entity': item['conceptual_entity'],
+                    'similarity': min(score / 10.0, 1.0),  # Normalize
+                    'method': 'KEYWORD'
+                })
+        
+        results.sort(key=lambda x: x['similarity'], reverse=True)
+        logger.info(f"Keyword search returned {len(results[:top_k])} candidates")
+        return results[:top_k]
+    
+    def bm25_search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """BM25 ranking search"""
+        if not self.bm25 or not query:
+            return []
+        
+        query_tokens = tokenize(query)
+        if not query_tokens:
+            return []
+        
+        scores = self.bm25.get_scores(query_tokens)
+        
+        # Get top-k indices
+        top_indices = np.argsort(scores)[::-1][:top_k * 2]
+        
+        results = []
+        max_score = max(scores) if len(scores) > 0 else 1.0
+        
+        for idx in top_indices:
+            if scores[idx] > 0:
+                item = self.corpus_data[idx]
+                results.append({
+                    'node_type': item['node_type'],
+                    'name': item['name'],
+                    'description': item['description'],
+                    'full_path': item['full_path'],
+                    'entity': item['entity'],
+                    'conceptual_entity': item['conceptual_entity'],
+                    'similarity': scores[idx] / max_score if max_score > 0 else 0.0,
+                    'method': 'BM25'
+                })
+        
+        results.sort(key=lambda x: x['similarity'], reverse=True)
+        logger.info(f"BM25 search returned {len(results[:top_k])} candidates")
+        return results[:top_k]
+    
+    def tfidf_search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """TF-IDF cosine similarity search"""
+        if not self.tfidf_vectorizer or self.tfidf_matrix is None or not query:
+            return []
+        
+        try:
+            query_vec = self.tfidf_vectorizer.transform([query])
+            cosine_similarities = (self.tfidf_matrix * query_vec.T).toarray().flatten()
+            
+            top_indices = np.argsort(cosine_similarities)[::-1][:top_k * 2]
+            
+            results = []
+            for idx in top_indices:
+                if cosine_similarities[idx] > 0:
+                    item = self.corpus_data[idx]
+                    results.append({
+                        'node_type': item['node_type'],
+                        'name': item['name'],
+                        'description': item['description'],
+                        'full_path': item['full_path'],
+                        'entity': item['entity'],
+                        'conceptual_entity': item['conceptual_entity'],
+                        'similarity': float(cosine_similarities[idx]),
+                        'method': 'TFIDF'
+                    })
+            
+            results.sort(key=lambda x: x['similarity'], reverse=True)
+            logger.info(f"TF-IDF search returned {len(results[:top_k])} candidates")
+            return results[:top_k]
+        except Exception as e:
+            logger.warning(f"TF-IDF search error: {e}")
+            return []
+    
+    def fuzzy_search(self, query: str, top_k: int = 5, threshold: int = FUZZY_THRESHOLD) -> List[Dict[str, Any]]:
+        """Fuzzy string matching using RapidFuzz"""
+        if not query:
+            return []
+        
+        results = []
+        
+        for item in self.corpus_data:
+            # Check name similarity
+            name_score = fuzz.ratio(query.lower(), item['name'].lower())
+            
+            # Check partial ratio
+            partial_score = fuzz.partial_ratio(query.lower(), item['name'].lower())
+            
+            # Check token sort ratio
+            token_score = fuzz.token_sort_ratio(query.lower(), item['searchable_text'].lower())
+            
+            # Take best score
+            max_score = max(name_score, partial_score, token_score * 0.8)
+            
+            if max_score >= threshold:
+                results.append({
+                    'node_type': item['node_type'],
+                    'name': item['name'],
+                    'description': item['description'],
+                    'full_path': item['full_path'],
+                    'entity': item['entity'],
+                    'conceptual_entity': item['conceptual_entity'],
+                    'similarity': max_score / 100.0,  # Normalize to 0-1
+                    'method': 'FUZZY'
+                })
+        
+        results.sort(key=lambda x: x['similarity'], reverse=True)
+        logger.info(f"Fuzzy search returned {len(results[:top_k])} candidates")
+        return results[:top_k]
+
+
+# ============================================================================
 # FALKORDB FULL HIERARCHICAL GRAPH RAG
 # ============================================================================
 
 class ELDMFullHierarchicalGraphRAG:
-    """
-    FalkorDB-based Graph RAG with embeddings at ALL hierarchy levels
-    Hierarchy: Attribute -> Entity -> Conceptual Entity
-    All nodes have vector embeddings for maximum knowledge graph power
-    """
+    """FalkorDB-based Graph RAG with complete hierarchy support"""
 
     def __init__(self):
         self.db = FalkorDB(
@@ -395,7 +598,6 @@ class ELDMFullHierarchicalGraphRAG:
     def create_indexes(self):
         """Create vector and full-text indexes for ALL node types"""
         try:
-            # Vector index for Attributes
             attr_vector_query = f"""
             CREATE VECTOR INDEX FOR (a:Attribute) ON (a.embedding) 
             OPTIONS {{
@@ -407,12 +609,11 @@ class ELDMFullHierarchicalGraphRAG:
             }}
             """
             self.graph.query(attr_vector_query)
-            logger.info("Created vector index for Attributes")
+            logger.info("✅ Created vector index for Attributes")
         except Exception as e:
             logger.warning(f"Attribute vector index note: {e}")
 
         try:
-            # Vector index for Entities
             entity_vector_query = f"""
             CREATE VECTOR INDEX FOR (e:Entity) ON (e.embedding) 
             OPTIONS {{
@@ -424,12 +625,11 @@ class ELDMFullHierarchicalGraphRAG:
             }}
             """
             self.graph.query(entity_vector_query)
-            logger.info("Created vector index for Entities")
+            logger.info("✅ Created vector index for Entities")
         except Exception as e:
             logger.warning(f"Entity vector index note: {e}")
 
         try:
-            # Vector index for Conceptual Entities
             conceptual_vector_query = f"""
             CREATE VECTOR INDEX FOR (c:ConceptualEntity) ON (c.embedding) 
             OPTIONS {{
@@ -441,164 +641,190 @@ class ELDMFullHierarchicalGraphRAG:
             }}
             """
             self.graph.query(conceptual_vector_query)
-            logger.info("Created vector index for Conceptual Entities")
+            logger.info("✅ Created vector index for Conceptual Entities")
         except Exception as e:
             logger.warning(f"Conceptual Entity vector index note: {e}")
 
-        # Full-text indexes - create separately with error handling
         try:
             attr_ft_query = "CALL db.idx.fulltext.createNodeIndex('Attribute', 'name', 'description', 'searchable_text')"
             self.graph.query(attr_ft_query)
-            logger.info("Created full-text index for Attributes")
+            logger.info("✅ Created full-text index for Attributes")
         except Exception as e:
             logger.warning(f"Attribute full-text index note: {e}")
 
         try:
             entity_ft_query = "CALL db.idx.fulltext.createNodeIndex('Entity', 'name', 'searchable_text')"
             self.graph.query(entity_ft_query)
-            logger.info("Created full-text index for Entities")
+            logger.info("✅ Created full-text index for Entities")
         except Exception as e:
             logger.warning(f"Entity full-text index note: {e}")
 
         try:
             conceptual_ft_query = "CALL db.idx.fulltext.createNodeIndex('ConceptualEntity', 'name', 'searchable_text')"
             self.graph.query(conceptual_ft_query)
-            logger.info("Created full-text index for Conceptual Entities")
+            logger.info("✅ Created full-text index for Conceptual Entities")
         except Exception as e:
             logger.warning(f"Conceptual Entity full-text index note: {e}")
 
-        # Property indexes
         try:
             self.graph.query("CREATE INDEX FOR (a:Attribute) ON (a.name)")
             self.graph.query("CREATE INDEX FOR (e:Entity) ON (e.name)")
             self.graph.query("CREATE INDEX FOR (c:ConceptualEntity) ON (c.name)")
             self.graph.query("CREATE INDEX FOR (t:TransactionField) ON (t.name)")
             self.graph.query("CREATE INDEX FOR (t:TransactionField) ON (t.data_type)")
-            logger.info("Created property indexes")
+            logger.info("✅ Created property indexes")
         except Exception as e:
             logger.warning(f"Property index note: {e}")
         
-        logger.info("Index creation completed for full hierarchy")
+        logger.info("✅ Index creation completed for full hierarchy")
 
     def store_full_hierarchy(self, attributes: List[ELDMAttribute], 
                             entities: List[ELDMEntity], 
                             conceptuals: List[ELDMConceptualEntity]):
-        """
-        Store complete ELDM hierarchy with embeddings at ALL levels
-        """
-        # Store Conceptual Entities with embeddings
-        for conceptual in conceptuals:
-            embedding_list = conceptual.embedding.tolist()
-            # Create sanitized searchable text
-            searchable_text = sanitize_fulltext_query(conceptual.get_searchable_text())
-            
-            query = """
-            CREATE (c:ConceptualEntity {
-                name: $name,
-                searchable_text: $searchable_text,
-                embedding: vecf32($embedding),
-                created_at: $created_at
-            })
-            """
-            self.graph.query(query, {
-                'name': conceptual.name,
-                'searchable_text': searchable_text,
-                'embedding': embedding_list,
-                'created_at': datetime.now().isoformat()
-            })
+        """Store complete ELDM hierarchy with ALL data"""
+        
+        logger.info(f"Starting to store {len(attributes)} Attributes...")
+        stored_attributes = 0
+        
+        # Store Attributes with ALL fields (Name + Description)
+        for i, attr in enumerate(attributes, 1):
+            try:
+                embedding_list = attr.embedding.tolist()
+                searchable_text = sanitize_fulltext_query(attr.get_searchable_text())
+                
+                query = """
+                CREATE (a:Attribute {{
+                    name: $name,
+                    description: $description,
+                    entity_name: $entity_name,
+                    conceptual_entity_name: $conceptual_entity_name,
+                    full_path: $full_path,
+                    searchable_text: $searchable_text,
+                    embedding: vecf32($embedding),
+                    created_at: $created_at
+                }})
+                """
+                self.graph.query(query, {
+                    'name': attr.name,
+                    'description': attr.description,
+                    'entity_name': attr.entity or '',
+                    'conceptual_entity_name': attr.conceptual_entity or '',
+                    'full_path': attr.full_path,
+                    'searchable_text': searchable_text,
+                    'embedding': embedding_list,
+                    'created_at': datetime.now().isoformat()
+                })
+                stored_attributes += 1
+                
+                if i % 100 == 0:
+                    logger.info(f"Stored {i}/{len(attributes)} attributes...")
+            except Exception as e:
+                logger.error(f"Error storing attribute {attr.name}: {e}")
 
-        logger.info(f"Created {len(conceptuals)} Conceptual Entity nodes with embeddings")
+        logger.info(f"✅ Created {stored_attributes}/{len(attributes)} Attribute nodes with embeddings")
 
-        # Store Entities with embeddings
+        # Store Entities
+        logger.info(f"Starting to store {len(entities)} Entities...")
+        stored_entities = 0
+        
         for entity in entities:
-            embedding_list = entity.embedding.tolist()
-            # Create sanitized searchable text
-            searchable_text = sanitize_fulltext_query(entity.get_searchable_text())
-            
-            query = """
-            CREATE (e:Entity {
-                name: $name,
-                conceptual_entity_name: $conceptual_entity_name,
-                searchable_text: $searchable_text,
-                embedding: vecf32($embedding),
-                created_at: $created_at
-            })
-            """
-            self.graph.query(query, {
-                'name': entity.name,
-                'conceptual_entity_name': entity.conceptual_entity or '',
-                'searchable_text': searchable_text,
-                'embedding': embedding_list,
-                'created_at': datetime.now().isoformat()
-            })
+            try:
+                embedding_list = entity.embedding.tolist()
+                searchable_text = sanitize_fulltext_query(entity.get_searchable_text())
+                
+                query = """
+                CREATE (e:Entity {{
+                    name: $name,
+                    conceptual_entity_name: $conceptual_entity_name,
+                    searchable_text: $searchable_text,
+                    embedding: vecf32($embedding),
+                    attribute_count: $attribute_count,
+                    created_at: $created_at
+                }})
+                """
+                self.graph.query(query, {
+                    'name': entity.name,
+                    'conceptual_entity_name': entity.conceptual_entity or '',
+                    'searchable_text': searchable_text,
+                    'embedding': embedding_list,
+                    'attribute_count': len(entity.attributes),
+                    'created_at': datetime.now().isoformat()
+                })
+                stored_entities += 1
+            except Exception as e:
+                logger.error(f"Error storing entity {entity.name}: {e}")
 
-        logger.info(f"Created {len(entities)} Entity nodes with embeddings")
+        logger.info(f"✅ Created {stored_entities}/{len(entities)} Entity nodes with embeddings")
 
-        # Store Attributes with embeddings
-        for attr in attributes:
-            embedding_list = attr.embedding.tolist()
-            # Create sanitized searchable text
-            searchable_text = sanitize_fulltext_query(attr.get_searchable_text())
-            
-            query = """
-            CREATE (a:Attribute {
-                name: $name,
-                description: $description,
-                entity_name: $entity_name,
-                conceptual_entity_name: $conceptual_entity_name,
-                full_path: $full_path,
-                searchable_text: $searchable_text,
-                embedding: vecf32($embedding),
-                created_at: $created_at
-            })
-            """
-            self.graph.query(query, {
-                'name': attr.name,
-                'description': attr.description,
-                'entity_name': attr.entity or '',
-                'conceptual_entity_name': attr.conceptual_entity or '',
-                'full_path': attr.full_path,
-                'searchable_text': searchable_text,
-                'embedding': embedding_list,
-                'created_at': datetime.now().isoformat()
-            })
+        # Store Conceptual Entities
+        logger.info(f"Starting to store {len(conceptuals)} Conceptual Entities...")
+        stored_conceptuals = 0
+        
+        for conceptual in conceptuals:
+            try:
+                embedding_list = conceptual.embedding.tolist()
+                searchable_text = sanitize_fulltext_query(conceptual.get_searchable_text())
+                
+                query = """
+                CREATE (c:ConceptualEntity {{
+                    name: $name,
+                    searchable_text: $searchable_text,
+                    embedding: vecf32($embedding),
+                    entity_count: $entity_count,
+                    created_at: $created_at
+                }})
+                """
+                self.graph.query(query, {
+                    'name': conceptual.name,
+                    'searchable_text': searchable_text,
+                    'embedding': embedding_list,
+                    'entity_count': len(conceptual.entities),
+                    'created_at': datetime.now().isoformat()
+                })
+                stored_conceptuals += 1
+            except Exception as e:
+                logger.error(f"Error storing conceptual entity {conceptual.name}: {e}")
 
-        logger.info(f"Created {len(attributes)} Attribute nodes with embeddings")
+        logger.info(f"✅ Created {stored_conceptuals}/{len(conceptuals)} Conceptual Entity nodes with embeddings")
 
-        # Create relationships: Attribute -> Entity
+        # Create relationships
         entity_rel_query = """
         MATCH (a:Attribute)
         WHERE a.entity_name <> ''
-        MATCH (e:Entity {name: a.entity_name})
+        MATCH (e:Entity {{name: a.entity_name}})
         MERGE (a)-[:BELONGS_TO]->(e)
         MERGE (e)-[:HAS_ATTRIBUTE]->(a)
         """
-        self.graph.query(entity_rel_query)
-        logger.info("Created Attribute -> Entity relationships")
+        result = self.graph.query(entity_rel_query)
+        logger.info(f"✅ Created Attribute -> Entity relationships")
 
-        # Create relationships: Entity -> Conceptual Entity
         conceptual_rel_query = """
         MATCH (e:Entity)
         WHERE e.conceptual_entity_name <> ''
-        MATCH (c:ConceptualEntity {name: e.conceptual_entity_name})
+        MATCH (c:ConceptualEntity {{name: e.conceptual_entity_name}})
         MERGE (e)-[:BELONGS_TO]->(c)
         MERGE (c)-[:HAS_ENTITY]->(e)
         """
-        self.graph.query(conceptual_rel_query)
-        logger.info("Created Entity -> Conceptual Entity relationships")
+        result = self.graph.query(conceptual_rel_query)
+        logger.info(f"✅ Created Entity -> Conceptual Entity relationships")
 
-        logger.info(f"Stored complete hierarchy with embeddings at ALL levels: "
-                   f"{len(attributes)} Attributes, {len(entities)} Entities, "
-                   f"{len(conceptuals)} Conceptual Entities")
+        # Verify ingestion
+        verify_query = """
+        MATCH (a:Attribute) WITH count(a) as attr_count
+        MATCH (e:Entity) WITH attr_count, count(e) as entity_count
+        MATCH (c:ConceptualEntity) WITH attr_count, entity_count, count(c) as conceptual_count
+        RETURN attr_count, entity_count, conceptual_count
+        """
+        result = self.graph.query(verify_query)
+        if result.result_set:
+            counts = result.result_set[0]
+            logger.info(f"✅ VERIFICATION: {counts[0]} Attributes, {counts[1]} Entities, {counts[2]} Conceptual Entities in graph")
 
     def multi_level_vector_search(self, query_embedding: np.ndarray, top_k: int = 5) -> List[Dict[str, Any]]:
-        """
-        Perform vector search across ALL hierarchy levels
-        Returns candidates from Attributes, Entities, and Conceptual Entities
-        """
+        """Vector search across ALL hierarchy levels"""
         candidates = []
 
-        # Search Attributes (most granular - highest priority)
+        # Search Attributes
         attr_query = f"""
         CALL db.idx.vector.queryNodes('Attribute', 'embedding', {top_k}, vecf32($embedding))
         YIELD node, score
@@ -625,10 +851,10 @@ class ELDMFullHierarchicalGraphRAG:
                 'conceptual_entity': record[5] or '',
                 'similarity': record[6],
                 'method': 'VECTOR',
-                'level_boost': 1.0  # Highest priority for attributes
+                'level_boost': 1.0
             })
 
-        # Search Entities (middle level)
+        # Search Entities
         entity_query = f"""
         CALL db.idx.vector.queryNodes('Entity', 'embedding', {top_k}, vecf32($embedding))
         YIELD node, score
@@ -651,16 +877,16 @@ class ELDMFullHierarchicalGraphRAG:
             candidates.append({
                 'node_type': record[0],
                 'name': record[1],
-                'description': f"Entity with attributes: {', '.join(attr_list[:5])}",
+                'description': f"Entity with {len(attr_list)} attributes",
                 'full_path': record[3],
                 'entity': record[4] or '',
                 'conceptual_entity': record[5] or '',
                 'similarity': record[6],
                 'method': 'VECTOR',
-                'level_boost': 0.8  # Medium priority for entities
+                'level_boost': 0.8
             })
 
-        # Search Conceptual Entities (highest level)
+        # Search Conceptual Entities
         conceptual_query = f"""
         CALL db.idx.vector.queryNodes('ConceptualEntity', 'embedding', {top_k}, vecf32($embedding))
         YIELD node, score
@@ -682,44 +908,37 @@ class ELDMFullHierarchicalGraphRAG:
             candidates.append({
                 'node_type': record[0],
                 'name': record[1],
-                'description': f"Conceptual entity with entities: {', '.join(entity_list[:5])}",
+                'description': f"Conceptual entity with {len(entity_list)} entities",
                 'full_path': record[3],
                 'entity': record[4] or '',
                 'conceptual_entity': record[5] or '',
                 'similarity': record[6],
                 'method': 'VECTOR',
-                'level_boost': 0.6  # Lower priority for conceptual entities
+                'level_boost': 0.6
             })
 
-        # Apply level boost and re-sort
         for candidate in candidates:
             candidate['similarity'] = candidate['similarity'] * candidate['level_boost']
 
         candidates.sort(key=lambda x: x['similarity'], reverse=True)
-
-        logger.info(f"Multi-level vector search returned {len(candidates)} candidates from all hierarchy levels")
-        return candidates[:top_k * 2]  # Return more for further filtering
+        logger.info(f"Vector search returned {len(candidates[:top_k*2])} candidates")
+        return candidates[:top_k * 2]
 
     def multi_level_fulltext_search(self, query_text: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """
-        Perform full-text search across ALL hierarchy levels with proper sanitization
-        """
+        """Full-text search across ALL hierarchy levels"""
         candidates = []
         
-        # Sanitize query for RediSearch
         sanitized_query = sanitize_fulltext_query(query_text, max_length=150)
         
-        # If sanitization results in empty or very short query, extract keywords
         if len(sanitized_query) < 3:
             sanitized_query = extract_keywords(query_text, max_keywords=6)
             sanitized_query = sanitize_fulltext_query(sanitized_query)
         
-        # If still no valid query, skip full-text search
         if len(sanitized_query) < 2:
             logger.info("Query too short after sanitization, skipping full-text search")
             return []
         
-        logger.info(f"Full-text search with sanitized query: '{sanitized_query}'")
+        logger.info(f"Full-text search with query: '{sanitized_query}'")
 
         # Search Attributes
         try:
@@ -752,7 +971,6 @@ class ELDMFullHierarchicalGraphRAG:
                     'method': 'FULLTEXT',
                     'level_boost': 1.0
                 })
-            logger.info(f"Attribute full-text search returned {len(result.result_set)} results")
         except Exception as e:
             logger.warning(f"Attribute full-text search error: {e}")
 
@@ -786,7 +1004,6 @@ class ELDMFullHierarchicalGraphRAG:
                     'method': 'FULLTEXT',
                     'level_boost': 0.8
                 })
-            logger.info(f"Entity full-text search returned {len(result.result_set)} results")
         except Exception as e:
             logger.warning(f"Entity full-text search error: {e}")
 
@@ -819,36 +1036,28 @@ class ELDMFullHierarchicalGraphRAG:
                     'method': 'FULLTEXT',
                     'level_boost': 0.6
                 })
-            logger.info(f"Conceptual Entity full-text search returned {len(result.result_set)} results")
         except Exception as e:
             logger.warning(f"Conceptual Entity full-text search error: {e}")
 
-        # If no full-text results, return empty list (vector search will handle it)
         if not candidates:
-            logger.info("No full-text search results found across all levels")
             return []
 
-        # Apply level boost
         for candidate in candidates:
             candidate['similarity'] = candidate['similarity'] * candidate['level_boost']
 
         candidates.sort(key=lambda x: x['similarity'], reverse=True)
-
-        logger.info(f"Multi-level full-text search returned {len(candidates)} total candidates")
+        logger.info(f"Full-text search returned {len(candidates[:top_k*2])} candidates")
         return candidates[:top_k * 2]
 
     def hybrid_search(self, query_embedding: np.ndarray, query_text: str, 
                      top_k: int = 5, alpha: float = HYBRID_SEARCH_ALPHA) -> List[Dict[str, Any]]:
-        """Hybrid search across all hierarchy levels"""
+        """Hybrid search combining vector and full-text"""
         vector_results = self.multi_level_vector_search(query_embedding, top_k * 2)
         fulltext_results = self.multi_level_fulltext_search(query_text, top_k * 2)
 
-        # If full-text search failed or returned nothing, fall back to vector search
         if not fulltext_results:
-            logger.info("Full-text search empty, using vector search only")
             return vector_results[:top_k]
         
-        # Combine and normalize
         combined_scores = {}
         metadata = {}
 
@@ -885,15 +1094,14 @@ class ELDMFullHierarchicalGraphRAG:
                 'method': 'HYBRID'
             })
 
-        logger.info(f"Hybrid search returned {len(candidates)} candidates from all levels")
+        logger.info(f"Hybrid search returned {len(candidates)} candidates")
         return candidates
 
     def graph_rag_search(self, query_embedding: np.ndarray, query_text: str, 
                         transaction_field: TransactionField, top_k: int = 5) -> List[Dict[str, Any]]:
-        """Graph RAG search with multi-level historical patterns"""
+        """Graph RAG with historical patterns"""
         candidates = self.hybrid_search(query_embedding, query_text, top_k * 2)
 
-        # Check historical mappings at all levels
         similar_mappings_query = """
         MATCH (t:TransactionField)-[r:MAPPED_TO]->(n)
         WHERE t.data_type = $data_type 
@@ -951,21 +1159,20 @@ class ELDMFullHierarchicalGraphRAG:
             enhanced_candidates.append(candidate)
 
         enhanced_candidates.sort(key=lambda x: x['similarity'], reverse=True)
-
-        logger.info(f"Graph RAG search returned {len(enhanced_candidates[:top_k])} candidates with multi-level context")
+        logger.info(f"Graph RAG returned {len(enhanced_candidates[:top_k])} candidates")
         return enhanced_candidates[:top_k]
 
     def store_mapping_result(self, result: MappingResult, transaction_field: TransactionField):
-        """Store mapping result - can be to any hierarchy level"""
+        """Store mapping result"""
         query = """
-        MATCH (n {name: $node_name})
+        MATCH (n {{name: $node_name}})
         WHERE n:Attribute OR n:Entity OR n:ConceptualEntity
-        MERGE (t:TransactionField {
+        MERGE (t:TransactionField {{
             name: $transaction_field,
             file_name: $file_name,
             data_type: $data_type,
             standardised_name: $standardised_name
-        })
+        }})
         MERGE (t)-[r:MAPPED_TO]->(n)
         SET r.confidence_score = $confidence_score,
             r.vector_similarity = $vector_similarity,
@@ -997,11 +1204,10 @@ class ELDMFullHierarchicalGraphRAG:
             'timestamp': result.timestamp
         }
         self.graph.query(query, params)
-        logger.info(f"Stored mapping to {result.mapped_node_type} level")
 
 
 # ============================================================================
-# AGENT PROMPTS (UPDATED FOR MULTI-LEVEL) - CURLY BRACES ESCAPED
+# AGENT PROMPTS
 # ============================================================================
 
 MAPPING_AGENT_SYSTEM_PROMPT = """You are an expert data architect and semantic mapping specialist.
@@ -1018,15 +1224,14 @@ MAPPING STRATEGY:
 2. Use Entity level if no suitable Attribute exists but entity matches well
 3. Use Conceptual Entity only as last resort for very broad matches
 
-You receive candidates from ALL hierarchy levels. Each candidate shows:
-- Node Type (ATTRIBUTE, ENTITY, or CONCEPTUAL_ENTITY)
-- Name and description
-- Hierarchy context
+You receive candidates from MULTIPLE search methods (Keyword, BM25, TF-IDF, Fuzzy, Vector, etc).
+Each candidate shows node type, name, description, and hierarchy context.
 
 Select the best match considering:
 - Semantic alignment (most important)
 - Granularity (prefer more specific)
 - Historical patterns (Graph RAG provides this)
+- Consistency across search methods
 
 Response must be JSON (use exact field names shown):
 {{
@@ -1085,11 +1290,11 @@ Response must be JSON (use exact field names shown):
 
 
 # ============================================================================
-# MULTI-AGENT SYSTEM (UPDATED)
+# MULTI-AGENT SYSTEM
 # ============================================================================
 
 class MappingAgent:
-    """Agent for proposing mappings at any hierarchy level"""
+    """Agent for proposing mappings"""
 
     def __init__(self):
         self.llm = ChatOpenAI(model=REASONING_MODEL, base_url=BASE_URL, api_key=API_KEY)
@@ -1101,15 +1306,34 @@ class MappingAgent:
 
     def propose_mapping(self, state: GraphState) -> GraphState:
         field = state['transaction_field']
-        candidates = state.get('graph_rag_candidates') or state.get('hybrid_candidates') or state.get('vector_candidates', [])
+        
+        # Aggregate all candidates
+        all_candidates = (
+            state.get('graph_rag_candidates', []) +
+            state.get('fuzzy_candidates', []) +
+            state.get('keyword_candidates', []) +
+            state.get('bm25_candidates', []) +
+            state.get('tfidf_candidates', [])
+        )
+        
+        # Remove duplicates and sort
+        seen = set()
+        unique_candidates = []
+        for c in all_candidates:
+            if c['name'] not in seen:
+                seen.add(c['name'])
+                unique_candidates.append(c)
+        
+        unique_candidates.sort(key=lambda x: x['similarity'], reverse=True)
+        candidates = unique_candidates[:TOP_K_CANDIDATES * 2]
 
         input_text = f"""
 Transaction Field:
 {field.get_context()}
 
-Candidates (from all hierarchy levels):
+Top Candidates from multiple search methods:
 """
-        for i, candidate in enumerate(candidates, 1):
+        for i, candidate in enumerate(candidates[:10], 1):
             input_text += f"""
 {i}. Type: {candidate.get('node_type', 'UNKNOWN')}
    Name: {candidate['name']}
@@ -1141,16 +1365,17 @@ Candidates (from all hierarchy levels):
 
         except Exception as e:
             logger.error(f"Error in propose_mapping: {e}")
-            proposal = {
-                'selected_node_name': candidates[0]['name'],
-                'selected_node_type': candidates[0].get('node_type', 'ATTRIBUTE'),
-                'confidence_score': candidates[0]['similarity'],
-                'reasoning': f"Fallback: {str(e)}",
-                'key_factors': ['semantic_similarity'],
-                'concerns': ['Error in reasoning'],
-                'granularity_justification': 'Top candidate'
-            }
-            state['mapping_proposals'].append(proposal)
+            if candidates:
+                proposal = {
+                    'selected_node_name': candidates[0]['name'],
+                    'selected_node_type': candidates[0].get('node_type', 'ATTRIBUTE'),
+                    'confidence_score': candidates[0]['similarity'],
+                    'reasoning': f"Fallback: {str(e)}",
+                    'key_factors': ['semantic_similarity'],
+                    'concerns': ['Error in reasoning'],
+                    'granularity_justification': 'Top candidate'
+                }
+                state['mapping_proposals'].append(proposal)
 
         return state
 
@@ -1174,8 +1399,18 @@ class ValidationAgent:
             return state
 
         latest_proposal = proposals[-1]
-        all_candidates = (state.get('graph_rag_candidates', []) + state.get('hybrid_candidates', []) + state.get('vector_candidates', []))
-        selected_candidate = next((c for c in all_candidates if c['name'] == latest_proposal['selected_node_name']), all_candidates[0] if all_candidates else None)
+        
+        # Find the selected candidate
+        all_candidates = (
+            state.get('graph_rag_candidates', []) +
+            state.get('fuzzy_candidates', []) +
+            state.get('keyword_candidates', []) +
+            state.get('bm25_candidates', []) +
+            state.get('tfidf_candidates', [])
+        )
+        
+        selected_candidate = next((c for c in all_candidates if c['name'] == latest_proposal['selected_node_name']), 
+                                  all_candidates[0] if all_candidates else None)
 
         if not selected_candidate:
             return state
@@ -1216,7 +1451,15 @@ Validate this mapping.
 
         except Exception as e:
             logger.error(f"Error in validate_mapping: {e}")
-            validation = {'validation_decision': 'NEEDS_REVIEW', 'validation_score': 0.6, 'validation_reasoning': f"Error: {str(e)}", 'identified_issues': ['Validation error'], 'strengths': [], 'level_appropriateness': 'Unable to assess', 'recommendations': 'Manual review'}
+            validation = {
+                'validation_decision': 'NEEDS_REVIEW',
+                'validation_score': 0.6,
+                'validation_reasoning': f"Error: {str(e)}",
+                'identified_issues': ['Validation error'],
+                'strengths': [],
+                'level_appropriateness': 'Unable to assess',
+                'recommendations': 'Manual review'
+            }
             state['validation_results'].append(validation)
 
         return state
@@ -1243,19 +1486,32 @@ class SupervisorAgent:
 
         latest_proposal = proposals[-1]
         latest_validation = validations[-1]
-        all_candidates = (state.get('graph_rag_candidates', []) + state.get('hybrid_candidates', []) + state.get('vector_candidates', []))
-        selected_candidate = next((c for c in all_candidates if c['name'] == latest_proposal['selected_node_name']), all_candidates[0] if all_candidates else None)
+        
+        all_candidates = (
+            state.get('graph_rag_candidates', []) +
+            state.get('fuzzy_candidates', []) +
+            state.get('keyword_candidates', []) +
+            state.get('bm25_candidates', []) +
+            state.get('tfidf_candidates', [])
+        )
+        
+        selected_candidate = next((c for c in all_candidates if c['name'] == latest_proposal['selected_node_name']), 
+                                  all_candidates[0] if all_candidates else None)
 
         if not selected_candidate:
             return state
 
-        all_similarities = [c['similarity'] for c in all_candidates]
+        all_similarities = [c['similarity'] for c in all_candidates if 'similarity' in c]
         z_scores = zscore(all_similarities) if len(all_similarities) > 1 else [0.0]
         top_similarity = selected_candidate['similarity']
         top_z_score = float(z_scores[0]) if all_similarities and all_similarities[0] == top_similarity else 0.0
         gap_to_second = top_similarity - all_similarities[1] if len(all_similarities) > 1 else top_similarity
 
-        statistical_metrics = {'semantic_similarity': top_similarity, 'z_score': top_z_score, 'gap_to_second_best': gap_to_second}
+        statistical_metrics = {
+            'semantic_similarity': top_similarity,
+            'z_score': top_z_score,
+            'gap_to_second_best': gap_to_second
+        }
 
         input_text = f"""
 Transaction Field: {field.tt_column_name}
@@ -1289,7 +1545,6 @@ Make final decision.
             decision = json.loads(content)
 
             if decision['final_decision'] == 'APPROVE':
-                # Determine hierarchy details based on node type
                 node_type = latest_proposal['selected_node_type']
                 if node_type == 'ATTRIBUTE':
                     attr_name = selected_candidate['name']
@@ -1299,7 +1554,7 @@ Make final decision.
                     attr_name = ''
                     entity_name = selected_candidate['name']
                     conceptual_name = selected_candidate.get('conceptual_entity', '')
-                else:  # CONCEPTUAL_ENTITY
+                else:
                     attr_name = ''
                     entity_name = ''
                     conceptual_name = selected_candidate['name']
@@ -1313,8 +1568,12 @@ Make final decision.
                     eldm_conceptual_entity=conceptual_name,
                     eldm_description=selected_candidate.get('description', ''),
                     confidence_score=decision['overall_confidence_score'],
-                    vector_similarity=selected_candidate.get('vector_score', selected_candidate['similarity']),
+                    vector_similarity=selected_candidate.get('vector_score', 0.0),
                     fulltext_score=selected_candidate.get('fulltext_score', 0.0),
+                    keyword_score=state.get('keyword_candidates', [{}])[0].get('similarity', 0.0) if state.get('keyword_candidates') else 0.0,
+                    bm25_score=state.get('bm25_candidates', [{}])[0].get('similarity', 0.0) if state.get('bm25_candidates') else 0.0,
+                    tfidf_score=state.get('tfidf_candidates', [{}])[0].get('similarity', 0.0) if state.get('tfidf_candidates') else 0.0,
+                    fuzzy_score=state.get('fuzzy_candidates', [{}])[0].get('similarity', 0.0) if state.get('fuzzy_candidates') else 0.0,
                     hybrid_score=selected_candidate.get('similarity', 0.0),
                     graph_rag_score=selected_candidate.get('graph_rag_score', 0.0),
                     reasoning_confidence=latest_proposal['confidence_score'],
@@ -1323,14 +1582,14 @@ Make final decision.
                     validation_notes=latest_validation['validation_reasoning'],
                     statistical_metrics=statistical_metrics,
                     confidence_level=decision['confidence_level'],
-                    retrieval_method=selected_candidate.get('method', 'UNKNOWN'),
+                    retrieval_method=selected_candidate.get('method', 'MULTI_METHOD'),
                     hierarchy_path=selected_candidate.get('full_path', selected_candidate['name']),
                     timestamp=datetime.now().isoformat()
                 )
                 state['final_mapping'] = result
-                logger.info(f"APPROVED: {result.mapped_node_name} ({result.mapped_node_type})")
+                logger.info(f"✅ APPROVED: {result.mapped_node_name} ({result.mapped_node_type})")
             else:
-                logger.info(f"REJECTED: {latest_proposal['selected_node_name']}")
+                logger.info(f"❌ REJECTED: {latest_proposal['selected_node_name']}")
 
             state['messages'].extend([HumanMessage(content=input_text), AIMessage(content=response.content)])
 
@@ -1357,13 +1616,14 @@ def create_mapping_workflow() -> StateGraph:
 
 
 class ELDMMappingSystem:
-    """Complete ELDM mapping system with embeddings at ALL hierarchy levels"""
+    """Complete ELDM mapping system with multiple search methods"""
 
     def __init__(self):
         self.embedding_service = EmbeddingService()
         self.graph_rag = ELDMFullHierarchicalGraphRAG()
+        self.multi_search = MultiMethodSearchEngine()
         self.workflow = create_mapping_workflow()
-        logger.info("Initialized Full Hierarchical ELDM Mapping System")
+        logger.info("✅ Initialized Complete ELDM Mapping System with Multiple Search Methods")
 
     def load_transaction_data(self) -> List[TransactionField]:
         df = pd.read_excel(TRANSACTION_FILE)
@@ -1377,65 +1637,82 @@ class ELDMMappingSystem:
             creation_sql=str(row.get('Creation', '')),
             transformation_sql=str(row.get('Transformation', ''))
         ) for _, row in df.iterrows()]
-        logger.info(f"Loaded {len(fields)} transaction fields")
+        logger.info(f"✅ Loaded {len(fields)} transaction fields")
         return fields
 
     def load_eldm_full_hierarchy(self) -> Tuple[List[ELDMAttribute], List[ELDMEntity], List[ELDMConceptualEntity]]:
-        """Load and create embeddings for ALL hierarchy levels"""
+        """Load and create embeddings for ALL hierarchy levels - ENSURING COMPLETE INGESTION"""
         df = pd.read_excel(ELDM_FILE)
+        
+        logger.info(f"📊 ELDM File has {len(df)} rows")
 
-        # Collect data
+        # Collect data with validation
         attributes = []
         entities_data = {}
         conceptuals_data = {}
 
-        for _, row in df.iterrows():
-            name = str(row['Name'])
-            description = str(row.get('Description', ''))
-            entity = str(row.get('Entity', '')) if pd.notna(row.get('Entity')) else None
-            conceptual = str(row.get('Conceptual Entity', '')) if pd.notna(row.get('Conceptual Entity')) else None
+        for idx, row in df.iterrows():
+            try:
+                name = str(row['Name']) if pd.notna(row.get('Name')) else None
+                if not name or name == 'nan':
+                    logger.warning(f"Row {idx}: Skipping - no Name")
+                    continue
+                
+                description = str(row.get('Description', '')) if pd.notna(row.get('Description')) else ''
+                entity = str(row.get('Entity', '')) if pd.notna(row.get('Entity')) else None
+                conceptual = str(row.get('Conceptual Entity', '')) if pd.notna(row.get('Conceptual Entity')) else None
 
-            path_parts = [p for p in [conceptual, entity, name] if p]
-            full_path = ' > '.join(path_parts)
+                path_parts = [p for p in [conceptual, entity, name] if p]
+                full_path = ' > '.join(path_parts)
 
-            attr = ELDMAttribute(name=name, description=description, entity=entity, conceptual_entity=conceptual, full_path=full_path)
-            attributes.append(attr)
+                attr = ELDMAttribute(
+                    name=name,
+                    description=description,
+                    entity=entity,
+                    conceptual_entity=conceptual,
+                    full_path=full_path
+                )
+                attributes.append(attr)
 
-            if entity:
-                if entity not in entities_data:
-                    entities_data[entity] = {'conceptual': conceptual, 'attributes': []}
-                entities_data[entity]['attributes'].append(name)
-
-            if conceptual:
-                if conceptual not in conceptuals_data:
-                    conceptuals_data[conceptual] = {'entities': set()}
                 if entity:
-                    conceptuals_data[conceptual]['entities'].add(entity)
+                    if entity not in entities_data:
+                        entities_data[entity] = {'conceptual': conceptual, 'attributes': []}
+                    entities_data[entity]['attributes'].append(name)
 
-        # Create entity and conceptual objects
+                if conceptual:
+                    if conceptual not in conceptuals_data:
+                        conceptuals_data[conceptual] = {'entities': set()}
+                    if entity:
+                        conceptuals_data[conceptual]['entities'].add(entity)
+                        
+            except Exception as e:
+                logger.error(f"Error processing row {idx}: {e}")
+
         entities = [ELDMEntity(name=name, conceptual_entity=data['conceptual'], attributes=data['attributes']) 
                    for name, data in entities_data.items()]
         conceptuals = [ELDMConceptualEntity(name=name, entities=list(data['entities'])) 
                       for name, data in conceptuals_data.items()]
 
-        logger.info(f"Loaded {len(attributes)} Attributes, {len(entities)} Entities, {len(conceptuals)} Conceptual Entities")
+        logger.info(f"✅ Loaded {len(attributes)} Attributes, {len(entities)} Entities, {len(conceptuals)} Conceptual Entities")
 
         # Create embeddings for ALL levels
-        logger.info("Creating embeddings for Attributes...")
+        logger.info("🔄 Creating embeddings for Attributes...")
         attr_texts = [attr.get_searchable_text() for attr in attributes]
         for i in range(0, len(attr_texts), BATCH_SIZE):
             batch_embeddings = self.embedding_service.create_embeddings_batch(attr_texts[i:i+BATCH_SIZE])
             for j, emb in enumerate(batch_embeddings):
                 attributes[i+j].embedding = emb
+            if (i + BATCH_SIZE) % 200 == 0:
+                logger.info(f"   Created embeddings for {min(i+BATCH_SIZE, len(attr_texts))}/{len(attr_texts)} attributes")
 
-        logger.info("Creating embeddings for Entities...")
+        logger.info("🔄 Creating embeddings for Entities...")
         entity_texts = [ent.get_searchable_text() for ent in entities]
         for i in range(0, len(entity_texts), BATCH_SIZE):
             batch_embeddings = self.embedding_service.create_embeddings_batch(entity_texts[i:i+BATCH_SIZE])
             for j, emb in enumerate(batch_embeddings):
                 entities[i+j].embedding = emb
 
-        logger.info("Creating embeddings for Conceptual Entities...")
+        logger.info("🔄 Creating embeddings for Conceptual Entities...")
         conceptual_texts = [con.get_searchable_text() for con in conceptuals]
         for i in range(0, len(conceptual_texts), BATCH_SIZE):
             batch_embeddings = self.embedding_service.create_embeddings_batch(conceptual_texts[i:i+BATCH_SIZE])
@@ -1446,29 +1723,43 @@ class ELDMMappingSystem:
         return attributes, entities, conceptuals
 
     def initialize_knowledge_graph(self):
-        logger.info("Initializing full hierarchical knowledge graph...")
+        logger.info("🔄 Initializing full hierarchical knowledge graph...")
         self.graph_rag.clear_graph()
         attributes, entities, conceptuals = self.load_eldm_full_hierarchy()
+        
+        # Store in graph
         self.graph_rag.store_full_hierarchy(attributes, entities, conceptuals)
+        
+        # Create indexes
         self.graph_rag.create_indexes()
-        logger.info("✅ Full hierarchical knowledge graph initialized with embeddings at ALL levels")
+        
+        # Index for multi-method search
+        self.multi_search.index_corpus(attributes, entities, conceptuals)
+        
+        logger.info("✅ Full hierarchical knowledge graph initialized with ALL search methods")
 
     def map_single_field(self, field: TransactionField) -> Optional[MappingResult]:
-        # Use the new keyword extraction method for full-text queries
         field_text = field.get_searchable_text()
-        field_keywords = field.get_fulltext_keywords()  # Sanitized keywords
+        field_keywords = field.get_fulltext_keywords()
         field_embedding = self.embedding_service.create_embedding(field_text)
 
+        # Run ALL search methods
+        keyword_candidates = self.multi_search.keyword_search(field_text, TOP_K_CANDIDATES)
+        bm25_candidates = self.multi_search.bm25_search(field_text, TOP_K_CANDIDATES)
+        tfidf_candidates = self.multi_search.tfidf_search(field_text, TOP_K_CANDIDATES)
+        fuzzy_candidates = self.multi_search.fuzzy_search(field.tt_column_name, TOP_K_CANDIDATES)
+        
         vector_candidates = self.graph_rag.multi_level_vector_search(field_embedding, TOP_K_CANDIDATES)
-        
-        # Use sanitized keywords for full-text search
         fulltext_candidates = self.graph_rag.multi_level_fulltext_search(field_keywords, TOP_K_CANDIDATES)
-        
-        hybrid_candidates = self.graph_rag.hybrid_search(field_embedding, field_keywords, TOP_K_CANDIDATES, HYBRID_SEARCH_ALPHA)
+        hybrid_candidates = self.graph_rag.hybrid_search(field_embedding, field_keywords, TOP_K_CANDIDATES)
         graph_rag_candidates = self.graph_rag.graph_rag_search(field_embedding, field_keywords, field, TOP_K_CANDIDATES)
 
         initial_state = {
             'transaction_field': field,
+            'keyword_candidates': keyword_candidates,
+            'bm25_candidates': bm25_candidates,
+            'tfidf_candidates': tfidf_candidates,
+            'fuzzy_candidates': fuzzy_candidates,
             'vector_candidates': vector_candidates,
             'fulltext_candidates': fulltext_candidates,
             'hybrid_candidates': hybrid_candidates,
@@ -1479,7 +1770,7 @@ class ELDMMappingSystem:
             'final_mapping': None,
             'messages': [],
             'iteration_count': 0,
-            'memory_context': {'sql_context': {'creation': field.creation_sql, 'transformation': field.transformation_sql}, 'lineage': {'file': field.tt_file_name, 'standardised_name': field.standardised_name}}
+            'memory_context': {}
         }
 
         try:
@@ -1491,7 +1782,7 @@ class ELDMMappingSystem:
                 logger.info(f"✅ Mapped: {field.tt_column_name} -> {final_mapping.mapped_node_name} ({final_mapping.mapped_node_type})")
                 return final_mapping
             else:
-                logger.warning(f"❌ No mapping found for: {field.tt_column_name}")
+                logger.warning(f"❌ No mapping for: {field.tt_column_name}")
 
         except Exception as e:
             logger.error(f"❌ Error mapping {field.tt_column_name}: {e}")
@@ -1503,14 +1794,14 @@ class ELDMMappingSystem:
         results = []
 
         for i, field in enumerate(fields, 1):
-            logger.info(f"Processing {i}/{len(fields)}: {field.tt_column_name}")
+            logger.info(f"🔄 Processing {i}/{len(fields)}: {field.tt_column_name}")
             result = self.map_single_field(field)
             if result:
                 results.append(result)
             if i % 10 == 0:
-                logger.info(f"Progress: {i}/{len(fields)} processed, {len(results)} mapped ({len(results)/i*100:.1f}%)")
+                logger.info(f"📊 Progress: {i}/{len(fields)} processed, {len(results)} mapped ({len(results)/i*100:.1f}%)")
 
-        logger.info(f"Complete: {len(results)}/{len(fields)} successful mappings ({len(results)/len(fields)*100:.1f}%)")
+        logger.info(f"✅ Complete: {len(results)}/{len(fields)} successful mappings ({len(results)/len(fields)*100:.1f}%)")
         return results
 
     def export_results(self, results: List[MappingResult]):
@@ -1526,7 +1817,12 @@ class ELDMMappingSystem:
             'Confidence Score': r.confidence_score,
             'Confidence Level': r.confidence_level,
             'Retrieval Method': r.retrieval_method,
-            'Vector Similarity': r.vector_similarity,
+            'Keyword Score': r.keyword_score,
+            'BM25 Score': r.bm25_score,
+            'TF-IDF Score': r.tfidf_score,
+            'Fuzzy Score': r.fuzzy_score,
+            'Vector Score': r.vector_similarity,
+            'Fulltext Score': r.fulltext_score,
             'Graph RAG Score': r.graph_rag_score,
             'Reasoning': r.reasoning_explanation,
             'Validation': r.validation_notes,
@@ -1546,8 +1842,11 @@ class ELDMMappingSystem:
                 'HIGH Confidence': len([r for r in results if r.confidence_level == 'HIGH']),
                 'MEDIUM Confidence': len([r for r in results if r.confidence_level == 'MEDIUM']),
                 'LOW Confidence': len([r for r in results if r.confidence_level == 'LOW']),
-                'Graph RAG Method': len([r for r in results if r.retrieval_method == 'GRAPH_RAG']),
-                'Avg Confidence': np.mean([r.confidence_score for r in results])
+                'Avg Confidence': np.mean([r.confidence_score for r in results]),
+                'Avg Keyword Score': np.mean([r.keyword_score for r in results]),
+                'Avg BM25 Score': np.mean([r.bm25_score for r in results]),
+                'Avg TF-IDF Score': np.mean([r.tfidf_score for r in results]),
+                'Avg Fuzzy Score': np.mean([r.fuzzy_score for r in results])
             }
             pd.DataFrame([summary]).to_excel(writer, sheet_name='Summary', index=False)
 
@@ -1555,9 +1854,9 @@ class ELDMMappingSystem:
 
     def run(self):
         logger.info("=" * 80)
-        logger.info("FULL HIERARCHICAL ELDM Mapping System - Starting")
-        logger.info("Embeddings at ALL levels: Attribute, Entity, Conceptual Entity")
-        logger.info("WITH REDISEARCH FULL-TEXT QUERY SANITIZATION")
+        logger.info("🚀 COMPLETE ELDM MAPPING SYSTEM - STARTING")
+        logger.info("📋 Multiple Search Methods: Keyword, BM25, TF-IDF, Fuzzy, Vector, Fulltext, Hybrid, Graph RAG")
+        logger.info("🌳 Full Hierarchy: Name (Attribute with Description) -> Entity -> Conceptual Entity")
         logger.info("=" * 80)
 
         try:
@@ -1566,7 +1865,7 @@ class ELDMMappingSystem:
             if results:
                 self.export_results(results)
             logger.info("=" * 80)
-            logger.info("✅ Completed Successfully")
+            logger.info("✅ COMPLETED SUCCESSFULLY")
             logger.info(f"✅ Mapped {len(results)} fields")
             logger.info("=" * 80)
             return results
