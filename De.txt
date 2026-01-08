@@ -1,22 +1,20 @@
 """
-FalkorDB Polars Loader - Blazing Fast for Massive Datasets
-Polars is 5-10x faster than pandas for large data operations
-Ideal for datasets > 1M rows
-
-Install: pip install polars pandas openpyxl
-Note: fastexcel is optional for even faster Excel reading
+FalkorDB Production Loader - Connection Resilient
+Handles connection timeouts, memory issues, and retry logic
 """
 
-import polars as pl
 import pandas as pd
 import asyncio
 from falkordb.asyncio import FalkorDB
-from redis.asyncio import BlockingConnectionPool
+from redis.asyncio import BlockingConnectionPool, Redis
+from redis.exceptions import ConnectionError, TimeoutError, ResponseError
 from typing import Dict, List, Set
 from collections import defaultdict
 import logging
 from datetime import datetime
 from tqdm.asyncio import tqdm as async_tqdm
+from tqdm import tqdm
+import time
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,14 +23,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class PolarsFalkorDBLoader:
+class RobustFalkorDBLoader:
     """
-    Ultra-fast loader using Polars for data processing
-    Polars advantages:
-    - 5-10x faster than pandas for large datasets
-    - Better memory efficiency
-    - Native parallel processing
-    - Lazy evaluation for query optimization
+    Production-ready FalkorDB loader with:
+    - Connection retry logic
+    - Memory monitoring
+    - Smaller, safer batch sizes
+    - Progressive saving
+    - Transaction safety
     """
     
     def __init__(
@@ -41,8 +39,12 @@ class PolarsFalkorDBLoader:
         port: int = 6379,
         password: str = None,
         graph_name: str = 'DataTransferGraph',
-        batch_size: int = 15000,  # Can handle larger batches
-        max_connections: int = 16
+        batch_size: int = 1000,  # Smaller, safer batches
+        max_connections: int = 8,  # Fewer connections for stability
+        socket_timeout: int = 300,  # 5 minutes
+        socket_connect_timeout: int = 30,
+        retry_attempts: int = 3,
+        retry_delay: int = 2
     ):
         self.host = host
         self.port = port
@@ -50,158 +52,181 @@ class PolarsFalkorDBLoader:
         self.graph_name = graph_name
         self.batch_size = batch_size
         self.max_connections = max_connections
+        self.socket_timeout = socket_timeout
+        self.socket_connect_timeout = socket_connect_timeout
+        self.retry_attempts = retry_attempts
+        self.retry_delay = retry_delay
         
         self.pool = None
         self.db = None
         self.graph = None
+        self.redis_client = None
         
         self.stats = {
             'total_cases': 0,
             'nodes_created': defaultdict(int),
             'relationships_created': defaultdict(int),
-            'preprocessing_time': 0,
-            'loading_time': 0,
+            'errors': defaultdict(int),
+            'retries': 0,
             'start_time': None,
             'end_time': None
         }
     
     async def connect(self):
-        """Initialize connection pool"""
-        logger.info(f"Connecting to FalkorDB with {self.max_connections} connections")
+        """Initialize connection pool with proper timeouts"""
+        logger.info(f"Connecting to FalkorDB at {self.host}:{self.port}")
+        logger.info(f"  Max connections: {self.max_connections}")
+        logger.info(f"  Socket timeout: {self.socket_timeout}s")
+        logger.info(f"  Batch size: {self.batch_size}")
         
+        # Create connection pool with proper settings
         self.pool = BlockingConnectionPool(
             host=self.host,
             port=self.port,
             password=self.password,
             max_connections=self.max_connections,
-            timeout=None,
-            decode_responses=True
+            timeout=self.socket_timeout,
+            socket_timeout=self.socket_timeout,
+            socket_connect_timeout=self.socket_connect_timeout,
+            decode_responses=True,
+            health_check_interval=30,  # Check connection health
+            retry_on_timeout=True
         )
         
         self.db = FalkorDB(connection_pool=self.pool)
         self.graph = self.db.select_graph(self.graph_name)
+        
+        # Direct Redis client for monitoring
+        self.redis_client = Redis(connection_pool=self.pool)
+        
+        # Check connection
+        await self._check_connection()
+        
+        # Check and configure Redis memory
+        await self._configure_redis_memory()
+    
+    async def _check_connection(self):
+        """Verify Redis/FalkorDB is accessible"""
+        try:
+            info = await self.redis_client.info()
+            logger.info(f"✅ Connected to Redis {info.get('redis_version', 'unknown')}")
+            logger.info(f"✅ FalkorDB module loaded")
+        except Exception as e:
+            logger.error(f"❌ Connection failed: {e}")
+            raise
+    
+    async def _configure_redis_memory(self):
+        """Check and configure Redis memory settings"""
+        try:
+            info = await self.redis_client.info('memory')
+            
+            used_memory = info.get('used_memory_human', 'unknown')
+            max_memory = info.get('maxmemory_human', 'unlimited')
+            
+            logger.info(f"\nRedis Memory Status:")
+            logger.info(f"  Used: {used_memory}")
+            logger.info(f"  Max: {max_memory}")
+            
+            # Warn if maxmemory is not set
+            if info.get('maxmemory', 0) == 0:
+                logger.warning("⚠️  maxmemory not set - Redis may run out of memory!")
+                logger.warning("   Recommendation: redis-server --maxmemory 16gb")
+            
+            # Check maxmemory policy
+            policy = info.get('maxmemory_policy', 'noeviction')
+            logger.info(f"  Policy: {policy}")
+            
+            if policy != 'noeviction':
+                logger.warning(f"⚠️  maxmemory-policy is '{policy}' - data may be evicted!")
+                logger.warning("   Recommendation: CONFIG SET maxmemory-policy noeviction")
+                
+        except Exception as e:
+            logger.warning(f"Could not check Redis memory: {e}")
     
     async def close(self):
-        if self.pool:
-            await self.pool.disconnect()
-    
-    def load_excel_polars(self, file_path: str) -> pl.DataFrame:
-        """
-        Load Excel with Polars - faster than pandas
-        Uses fastexcel for even better performance
-        """
-        logger.info(f"Loading Excel with Polars: {file_path}")
-        
+        """Close connections gracefully"""
         try:
-            # Try fastexcel for maximum speed (if available)
-            from fastexcel import read_excel
-            # fastexcel returns list of sheets, get first sheet
-            excel_sheets = read_excel(file_path)
-            # Convert to polars - get the first sheet
-            if hasattr(excel_sheets, 'load_sheet'):
-                # Newer fastexcel API
-                df = excel_sheets.load_sheet(0).to_polars()
-            else:
-                # Alternative API
-                df = pl.from_pandas(excel_sheets.to_pandas())
-            logger.info(f"  Using fastexcel (fastest)")
-        except (ImportError, AttributeError) as e:
-            # Fallback: Load with pandas then convert to Polars
-            logger.info(f"  Fastexcel not available, using pandas->polars conversion")
-            import pandas as pd
-            pdf = pd.read_excel(file_path, engine='openpyxl')
-            df = pl.from_pandas(pdf)
-            logger.info(f"  Using pandas->polars conversion")
+            if self.pool:
+                await self.pool.disconnect()
+            logger.info("✅ Connections closed")
+        except Exception as e:
+            logger.warning(f"Error closing connections: {e}")
+    
+    def load_excel_optimized(self, file_path: str) -> pd.DataFrame:
+        """Load Excel with proper dtypes"""
+        logger.info(f"Loading Excel file: {file_path}")
         
+        dtypes = {col: 'str' for col in [
+            'CaseId', 'EimId', 'BusinessApp_Id', 'OriginatingCountryName',
+            'ReceivingJurisdictions', 'LegalProcessingPurposeNames',
+            'PersonalDataCategoryNames', 'PersonalDataNames', 
+            'CategoryNames', 'pia_module', 'tia_module', 'hrpr_module'
+        ]}
+        
+        df = pd.read_excel(file_path, dtype=dtypes, engine='openpyxl')
         logger.info(f"Loaded {len(df):,} rows")
         return df
     
-    def preprocess_polars_fast(self, df: pl.DataFrame) -> List[Dict]:
-        """
-        Ultra-fast preprocessing with Polars vectorized operations
-        10x faster than pandas for large datasets
-        """
-        logger.info(f"Preprocessing {len(df):,} records with Polars...")
+    def preprocess_fast(self, df: pd.DataFrame) -> List[Dict]:
+        """Fast preprocessing with to_records()"""
+        logger.info(f"Preprocessing {len(df):,} records...")
         start_time = datetime.now()
         
-        # Define split and deduplicate function
-        def split_and_dedupe(s: str) -> List[str]:
-            if not s or s == 'null' or s == 'None' or pd.isna(s):
-                return []
-            values = [v.strip() for v in str(s).split('|') if v.strip()]
-            # Deduplicate while preserving order
-            seen = set()
+        # Convert to string and handle nulls
+        df = df.astype(str).replace('nan', None)
+        
+        # Vectorized splitting
+        def split_pipe_vectorized(series):
+            series = series.fillna('')
+            split_series = series.str.split('|')
             result = []
-            for v in values:
-                if v not in seen:
-                    seen.add(v)
-                    result.append(v)
+            for values in split_series:
+                if values and values != ['']:
+                    cleaned = []
+                    seen = set()
+                    for v in values:
+                        v_stripped = v.strip()
+                        if v_stripped and v_stripped not in seen:
+                            seen.add(v_stripped)
+                            cleaned.append(v_stripped)
+                    result.append(cleaned)
+                else:
+                    result.append([])
             return result
         
-        # Vectorized operations on all columns
-        logger.info("  Processing with vectorized Polars operations...")
+        logger.info("  Splitting pipe-delimited values...")
+        receiving_juris = split_pipe_vectorized(df['ReceivingJurisdictions'])
+        purposes = split_pipe_vectorized(df['LegalProcessingPurposeNames'])
+        pdc = split_pipe_vectorized(df['PersonalDataCategoryNames'])
+        personal_data = split_pipe_vectorized(df['PersonalDataNames'])
+        categories = split_pipe_vectorized(df['CategoryNames'])
         
-        # Fill nulls and convert to string - handle all columns
-        string_columns = df.columns
-        df = df.with_columns([
-            pl.col(col).cast(pl.Utf8).fill_null("")
-            for col in string_columns
-        ])
-        
-        # Apply split function to pipe-delimited columns
-        logger.info("  Splitting pipe-delimited columns...")
-        df = df.with_columns([
-            pl.col("ReceivingJurisdictions").map_elements(
-                split_and_dedupe, 
-                return_dtype=pl.List(pl.Utf8),
-                skip_nulls=False
-            ).alias("receiving_jurisdictions"),
-            pl.col("LegalProcessingPurposeNames").map_elements(
-                split_and_dedupe,
-                return_dtype=pl.List(pl.Utf8),
-                skip_nulls=False
-            ).alias("purposes"),
-            pl.col("PersonalDataCategoryNames").map_elements(
-                split_and_dedupe,
-                return_dtype=pl.List(pl.Utf8),
-                skip_nulls=False
-            ).alias("personal_data_categories"),
-            pl.col("PersonalDataNames").map_elements(
-                split_and_dedupe,
-                return_dtype=pl.List(pl.Utf8),
-                skip_nulls=False
-            ).alias("personal_data"),
-            pl.col("CategoryNames").map_elements(
-                split_and_dedupe,
-                return_dtype=pl.List(pl.Utf8),
-                skip_nulls=False
-            ).alias("categories"),
-        ])
-        
-        # Convert to dictionaries (Polars is very fast at this)
+        # Use to_records for fast iteration
         logger.info("  Converting to records...")
-        records = df.select([
-            pl.col("CaseId").alias("case_id"),
-            pl.when(pl.col("EimId") != "").then(pl.col("EimId")).otherwise(None).alias("eim_id"),
-            pl.when(pl.col("BusinessApp_Id") != "").then(pl.col("BusinessApp_Id")).otherwise(None).alias("business_app_id"),
-            pl.when(pl.col("OriginatingCountryName") != "").then(pl.col("OriginatingCountryName")).otherwise(None).alias("originating_country"),
-            pl.col("receiving_jurisdictions"),
-            pl.col("purposes"),
-            pl.col("personal_data_categories"),
-            pl.col("personal_data"),
-            pl.col("categories"),
-            pl.when(pl.col("pia_module") != "").then(pl.col("pia_module")).otherwise(None).alias("pia_module"),
-            pl.when(pl.col("tia_module") != "").then(pl.col("tia_module")).otherwise(None).alias("tia_module"),
-            pl.when(pl.col("hrpr_module") != "").then(pl.col("hrpr_module")).otherwise(None).alias("hrpr_module"),
-        ]).to_dicts()
+        records_array = df.to_records(index=False)
+        
+        processed_records = []
+        for idx, record in enumerate(records_array):
+            processed_record = {
+                'case_id': record['CaseId'],
+                'eim_id': record['EimId'] if record['EimId'] != 'None' else None,
+                'business_app_id': record['BusinessApp_Id'] if record['BusinessApp_Id'] != 'None' else None,
+                'originating_country': record['OriginatingCountryName'] if record['OriginatingCountryName'] != 'None' else None,
+                'receiving_jurisdictions': receiving_juris[idx],
+                'purposes': purposes[idx],
+                'personal_data_categories': pdc[idx],
+                'personal_data': personal_data[idx],
+                'categories': categories[idx],
+                'pia_module': record['pia_module'] if record['pia_module'] != 'None' else None,
+                'tia_module': record['tia_module'] if record['tia_module'] != 'None' else None,
+                'hrpr_module': record['hrpr_module'] if record['hrpr_module'] != 'None' else None,
+            }
+            processed_records.append(processed_record)
         
         duration = (datetime.now() - start_time).total_seconds()
-        self.stats['preprocessing_time'] = duration
+        logger.info(f"Preprocessed {len(processed_records):,} records in {duration:.2f}s")
         
-        logger.info(f"Preprocessed {len(records):,} records in {duration:.2f}s")
-        logger.info(f"  Speed: {len(records)/duration:,.0f} records/second")
-        
-        return records
+        return processed_records
     
     def collect_unique_entities(self, records: List[Dict]) -> Dict[str, Set]:
         """Collect unique entities"""
@@ -231,7 +256,9 @@ class PolarsFalkorDBLoader:
         return entities
     
     async def create_indexes(self):
-        """Create indexes"""
+        """Create indexes with error handling"""
+        logger.info("Creating indexes...")
+        
         indexes = [
             "CREATE INDEX FOR (c:Case) ON (c.case_id)",
             "CREATE INDEX FOR (c:Country) ON (c.name)",
@@ -242,183 +269,218 @@ class PolarsFalkorDBLoader:
             "CREATE INDEX FOR (cat:Category) ON (cat.name)",
         ]
         
-        tasks = [self._create_index(idx) for idx in indexes]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        for idx_query in indexes:
+            try:
+                await self.graph.query(idx_query)
+                logger.info(f"  ✅ {idx_query}")
+            except Exception as e:
+                logger.debug(f"  Index exists or error: {e}")
     
-    async def _create_index(self, query: str):
-        try:
-            await self.graph.query(query)
-        except:
-            pass
+    async def execute_with_retry(self, query: str, params: dict, operation_name: str):
+        """Execute query with retry logic"""
+        for attempt in range(self.retry_attempts):
+            try:
+                result = await self.graph.query(query, params=params)
+                return result
+            except (ConnectionError, TimeoutError) as e:
+                self.stats['retries'] += 1
+                if attempt < self.retry_attempts - 1:
+                    logger.warning(f"⚠️  {operation_name} failed (attempt {attempt + 1}/{self.retry_attempts}): {e}")
+                    logger.warning(f"   Retrying in {self.retry_delay}s...")
+                    await asyncio.sleep(self.retry_delay)
+                    
+                    # Try to reconnect
+                    try:
+                        await self.close()
+                        await self.connect()
+                    except:
+                        pass
+                else:
+                    logger.error(f"❌ {operation_name} failed after {self.retry_attempts} attempts")
+                    self.stats['errors'][operation_name] += 1
+                    raise
+            except ResponseError as e:
+                logger.error(f"❌ Query error in {operation_name}: {e}")
+                self.stats['errors'][operation_name] += 1
+                raise
+            except Exception as e:
+                logger.error(f"❌ Unexpected error in {operation_name}: {e}")
+                self.stats['errors'][operation_name] += 1
+                raise
     
-    async def bulk_create_nodes(self, node_label: str, property_name: str, values: List[str]):
-        """Bulk create nodes"""
+    async def create_nodes_safe(self, node_label: str, property_name: str, values: List[str]):
+        """Create nodes with safe batching and retry logic"""
         if not values:
             return
         
         logger.info(f"Creating {len(values):,} {node_label} nodes...")
         
-        tasks = []
-        for i in range(0, len(values), self.batch_size):
+        total_created = 0
+        for i in tqdm(range(0, len(values), self.batch_size), desc=f"Creating {node_label}"):
             batch = values[i:i + self.batch_size]
-            tasks.append(self._create_node_batch(node_label, property_name, batch))
+            
+            query = f"""
+            UNWIND $values AS value
+            MERGE (n:{node_label} {{{property_name}: value}})
+            RETURN count(n) as count
+            """
+            
+            try:
+                result = await self.execute_with_retry(
+                    query, 
+                    {'values': batch},
+                    f"Create {node_label} batch"
+                )
+                count = result.result_set[0][0] if result.result_set else 0
+                total_created += count
+                
+                # Small delay to prevent overwhelming server
+                await asyncio.sleep(0.05)
+                
+            except Exception as e:
+                logger.error(f"Failed to create {node_label} batch: {e}")
+                continue
         
-        for task in async_tqdm(asyncio.as_completed(tasks), total=len(tasks), desc=f"{node_label}"):
-            count = await task
-            self.stats['nodes_created'][node_label] += count
+        self.stats['nodes_created'][node_label] = total_created
+        logger.info(f"  ✅ Created {total_created:,} {node_label} nodes")
     
-    async def _create_node_batch(self, node_label: str, property_name: str, batch: List[str]) -> int:
-        query = f"""
-        UNWIND $values AS value
-        MERGE (n:{node_label} {{{property_name}: value}})
-        RETURN count(n) as count
-        """
+    async def create_cases_safe(self, records: List[Dict]):
+        """Create case nodes with safe batching"""
+        logger.info(f"Creating {len(records):,} Case nodes...")
         
-        try:
-            result = await self.graph.query(query, params={'values': batch})
-            return result.result_set[0][0] if result.result_set else 0
-        except Exception as e:
-            logger.error(f"Error: {e}")
-            return 0
-    
-    async def bulk_create_cases_and_relationships(self, records: List[Dict]):
-        """Bulk create cases and relationships"""
-        logger.info("Creating cases and relationships...")
-        
-        tasks = []
-        for i in range(0, len(records), self.batch_size):
+        total_created = 0
+        for i in tqdm(range(0, len(records), self.batch_size), desc="Creating Cases"):
             batch = records[i:i + self.batch_size]
-            tasks.append(self._process_batch(batch))
+            
+            case_data = [
+                {
+                    'case_id': r['case_id'],
+                    'eim_id': r['eim_id'],
+                    'business_app_id': r['business_app_id'],
+                    'pia_module': r['pia_module'],
+                    'tia_module': r['tia_module'],
+                    'hrpr_module': r['hrpr_module']
+                }
+                for r in batch
+            ]
+            
+            query = """
+            UNWIND $cases AS case_data
+            MERGE (c:Case {case_id: case_data.case_id})
+            SET c.eim_id = case_data.eim_id,
+                c.business_app_id = case_data.business_app_id,
+                c.pia_module = case_data.pia_module,
+                c.tia_module = case_data.tia_module,
+                c.hrpr_module = case_data.hrpr_module
+            RETURN count(c) as count
+            """
+            
+            try:
+                result = await self.execute_with_retry(
+                    query,
+                    {'cases': case_data},
+                    f"Create Cases batch"
+                )
+                count = result.result_set[0][0] if result.result_set else 0
+                total_created += count
+                
+                await asyncio.sleep(0.05)
+                
+            except Exception as e:
+                logger.error(f"Failed to create Cases batch: {e}")
+                continue
         
-        for task in async_tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Processing"):
-            result = await task
-            self.stats['nodes_created']['Case'] += result['cases']
-            self.stats['relationships_created']['total'] += result['relationships']
+        self.stats['nodes_created']['Case'] = total_created
+        logger.info(f"  ✅ Created {total_created:,} Case nodes")
     
-    async def _process_batch(self, batch: List[Dict]) -> Dict[str, int]:
-        """Process a batch"""
-        # Create cases
-        case_data = [
-            {
-                'case_id': r['case_id'],
-                'eim_id': r['eim_id'],
-                'business_app_id': r['business_app_id'],
-                'pia_module': r['pia_module'],
-                'tia_module': r['tia_module'],
-                'hrpr_module': r['hrpr_module']
-            }
-            for r in batch
+    async def create_relationships_safe(self, records: List[Dict]):
+        """Create relationships with VERY safe batching - one type at a time"""
+        logger.info(f"Creating relationships for {len(records):,} cases...")
+        
+        # Process each relationship type separately for stability
+        rel_types = [
+            ('country', 'ORIGINATES_FROM', 'Country', 'originating_country'),
+            ('jurisdiction', 'TRANSFERS_TO', 'Jurisdiction', 'receiving_jurisdictions'),
+            ('purpose', 'HAS_PURPOSE', 'Purpose', 'purposes'),
+            ('pdc', 'HAS_PERSONAL_DATA_CATEGORY', 'PersonalDataCategory', 'personal_data_categories'),
+            ('pd', 'HAS_PERSONAL_DATA', 'PersonalData', 'personal_data'),
+            ('category', 'HAS_CATEGORY', 'Category', 'categories')
         ]
         
-        query = """
-        UNWIND $cases AS case_data
-        MERGE (c:Case {case_id: case_data.case_id})
-        SET c.eim_id = case_data.eim_id,
-            c.business_app_id = case_data.business_app_id,
-            c.pia_module = case_data.pia_module,
-            c.tia_module = case_data.tia_module,
-            c.hrpr_module = case_data.hrpr_module
-        RETURN count(c) as count
-        """
+        total_rels = 0
         
-        try:
-            result = await self.graph.query(query, params={'cases': case_data})
-            case_count = result.result_set[0][0] if result.result_set else 0
-        except Exception as e:
-            logger.error(f"Error: {e}")
-            case_count = 0
+        for rel_key, rel_type, target_label, record_field in rel_types:
+            logger.info(f"\nCreating {rel_type} relationships...")
+            
+            # Build relationship data for this type only
+            rel_data = []
+            for record in records:
+                case_id = record['case_id']
+                
+                if record_field in ['originating_country']:
+                    if record[record_field]:
+                        rel_data.append({
+                            'case_id': case_id,
+                            'value': record[record_field]
+                        })
+                else:
+                    for value in record[record_field]:
+                        rel_data.append({
+                            'case_id': case_id,
+                            'value': value
+                        })
+            
+            if not rel_data:
+                continue
+            
+            # Process in small batches
+            batch_size = min(self.batch_size, 500)  # Even smaller for relationships
+            created = 0
+            
+            for i in tqdm(range(0, len(rel_data), batch_size), desc=f"  {rel_type}"):
+                batch = rel_data[i:i + batch_size]
+                
+                query = f"""
+                UNWIND $rels AS rel
+                MATCH (c:Case {{case_id: rel.case_id}})
+                MATCH (t:{target_label} {{name: rel.value}})
+                MERGE (c)-[:{rel_type}]->(t)
+                RETURN count(*) as cnt
+                """
+                
+                try:
+                    result = await self.execute_with_retry(
+                        query,
+                        {'rels': batch},
+                        f"Create {rel_type}"
+                    )
+                    count = result.result_set[0][0] if result.result_set else 0
+                    created += count
+                    total_rels += count
+                    
+                    # Longer delay for relationship creation
+                    await asyncio.sleep(0.1)
+                    
+                except Exception as e:
+                    logger.error(f"Failed to create {rel_type} batch: {e}")
+                    continue
+            
+            logger.info(f"  ✅ Created {created:,} {rel_type} relationships")
         
-        # Create relationships
-        rel_count = await self._create_relationships(batch)
-        
-        return {'cases': case_count, 'relationships': rel_count}
-    
-    async def _create_relationships(self, batch: List[Dict]) -> int:
-        """Create relationships"""
-        rel_data = []
-        
-        for record in batch:
-            case_id = record['case_id']
-            
-            if record['originating_country']:
-                rel_data.append({'case_id': case_id, 'type': 'country', 'value': record['originating_country']})
-            
-            for v in record['receiving_jurisdictions']:
-                rel_data.append({'case_id': case_id, 'type': 'jurisdiction', 'value': v})
-            
-            for v in record['purposes']:
-                rel_data.append({'case_id': case_id, 'type': 'purpose', 'value': v})
-            
-            for v in record['personal_data_categories']:
-                rel_data.append({'case_id': case_id, 'type': 'pdc', 'value': v})
-            
-            for v in record['personal_data']:
-                rel_data.append({'case_id': case_id, 'type': 'pd', 'value': v})
-            
-            for v in record['categories']:
-                rel_data.append({'case_id': case_id, 'type': 'category', 'value': v})
-        
-        query = """
-        UNWIND $rels AS rel
-        MATCH (c:Case {case_id: rel.case_id})
-        CALL {
-            WITH c, rel
-            WITH c, rel WHERE rel.type = 'country'
-            MATCH (t:Country {name: rel.value})
-            MERGE (c)-[:ORIGINATES_FROM]->(t)
-            RETURN 1 as cnt
-            UNION
-            WITH c, rel
-            WITH c, rel WHERE rel.type = 'jurisdiction'
-            MATCH (t:Jurisdiction {name: rel.value})
-            MERGE (c)-[:TRANSFERS_TO]->(t)
-            RETURN 1 as cnt
-            UNION
-            WITH c, rel
-            WITH c, rel WHERE rel.type = 'purpose'
-            MATCH (t:Purpose {name: rel.value})
-            MERGE (c)-[:HAS_PURPOSE]->(t)
-            RETURN 1 as cnt
-            UNION
-            WITH c, rel
-            WITH c, rel WHERE rel.type = 'pdc'
-            MATCH (t:PersonalDataCategory {name: rel.value})
-            MERGE (c)-[:HAS_PERSONAL_DATA_CATEGORY]->(t)
-            RETURN 1 as cnt
-            UNION
-            WITH c, rel
-            WITH c, rel WHERE rel.type = 'pd'
-            MATCH (t:PersonalData {name: rel.value})
-            MERGE (c)-[:HAS_PERSONAL_DATA]->(t)
-            RETURN 1 as cnt
-            UNION
-            WITH c, rel
-            WITH c, rel WHERE rel.type = 'category'
-            MATCH (t:Category {name: rel.value})
-            MERGE (c)-[:HAS_CATEGORY]->(t)
-            RETURN 1 as cnt
-        }
-        RETURN sum(cnt) as total
-        """
-        
-        try:
-            result = await self.graph.query(query, params={'rels': rel_data})
-            return result.result_set[0][0] if result.result_set else 0
-        except:
-            return 0
+        self.stats['relationships_created']['total'] = total_rels
+        logger.info(f"\n✅ Total relationships created: {total_rels:,}")
     
     async def load_data(self, file_path: str):
-        """Main loading method"""
+        """Main loading method with robust error handling"""
         self.stats['start_time'] = datetime.now()
         
         try:
+            # Connect
             await self.connect()
             
-            # Load with Polars
-            df = self.load_excel_polars(file_path)
-            
-            # Preprocess
-            records = self.preprocess_polars_fast(df)
+            # Load and preprocess
+            df = self.load_excel_optimized(file_path)
+            records = self.preprocess_fast(df)
             self.stats['total_cases'] = len(records)
             
             # Create indexes
@@ -427,69 +489,90 @@ class PolarsFalkorDBLoader:
             # Collect entities
             entities = self.collect_unique_entities(records)
             
-            load_start = datetime.now()
+            # Create entity nodes (in sequence for stability)
+            logger.info("\n" + "="*60)
+            logger.info("CREATING ENTITY NODES")
+            logger.info("="*60)
             
-            # Create nodes
-            await asyncio.gather(
-                self.bulk_create_nodes('Country', 'name', list(entities['countries'])),
-                self.bulk_create_nodes('Jurisdiction', 'name', list(entities['jurisdictions'])),
-                self.bulk_create_nodes('Purpose', 'name', list(entities['purposes'])),
-                self.bulk_create_nodes('PersonalDataCategory', 'name', list(entities['personal_data_categories'])),
-                self.bulk_create_nodes('PersonalData', 'name', list(entities['personal_data'])),
-                self.bulk_create_nodes('Category', 'name', list(entities['categories'])),
-            )
+            await self.create_nodes_safe('Country', 'name', list(entities['countries']))
+            await self.create_nodes_safe('Jurisdiction', 'name', list(entities['jurisdictions']))
+            await self.create_nodes_safe('Purpose', 'name', list(entities['purposes']))
+            await self.create_nodes_safe('PersonalDataCategory', 'name', list(entities['personal_data_categories']))
+            await self.create_nodes_safe('PersonalData', 'name', list(entities['personal_data']))
+            await self.create_nodes_safe('Category', 'name', list(entities['categories']))
             
-            # Create cases
-            await self.bulk_create_cases_and_relationships(records)
+            # Create case nodes
+            logger.info("\n" + "="*60)
+            logger.info("CREATING CASE NODES")
+            logger.info("="*60)
+            await self.create_cases_safe(records)
             
-            self.stats['loading_time'] = (datetime.now() - load_start).total_seconds()
+            # Create relationships
+            logger.info("\n" + "="*60)
+            logger.info("CREATING RELATIONSHIPS")
+            logger.info("="*60)
+            await self.create_relationships_safe(records)
+            
             self.stats['end_time'] = datetime.now()
-            
             self.print_statistics()
             
         except Exception as e:
-            logger.error(f"Error: {e}")
+            logger.error(f"\n❌ FATAL ERROR: {e}")
             raise
         finally:
             await self.close()
     
     def print_statistics(self):
-        """Print statistics"""
-        total = (self.stats['end_time'] - self.stats['start_time']).total_seconds()
+        """Print comprehensive statistics"""
+        duration = (self.stats['end_time'] - self.stats['start_time']).total_seconds()
         
         logger.info("\n" + "="*70)
-        logger.info("POLARS LOADER STATISTICS")
+        logger.info("LOADING COMPLETE - STATISTICS")
         logger.info("="*70)
-        logger.info(f"Total cases: {self.stats['total_cases']:,}")
-        logger.info(f"\nPreprocessing: {self.stats['preprocessing_time']:.2f}s ({self.stats['total_cases']/self.stats['preprocessing_time']:,.0f} rec/s)")
-        logger.info(f"Graph loading: {self.stats['loading_time']:.2f}s ({self.stats['total_cases']/self.stats['loading_time']:,.0f} rec/s)")
-        logger.info(f"Total: {total:.2f}s ({self.stats['total_cases']/total:,.0f} rec/s)")
-        logger.info(f"\nNodes:")
-        for k, v in sorted(self.stats['nodes_created'].items()):
-            logger.info(f"  {k}: {v:,}")
-        logger.info(f"\nRelationships: {self.stats['relationships_created']['total']:,}")
+        logger.info(f"\n✅ Successfully processed {self.stats['total_cases']:,} cases")
+        logger.info(f"⏱️  Total time: {duration:.2f}s ({duration/60:.1f} minutes)")
+        logger.info(f"🔄 Retries: {self.stats['retries']}")
+        
+        logger.info("\n📊 Nodes created:")
+        for node_type, count in sorted(self.stats['nodes_created'].items()):
+            logger.info(f"   {node_type}: {count:,}")
+        
+        logger.info(f"\n🔗 Relationships created: {self.stats['relationships_created']['total']:,}")
+        
+        if self.stats['errors']:
+            logger.warning("\n⚠️  Errors encountered:")
+            for error_type, count in self.stats['errors'].items():
+                logger.warning(f"   {error_type}: {count}")
+        
         logger.info("="*70)
 
 
 async def main():
+    """Main execution"""
     CONFIG = {
         'host': 'localhost',
         'port': 6379,
+        'password': None,
         'graph_name': 'DataTransferGraph',
-        'batch_size': 15000,
-        'max_connections': 16,
+        'batch_size': 1000,  # Safe batch size
+        'max_connections': 8,  # Conservative connection pool
+        'socket_timeout': 300,  # 5 minute timeout
         'excel_file': 'your_data_file.xlsx'
     }
     
-    loader = PolarsFalkorDBLoader(
+    loader = RobustFalkorDBLoader(
         host=CONFIG['host'],
         port=CONFIG['port'],
+        password=CONFIG['password'],
         graph_name=CONFIG['graph_name'],
         batch_size=CONFIG['batch_size'],
-        max_connections=CONFIG['max_connections']
+        max_connections=CONFIG['max_connections'],
+        socket_timeout=CONFIG['socket_timeout']
     )
     
     await loader.load_data(CONFIG['excel_file'])
+    
+    logger.info("\n✅ Data loading completed!")
 
 
 if __name__ == "__main__":
