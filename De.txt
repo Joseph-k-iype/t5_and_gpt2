@@ -1,1641 +1,470 @@
 """
-Advanced Schema Mapping System with Graph RAG and Sophisticated Reasoning
-WITH COMPLETE DEDUPLICATION - Deduplicates existing graph and prevents all duplicates
+FalkorDB Polars Loader - Blazing Fast for Massive Datasets
+Polars is 5-10x faster than pandas for large data operations
+Ideal for datasets > 1M rows
+
+Install: pip install polars fastexcel
 """
 
-import os
-import json
-import pandas as pd
-from typing import List, Dict, Any, TypedDict, Annotated
-from operator import add
+import polars as pl
+import asyncio
+from falkordb.asyncio import FalkorDB
+from redis.asyncio import BlockingConnectionPool
+from typing import Dict, List, Set
+from collections import defaultdict
+import logging
+from datetime import datetime
+from tqdm.asyncio import tqdm as async_tqdm
 
-from falkordb import FalkorDB
-from openai import OpenAI
-
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, SystemMessage
-
-from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
-
-# ============================================================================
-# GLOBAL CONFIGURATION
-# ============================================================================
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "your-api-key-here")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-FALKORDB_HOST = os.getenv("FALKORDB_HOST", "localhost")
-FALKORDB_PORT = int(os.getenv("FALKORDB_PORT", 6379))
-
-# Initialize OpenAI client
-openai_client = OpenAI(
-    api_key=OPENAI_API_KEY,
-    base_url=OPENAI_BASE_URL
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
-
-# Configure LangChain LLMs
-llm = ChatOpenAI(
-    model="gpt-4o",
-    api_key=OPENAI_API_KEY,
-    base_url=OPENAI_BASE_URL
-)
-
-reasoning_llm = ChatOpenAI(
-    model="o1",
-    api_key=OPENAI_API_KEY,
-    base_url=OPENAI_BASE_URL
-)
-
-# ============================================================================
-# EMBEDDING UTILITIES
-# ============================================================================
-
-def create_embedding(text: str) -> List[float]:
-    """Create embedding using OpenAI text-embedding-3-large model"""
-    response = openai_client.embeddings.create(
-        model="text-embedding-3-large",
-        input=text
-    )
-    return response.data[0].embedding
+logger = logging.getLogger(__name__)
 
 
-def batch_create_embeddings(texts: List[str]) -> List[List[float]]:
-    """Create embeddings for multiple texts in batch"""
-    response = openai_client.embeddings.create(
-        model="text-embedding-3-large",
-        input=texts
-    )
-    return [item.embedding for item in response.data]
-
-
-def escape_string(s: Any) -> str:
-    """Escape string for Cypher query"""
-    if s is None or pd.isna(s):
-        return ''
-    return str(s).replace("'", "\\'").replace('"', '\\"')
-
-
-# ============================================================================
-# FALKORDB SCHEMA LOADER WITH COMPLETE DEDUPLICATION
-# ============================================================================
-
-class SchemaLoader:
-    """Load schema into FalkorDB with complete deduplication - cleans existing duplicates and prevents new ones"""
+class PolarsFalkorDBLoader:
+    """
+    Ultra-fast loader using Polars for data processing
+    Polars advantages:
+    - 5-10x faster than pandas for large datasets
+    - Better memory efficiency
+    - Native parallel processing
+    - Lazy evaluation for query optimization
+    """
     
-    def __init__(self, host: str = FALKORDB_HOST, port: int = FALKORDB_PORT):
-        self.db = FalkorDB(host=host, port=port)
-        self.graph = self.db.select_graph('schema_graph')
+    def __init__(
+        self,
+        host: str = 'localhost',
+        port: int = 6379,
+        password: str = None,
+        graph_name: str = 'DataTransferGraph',
+        batch_size: int = 15000,  # Can handle larger batches
+        max_connections: int = 16
+    ):
+        self.host = host
+        self.port = port
+        self.password = password
+        self.graph_name = graph_name
+        self.batch_size = batch_size
+        self.max_connections = max_connections
+        
+        self.pool = None
+        self.db = None
+        self.graph = None
+        
         self.stats = {
-            'duplicates_removed_tables': 0,
-            'duplicates_removed_columns': 0,
-            'duplicates_removed_relationships': 0,
-            'tables_created': 0,
-            'tables_updated': 0,
-            'tables_skipped': 0,
-            'columns_created': 0,
-            'columns_updated': 0,
-            'columns_skipped': 0,
-            'relationships_created': 0,
-            'relationships_skipped': 0
+            'total_cases': 0,
+            'nodes_created': defaultdict(int),
+            'relationships_created': defaultdict(int),
+            'preprocessing_time': 0,
+            'loading_time': 0,
+            'start_time': None,
+            'end_time': None
         }
     
-    def deduplicate_graph(self):
-        """Remove all duplicate nodes and relationships from existing graph"""
-        print("\n" + "="*60)
-        print("DEDUPLICATING EXISTING GRAPH")
-        print("="*60)
-        
-        # Deduplicate Tables by table_id
-        print("Deduplicating Table nodes...")
-        self._deduplicate_tables()
-        
-        # Deduplicate Columns by table_id + column_name
-        print("Deduplicating Column nodes...")
-        self._deduplicate_columns()
-        
-        # Deduplicate Relationships
-        print("Deduplicating relationships...")
-        self._deduplicate_relationships()
-        
-        print("\n" + "="*60)
-        print("DEDUPLICATION STATISTICS")
-        print("="*60)
-        print(f"Duplicate Tables Removed: {self.stats['duplicates_removed_tables']}")
-        print(f"Duplicate Columns Removed: {self.stats['duplicates_removed_columns']}")
-        print(f"Duplicate Relationships Removed: {self.stats['duplicates_removed_relationships']}")
-        print("="*60)
-    
-    def _deduplicate_tables(self):
-        """Find and merge duplicate table nodes"""
-        # Find tables with same table_id
-        query = """
-            MATCH (t:Table)
-            WITH t.table_id AS table_id, COLLECT(t) AS nodes
-            WHERE SIZE(nodes) > 1
-            RETURN table_id, nodes
-        """
-        result = self.graph.query(query)
-        
-        for record in result.result_set:
-            table_id = record[0]
-            nodes = record[1]
-            
-            print(f"  Found {len(nodes)} duplicate nodes for table_id: {table_id}")
-            
-            # Merge duplicates - keep the most complete one
-            self._merge_duplicate_tables(table_id, nodes)
-            self.stats['duplicates_removed_tables'] += (len(nodes) - 1)
-    
-    def _merge_duplicate_tables(self, table_id: str, nodes: List):
-        """Merge duplicate table nodes, keeping most complete attributes"""
-        table_id_esc = escape_string(table_id)
-        
-        # Get all instances with their properties
-        query = f"""
-            MATCH (t:Table {{table_id: '{table_id_esc}'}})
-            RETURN id(t) AS node_id, 
-                   t.table_name AS table_name,
-                   t.data_model AS data_model,
-                   t.name_embedding AS embedding
-        """
-        result = self.graph.query(query)
-        
-        # Find the most complete node (one with most non-null attributes)
-        best_node = None
-        best_score = -1
-        
-        for record in result.result_set:
-            score = sum([
-                1 if record[1] else 0,  # table_name
-                1 if record[2] else 0,  # data_model
-                1 if record[3] else 0,  # embedding
-            ])
-            if score > best_score:
-                best_score = score
-                best_node = record
-        
-        if not best_node:
-            return
-        
-        best_node_id = best_node[0]
-        
-        # Collect all unique attributes from all duplicates
-        all_table_names = set()
-        all_data_models = set()
-        all_embeddings = []
-        
-        for record in result.result_set:
-            if record[1]:
-                all_table_names.add(record[1])
-            if record[2]:
-                all_data_models.add(record[2])
-            if record[3]:
-                all_embeddings.append(record[3])
-        
-        # Take the first non-null value for each attribute
-        table_name = list(all_table_names)[0] if all_table_names else ''
-        data_model = list(all_data_models)[0] if all_data_models else ''
-        embedding = all_embeddings[0] if all_embeddings else None
-        
-        # Transfer all relationships and columns to the best node
-        for record in result.result_set:
-            if record[0] != best_node_id:
-                # Transfer HAS_COLUMN relationships
-                transfer_query = f"""
-                    MATCH (duplicate)-[r:HAS_COLUMN]->(c:Column)
-                    WHERE id(duplicate) = {record[0]}
-                    MATCH (keeper:Table)
-                    WHERE id(keeper) = {best_node_id}
-                    MERGE (keeper)-[:HAS_COLUMN]->(c)
-                    DELETE r
-                """
-                self.graph.query(transfer_query)
-                
-                # Transfer RELATES_TO relationships (outgoing)
-                transfer_query = f"""
-                    MATCH (duplicate)-[r:RELATES_TO]->(other)
-                    WHERE id(duplicate) = {record[0]}
-                    MATCH (keeper:Table)
-                    WHERE id(keeper) = {best_node_id}
-                    MERGE (keeper)-[new:RELATES_TO]->(other)
-                    SET new = r
-                    DELETE r
-                """
-                self.graph.query(transfer_query)
-                
-                # Transfer RELATES_TO relationships (incoming)
-                transfer_query = f"""
-                    MATCH (other)-[r:RELATES_TO]->(duplicate)
-                    WHERE id(duplicate) = {record[0]}
-                    MATCH (keeper:Table)
-                    WHERE id(keeper) = {best_node_id}
-                    MERGE (other)-[new:RELATES_TO]->(keeper)
-                    SET new = r
-                    DELETE r
-                """
-                self.graph.query(transfer_query)
-                
-                # Delete the duplicate node
-                delete_query = f"""
-                    MATCH (t:Table)
-                    WHERE id(t) = {record[0]}
-                    DELETE t
-                """
-                self.graph.query(delete_query)
-        
-        # Update the keeper node with best attributes
-        table_name_esc = escape_string(table_name)
-        data_model_esc = escape_string(data_model)
-        
-        if embedding:
-            update_query = f"""
-                MATCH (t:Table)
-                WHERE id(t) = {best_node_id}
-                SET t.table_name = '{table_name_esc}',
-                    t.data_model = '{data_model_esc}',
-                    t.name_embedding = vecf32({embedding})
-            """
-        else:
-            update_query = f"""
-                MATCH (t:Table)
-                WHERE id(t) = {best_node_id}
-                SET t.table_name = '{table_name_esc}',
-                    t.data_model = '{data_model_esc}'
-            """
-        self.graph.query(update_query)
-    
-    def _deduplicate_columns(self):
-        """Find and merge duplicate column nodes"""
-        # Find columns with same table_id + column_name combination
-        query = """
-            MATCH (t:Table)-[:HAS_COLUMN]->(c:Column)
-            WITH t.table_id AS table_id, c.column_name AS column_name, COLLECT(c) AS nodes
-            WHERE SIZE(nodes) > 1
-            RETURN table_id, column_name, nodes
-        """
-        result = self.graph.query(query)
-        
-        for record in result.result_set:
-            table_id = record[0]
-            column_name = record[1]
-            nodes = record[2]
-            
-            print(f"  Found {len(nodes)} duplicate columns for {table_id}.{column_name}")
-            
-            # Merge duplicates
-            self._merge_duplicate_columns(table_id, column_name, nodes)
-            self.stats['duplicates_removed_columns'] += (len(nodes) - 1)
-    
-    def _merge_duplicate_columns(self, table_id: str, column_name: str, nodes: List):
-        """Merge duplicate column nodes, keeping most complete attributes"""
-        table_id_esc = escape_string(table_id)
-        column_name_esc = escape_string(column_name)
-        
-        # Get all instances with their properties
-        query = f"""
-            MATCH (t:Table {{table_id: '{table_id_esc}'}})-[:HAS_COLUMN]->(c:Column {{column_name: '{column_name_esc}'}})
-            RETURN id(c) AS node_id,
-                   c.column_id AS column_id,
-                   c.type AS type,
-                   c.length AS length,
-                   c.scale AS scale,
-                   c.nullable AS nullable,
-                   c.primary_key AS primary_key,
-                   c.unique AS unique,
-                   c.foreign_key AS foreign_key,
-                   c.name_embedding AS embedding
-        """
-        result = self.graph.query(query)
-        
-        # Find the most complete node
-        best_node = None
-        best_score = -1
-        
-        for record in result.result_set:
-            score = sum([
-                1 if record[1] else 0,  # column_id
-                1 if record[2] else 0,  # type
-                1 if record[3] else 0,  # length
-                1 if record[4] else 0,  # scale
-                1 if record[5] else 0,  # nullable
-                1 if record[6] else 0,  # primary_key
-                1 if record[7] else 0,  # unique
-                1 if record[8] else 0,  # foreign_key
-                1 if record[9] else 0,  # embedding
-            ])
-            if score > best_score:
-                best_score = score
-                best_node = record
-        
-        if not best_node:
-            return
-        
-        best_node_id = best_node[0]
-        
-        # Collect best attributes from all duplicates
-        attrs = {
-            'column_id': set(),
-            'type': set(),
-            'length': set(),
-            'scale': set(),
-            'nullable': set(),
-            'primary_key': set(),
-            'unique': set(),
-            'foreign_key': set(),
-            'embedding': []
-        }
-        
-        for record in result.result_set:
-            if record[1]: attrs['column_id'].add(record[1])
-            if record[2]: attrs['type'].add(record[2])
-            if record[3]: attrs['length'].add(record[3])
-            if record[4]: attrs['scale'].add(record[4])
-            if record[5]: attrs['nullable'].add(record[5])
-            if record[6]: attrs['primary_key'].add(record[6])
-            if record[7]: attrs['unique'].add(record[7])
-            if record[8]: attrs['foreign_key'].add(record[8])
-            if record[9]: attrs['embedding'].append(record[9])
-        
-        # Delete all duplicate nodes except the best one
-        for record in result.result_set:
-            if record[0] != best_node_id:
-                delete_query = f"""
-                    MATCH (c:Column)
-                    WHERE id(c) = {record[0]}
-                    DETACH DELETE c
-                """
-                self.graph.query(delete_query)
-        
-        # Update the keeper node with best attributes
-        column_id_esc = escape_string(list(attrs['column_id'])[0] if attrs['column_id'] else '')
-        type_esc = escape_string(list(attrs['type'])[0] if attrs['type'] else '')
-        length_esc = escape_string(list(attrs['length'])[0] if attrs['length'] else '')
-        scale_esc = escape_string(list(attrs['scale'])[0] if attrs['scale'] else '')
-        nullable_esc = escape_string(list(attrs['nullable'])[0] if attrs['nullable'] else '')
-        pk_esc = escape_string(list(attrs['primary_key'])[0] if attrs['primary_key'] else '')
-        unique_esc = escape_string(list(attrs['unique'])[0] if attrs['unique'] else '')
-        fk_esc = escape_string(list(attrs['foreign_key'])[0] if attrs['foreign_key'] else '')
-        
-        if attrs['embedding']:
-            update_query = f"""
-                MATCH (c:Column)
-                WHERE id(c) = {best_node_id}
-                SET c.column_id = '{column_id_esc}',
-                    c.type = '{type_esc}',
-                    c.length = '{length_esc}',
-                    c.scale = '{scale_esc}',
-                    c.nullable = '{nullable_esc}',
-                    c.primary_key = '{pk_esc}',
-                    c.unique = '{unique_esc}',
-                    c.foreign_key = '{fk_esc}',
-                    c.name_embedding = vecf32({attrs['embedding'][0]})
-            """
-        else:
-            update_query = f"""
-                MATCH (c:Column)
-                WHERE id(c) = {best_node_id}
-                SET c.column_id = '{column_id_esc}',
-                    c.type = '{type_esc}',
-                    c.length = '{length_esc}',
-                    c.scale = '{scale_esc}',
-                    c.nullable = '{nullable_esc}',
-                    c.primary_key = '{pk_esc}',
-                    c.unique = '{unique_esc}',
-                    c.foreign_key = '{fk_esc}'
-            """
-        self.graph.query(update_query)
-        
-        # Ensure HAS_COLUMN relationship exists
-        reconnect_query = f"""
-            MATCH (t:Table {{table_id: '{table_id_esc}'}}), (c:Column)
-            WHERE id(c) = {best_node_id}
-            MERGE (t)-[:HAS_COLUMN]->(c)
-        """
-        self.graph.query(reconnect_query)
-    
-    def _deduplicate_relationships(self):
-        """Remove duplicate RELATES_TO relationships"""
-        query = """
-            MATCH (t1:Table)-[r:RELATES_TO]->(t2:Table)
-            WITH t1, t2, COLLECT(r) AS rels
-            WHERE SIZE(rels) > 1
-            RETURN t1.table_id AS from_id, t2.table_id AS to_id, SIZE(rels) AS count
-        """
-        result = self.graph.query(query)
-        
-        for record in result.result_set:
-            from_id = record[0]
-            to_id = record[1]
-            count = record[2]
-            
-            print(f"  Found {count} duplicate relationships: {from_id} -> {to_id}")
-            
-            from_id_esc = escape_string(from_id)
-            to_id_esc = escape_string(to_id)
-            
-            # Keep only one relationship, merge properties
-            merge_query = f"""
-                MATCH (t1:Table {{table_id: '{from_id_esc}'}})-[r:RELATES_TO]->(t2:Table {{table_id: '{to_id_esc}'}})
-                WITH t1, t2, COLLECT(r) AS rels
-                WITH t1, t2, rels[0] AS keep, rels[1..] AS duplicates
-                FOREACH (dup IN duplicates | DELETE dup)
-            """
-            self.graph.query(merge_query)
-            
-            self.stats['duplicates_removed_relationships'] += (count - 1)
-        
-    def load_schema(self, attributes_csv: str, relationships_csv: str):
-        """Load schema from CSV files into FalkorDB with deduplication"""
-        print("Loading schema attributes...")
-        df_attrs = pd.read_csv(attributes_csv)
-        
-        print("Loading schema relationships...")
-        df_rels = pd.read_csv(relationships_csv)
-        
-        print("\nDeduplicating existing graph...")
-        self.deduplicate_graph()
-        
-        print("\nCreating vector indices...")
-        self._create_vector_indices()
-        
-        print("\nLoading tables and columns with smart deduplication...")
-        self._load_tables_and_columns(df_attrs)
-        
-        print("\nLoading relationships with deduplication...")
-        self._load_relationships(df_rels)
-        
-        print("\n" + "="*60)
-        print("SCHEMA LOADING STATISTICS")
-        print("="*60)
-        print(f"Tables - Created: {self.stats['tables_created']}, "
-              f"Updated: {self.stats['tables_updated']}, "
-              f"Skipped: {self.stats['tables_skipped']}")
-        print(f"Columns - Created: {self.stats['columns_created']}, "
-              f"Updated: {self.stats['columns_updated']}, "
-              f"Skipped: {self.stats['columns_skipped']}")
-        print(f"Relationships - Created: {self.stats['relationships_created']}, "
-              f"Skipped: {self.stats['relationships_skipped']}")
-        print("="*60)
-        print("Schema loaded successfully!")
-        
-    def _create_vector_indices(self):
-        """Create vector indices for semantic search"""
-        try:
-            self.graph.query("""
-                CREATE VECTOR INDEX FOR (t:Table) ON (t.name_embedding) 
-                OPTIONS {dimension:3072, similarityFunction:'cosine'}
-            """)
-            print("✓ Created vector index for Table nodes")
-        except Exception as e:
-            print(f"✓ Table vector index already exists")
-        
-        try:
-            self.graph.query("""
-                CREATE VECTOR INDEX FOR (c:Column) ON (c.name_embedding) 
-                OPTIONS {dimension:3072, similarityFunction:'cosine'}
-            """)
-            print("✓ Created vector index for Column nodes")
-        except Exception as e:
-            print(f"✓ Column vector index already exists")
-    
-    def _check_node_completeness(self, table_id: str, table_name: str = None, column_name: str = None) -> tuple:
-        """Check if node exists and is complete, return (exists, is_complete, node_id)"""
-        table_id_esc = escape_string(table_id)
-        
-        if column_name:
-            # Check column completeness
-            column_name_esc = escape_string(column_name)
-            query = f"""
-                MATCH (t:Table {{table_id: '{table_id_esc}'}})-[:HAS_COLUMN]->(c:Column {{column_name: '{column_name_esc}'}})
-                RETURN id(c) AS node_id,
-                       c.column_id AS col_id,
-                       c.type AS type,
-                       c.name_embedding AS embedding
-                LIMIT 1
-            """
-            result = self.graph.query(query)
-            
-            if not result.result_set:
-                return (False, False, None)
-            
-            record = result.result_set[0]
-            node_id = record[0]
-            has_col_id = record[1] is not None and record[1] != ''
-            has_type = record[2] is not None and record[2] != ''
-            has_embedding = record[3] is not None
-            
-            is_complete = has_col_id and has_type and has_embedding
-            return (True, is_complete, node_id)
-        else:
-            # Check table completeness
-            query = f"""
-                MATCH (t:Table {{table_id: '{table_id_esc}'}})
-                RETURN id(t) AS node_id,
-                       t.table_name AS name,
-                       t.data_model AS model,
-                       t.name_embedding AS embedding
-                LIMIT 1
-            """
-            result = self.graph.query(query)
-            
-            if not result.result_set:
-                return (False, False, None)
-            
-            record = result.result_set[0]
-            node_id = record[0]
-            has_name = record[1] is not None and record[1] != ''
-            has_model = record[2] is not None and record[2] != ''
-            has_embedding = record[3] is not None
-            
-            is_complete = has_name and has_model and has_embedding
-            return (True, is_complete, node_id)
-    
-    def _load_tables_and_columns(self, df_attrs: pd.DataFrame):
-        """Load tables and columns using MERGE to prevent any duplicates"""
-        tables = df_attrs.groupby(['table_id', 'table_name', 'data_model'])
-        
-        for (table_id, table_name, data_model), columns in tables:
-            table_id_esc = escape_string(table_id)
-            table_name_esc = escape_string(table_name)
-            data_model_esc = escape_string(data_model)
-            
-            # Check table status
-            exists, is_complete, node_id = self._check_node_completeness(table_id, table_name)
-            
-            if is_complete:
-                print(f"⊘ Skipping table {table_name} (already complete)")
-                self.stats['tables_skipped'] += 1
-            else:
-                # Create embedding for table
-                table_embedding = create_embedding(str(table_name))
-                
-                if not exists:
-                    print(f"+ Creating table {table_name}")
-                    # Use MERGE to prevent duplicates
-                    query = f"""
-                        MERGE (t:Table {{table_id: '{table_id_esc}'}})
-                        ON CREATE SET 
-                            t.table_name = '{table_name_esc}',
-                            t.data_model = '{data_model_esc}',
-                            t.name_embedding = vecf32({table_embedding})
-                    """
-                    self.graph.query(query)
-                    self.stats['tables_created'] += 1
-                else:
-                    print(f"↻ Updating table {table_name}")
-                    # Update only missing attributes
-                    query = f"""
-                        MERGE (t:Table {{table_id: '{table_id_esc}'}})
-                        ON MATCH SET 
-                            t.table_name = COALESCE(t.table_name, '{table_name_esc}'),
-                            t.data_model = COALESCE(t.data_model, '{data_model_esc}'),
-                            t.name_embedding = CASE 
-                                WHEN t.name_embedding IS NULL 
-                                THEN vecf32({table_embedding})
-                                ELSE t.name_embedding
-                            END
-                    """
-                    self.graph.query(query)
-                    self.stats['tables_updated'] += 1
-            
-            # Process columns for this table
-            for _, col in columns.iterrows():
-                col_name = str(col['column_name'])
-                
-                # Check column status
-                exists, is_complete, node_id = self._check_node_completeness(table_id, column_name=col_name)
-                
-                if is_complete:
-                    self.stats['columns_skipped'] += 1
-                    continue
-                
-                col_embedding = create_embedding(col_name)
-                
-                col_id_esc = escape_string(col['column_id'])
-                col_name_esc = escape_string(col_name)
-                type_esc = escape_string(col.get('type', ''))
-                length_esc = escape_string(col.get('length', ''))
-                scale_esc = escape_string(col.get('scale', ''))
-                nullable_esc = escape_string(col.get('nullable', ''))
-                pk_esc = escape_string(col.get('primary_key', ''))
-                unique_esc = escape_string(col.get('unique', ''))
-                fk_esc = escape_string(col.get('foreign_key', ''))
-                
-                if not exists:
-                    # Create new column with MERGE and relationship
-                    query = f"""
-                        MATCH (t:Table {{table_id: '{table_id_esc}'}})
-                        MERGE (c:Column {{column_id: '{col_id_esc}'}})
-                        ON CREATE SET
-                            c.column_name = '{col_name_esc}',
-                            c.type = '{type_esc}',
-                            c.length = '{length_esc}',
-                            c.scale = '{scale_esc}',
-                            c.nullable = '{nullable_esc}',
-                            c.primary_key = '{pk_esc}',
-                            c.unique = '{unique_esc}',
-                            c.foreign_key = '{fk_esc}',
-                            c.name_embedding = vecf32({col_embedding})
-                        MERGE (t)-[:HAS_COLUMN]->(c)
-                    """
-                    self.graph.query(query)
-                    self.stats['columns_created'] += 1
-                else:
-                    # Update only missing attributes with MERGE
-                    query = f"""
-                        MATCH (t:Table {{table_id: '{table_id_esc}'}})
-                        MERGE (c:Column {{column_id: '{col_id_esc}'}})
-                        ON MATCH SET
-                            c.column_name = COALESCE(c.column_name, '{col_name_esc}'),
-                            c.type = CASE WHEN c.type IS NULL OR c.type = '' THEN '{type_esc}' ELSE c.type END,
-                            c.length = CASE WHEN c.length IS NULL OR c.length = '' THEN '{length_esc}' ELSE c.length END,
-                            c.scale = CASE WHEN c.scale IS NULL OR c.scale = '' THEN '{scale_esc}' ELSE c.scale END,
-                            c.nullable = COALESCE(c.nullable, '{nullable_esc}'),
-                            c.primary_key = COALESCE(c.primary_key, '{pk_esc}'),
-                            c.unique = COALESCE(c.unique, '{unique_esc}'),
-                            c.foreign_key = COALESCE(c.foreign_key, '{fk_esc}'),
-                            c.name_embedding = CASE 
-                                WHEN c.name_embedding IS NULL 
-                                THEN vecf32({col_embedding})
-                                ELSE c.name_embedding
-                            END
-                        MERGE (t)-[:HAS_COLUMN]->(c)
-                    """
-                    self.graph.query(query)
-                    self.stats['columns_updated'] += 1
-            
-            # Show progress
-            if (self.stats['tables_created'] + self.stats['tables_updated'] + self.stats['tables_skipped']) % 10 == 0:
-                print(f"  Processed {self.stats['tables_created'] + self.stats['tables_updated'] + self.stats['tables_skipped']} tables...")
-    
-    def _load_relationships(self, df_rels: pd.DataFrame):
-        """Load relationships using MERGE to prevent duplicates"""
-        for _, rel in df_rels.iterrows():
-            rel_id_esc = escape_string(rel['relationship_id'])
-            from_table_esc = escape_string(rel['from_table_id'])
-            to_table_esc = escape_string(rel['to_table_id'])
-            from_mult_esc = escape_string(rel.get('from_multiplicity', ''))
-            to_mult_esc = escape_string(rel.get('to_multiplicity', ''))
-            ident_esc = escape_string(rel.get('identifying', ''))
-            
-            # Use MERGE to prevent any duplicate relationships
-            query = f"""
-                MATCH (t1:Table {{table_id: '{from_table_esc}'}}),
-                      (t2:Table {{table_id: '{to_table_esc}'}})
-                MERGE (t1)-[r:RELATES_TO {{relationship_id: '{rel_id_esc}'}}]->(t2)
-                ON CREATE SET 
-                    r.from_multiplicity = '{from_mult_esc}',
-                    r.to_multiplicity = '{to_mult_esc}',
-                    r.identifying = '{ident_esc}'
-                ON MATCH SET
-                    r.from_multiplicity = COALESCE(r.from_multiplicity, '{from_mult_esc}'),
-                    r.to_multiplicity = COALESCE(r.to_multiplicity, '{to_mult_esc}'),
-                    r.identifying = COALESCE(r.identifying, '{ident_esc}')
-                RETURN COUNT(r) AS created
-            """
-            result = self.graph.query(query)
-            
-            if result.result_set and result.result_set[0][0] > 0:
-                self.stats['relationships_created'] += 1
-            else:
-                self.stats['relationships_skipped'] += 1
-            
-            if (self.stats['relationships_created'] + self.stats['relationships_skipped']) % 10 == 0:
-                print(f"  Processed {self.stats['relationships_created'] + self.stats['relationships_skipped']} relationships...")
-
-
-# ============================================================================
-# ENHANCED GRAPH RAG RETRIEVER WITH CONTEXT
-# ============================================================================
-
-class EnhancedGraphRAGRetriever:
-    """Retrieve schema with full context: relationships, lineage, transformations"""
-    
-    def __init__(self, host: str = FALKORDB_HOST, port: int = FALKORDB_PORT):
-        self.db = FalkorDB(host=host, port=port)
-        self.graph = self.db.select_graph('schema_graph')
-    
-    def semantic_search_with_context(self, query_text: str, top_k: int = 10) -> List[Dict]:
-        """Search for columns with full contextual information"""
-        query_embedding = create_embedding(query_text)
-        
-        query = f"""
-            CALL db.idx.vector.queryNodes('Column', 'name_embedding', {top_k}, vecf32({query_embedding}))
-            YIELD node, score
-            MATCH (t:Table)-[:HAS_COLUMN]->(node)
-            RETURN 
-                node.column_id AS column_id,
-                node.column_name AS column_name,
-                node.type AS type,
-                node.primary_key AS primary_key,
-                node.foreign_key AS foreign_key,
-                node.nullable AS nullable,
-                t.table_name AS table_name,
-                t.table_id AS table_id,
-                t.data_model AS data_model,
-                score
-            ORDER BY score DESC
-        """
-        result = self.graph.query(query)
-        
-        columns = []
-        for record in result.result_set:
-            column_info = {
-                'column_id': record[0],
-                'column_name': record[1],
-                'type': record[2],
-                'primary_key': record[3],
-                'foreign_key': record[4],
-                'nullable': record[5],
-                'table_name': record[6],
-                'table_id': record[7],
-                'data_model': record[8],
-                'similarity_score': record[9]
-            }
-            
-            column_info['relationships'] = self.get_table_relationships(record[7])
-            column_info['related_columns'] = self.get_related_columns_in_table(record[7])
-            column_info['lineage'] = self.get_column_lineage(record[7], record[1])
-            column_info['table_context'] = self.get_table_context(record[7])
-            
-            columns.append(column_info)
-        
-        return columns
-    
-    def get_table_relationships(self, table_id: str) -> Dict[str, List[Dict]]:
-        """Get both incoming and outgoing relationships for a table"""
-        table_id_esc = escape_string(table_id)
-        
-        query_out = f"""
-            MATCH (t1:Table {{table_id: '{table_id_esc}'}})-[r:RELATES_TO]->(t2:Table)
-            RETURN 
-                t2.table_name AS related_table_name,
-                r.from_multiplicity AS from_multiplicity,
-                r.to_multiplicity AS to_multiplicity
-        """
-        outgoing = self.graph.query(query_out)
-        
-        query_in = f"""
-            MATCH (t1:Table)-[r:RELATES_TO]->(t2:Table {{table_id: '{table_id_esc}'}})
-            RETURN 
-                t1.table_name AS related_table_name,
-                r.from_multiplicity AS from_multiplicity,
-                r.to_multiplicity AS to_multiplicity
-        """
-        incoming = self.graph.query(query_in)
-        
-        relationships = {
-            'outgoing': [],
-            'incoming': []
-        }
-        
-        for record in outgoing.result_set:
-            relationships['outgoing'].append({
-                'related_table': record[0],
-                'cardinality': f"{record[1]}:{record[2]}"
-            })
-        
-        for record in incoming.result_set:
-            relationships['incoming'].append({
-                'related_table': record[0],
-                'cardinality': f"{record[1]}:{record[2]}"
-            })
-        
-        return relationships
-    
-    def get_related_columns_in_table(self, table_id: str) -> List[Dict]:
-        """Get all columns in the same table for context"""
-        table_id_esc = escape_string(table_id)
-        
-        query = f"""
-            MATCH (t:Table {{table_id: '{table_id_esc}'}})-[:HAS_COLUMN]->(c:Column)
-            RETURN 
-                c.column_name AS column_name,
-                c.type AS type,
-                c.primary_key AS primary_key,
-                c.foreign_key AS foreign_key
-            ORDER BY c.column_name
-        """
-        result = self.graph.query(query)
-        
-        columns = []
-        for record in result.result_set:
-            columns.append({
-                'column_name': record[0],
-                'type': record[1],
-                'is_pk': record[2] == 'Y',
-                'is_fk': record[3] == 'Y'
-            })
-        
-        return columns
-    
-    def get_column_lineage(self, table_id: str, column_name: str) -> Dict[str, Any]:
-        """Get data lineage through foreign key relationships"""
-        table_id_esc = escape_string(table_id)
-        column_name_esc = escape_string(column_name)
-        
-        query = f"""
-            MATCH (t:Table {{table_id: '{table_id_esc}'}})-[:HAS_COLUMN]->(c:Column {{column_name: '{column_name_esc}'}})
-            WHERE c.foreign_key = 'Y'
-            RETURN c.foreign_key
-        """
-        fk_result = self.graph.query(query)
-        
-        if not fk_result.result_set:
-            return {'is_foreign_key': False, 'references': None}
-        
-        query2 = f"""
-            MATCH (source:Table {{table_id: '{table_id_esc}'}})-[r:RELATES_TO]->(target:Table)
-            MATCH (target)-[:HAS_COLUMN]->(target_col:Column)
-            WHERE target_col.primary_key = 'Y'
-            RETURN 
-                target.table_name AS referenced_table,
-                target_col.column_name AS referenced_column,
-                r.from_multiplicity AS from_card,
-                r.to_multiplicity AS to_card
-        """
-        lineage_result = self.graph.query(query2)
-        
-        references = []
-        for record in lineage_result.result_set:
-            references.append({
-                'referenced_table': record[0],
-                'referenced_column': record[1],
-                'relationship': f"{record[2]}:{record[3]}"
-            })
-        
-        return {
-            'is_foreign_key': True,
-            'references': references
-        }
-    
-    def get_table_context(self, table_id: str) -> Dict[str, Any]:
-        """Get comprehensive table context"""
-        table_id_esc = escape_string(table_id)
-        
-        query = f"""
-            MATCH (t:Table {{table_id: '{table_id_esc}'}})-[:HAS_COLUMN]->(c:Column)
-            WITH t, count(c) AS column_count,
-                 sum(CASE WHEN c.primary_key = 'Y' THEN 1 ELSE 0 END) AS pk_count,
-                 sum(CASE WHEN c.foreign_key = 'Y' THEN 1 ELSE 0 END) AS fk_count
-            OPTIONAL MATCH (t)-[r:RELATES_TO]-()
-            WITH t, column_count, pk_count, fk_count, count(DISTINCT r) AS relationship_count
-            RETURN 
-                t.table_name AS table_name,
-                t.data_model AS data_model,
-                column_count,
-                pk_count,
-                fk_count,
-                relationship_count
-        """
-        result = self.graph.query(query)
-        
-        if result.result_set:
-            record = result.result_set[0]
-            return {
-                'table_name': record[0],
-                'data_model': record[1],
-                'column_count': record[2],
-                'primary_keys': record[3],
-                'foreign_keys': record[4],
-                'relationships': record[5]
-            }
-        
-        return {}
-
-
-# ============================================================================
-# ADVANCED AGENT STATE
-# ============================================================================
-
-class EnhancedMappingState(TypedDict):
-    """Enhanced state with full context"""
-    transaction_field: Dict[str, Any]
-    candidate_columns: List[Dict]
-    contextual_analysis: Dict[str, Any]
-    expert_analyses: Dict[str, str]
-    reasoning_paths: List[Dict]
-    mapping_decision: Dict[str, Any]
-    verification_result: Dict[str, Any]
-    final_mapping: Dict[str, Any]
-    messages: Annotated[List, add]
-
-
-# ============================================================================
-# ADVANCED PROMPTING TECHNIQUES
-# ============================================================================
-
-CHAIN_OF_THOUGHT_PROMPT = """You are an expert data analyst. Use step-by-step reasoning to solve this mapping problem.
-
-Think through this systematically:
-
-1. UNDERSTAND THE SOURCE FIELD
-   - What is the semantic meaning?
-   - What is the data type and format?
-   - What transformations are being applied?
-   - What is the business context?
-
-2. ANALYZE EACH CANDIDATE
-   - How well does the name match semantically?
-   - Is the data type compatible?
-   - Do the transformations align?
-   - Are the relationships consistent?
-
-3. CONSIDER CONTEXT
-   - What other columns exist in both tables?
-   - What are the foreign key relationships?
-   - What is the data lineage?
-   - How does cardinality affect the mapping?
-
-4. EVALUATE RISKS
-   - Data loss in transformation?
-   - Type conversion issues?
-   - Referential integrity concerns?
-   - Performance implications?
-
-5. MAKE RECOMMENDATION
-   - Which candidate is the best match?
-   - What is your confidence level?
-   - What transformations are needed?
-   - What should be validated?
-
-Walk through each step explicitly, showing your reasoning."""
-
-MIXTURE_OF_EXPERTS_PROMPTS = {
-    'database_expert': """You are a database schema expert specializing in relational database design, 
-normalization, foreign keys, and referential integrity. Analyze the mapping from a database structure perspective.
-
-Focus on:
-- Primary key / foreign key relationships
-- Referential integrity constraints
-- Cardinality and multiplicity
-- Table normalization levels
-- Index implications""",
-
-    'etl_expert': """You are an ETL (Extract, Transform, Load) specialist with expertise in data transformations,
-type conversions, and data integration patterns.
-
-Focus on:
-- SQL transformation logic compatibility
-- Data type conversion safety
-- NULL handling and default values
-- Data quality and validation rules
-- Performance of transformations""",
-
-    'business_analyst': """You are a business analyst who understands data semantics, business rules,
-and how data represents real-world entities and relationships.
-
-Focus on:
-- Semantic meaning alignment
-- Business logic consistency
-- Data governance and compliance
-- Domain-specific terminology
-- Data usage patterns""",
-
-    'data_quality_expert': """You are a data quality specialist focused on data accuracy, completeness,
-consistency, and fitness for use.
-
-Focus on:
-- Data validation rules
-- Quality metrics and thresholds
-- Data profiling compatibility
-- Anomaly detection considerations
-- Master data management implications"""
-}
-
-
-# ============================================================================
-# ENHANCED AGENTS WITH ADVANCED REASONING
-# ============================================================================
-
-class AdvancedMappingAgents:
-    """Agents with sophisticated reasoning capabilities"""
-    
-    def __init__(self, retriever: EnhancedGraphRAGRetriever):
-        self.retriever = retriever
-        self.llm = llm
-        self.reasoning_llm = reasoning_llm
-    
-    def retriever_agent(self, state: EnhancedMappingState) -> EnhancedMappingState:
-        """Retrieve candidates with full contextual information"""
-        field = state['transaction_field']
-        standardized_name = field['Standardised Name']
-        
-        print(f"\n🔍 Retriever Agent: Enhanced search for '{standardized_name}'")
-        
-        search_components = [standardized_name]
-        
-        if pd.notna(field.get('Creation')):
-            search_components.append(str(field['Creation']))
-        
-        if pd.notna(field.get('Transformation')):
-            search_components.append(str(field['Transformation']))
-        
-        if pd.notna(field.get('Comment')):
-            search_components.append(str(field['Comment']))
-        
-        search_query = " ".join(search_components)
-        
-        candidates = self.retriever.semantic_search_with_context(search_query, top_k=10)
-        
-        state['candidate_columns'] = candidates
-        state['messages'].append({
-            'role': 'retriever',
-            'content': f"Found {len(candidates)} candidates with relationships and lineage"
-        })
-        
-        return state
-    
-    def context_analyzer_agent(self, state: EnhancedMappingState) -> EnhancedMappingState:
-        """Analyze contextual information: relationships, lineage, transformations"""
-        field = state['transaction_field']
-        candidates = state['candidate_columns']
-        
-        print(f"📊 Context Analyzer: Analyzing relationships and lineage")
-        
-        contextual_analysis = {
-            'transformation_analysis': self._analyze_transformations(field, candidates),
-            'relationship_analysis': self._analyze_relationships(candidates),
-            'lineage_analysis': self._analyze_lineage(candidates),
-            'type_compatibility': self._analyze_type_compatibility(field, candidates)
-        }
-        
-        state['contextual_analysis'] = contextual_analysis
-        state['messages'].append({
-            'role': 'context_analyzer',
-            'content': 'Completed contextual analysis'
-        })
-        
-        return state
-    
-    def _analyze_transformations(self, field: Dict, candidates: List[Dict]) -> Dict:
-        """Analyze SQL transformation compatibility"""
-        transformation_sql = str(field.get('Transformation', ''))
-        
-        analysis = {
-            'has_transformation': bool(transformation_sql and transformation_sql != 'nan'),
-            'transformation_complexity': 'simple',
-            'operations': []
-        }
-        
-        if 'CASE' in transformation_sql or 'JOIN' in transformation_sql:
-            analysis['transformation_complexity'] = 'complex'
-        
-        if 'CAST' in transformation_sql:
-            analysis['operations'].append('type_conversion')
-        if 'CONCAT' in transformation_sql:
-            analysis['operations'].append('string_concatenation')
-        if 'UPPER' in transformation_sql or 'LOWER' in transformation_sql:
-            analysis['operations'].append('case_normalization')
-        if 'TRIM' in transformation_sql:
-            analysis['operations'].append('whitespace_handling')
-        
-        return analysis
-    
-    def _analyze_relationships(self, candidates: List[Dict]) -> Dict:
-        """Analyze relationship patterns across candidates"""
-        analysis = {
-            'candidates_with_relationships': 0,
-            'relationship_patterns': []
-        }
-        
-        for candidate in candidates:
-            rels = candidate.get('relationships', {})
-            if rels.get('incoming') or rels.get('outgoing'):
-                analysis['candidates_with_relationships'] += 1
-                
-                for rel in rels.get('outgoing', []):
-                    analysis['relationship_patterns'].append({
-                        'table': candidate['table_name'],
-                        'relates_to': rel['related_table'],
-                        'type': 'references'
-                    })
-        
-        return analysis
-    
-    def _analyze_lineage(self, candidates: List[Dict]) -> Dict:
-        """Analyze data lineage patterns"""
-        analysis = {
-            'foreign_key_candidates': [],
-            'primary_key_candidates': []
-        }
-        
-        for candidate in candidates:
-            lineage = candidate.get('lineage', {})
-            
-            if lineage.get('is_foreign_key'):
-                analysis['foreign_key_candidates'].append({
-                    'column': candidate['column_name'],
-                    'table': candidate['table_name'],
-                    'references': lineage.get('references', [])
-                })
-            
-            if candidate.get('primary_key') == 'Y':
-                analysis['primary_key_candidates'].append({
-                    'column': candidate['column_name'],
-                    'table': candidate['table_name']
-                })
-        
-        return analysis
-    
-    def _analyze_type_compatibility(self, field: Dict, candidates: List[Dict]) -> List[Dict]:
-        """Analyze data type compatibility"""
-        source_type = str(field.get('DataType', '')).upper()
-        
-        compatibility = []
-        for candidate in candidates:
-            target_type = str(candidate.get('type', '')).upper()
-            compatible = self._check_type_compatibility(source_type, target_type)
-            
-            compatibility.append({
-                'candidate': f"{candidate['table_name']}.{candidate['column_name']}",
-                'source_type': source_type,
-                'target_type': target_type,
-                'compatible': compatible,
-                'requires_conversion': not compatible
-            })
-        
-        return compatibility
-    
-    def _check_type_compatibility(self, source: str, target: str) -> bool:
-        """Check if types are compatible"""
-        compatible_types = {
-            'INTEGER': ['INT', 'INTEGER', 'BIGINT', 'DECIMAL', 'NUMERIC'],
-            'INT': ['INT', 'INTEGER', 'BIGINT', 'DECIMAL', 'NUMERIC'],
-            'VARCHAR': ['VARCHAR', 'CHAR', 'TEXT', 'STRING'],
-            'DATE': ['DATE', 'TIMESTAMP', 'DATETIME'],
-            'DECIMAL': ['DECIMAL', 'NUMERIC', 'FLOAT', 'DOUBLE']
-        }
-        
-        for base_type, compatible_list in compatible_types.items():
-            if base_type in source:
-                return any(comp in target for comp in compatible_list)
-        
-        return source == target
-    
-    def mixture_of_experts_agent(self, state: EnhancedMappingState) -> EnhancedMappingState:
-        """Get perspectives from multiple expert agents"""
-        field = state['transaction_field']
-        candidates = state['candidate_columns'][:3]
-        context = state['contextual_analysis']
-        
-        print(f"👥 Mixture of Experts: Consulting specialists")
-        
-        expert_analyses = {}
-        expert_context = self._prepare_expert_context(field, candidates, context)
-        
-        for expert_name, expert_prompt in MIXTURE_OF_EXPERTS_PROMPTS.items():
-            print(f"   Consulting {expert_name}...")
-            
-            messages = [
-                SystemMessage(content=expert_prompt),
-                HumanMessage(content=expert_context)
-            ]
-            
-            response = self.llm.invoke(messages)
-            expert_analyses[expert_name] = response.content
-        
-        state['expert_analyses'] = expert_analyses
-        state['messages'].append({
-            'role': 'mixture_of_experts',
-            'content': f"Collected {len(expert_analyses)} expert opinions"
-        })
-        
-        return state
-    
-    def _prepare_expert_context(self, field: Dict, candidates: List[Dict], context: Dict) -> str:
-        """Prepare comprehensive context for expert analysis"""
-        context_str = f"""
-TRANSACTION FIELD TO MAP:
-Field Name: {field.get('Standardised Name', 'N/A')}
-Original Name: {field.get('TT COLUMN/FIELD NAME', 'N/A')}
-Data Type: {field.get('DataType', 'N/A')}
-Is Primary Key: {field.get('PK', 'N/A')}
-Comment: {field.get('Comment', 'N/A')}
-Creation SQL: {field.get('Creation', 'N/A')}
-Transformation SQL: {field.get('Transformation', 'N/A')}
-
-TOP CANDIDATE COLUMNS:
-"""
-        
-        for i, candidate in enumerate(candidates, 1):
-            rels = candidate.get('relationships', {})
-            context_str += f"""
-Candidate {i}: {candidate['table_name']}.{candidate['column_name']}
-- Type: {candidate['type']}
-- Primary Key: {candidate['primary_key']}
-- Foreign Key: {candidate['foreign_key']}
-- Similarity Score: {candidate['similarity_score']:.4f}
-- Relationships: {len(rels.get('outgoing', []))} outgoing, {len(rels.get('incoming', []))} incoming
-- Related Columns: {len(candidate.get('related_columns', []))}
-"""
-            
-            if rels.get('outgoing'):
-                refs = [r['related_table'] for r in rels['outgoing']]
-                context_str += f"  References: {', '.join(refs)}\n"
-            
-            if rels.get('incoming'):
-                refs = [r['related_table'] for r in rels['incoming']]
-                context_str += f"  Referenced By: {', '.join(refs)}\n"
-            
-            lineage = candidate.get('lineage', {})
-            if lineage.get('is_foreign_key') and lineage.get('references'):
-                refs = [f"{r['referenced_table']}.{r['referenced_column']}" for r in lineage['references']]
-                context_str += f"  FK References: {', '.join(refs)}\n"
-        
-        trans_ops = context['transformation_analysis'].get('operations', [])
-        context_str += f"""
-
-CONTEXTUAL ANALYSIS:
-Transformation Complexity: {context['transformation_analysis'].get('transformation_complexity', 'N/A')}
-Operations: {', '.join(trans_ops) if trans_ops else 'None'}
-Candidates with Relationships: {context['relationship_analysis']['candidates_with_relationships']}
-Foreign Key Candidates: {len(context['lineage_analysis']['foreign_key_candidates'])}
-Primary Key Candidates: {len(context['lineage_analysis']['primary_key_candidates'])}
-
-Provide your expert analysis focusing on your domain of expertise.
-"""
-        
-        return context_str
-    
-    def chain_of_thought_reasoning_agent(self, state: EnhancedMappingState) -> EnhancedMappingState:
-        """Apply chain-of-thought reasoning with o1 model"""
-        field = state['transaction_field']
-        candidates = state['candidate_columns'][:5]
-        context = state['contextual_analysis']
-        expert_opinions = state['expert_analyses']
-        
-        print(f"🧠 Chain-of-Thought Reasoning: Deep analysis with o1")
-        
-        reasoning_context = f"""
-FIELD TO MAP: {field.get('Standardised Name', 'N/A')}
-
-{self._prepare_expert_context(field, candidates, context)}
-
-EXPERT OPINIONS:
-"""
-        for expert, opinion in expert_opinions.items():
-            reasoning_context += f"\n{expert.upper()}:\n{opinion}\n"
-        
-        reasoning_context += """
-
-Now, use step-by-step reasoning to determine the best mapping.
-Consider all expert opinions, relationships, lineage, and transformations.
-"""
-        
-        messages = [
-            SystemMessage(content=CHAIN_OF_THOUGHT_PROMPT),
-            HumanMessage(content=reasoning_context)
-        ]
-        
-        response = self.reasoning_llm.invoke(messages)
-        
-        reasoning_paths = [{
-            'model': 'o1',
-            'reasoning': response.content,
-            'timestamp': pd.Timestamp.now().isoformat()
-        }]
-        
-        state['reasoning_paths'] = reasoning_paths
-        state['messages'].append({
-            'role': 'chain_of_thought',
-            'content': 'Completed deep reasoning analysis'
-        })
-        
-        return state
-    
-    def mapper_agent(self, state: EnhancedMappingState) -> EnhancedMappingState:
-        """Make final mapping decision based on all analyses"""
-        field = state['transaction_field']
-        reasoning = state['reasoning_paths'][0]['reasoning']
-        candidates = state['candidate_columns']
-        
-        print(f"🎯 Mapper Agent: Making final decision")
-        
-        system_prompt = """You are a data mapping specialist.
-Based on the comprehensive analysis provided (expert opinions, chain-of-thought reasoning, 
-contextual analysis), make a definitive mapping decision.
-
-Return your response as JSON with keys:
-{
-    "selected_column": "column_name",
-    "table_name": "table_name",
-    "confidence": 0.0-1.0,
-    "reasoning_summary": "brief explanation",
-    "transformation_requirements": ["list of required transformations"],
-    "relationship_validation": "how relationships validate this mapping",
-    "lineage_justification": "how lineage supports this choice",
-    "risks": ["list of risks"],
-    "recommendations": ["list of recommendations"]
-}"""
-        
-        top_candidates = [{
-            'table': c['table_name'],
-            'column': c['column_name'],
-            'score': c['similarity_score'],
-            'pk': c['primary_key'],
-            'fk': c['foreign_key']
-        } for c in candidates[:3]]
-        
-        mapping_context = f"""
-Field: {field.get('Standardised Name', 'N/A')}
-
-Chain-of-Thought Analysis:
-{reasoning}
-
-Top Candidates:
-{json.dumps(top_candidates, indent=2)}
-
-Make the mapping decision.
-"""
-        
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=mapping_context)
-        ]
-        
-        response = self.llm.invoke(messages)
-        
-        try:
-            content = response.content
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
-            
-            mapping_decision = json.loads(content)
-        except Exception as e:
-            print(f"Warning: Could not parse mapper response as JSON: {e}")
-            mapping_decision = {
-                'selected_column': candidates[0]['column_name'] if candidates else 'None',
-                'table_name': candidates[0]['table_name'] if candidates else 'None',
-                'confidence': candidates[0]['similarity_score'] if candidates else 0.0,
-                'reasoning_summary': response.content,
-                'transformation_requirements': [],
-                'relationship_validation': 'See reasoning',
-                'lineage_justification': 'See reasoning',
-                'risks': [],
-                'recommendations': []
-            }
-        
-        state['mapping_decision'] = mapping_decision
-        state['messages'].append({
-            'role': 'mapper',
-            'content': 'Mapping decision made'
-        })
-        
-        return state
-    
-    def verifier_agent(self, state: EnhancedMappingState) -> EnhancedMappingState:
-        """Verify mapping with relationship and lineage validation"""
-        field = state['transaction_field']
-        mapping = state['mapping_decision']
-        context = state['contextual_analysis']
-        
-        print(f"✅ Verifier Agent: Validating mapping")
-        
-        system_prompt = """You are a quality assurance specialist.
-Verify the mapping by checking:
-1. Data type compatibility
-2. Relationship consistency
-3. Lineage validity
-4. Transformation feasibility
-5. Risk assessment
-
-Return JSON with keys: approved (boolean), validation_checks (dict), issues (list), recommendations (list)"""
-        
-        verification_context = f"""
-Proposed Mapping: {mapping['table_name']}.{mapping['selected_column']}
-Confidence: {mapping['confidence']}
-
-Contextual Analysis Summary:
-- Transformation Complexity: {context['transformation_analysis'].get('transformation_complexity')}
-- Relationships: {context['relationship_analysis']['candidates_with_relationships']} candidates have relationships
-- FK Candidates: {len(context['lineage_analysis']['foreign_key_candidates'])}
-- PK Candidates: {len(context['lineage_analysis']['primary_key_candidates'])}
-
-Relationship Validation: {mapping.get('relationship_validation', 'N/A')}
-Lineage Justification: {mapping.get('lineage_justification', 'N/A')}
-
-Verify this mapping comprehensively.
-"""
-        
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=verification_context)
-        ]
-        
-        response = self.llm.invoke(messages)
-        
-        try:
-            content = response.content
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
-            
-            verification = json.loads(content)
-        except Exception as e:
-            print(f"Warning: Could not parse verifier response as JSON: {e}")
-            verification = {
-                'approved': mapping.get('confidence', 0.0) > 0.6,
-                'validation_checks': {},
-                'issues': [],
-                'recommendations': []
-            }
-        
-        state['verification_result'] = verification
-        state['messages'].append({
-            'role': 'verifier',
-            'content': 'Verification complete'
-        })
-        
-        return state
-    
-    def supervisor_agent(self, state: EnhancedMappingState) -> EnhancedMappingState:
-        """Supervise and finalize with full traceability"""
-        field = state['transaction_field']
-        mapping = state['mapping_decision']
-        verification = state['verification_result']
-        context = state['contextual_analysis']
-        expert_analyses = state['expert_analyses']
-        
-        print(f"👔 Supervisor Agent: Finalizing with traceability")
-        
-        confidence = mapping.get('confidence', 0.0)
-        if verification.get('approved', False) and confidence > 0.6:
-            final_status = 'APPROVED'
-        elif confidence > 0.4:
-            final_status = 'REVIEW_REQUIRED'
-        else:
-            final_status = 'REJECTED'
-        
-        final_mapping = {
-            'transaction_field': field.get('Standardised Name', ''),
-            'original_field': field.get('TT COLUMN/FIELD NAME', ''),
-            'mapped_table': mapping.get('table_name', ''),
-            'mapped_column': mapping.get('selected_column', ''),
-            'confidence': confidence,
-            'status': final_status,
-            'reasoning_summary': mapping.get('reasoning_summary', ''),
-            'transformation_requirements': json.dumps(mapping.get('transformation_requirements', [])),
-            'relationship_validation': mapping.get('relationship_validation', ''),
-            'lineage_justification': mapping.get('lineage_justification', ''),
-            'database_expert_opinion': expert_analyses.get('database_expert', ''),
-            'etl_expert_opinion': expert_analyses.get('etl_expert', ''),
-            'business_analyst_opinion': expert_analyses.get('business_analyst', ''),
-            'data_quality_expert_opinion': expert_analyses.get('data_quality_expert', ''),
-            'has_relationships': context['relationship_analysis']['candidates_with_relationships'] > 0,
-            'is_foreign_key': len(context['lineage_analysis']['foreign_key_candidates']) > 0,
-            'transformation_complexity': context['transformation_analysis'].get('transformation_complexity', ''),
-            'verification_issues': json.dumps(verification.get('issues', [])),
-            'risks': json.dumps(mapping.get('risks', [])),
-            'recommendations': json.dumps(verification.get('recommendations', []))
-        }
-        
-        state['final_mapping'] = final_mapping
-        state['messages'].append({
-            'role': 'supervisor',
-            'content': f"Final Status: {final_status}"
-        })
-        
-        return state
-
-
-# ============================================================================
-# ENHANCED LANGGRAPH WORKFLOW
-# ============================================================================
-
-def create_advanced_mapping_workflow(retriever: EnhancedGraphRAGRetriever) -> StateGraph:
-    """Create advanced workflow with all reasoning agents"""
-    agents = AdvancedMappingAgents(retriever)
-    
-    workflow = StateGraph(EnhancedMappingState)
-    
-    workflow.add_node("retriever", agents.retriever_agent)
-    workflow.add_node("context_analyzer", agents.context_analyzer_agent)
-    workflow.add_node("mixture_of_experts", agents.mixture_of_experts_agent)
-    workflow.add_node("chain_of_thought", agents.chain_of_thought_reasoning_agent)
-    workflow.add_node("mapper", agents.mapper_agent)
-    workflow.add_node("verifier", agents.verifier_agent)
-    workflow.add_node("supervisor", agents.supervisor_agent)
-    
-    workflow.set_entry_point("retriever")
-    workflow.add_edge("retriever", "context_analyzer")
-    workflow.add_edge("context_analyzer", "mixture_of_experts")
-    workflow.add_edge("mixture_of_experts", "chain_of_thought")
-    workflow.add_edge("chain_of_thought", "mapper")
-    workflow.add_edge("mapper", "verifier")
-    workflow.add_edge("verifier", "supervisor")
-    workflow.add_edge("supervisor", END)
-    
-    return workflow
-
-
-# ============================================================================
-# ENHANCED PIPELINE
-# ============================================================================
-
-class AdvancedSchemaMappingPipeline:
-    """Complete pipeline with advanced reasoning and complete deduplication"""
-    
-    def __init__(self):
-        self.loader = SchemaLoader()
-        self.retriever = EnhancedGraphRAGRetriever()
-        self.workflow = create_advanced_mapping_workflow(self.retriever).compile(
-            checkpointer=MemorySaver()
+    async def connect(self):
+        """Initialize connection pool"""
+        logger.info(f"Connecting to FalkorDB with {self.max_connections} connections")
+        
+        self.pool = BlockingConnectionPool(
+            host=self.host,
+            port=self.port,
+            password=self.password,
+            max_connections=self.max_connections,
+            timeout=None,
+            decode_responses=True
         )
-    
-    def load_schema(self, attributes_csv: str, relationships_csv: str):
-        """Load schema into FalkorDB with complete deduplication"""
-        self.loader.load_schema(attributes_csv, relationships_csv)
-    
-    def map_transaction_fields(self, transaction_csv: str, output_csv: str = "mapping_results.csv"):
-        """Map transaction fields using advanced reasoning"""
-        print("\n" + "="*80)
-        print("ADVANCED SCHEMA MAPPING WITH REASONING")
-        print("="*80)
         
-        df_trans = pd.read_csv(transaction_csv)
-        results = []
+        self.db = FalkorDB(connection_pool=self.pool)
+        self.graph = self.db.select_graph(self.graph_name)
+    
+    async def close(self):
+        if self.pool:
+            await self.pool.disconnect()
+    
+    def load_excel_polars(self, file_path: str) -> pl.DataFrame:
+        """
+        Load Excel with Polars - faster than pandas
+        Uses fastexcel for even better performance
+        """
+        logger.info(f"Loading Excel with Polars: {file_path}")
         
-        for idx, field in df_trans.iterrows():
-            print(f"\n{'='*80}")
-            print(f"Processing Field {idx + 1}/{len(df_trans)}: {field.get('Standardised Name', 'Unknown')}")
-            print(f"{'='*80}")
-            
-            initial_state = {
-                'transaction_field': field.to_dict(),
-                'candidate_columns': [],
-                'contextual_analysis': {},
-                'expert_analyses': {},
-                'reasoning_paths': [],
-                'mapping_decision': {},
-                'verification_result': {},
-                'final_mapping': {},
-                'messages': []
+        try:
+            # Try fastexcel for maximum speed (if available)
+            import fastexcel
+            df = fastexcel.read_excel(file_path).to_polars()
+            logger.info(f"  Using fastexcel (fastest)")
+        except ImportError:
+            # Fallback to Polars native (still fast)
+            df = pl.read_excel(file_path)
+            logger.info(f"  Using Polars native")
+        
+        logger.info(f"Loaded {len(df):,} rows")
+        return df
+    
+    def load_excel_lazy(self, file_path: str) -> pl.LazyFrame:
+        """
+        Load Excel as LazyFrame for query optimization
+        Better for very large files
+        """
+        logger.info(f"Loading Excel as LazyFrame: {file_path}")
+        df = pl.read_excel(file_path).lazy()
+        return df
+    
+    def preprocess_polars_fast(self, df: pl.DataFrame) -> List[Dict]:
+        """
+        Ultra-fast preprocessing with Polars vectorized operations
+        10x faster than pandas for large datasets
+        """
+        logger.info(f"Preprocessing {len(df):,} records with Polars...")
+        start_time = datetime.now()
+        
+        # Define split and deduplicate function
+        def split_and_dedupe(s: str) -> List[str]:
+            if not s or s == 'null' or s == 'None':
+                return []
+            values = [v.strip() for v in s.split('|') if v.strip()]
+            # Deduplicate while preserving order
+            seen = set()
+            result = []
+            for v in values:
+                if v not in seen:
+                    seen.add(v)
+                    result.append(v)
+            return result
+        
+        # Vectorized operations on all columns
+        logger.info("  Processing with vectorized Polars operations...")
+        
+        # Fill nulls and convert to string
+        df = df.with_columns([
+            pl.col(col).fill_null("").cast(pl.Utf8)
+            for col in df.columns
+        ])
+        
+        # Apply split function to pipe-delimited columns
+        df = df.with_columns([
+            pl.col("ReceivingJurisdictions").map_elements(split_and_dedupe, return_dtype=pl.List(pl.Utf8)),
+            pl.col("LegalProcessingPurposeNames").map_elements(split_and_dedupe, return_dtype=pl.List(pl.Utf8)),
+            pl.col("PersonalDataCategoryNames").map_elements(split_and_dedupe, return_dtype=pl.List(pl.Utf8)),
+            pl.col("PersonalDataNames").map_elements(split_and_dedupe, return_dtype=pl.List(pl.Utf8)),
+            pl.col("CategoryNames").map_elements(split_and_dedupe, return_dtype=pl.List(pl.Utf8)),
+        ])
+        
+        # Convert to dictionaries (Polars is very fast at this)
+        logger.info("  Converting to records...")
+        records = df.select([
+            pl.col("CaseId").alias("case_id"),
+            pl.when(pl.col("EimId") != "").then(pl.col("EimId")).otherwise(None).alias("eim_id"),
+            pl.when(pl.col("BusinessApp_Id") != "").then(pl.col("BusinessApp_Id")).otherwise(None).alias("business_app_id"),
+            pl.when(pl.col("OriginatingCountryName") != "").then(pl.col("OriginatingCountryName")).otherwise(None).alias("originating_country"),
+            pl.col("ReceivingJurisdictions").alias("receiving_jurisdictions"),
+            pl.col("LegalProcessingPurposeNames").alias("purposes"),
+            pl.col("PersonalDataCategoryNames").alias("personal_data_categories"),
+            pl.col("PersonalDataNames").alias("personal_data"),
+            pl.col("CategoryNames").alias("categories"),
+            pl.when(pl.col("pia_module") != "").then(pl.col("pia_module")).otherwise(None).alias("pia_module"),
+            pl.when(pl.col("tia_module") != "").then(pl.col("tia_module")).otherwise(None).alias("tia_module"),
+            pl.when(pl.col("hrpr_module") != "").then(pl.col("hrpr_module")).otherwise(None).alias("hrpr_module"),
+        ]).to_dicts()
+        
+        duration = (datetime.now() - start_time).total_seconds()
+        self.stats['preprocessing_time'] = duration
+        
+        logger.info(f"Preprocessed {len(records):,} records in {duration:.2f}s")
+        logger.info(f"  Speed: {len(records)/duration:,.0f} records/second")
+        
+        return records
+    
+    def collect_unique_entities(self, records: List[Dict]) -> Dict[str, Set]:
+        """Collect unique entities"""
+        logger.info("Collecting unique entities...")
+        
+        entities = {
+            'countries': set(),
+            'jurisdictions': set(),
+            'purposes': set(),
+            'personal_data_categories': set(),
+            'personal_data': set(),
+            'categories': set(),
+        }
+        
+        for record in records:
+            if record['originating_country']:
+                entities['countries'].add(record['originating_country'])
+            entities['jurisdictions'].update(record['receiving_jurisdictions'])
+            entities['purposes'].update(record['purposes'])
+            entities['personal_data_categories'].update(record['personal_data_categories'])
+            entities['personal_data'].update(record['personal_data'])
+            entities['categories'].update(record['categories'])
+        
+        for entity_type, values in entities.items():
+            logger.info(f"  {entity_type}: {len(values):,}")
+        
+        return entities
+    
+    async def create_indexes(self):
+        """Create indexes"""
+        indexes = [
+            "CREATE INDEX FOR (c:Case) ON (c.case_id)",
+            "CREATE INDEX FOR (c:Country) ON (c.name)",
+            "CREATE INDEX FOR (j:Jurisdiction) ON (j.name)",
+            "CREATE INDEX FOR (p:Purpose) ON (p.name)",
+            "CREATE INDEX FOR (pdc:PersonalDataCategory) ON (pdc.name)",
+            "CREATE INDEX FOR (pd:PersonalData) ON (pd.name)",
+            "CREATE INDEX FOR (cat:Category) ON (cat.name)",
+        ]
+        
+        tasks = [self._create_index(idx) for idx in indexes]
+        await asyncio.gather(*tasks, return_exceptions=True)
+    
+    async def _create_index(self, query: str):
+        try:
+            await self.graph.query(query)
+        except:
+            pass
+    
+    async def bulk_create_nodes(self, node_label: str, property_name: str, values: List[str]):
+        """Bulk create nodes"""
+        if not values:
+            return
+        
+        logger.info(f"Creating {len(values):,} {node_label} nodes...")
+        
+        tasks = []
+        for i in range(0, len(values), self.batch_size):
+            batch = values[i:i + self.batch_size]
+            tasks.append(self._create_node_batch(node_label, property_name, batch))
+        
+        for task in async_tqdm(asyncio.as_completed(tasks), total=len(tasks), desc=f"{node_label}"):
+            count = await task
+            self.stats['nodes_created'][node_label] += count
+    
+    async def _create_node_batch(self, node_label: str, property_name: str, batch: List[str]) -> int:
+        query = f"""
+        UNWIND $values AS value
+        MERGE (n:{node_label} {{{property_name}: value}})
+        RETURN count(n) as count
+        """
+        
+        try:
+            result = await self.graph.query(query, params={'values': batch})
+            return result.result_set[0][0] if result.result_set else 0
+        except Exception as e:
+            logger.error(f"Error: {e}")
+            return 0
+    
+    async def bulk_create_cases_and_relationships(self, records: List[Dict]):
+        """Bulk create cases and relationships"""
+        logger.info("Creating cases and relationships...")
+        
+        tasks = []
+        for i in range(0, len(records), self.batch_size):
+            batch = records[i:i + self.batch_size]
+            tasks.append(self._process_batch(batch))
+        
+        for task in async_tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Processing"):
+            result = await task
+            self.stats['nodes_created']['Case'] += result['cases']
+            self.stats['relationships_created']['total'] += result['relationships']
+    
+    async def _process_batch(self, batch: List[Dict]) -> Dict[str, int]:
+        """Process a batch"""
+        # Create cases
+        case_data = [
+            {
+                'case_id': r['case_id'],
+                'eim_id': r['eim_id'],
+                'business_app_id': r['business_app_id'],
+                'pia_module': r['pia_module'],
+                'tia_module': r['tia_module'],
+                'hrpr_module': r['hrpr_module']
             }
-            
-            config = {"configurable": {"thread_id": f"mapping_{idx}"}}
-            
-            try:
-                final_state = self.workflow.invoke(initial_state, config)
-                results.append(final_state['final_mapping'])
-                
-                mapping = final_state['final_mapping']
-                print(f"\n📊 MAPPING SUMMARY:")
-                print(f"   Status: {mapping['status']}")
-                print(f"   Mapped to: {mapping['mapped_table']}.{mapping['mapped_column']}")
-                print(f"   Confidence: {mapping['confidence']:.4f}")
-                print(f"   Has Relationships: {mapping['has_relationships']}")
-                print(f"   Is Foreign Key: {mapping['is_foreign_key']}")
-            except Exception as e:
-                print(f"❌ Error processing field: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
+            for r in batch
+        ]
         
-        if results:
-            df_results = pd.DataFrame(results)
-            df_results.to_csv(output_csv, index=False)
+        query = """
+        UNWIND $cases AS case_data
+        MERGE (c:Case {case_id: case_data.case_id})
+        SET c.eim_id = case_data.eim_id,
+            c.business_app_id = case_data.business_app_id,
+            c.pia_module = case_data.pia_module,
+            c.tia_module = case_data.tia_module,
+            c.hrpr_module = case_data.hrpr_module
+        RETURN count(c) as count
+        """
+        
+        try:
+            result = await self.graph.query(query, params={'cases': case_data})
+            case_count = result.result_set[0][0] if result.result_set else 0
+        except Exception as e:
+            logger.error(f"Error: {e}")
+            case_count = 0
+        
+        # Create relationships
+        rel_count = await self._create_relationships(batch)
+        
+        return {'cases': case_count, 'relationships': rel_count}
+    
+    async def _create_relationships(self, batch: List[Dict]) -> int:
+        """Create relationships"""
+        rel_data = []
+        
+        for record in batch:
+            case_id = record['case_id']
             
-            print(f"\n{'='*80}")
-            print(f"MAPPING COMPLETE! Results saved to {output_csv}")
-            print(f"{'='*80}")
+            if record['originating_country']:
+                rel_data.append({'case_id': case_id, 'type': 'country', 'value': record['originating_country']})
             
-            return df_results
-        else:
-            print("\n❌ No mappings were generated")
-            return pd.DataFrame()
+            for v in record['receiving_jurisdictions']:
+                rel_data.append({'case_id': case_id, 'type': 'jurisdiction', 'value': v})
+            
+            for v in record['purposes']:
+                rel_data.append({'case_id': case_id, 'type': 'purpose', 'value': v})
+            
+            for v in record['personal_data_categories']:
+                rel_data.append({'case_id': case_id, 'type': 'pdc', 'value': v})
+            
+            for v in record['personal_data']:
+                rel_data.append({'case_id': case_id, 'type': 'pd', 'value': v})
+            
+            for v in record['categories']:
+                rel_data.append({'case_id': case_id, 'type': 'category', 'value': v})
+        
+        query = """
+        UNWIND $rels AS rel
+        MATCH (c:Case {case_id: rel.case_id})
+        CALL {
+            WITH c, rel
+            WITH c, rel WHERE rel.type = 'country'
+            MATCH (t:Country {name: rel.value})
+            MERGE (c)-[:ORIGINATES_FROM]->(t)
+            RETURN 1 as cnt
+            UNION
+            WITH c, rel
+            WITH c, rel WHERE rel.type = 'jurisdiction'
+            MATCH (t:Jurisdiction {name: rel.value})
+            MERGE (c)-[:TRANSFERS_TO]->(t)
+            RETURN 1 as cnt
+            UNION
+            WITH c, rel
+            WITH c, rel WHERE rel.type = 'purpose'
+            MATCH (t:Purpose {name: rel.value})
+            MERGE (c)-[:HAS_PURPOSE]->(t)
+            RETURN 1 as cnt
+            UNION
+            WITH c, rel
+            WITH c, rel WHERE rel.type = 'pdc'
+            MATCH (t:PersonalDataCategory {name: rel.value})
+            MERGE (c)-[:HAS_PERSONAL_DATA_CATEGORY]->(t)
+            RETURN 1 as cnt
+            UNION
+            WITH c, rel
+            WITH c, rel WHERE rel.type = 'pd'
+            MATCH (t:PersonalData {name: rel.value})
+            MERGE (c)-[:HAS_PERSONAL_DATA]->(t)
+            RETURN 1 as cnt
+            UNION
+            WITH c, rel
+            WITH c, rel WHERE rel.type = 'category'
+            MATCH (t:Category {name: rel.value})
+            MERGE (c)-[:HAS_CATEGORY]->(t)
+            RETURN 1 as cnt
+        }
+        RETURN sum(cnt) as total
+        """
+        
+        try:
+            result = await self.graph.query(query, params={'rels': rel_data})
+            return result.result_set[0][0] if result.result_set else 0
+        except:
+            return 0
+    
+    async def load_data(self, file_path: str):
+        """Main loading method"""
+        self.stats['start_time'] = datetime.now()
+        
+        try:
+            await self.connect()
+            
+            # Load with Polars
+            df = self.load_excel_polars(file_path)
+            
+            # Preprocess
+            records = self.preprocess_polars_fast(df)
+            self.stats['total_cases'] = len(records)
+            
+            # Create indexes
+            await self.create_indexes()
+            
+            # Collect entities
+            entities = self.collect_unique_entities(records)
+            
+            load_start = datetime.now()
+            
+            # Create nodes
+            await asyncio.gather(
+                self.bulk_create_nodes('Country', 'name', list(entities['countries'])),
+                self.bulk_create_nodes('Jurisdiction', 'name', list(entities['jurisdictions'])),
+                self.bulk_create_nodes('Purpose', 'name', list(entities['purposes'])),
+                self.bulk_create_nodes('PersonalDataCategory', 'name', list(entities['personal_data_categories'])),
+                self.bulk_create_nodes('PersonalData', 'name', list(entities['personal_data'])),
+                self.bulk_create_nodes('Category', 'name', list(entities['categories'])),
+            )
+            
+            # Create cases
+            await self.bulk_create_cases_and_relationships(records)
+            
+            self.stats['loading_time'] = (datetime.now() - load_start).total_seconds()
+            self.stats['end_time'] = datetime.now()
+            
+            self.print_statistics()
+            
+        except Exception as e:
+            logger.error(f"Error: {e}")
+            raise
+        finally:
+            await self.close()
+    
+    def print_statistics(self):
+        """Print statistics"""
+        total = (self.stats['end_time'] - self.stats['start_time']).total_seconds()
+        
+        logger.info("\n" + "="*70)
+        logger.info("POLARS LOADER STATISTICS")
+        logger.info("="*70)
+        logger.info(f"Total cases: {self.stats['total_cases']:,}")
+        logger.info(f"\nPreprocessing: {self.stats['preprocessing_time']:.2f}s ({self.stats['total_cases']/self.stats['preprocessing_time']:,.0f} rec/s)")
+        logger.info(f"Graph loading: {self.stats['loading_time']:.2f}s ({self.stats['total_cases']/self.stats['loading_time']:,.0f} rec/s)")
+        logger.info(f"Total: {total:.2f}s ({self.stats['total_cases']/total:,.0f} rec/s)")
+        logger.info(f"\nNodes:")
+        for k, v in sorted(self.stats['nodes_created'].items()):
+            logger.info(f"  {k}: {v:,}")
+        logger.info(f"\nRelationships: {self.stats['relationships_created']['total']:,}")
+        logger.info("="*70)
 
 
-# ============================================================================
-# EXAMPLE USAGE
-# ============================================================================
+async def main():
+    CONFIG = {
+        'host': 'localhost',
+        'port': 6379,
+        'graph_name': 'DataTransferGraph',
+        'batch_size': 15000,
+        'max_connections': 16,
+        'excel_file': 'your_data_file.xlsx'
+    }
+    
+    loader = PolarsFalkorDBLoader(
+        host=CONFIG['host'],
+        port=CONFIG['port'],
+        graph_name=CONFIG['graph_name'],
+        batch_size=CONFIG['batch_size'],
+        max_connections=CONFIG['max_connections']
+    )
+    
+    await loader.load_data(CONFIG['excel_file'])
+
 
 if __name__ == "__main__":
-    pipeline = AdvancedSchemaMappingPipeline()
-    
-    print("Loading schema into FalkorDB with complete deduplication...")
-    pipeline.load_schema(
-        attributes_csv="schema_attributes.csv",
-        relationships_csv="schema_relationships.csv"
-    )
-    
-    print("\nMapping transaction fields with advanced reasoning...")
-    results = pipeline.map_transaction_fields(
-        transaction_csv="transaction_fields.csv",
-        output_csv="advanced_mapping_results.csv"
-    )
-    
-    if not results.empty:
-        print("\n" + "="*80)
-        print("ADVANCED MAPPING STATISTICS")
-        print("="*80)
-        print(f"Total Fields: {len(results)}")
-        print(f"Approved: {len(results[results['status'] == 'APPROVED'])}")
-        print(f"Review Required: {len(results[results['status'] == 'REVIEW_REQUIRED'])}")
-        print(f"Rejected: {len(results[results['status'] == 'REJECTED'])}")
-        print(f"Average Confidence: {results['confidence'].mean():.4f}")
-        print(f"Mappings with Relationships: {results['has_relationships'].sum()}")
-        print(f"Foreign Key Mappings: {results['is_foreign_key'].sum()}")
+    asyncio.run(main())
