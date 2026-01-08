@@ -1,579 +1,497 @@
-"""
-FalkorDB Production Loader - Connection Resilient
-Handles connection timeouts, memory issues, and retry logic
-"""
+# FalkorDB Analysis Queries - Data Transfer Reports
 
-import pandas as pd
-import asyncio
-from falkordb.asyncio import FalkorDB
-from redis.asyncio import BlockingConnectionPool, Redis
-from redis.exceptions import ConnectionError, TimeoutError, ResponseError
-from typing import Dict, List, Set
-from collections import defaultdict
-import logging
-from datetime import datetime
-from tqdm.asyncio import tqdm as async_tqdm
-from tqdm import tqdm
-import time
+## 🎯 Core Analysis Queries
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+### 1. Data Transfers with Personal Data (Originating → Receiving)
 
+```cypher
+// Basic transfer list with personal data
+MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country)
+MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction)
+MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData)
+RETURN DISTINCT
+    origin.name AS OriginatingCountry,
+    dest.name AS ReceivingJurisdiction,
+    collect(DISTINCT pd.name) AS PersonalDataNames,
+    count(DISTINCT c) AS NumberOfCases
+ORDER BY NumberOfCases DESC
+```
 
-class RobustFalkorDBLoader:
-    """
-    Production-ready FalkorDB loader with:
-    - Connection retry logic
-    - Memory monitoring
-    - Smaller, safer batch sizes
-    - Progressive saving
-    - Transaction safety
-    """
-    
-    def __init__(
-        self,
-        host: str = 'localhost',
-        port: int = 6379,
-        password: str = None,
-        graph_name: str = 'DataTransferGraph',
-        batch_size: int = 1000,  # Smaller, safer batches
-        max_connections: int = 8,  # Fewer connections for stability
-        socket_timeout: int = 300,  # 5 minutes
-        socket_connect_timeout: int = 30,
-        retry_attempts: int = 3,
-        retry_delay: int = 2
-    ):
-        self.host = host
-        self.port = port
-        self.password = password
-        self.graph_name = graph_name
-        self.batch_size = batch_size
-        self.max_connections = max_connections
-        self.socket_timeout = socket_timeout
-        self.socket_connect_timeout = socket_connect_timeout
-        self.retry_attempts = retry_attempts
-        self.retry_delay = retry_delay
-        
-        self.pool = None
-        self.db = None
-        self.graph = None
-        self.redis_client = None
-        
-        self.stats = {
-            'total_cases': 0,
-            'nodes_created': defaultdict(int),
-            'relationships_created': defaultdict(int),
-            'errors': defaultdict(int),
-            'retries': 0,
-            'start_time': None,
-            'end_time': None
-        }
-    
-    async def connect(self):
-        """Initialize connection pool with proper timeouts"""
-        logger.info(f"Connecting to FalkorDB at {self.host}:{self.port}")
-        logger.info(f"  Max connections: {self.max_connections}")
-        logger.info(f"  Socket timeout: {self.socket_timeout}s")
-        logger.info(f"  Batch size: {self.batch_size}")
-        
-        # Create connection pool with proper settings
-        self.pool = BlockingConnectionPool(
-            host=self.host,
-            port=self.port,
-            password=self.password,
-            max_connections=self.max_connections,
-            timeout=self.socket_timeout,
-            socket_timeout=self.socket_timeout,
-            socket_connect_timeout=self.socket_connect_timeout,
-            decode_responses=True,
-            health_check_interval=30,  # Check connection health
-            retry_on_timeout=True
-        )
-        
-        self.db = FalkorDB(connection_pool=self.pool)
-        self.graph = self.db.select_graph(self.graph_name)
-        
-        # Direct Redis client for monitoring
-        self.redis_client = Redis(connection_pool=self.pool)
-        
-        # Check connection
-        await self._check_connection()
-        
-        # Check and configure Redis memory
-        await self._configure_redis_memory()
-    
-    async def _check_connection(self):
-        """Verify Redis/FalkorDB is accessible"""
-        try:
-            info = await self.redis_client.info()
-            logger.info(f"✅ Connected to Redis {info.get('redis_version', 'unknown')}")
-            logger.info(f"✅ FalkorDB module loaded")
-        except Exception as e:
-            logger.error(f"❌ Connection failed: {e}")
-            raise
-    
-    async def _configure_redis_memory(self):
-        """Check and configure Redis memory settings"""
-        try:
-            info = await self.redis_client.info('memory')
-            
-            used_memory = info.get('used_memory_human', 'unknown')
-            max_memory = info.get('maxmemory_human', 'unlimited')
-            
-            logger.info(f"\nRedis Memory Status:")
-            logger.info(f"  Used: {used_memory}")
-            logger.info(f"  Max: {max_memory}")
-            
-            # Warn if maxmemory is not set
-            if info.get('maxmemory', 0) == 0:
-                logger.warning("⚠️  maxmemory not set - Redis may run out of memory!")
-                logger.warning("   Recommendation: redis-server --maxmemory 16gb")
-            
-            # Check maxmemory policy
-            policy = info.get('maxmemory_policy', 'noeviction')
-            logger.info(f"  Policy: {policy}")
-            
-            if policy != 'noeviction':
-                logger.warning(f"⚠️  maxmemory-policy is '{policy}' - data may be evicted!")
-                logger.warning("   Recommendation: CONFIG SET maxmemory-policy noeviction")
-                
-        except Exception as e:
-            logger.warning(f"Could not check Redis memory: {e}")
-    
-    async def close(self):
-        """Close connections gracefully"""
-        try:
-            if self.pool:
-                await self.pool.disconnect()
-            logger.info("✅ Connections closed")
-        except Exception as e:
-            logger.warning(f"Error closing connections: {e}")
-    
-    def load_excel_optimized(self, file_path: str) -> pd.DataFrame:
-        """Load Excel with proper dtypes"""
-        logger.info(f"Loading Excel file: {file_path}")
-        
-        dtypes = {col: 'str' for col in [
-            'CaseId', 'EimId', 'BusinessApp_Id', 'OriginatingCountryName',
-            'ReceivingJurisdictions', 'LegalProcessingPurposeNames',
-            'PersonalDataCategoryNames', 'PersonalDataNames', 
-            'CategoryNames', 'pia_module', 'tia_module', 'hrpr_module'
-        ]}
-        
-        df = pd.read_excel(file_path, dtype=dtypes, engine='openpyxl')
-        logger.info(f"Loaded {len(df):,} rows")
-        return df
-    
-    def preprocess_fast(self, df: pd.DataFrame) -> List[Dict]:
-        """Fast preprocessing with to_records()"""
-        logger.info(f"Preprocessing {len(df):,} records...")
-        start_time = datetime.now()
-        
-        # Convert to string and handle nulls
-        df = df.astype(str).replace('nan', None)
-        
-        # Vectorized splitting
-        def split_pipe_vectorized(series):
-            series = series.fillna('')
-            split_series = series.str.split('|')
-            result = []
-            for values in split_series:
-                if values and values != ['']:
-                    cleaned = []
-                    seen = set()
-                    for v in values:
-                        v_stripped = v.strip()
-                        if v_stripped and v_stripped not in seen:
-                            seen.add(v_stripped)
-                            cleaned.append(v_stripped)
-                    result.append(cleaned)
-                else:
-                    result.append([])
-            return result
-        
-        logger.info("  Splitting pipe-delimited values...")
-        receiving_juris = split_pipe_vectorized(df['ReceivingJurisdictions'])
-        purposes = split_pipe_vectorized(df['LegalProcessingPurposeNames'])
-        pdc = split_pipe_vectorized(df['PersonalDataCategoryNames'])
-        personal_data = split_pipe_vectorized(df['PersonalDataNames'])
-        categories = split_pipe_vectorized(df['CategoryNames'])
-        
-        # Use to_records for fast iteration
-        logger.info("  Converting to records...")
-        records_array = df.to_records(index=False)
-        
-        processed_records = []
-        for idx, record in enumerate(records_array):
-            processed_record = {
-                'case_id': record['CaseId'],
-                'eim_id': record['EimId'] if record['EimId'] != 'None' else None,
-                'business_app_id': record['BusinessApp_Id'] if record['BusinessApp_Id'] != 'None' else None,
-                'originating_country': record['OriginatingCountryName'] if record['OriginatingCountryName'] != 'None' else None,
-                'receiving_jurisdictions': receiving_juris[idx],
-                'purposes': purposes[idx],
-                'personal_data_categories': pdc[idx],
-                'personal_data': personal_data[idx],
-                'categories': categories[idx],
-                'pia_module': record['pia_module'] if record['pia_module'] != 'None' else None,
-                'tia_module': record['tia_module'] if record['tia_module'] != 'None' else None,
-                'hrpr_module': record['hrpr_module'] if record['hrpr_module'] != 'None' else None,
-            }
-            processed_records.append(processed_record)
-        
-        duration = (datetime.now() - start_time).total_seconds()
-        logger.info(f"Preprocessed {len(processed_records):,} records in {duration:.2f}s")
-        
-        return processed_records
-    
-    def collect_unique_entities(self, records: List[Dict]) -> Dict[str, Set]:
-        """Collect unique entities"""
-        logger.info("Collecting unique entities...")
-        
-        entities = {
-            'countries': set(),
-            'jurisdictions': set(),
-            'purposes': set(),
-            'personal_data_categories': set(),
-            'personal_data': set(),
-            'categories': set(),
-        }
-        
-        for record in records:
-            if record['originating_country']:
-                entities['countries'].add(record['originating_country'])
-            entities['jurisdictions'].update(record['receiving_jurisdictions'])
-            entities['purposes'].update(record['purposes'])
-            entities['personal_data_categories'].update(record['personal_data_categories'])
-            entities['personal_data'].update(record['personal_data'])
-            entities['categories'].update(record['categories'])
-        
-        for entity_type, values in entities.items():
-            logger.info(f"  {entity_type}: {len(values):,}")
-        
-        return entities
-    
-    async def create_indexes(self):
-        """Create indexes with error handling"""
-        logger.info("Creating indexes...")
-        
-        indexes = [
-            "CREATE INDEX FOR (c:Case) ON (c.case_id)",
-            "CREATE INDEX FOR (c:Country) ON (c.name)",
-            "CREATE INDEX FOR (j:Jurisdiction) ON (j.name)",
-            "CREATE INDEX FOR (p:Purpose) ON (p.name)",
-            "CREATE INDEX FOR (pdc:PersonalDataCategory) ON (pdc.name)",
-            "CREATE INDEX FOR (pd:PersonalData) ON (pd.name)",
-            "CREATE INDEX FOR (cat:Category) ON (cat.name)",
-        ]
-        
-        for idx_query in indexes:
-            try:
-                await self.graph.query(idx_query)
-                logger.info(f"  ✅ {idx_query}")
-            except Exception as e:
-                logger.debug(f"  Index exists or error: {e}")
-    
-    async def execute_with_retry(self, query: str, params: dict, operation_name: str):
-        """Execute query with retry logic"""
-        for attempt in range(self.retry_attempts):
-            try:
-                result = await self.graph.query(query, params=params)
-                return result
-            except (ConnectionError, TimeoutError) as e:
-                self.stats['retries'] += 1
-                if attempt < self.retry_attempts - 1:
-                    logger.warning(f"⚠️  {operation_name} failed (attempt {attempt + 1}/{self.retry_attempts}): {e}")
-                    logger.warning(f"   Retrying in {self.retry_delay}s...")
-                    await asyncio.sleep(self.retry_delay)
-                    
-                    # Try to reconnect
-                    try:
-                        await self.close()
-                        await self.connect()
-                    except:
-                        pass
-                else:
-                    logger.error(f"❌ {operation_name} failed after {self.retry_attempts} attempts")
-                    self.stats['errors'][operation_name] += 1
-                    raise
-            except ResponseError as e:
-                logger.error(f"❌ Query error in {operation_name}: {e}")
-                self.stats['errors'][operation_name] += 1
-                raise
-            except Exception as e:
-                logger.error(f"❌ Unexpected error in {operation_name}: {e}")
-                self.stats['errors'][operation_name] += 1
-                raise
-    
-    async def create_nodes_safe(self, node_label: str, property_name: str, values: List[str]):
-        """Create nodes with safe batching and retry logic"""
-        if not values:
-            return
-        
-        logger.info(f"Creating {len(values):,} {node_label} nodes...")
-        
-        total_created = 0
-        for i in tqdm(range(0, len(values), self.batch_size), desc=f"Creating {node_label}"):
-            batch = values[i:i + self.batch_size]
-            
-            query = f"""
-            UNWIND $values AS value
-            MERGE (n:{node_label} {{{property_name}: value}})
-            RETURN count(n) as count
-            """
-            
-            try:
-                result = await self.execute_with_retry(
-                    query, 
-                    {'values': batch},
-                    f"Create {node_label} batch"
-                )
-                count = result.result_set[0][0] if result.result_set else 0
-                total_created += count
-                
-                # Small delay to prevent overwhelming server
-                await asyncio.sleep(0.05)
-                
-            except Exception as e:
-                logger.error(f"Failed to create {node_label} batch: {e}")
-                continue
-        
-        self.stats['nodes_created'][node_label] = total_created
-        logger.info(f"  ✅ Created {total_created:,} {node_label} nodes")
-    
-    async def create_cases_safe(self, records: List[Dict]):
-        """Create case nodes with safe batching"""
-        logger.info(f"Creating {len(records):,} Case nodes...")
-        
-        total_created = 0
-        for i in tqdm(range(0, len(records), self.batch_size), desc="Creating Cases"):
-            batch = records[i:i + self.batch_size]
-            
-            case_data = [
-                {
-                    'case_id': r['case_id'],
-                    'eim_id': r['eim_id'],
-                    'business_app_id': r['business_app_id'],
-                    'pia_module': r['pia_module'],
-                    'tia_module': r['tia_module'],
-                    'hrpr_module': r['hrpr_module']
-                }
-                for r in batch
-            ]
-            
-            query = """
-            UNWIND $cases AS case_data
-            MERGE (c:Case {case_id: case_data.case_id})
-            SET c.eim_id = case_data.eim_id,
-                c.business_app_id = case_data.business_app_id,
-                c.pia_module = case_data.pia_module,
-                c.tia_module = case_data.tia_module,
-                c.hrpr_module = case_data.hrpr_module
-            RETURN count(c) as count
-            """
-            
-            try:
-                result = await self.execute_with_retry(
-                    query,
-                    {'cases': case_data},
-                    f"Create Cases batch"
-                )
-                count = result.result_set[0][0] if result.result_set else 0
-                total_created += count
-                
-                await asyncio.sleep(0.05)
-                
-            except Exception as e:
-                logger.error(f"Failed to create Cases batch: {e}")
-                continue
-        
-        self.stats['nodes_created']['Case'] = total_created
-        logger.info(f"  ✅ Created {total_created:,} Case nodes")
-    
-    async def create_relationships_safe(self, records: List[Dict]):
-        """Create relationships with VERY safe batching - one type at a time"""
-        logger.info(f"Creating relationships for {len(records):,} cases...")
-        
-        # Process each relationship type separately for stability
-        rel_types = [
-            ('country', 'ORIGINATES_FROM', 'Country', 'originating_country'),
-            ('jurisdiction', 'TRANSFERS_TO', 'Jurisdiction', 'receiving_jurisdictions'),
-            ('purpose', 'HAS_PURPOSE', 'Purpose', 'purposes'),
-            ('pdc', 'HAS_PERSONAL_DATA_CATEGORY', 'PersonalDataCategory', 'personal_data_categories'),
-            ('pd', 'HAS_PERSONAL_DATA', 'PersonalData', 'personal_data'),
-            ('category', 'HAS_CATEGORY', 'Category', 'categories')
-        ]
-        
-        total_rels = 0
-        
-        for rel_key, rel_type, target_label, record_field in rel_types:
-            logger.info(f"\nCreating {rel_type} relationships...")
-            
-            # Build relationship data for this type only
-            rel_data = []
-            for record in records:
-                case_id = record['case_id']
-                
-                if record_field in ['originating_country']:
-                    if record[record_field]:
-                        rel_data.append({
-                            'case_id': case_id,
-                            'value': record[record_field]
-                        })
-                else:
-                    for value in record[record_field]:
-                        rel_data.append({
-                            'case_id': case_id,
-                            'value': value
-                        })
-            
-            if not rel_data:
-                continue
-            
-            # Process in small batches
-            batch_size = min(self.batch_size, 500)  # Even smaller for relationships
-            created = 0
-            
-            for i in tqdm(range(0, len(rel_data), batch_size), desc=f"  {rel_type}"):
-                batch = rel_data[i:i + batch_size]
-                
-                query = f"""
-                UNWIND $rels AS rel
-                MATCH (c:Case {{case_id: rel.case_id}})
-                MATCH (t:{target_label} {{name: rel.value}})
-                MERGE (c)-[:{rel_type}]->(t)
-                RETURN count(*) as cnt
-                """
-                
-                try:
-                    result = await self.execute_with_retry(
-                        query,
-                        {'rels': batch},
-                        f"Create {rel_type}"
-                    )
-                    count = result.result_set[0][0] if result.result_set else 0
-                    created += count
-                    total_rels += count
-                    
-                    # Longer delay for relationship creation
-                    await asyncio.sleep(0.1)
-                    
-                except Exception as e:
-                    logger.error(f"Failed to create {rel_type} batch: {e}")
-                    continue
-            
-            logger.info(f"  ✅ Created {created:,} {rel_type} relationships")
-        
-        self.stats['relationships_created']['total'] = total_rels
-        logger.info(f"\n✅ Total relationships created: {total_rels:,}")
-    
-    async def load_data(self, file_path: str):
-        """Main loading method with robust error handling"""
-        self.stats['start_time'] = datetime.now()
-        
-        try:
-            # Connect
-            await self.connect()
-            
-            # Load and preprocess
-            df = self.load_excel_optimized(file_path)
-            records = self.preprocess_fast(df)
-            self.stats['total_cases'] = len(records)
-            
-            # Create indexes
-            await self.create_indexes()
-            
-            # Collect entities
-            entities = self.collect_unique_entities(records)
-            
-            # Create entity nodes (in sequence for stability)
-            logger.info("\n" + "="*60)
-            logger.info("CREATING ENTITY NODES")
-            logger.info("="*60)
-            
-            await self.create_nodes_safe('Country', 'name', list(entities['countries']))
-            await self.create_nodes_safe('Jurisdiction', 'name', list(entities['jurisdictions']))
-            await self.create_nodes_safe('Purpose', 'name', list(entities['purposes']))
-            await self.create_nodes_safe('PersonalDataCategory', 'name', list(entities['personal_data_categories']))
-            await self.create_nodes_safe('PersonalData', 'name', list(entities['personal_data']))
-            await self.create_nodes_safe('Category', 'name', list(entities['categories']))
-            
-            # Create case nodes
-            logger.info("\n" + "="*60)
-            logger.info("CREATING CASE NODES")
-            logger.info("="*60)
-            await self.create_cases_safe(records)
-            
-            # Create relationships
-            logger.info("\n" + "="*60)
-            logger.info("CREATING RELATIONSHIPS")
-            logger.info("="*60)
-            await self.create_relationships_safe(records)
-            
-            self.stats['end_time'] = datetime.now()
-            self.print_statistics()
-            
-        except Exception as e:
-            logger.error(f"\n❌ FATAL ERROR: {e}")
-            raise
-        finally:
-            await self.close()
-    
-    def print_statistics(self):
-        """Print comprehensive statistics"""
-        duration = (self.stats['end_time'] - self.stats['start_time']).total_seconds()
-        
-        logger.info("\n" + "="*70)
-        logger.info("LOADING COMPLETE - STATISTICS")
-        logger.info("="*70)
-        logger.info(f"\n✅ Successfully processed {self.stats['total_cases']:,} cases")
-        logger.info(f"⏱️  Total time: {duration:.2f}s ({duration/60:.1f} minutes)")
-        logger.info(f"🔄 Retries: {self.stats['retries']}")
-        
-        logger.info("\n📊 Nodes created:")
-        for node_type, count in sorted(self.stats['nodes_created'].items()):
-            logger.info(f"   {node_type}: {count:,}")
-        
-        logger.info(f"\n🔗 Relationships created: {self.stats['relationships_created']['total']:,}")
-        
-        if self.stats['errors']:
-            logger.warning("\n⚠️  Errors encountered:")
-            for error_type, count in self.stats['errors'].items():
-                logger.warning(f"   {error_type}: {count}")
-        
-        logger.info("="*70)
+### 2. Detailed Transfer View with All Personal Data
 
+```cypher
+// Comprehensive view with all personal data per transfer
+MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country)
+MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction)
+MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData)
+RETURN 
+    c.case_id AS CaseID,
+    origin.name AS OriginatingCountry,
+    dest.name AS ReceivingJurisdiction,
+    collect(DISTINCT pd.name) AS PersonalDataNames,
+    c.eim_id AS EimID,
+    c.business_app_id AS BusinessAppID
+ORDER BY origin.name, dest.name
+```
 
-async def main():
-    """Main execution"""
-    CONFIG = {
-        'host': 'localhost',
-        'port': 6379,
-        'password': None,
-        'graph_name': 'DataTransferGraph',
-        'batch_size': 1000,  # Safe batch size
-        'max_connections': 8,  # Conservative connection pool
-        'socket_timeout': 300,  # 5 minute timeout
-        'excel_file': 'your_data_file.xlsx'
-    }
-    
-    loader = RobustFalkorDBLoader(
-        host=CONFIG['host'],
-        port=CONFIG['port'],
-        password=CONFIG['password'],
-        graph_name=CONFIG['graph_name'],
-        batch_size=CONFIG['batch_size'],
-        max_connections=CONFIG['max_connections'],
-        socket_timeout=CONFIG['socket_timeout']
-    )
-    
-    await loader.load_data(CONFIG['excel_file'])
-    
-    logger.info("\n✅ Data loading completed!")
+### 3. Transfer Matrix (Country → Jurisdiction with Personal Data Count)
 
+```cypher
+// Create a transfer matrix showing volumes
+MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country)
+MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction)
+MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData)
+WITH origin, dest, count(DISTINCT c) AS cases, count(DISTINCT pd) AS unique_personal_data_types
+RETURN 
+    origin.name AS OriginatingCountry,
+    dest.name AS ReceivingJurisdiction,
+    cases AS NumberOfCases,
+    unique_personal_data_types AS PersonalDataTypeCount
+ORDER BY cases DESC
+LIMIT 100
+```
 
-if __name__ == "__main__":
-    asyncio.run(main())
+---
+
+## 📋 Module-Specific Queries (CM Value)
+
+### 4. PIA Module = 'CM' Transfers
+
+```cypher
+// Cases where PIA module is CM
+MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country)
+MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction)
+MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData)
+WHERE c.pia_module = 'CM'
+RETURN 
+    c.case_id AS CaseID,
+    origin.name AS OriginatingCountry,
+    collect(DISTINCT dest.name) AS ReceivingJurisdictions,
+    collect(DISTINCT pd.name) AS PersonalDataNames,
+    c.pia_module AS PIA_Module,
+    c.tia_module AS TIA_Module,
+    c.hrpr_module AS HRPR_Module,
+    c.eim_id AS EimID,
+    c.business_app_id AS BusinessAppID
+ORDER BY origin.name
+```
+
+#### Aggregated PIA CM Summary:
+```cypher
+// Summary statistics for PIA = CM
+MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country)
+MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction)
+MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData)
+WHERE c.pia_module = 'CM'
+RETURN 
+    origin.name AS OriginatingCountry,
+    dest.name AS ReceivingJurisdiction,
+    count(DISTINCT c) AS Cases_PIA_CM,
+    collect(DISTINCT pd.name) AS PersonalDataTypes
+ORDER BY Cases_PIA_CM DESC
+```
+
+### 5. TIA Module = 'CM' Transfers
+
+```cypher
+// Cases where TIA module is CM
+MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country)
+MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction)
+MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData)
+WHERE c.tia_module = 'CM'
+RETURN 
+    c.case_id AS CaseID,
+    origin.name AS OriginatingCountry,
+    collect(DISTINCT dest.name) AS ReceivingJurisdictions,
+    collect(DISTINCT pd.name) AS PersonalDataNames,
+    c.pia_module AS PIA_Module,
+    c.tia_module AS TIA_Module,
+    c.hrpr_module AS HRPR_Module,
+    c.eim_id AS EimID,
+    c.business_app_id AS BusinessAppID
+ORDER BY origin.name
+```
+
+#### Aggregated TIA CM Summary:
+```cypher
+// Summary statistics for TIA = CM
+MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country)
+MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction)
+MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData)
+WHERE c.tia_module = 'CM'
+RETURN 
+    origin.name AS OriginatingCountry,
+    dest.name AS ReceivingJurisdiction,
+    count(DISTINCT c) AS Cases_TIA_CM,
+    collect(DISTINCT pd.name) AS PersonalDataTypes
+ORDER BY Cases_TIA_CM DESC
+```
+
+### 6. HRPR Module = 'CM' Transfers
+
+```cypher
+// Cases where HRPR module is CM
+MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country)
+MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction)
+MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData)
+WHERE c.hrpr_module = 'CM'
+RETURN 
+    c.case_id AS CaseID,
+    origin.name AS OriginatingCountry,
+    collect(DISTINCT dest.name) AS ReceivingJurisdictions,
+    collect(DISTINCT pd.name) AS PersonalDataNames,
+    c.pia_module AS PIA_Module,
+    c.tia_module AS TIA_Module,
+    c.hrpr_module AS HRPR_Module,
+    c.eim_id AS EimID,
+    c.business_app_id AS BusinessAppID
+ORDER BY origin.name
+```
+
+#### Aggregated HRPR CM Summary:
+```cypher
+// Summary statistics for HRPR = CM
+MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country)
+MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction)
+MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData)
+WHERE c.hrpr_module = 'CM'
+RETURN 
+    origin.name AS OriginatingCountry,
+    dest.name AS ReceivingJurisdiction,
+    count(DISTINCT c) AS Cases_HRPR_CM,
+    collect(DISTINCT pd.name) AS PersonalDataTypes
+ORDER BY Cases_HRPR_CM DESC
+```
+
+---
+
+## 🔍 Combined Module Analysis
+
+### 7. All Modules = 'CM' (Intersection)
+
+```cypher
+// Cases where ALL three modules are CM
+MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country)
+MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction)
+MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData)
+WHERE c.pia_module = 'CM' 
+  AND c.tia_module = 'CM' 
+  AND c.hrpr_module = 'CM'
+RETURN 
+    c.case_id AS CaseID,
+    origin.name AS OriginatingCountry,
+    collect(DISTINCT dest.name) AS ReceivingJurisdictions,
+    collect(DISTINCT pd.name) AS PersonalDataNames,
+    c.eim_id AS EimID,
+    c.business_app_id AS BusinessAppID
+ORDER BY origin.name
+```
+
+### 8. Any Module = 'CM' (Union)
+
+```cypher
+// Cases where ANY module is CM
+MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country)
+MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction)
+MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData)
+WHERE c.pia_module = 'CM' 
+   OR c.tia_module = 'CM' 
+   OR c.hrpr_module = 'CM'
+RETURN 
+    c.case_id AS CaseID,
+    origin.name AS OriginatingCountry,
+    collect(DISTINCT dest.name) AS ReceivingJurisdictions,
+    collect(DISTINCT pd.name) AS PersonalDataNames,
+    c.pia_module AS PIA_Module,
+    c.tia_module AS TIA_Module,
+    c.hrpr_module AS HRPR_Module
+ORDER BY origin.name
+```
+
+### 9. Module Comparison Matrix
+
+```cypher
+// Compare CM counts across all three modules
+MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country)
+MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction)
+MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData)
+RETURN 
+    origin.name AS OriginatingCountry,
+    dest.name AS ReceivingJurisdiction,
+    count(DISTINCT CASE WHEN c.pia_module = 'CM' THEN c END) AS PIA_CM_Count,
+    count(DISTINCT CASE WHEN c.tia_module = 'CM' THEN c END) AS TIA_CM_Count,
+    count(DISTINCT CASE WHEN c.hrpr_module = 'CM' THEN c END) AS HRPR_CM_Count,
+    count(DISTINCT c) AS Total_Cases
+ORDER BY Total_Cases DESC
+```
+
+---
+
+## 📊 Advanced Analysis Queries
+
+### 10. High-Risk Transfers (Multiple Personal Data Types)
+
+```cypher
+// Transfers with 5+ types of personal data
+MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country)
+MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction)
+MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData)
+WITH c, origin, dest, collect(DISTINCT pd.name) AS personal_data_list
+WHERE size(personal_data_list) >= 5
+RETURN 
+    c.case_id AS CaseID,
+    origin.name AS OriginatingCountry,
+    dest.name AS ReceivingJurisdiction,
+    personal_data_list AS PersonalDataNames,
+    size(personal_data_list) AS PersonalDataCount,
+    c.pia_module AS PIA_Module,
+    c.tia_module AS TIA_Module,
+    c.hrpr_module AS HRPR_Module
+ORDER BY PersonalDataCount DESC
+```
+
+### 11. Transfers by Personal Data Category
+
+```cypher
+// Group by personal data category
+MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country)
+MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction)
+MATCH (c)-[:HAS_PERSONAL_DATA_CATEGORY]->(pdc:PersonalDataCategory)
+MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData)
+RETURN 
+    origin.name AS OriginatingCountry,
+    dest.name AS ReceivingJurisdiction,
+    pdc.name AS PersonalDataCategory,
+    collect(DISTINCT pd.name) AS PersonalDataNames,
+    count(DISTINCT c) AS NumberOfCases
+ORDER BY NumberOfCases DESC
+```
+
+### 12. Cross-Border Transfers Only
+
+```cypher
+// Only show transfers where origin != destination
+MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country)
+MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction)
+MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData)
+WHERE origin.name <> dest.name
+RETURN 
+    origin.name AS OriginatingCountry,
+    dest.name AS ReceivingJurisdiction,
+    collect(DISTINCT pd.name) AS PersonalDataNames,
+    count(DISTINCT c) AS CrossBorderCases
+ORDER BY CrossBorderCases DESC
+```
+
+### 13. Module Status Distribution
+
+```cypher
+// Distribution of module statuses for transfers with personal data
+MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country)
+MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction)
+MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData)
+RETURN 
+    c.pia_module AS PIA_Status,
+    c.tia_module AS TIA_Status,
+    c.hrpr_module AS HRPR_Status,
+    count(DISTINCT c) AS CaseCount,
+    collect(DISTINCT origin.name)[0..5] AS SampleOrigins,
+    collect(DISTINCT dest.name)[0..5] AS SampleDestinations
+ORDER BY CaseCount DESC
+```
+
+### 14. Purpose-based Transfer Analysis
+
+```cypher
+// Transfers grouped by legal processing purpose
+MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country)
+MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction)
+MATCH (c)-[:HAS_PURPOSE]->(p:Purpose)
+MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData)
+RETURN 
+    origin.name AS OriginatingCountry,
+    dest.name AS ReceivingJurisdiction,
+    p.name AS ProcessingPurpose,
+    collect(DISTINCT pd.name) AS PersonalDataNames,
+    count(DISTINCT c) AS NumberOfCases
+ORDER BY NumberOfCases DESC
+```
+
+---
+
+## 🎨 Visualization Queries
+
+### 15. Top 10 Transfer Routes
+
+```cypher
+// Most common transfer routes
+MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country)
+MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction)
+MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData)
+WITH origin.name AS Origin, 
+     dest.name AS Destination, 
+     count(DISTINCT c) AS Transfers,
+     collect(DISTINCT pd.name) AS PersonalData
+ORDER BY Transfers DESC
+LIMIT 10
+RETURN Origin, Destination, Transfers, PersonalData
+```
+
+### 16. Network Graph of Transfers
+
+```cypher
+// Get full transfer network for visualization
+MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country)
+MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction)
+MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData)
+RETURN origin, dest, c, pd
+LIMIT 500
+```
+
+---
+
+## 📈 Statistical Queries
+
+### 17. Overall Statistics
+
+```cypher
+// High-level statistics
+MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country)
+MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction)
+MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData)
+RETURN 
+    count(DISTINCT c) AS TotalCases,
+    count(DISTINCT origin) AS UniqueOriginCountries,
+    count(DISTINCT dest) AS UniqueDestinationJurisdictions,
+    count(DISTINCT pd) AS UniquePersonalDataTypes,
+    count(*) AS TotalTransferRelationships
+```
+
+### 18. Personal Data Frequency
+
+```cypher
+// Most commonly transferred personal data
+MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country)
+MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction)
+MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData)
+RETURN 
+    pd.name AS PersonalDataType,
+    count(DISTINCT c) AS CaseCount,
+    count(DISTINCT origin) AS OriginCountryCount,
+    count(DISTINCT dest) AS DestinationCount
+ORDER BY CaseCount DESC
+```
+
+---
+
+## 🔐 Compliance Queries
+
+### 19. Cases Missing Module Assessments
+
+```cypher
+// Cases with personal data but missing CM assessments
+MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country)
+MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction)
+MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData)
+WHERE c.pia_module IS NULL 
+   OR c.tia_module IS NULL 
+   OR c.hrpr_module IS NULL
+RETURN 
+    c.case_id AS CaseID,
+    origin.name AS OriginatingCountry,
+    collect(DISTINCT dest.name) AS ReceivingJurisdictions,
+    collect(DISTINCT pd.name) AS PersonalDataNames,
+    c.pia_module AS PIA_Module,
+    c.tia_module AS TIA_Module,
+    c.hrpr_module AS HRPR_Module
+ORDER BY c.case_id
+```
+
+### 20. EU/EEA Specific Transfers
+
+```cypher
+// Transfers involving EU/EEA jurisdictions
+MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country)
+MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction)
+MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData)
+WHERE dest.name IN ['EU', 'EEA', 'UK', 'Switzerland']
+RETURN 
+    origin.name AS OriginatingCountry,
+    dest.name AS EU_Jurisdiction,
+    count(DISTINCT c) AS TransferCount,
+    collect(DISTINCT pd.name) AS PersonalDataTypes,
+    count(DISTINCT CASE WHEN c.pia_module = 'CM' THEN c END) AS PIA_CM_Count,
+    count(DISTINCT CASE WHEN c.tia_module = 'CM' THEN c END) AS TIA_CM_Count
+ORDER BY TransferCount DESC
+```
+
+---
+
+## 💾 Export Queries (For CSV/Excel)
+
+### 21. Complete Transfer Export
+
+```cypher
+// Export all transfer details (use with LIMIT for large datasets)
+MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country)
+MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction)
+OPTIONAL MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData)
+OPTIONAL MATCH (c)-[:HAS_PURPOSE]->(p:Purpose)
+OPTIONAL MATCH (c)-[:HAS_CATEGORY]->(cat:Category)
+RETURN 
+    c.case_id,
+    c.eim_id,
+    c.business_app_id,
+    origin.name AS originating_country,
+    collect(DISTINCT dest.name) AS receiving_jurisdictions,
+    collect(DISTINCT pd.name) AS personal_data_names,
+    collect(DISTINCT p.name) AS purposes,
+    collect(DISTINCT cat.name) AS categories,
+    c.pia_module,
+    c.tia_module,
+    c.hrpr_module
+ORDER BY c.case_id
+LIMIT 10000
+```
+
+---
+
+## 🚀 Quick Access Commands
+
+### Run from Command Line:
+
+```bash
+# Basic transfer list
+redis-cli GRAPH.QUERY DataTransferGraph "MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country) MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction) MATCH (c)-[:HAS_PERSONAL_DATA]->(pd:PersonalData) RETURN origin.name, dest.name, count(c) LIMIT 10"
+
+# PIA CM cases
+redis-cli GRAPH.QUERY DataTransferGraph "MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country) MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction) WHERE c.pia_module = 'CM' RETURN origin.name, dest.name, count(c) ORDER BY count(c) DESC LIMIT 20"
+
+# TIA CM cases
+redis-cli GRAPH.QUERY DataTransferGraph "MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country) MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction) WHERE c.tia_module = 'CM' RETURN origin.name, dest.name, count(c) ORDER BY count(c) DESC LIMIT 20"
+
+# HRPR CM cases
+redis-cli GRAPH.QUERY DataTransferGraph "MATCH (c:Case)-[:ORIGINATES_FROM]->(origin:Country) MATCH (c)-[:TRANSFERS_TO]->(dest:Jurisdiction) WHERE c.hrpr_module = 'CM' RETURN origin.name, dest.name, count(c) ORDER BY count(c) DESC LIMIT 20"
+```
+
+---
+
+## 📝 Notes
+
+1. **Performance**: For large datasets, use `LIMIT` to test queries first
+2. **NULL handling**: Personal data should not be NULL based on your schema, but use `OPTIONAL MATCH` if needed
+3. **Aggregations**: Use `collect(DISTINCT ...)` to avoid duplicates in arrays
+4. **Module values**: Queries assume 'CM' is the exact string. Adjust if it's different (e.g., 'cm', 'CM ', etc.)
+5. **Export**: For large exports, run queries in batches using `SKIP` and `LIMIT`
+
+### Example Batched Export:
+```cypher
+// Batch 1 (first 10K)
+... LIMIT 10000
+
+// Batch 2 (next 10K)
+... SKIP 10000 LIMIT 10000
+
+// Batch 3 (next 10K)
+... SKIP 20000 LIMIT 10000
+```
