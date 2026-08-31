@@ -65,10 +65,12 @@ void main(){
   float live = smoothstep(0.58, 0.78, f);
 
   vec3 col = u_paper;
-  col = mix(col, u_line, edge * 0.62 * u_intensity);
-  col = mix(col, u_ink,  dots * 0.16 * u_intensity);
-  col = mix(col, u_ink,  ring * live * 0.45 * u_intensity);
-  col = mix(col, mix(u_paper, u_ink, 0.06), smoothstep(0.56, 0.96, f) * u_intensity);
+  /* Red carries far more visual weight than the blue this replaced, so every
+     pass is dialled back — the field should register at the edge of vision. */
+  col = mix(col, u_line, edge * 0.42 * u_intensity);
+  col = mix(col, u_ink,  dots * 0.10 * u_intensity);
+  col = mix(col, u_ink,  ring * live * 0.26 * u_intensity);
+  col = mix(col, mix(u_paper, u_ink, 0.04), smoothstep(0.56, 0.96, f) * u_intensity);
 
   /* keep the type side clean: fade in from the left, ease out at the base */
   float fade = smoothstep(0.06, 0.70, uv.x);

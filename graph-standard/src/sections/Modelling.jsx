@@ -2,7 +2,8 @@ import { Band, SectionHead, Note, Table, Grid } from "../components/Primitives.j
 import Code from "../components/Code.jsx";
 import Decider from "../components/Decider.jsx";
 import Counter from "../components/Counter.jsx";
-import { LABEL_YAML, REIFICATION } from "../lib/samples.js";
+import ReificationDiagram from "../components/ReificationDiagram.jsx";
+import { LABEL_YAML } from "../lib/samples.js";
 
 const TESTS = [
   ["1", "Does it need its own relationships?", <>A <code>country</code> string cannot participate in a trade-bloc hierarchy; a <code>(:Country)</code> node can.</>],
@@ -14,11 +15,10 @@ const TESTS = [
 
 export default function Modelling() {
   return (
-    <Band id="p1" aud="eng sci">
+    <Band id="p1">
       <SectionHead
         index="03 · Pillar one"
         title="Graph modelling standard"
-        aud={["Data engineering", "Data science"]}
       >
         How we shape a graph. In a labelled property graph there is no class hierarchy to formalise — so
         the artefact is not an ontology, it&rsquo;s a registry, and it&rsquo;s concrete.
@@ -63,7 +63,7 @@ export default function Modelling() {
               <tr><td>Prohibited</td><td>Explicitly disallowed — usually because it belongs on another label, or should be a node</td><td>Conformance check</td></tr>
             </Table>
           </div>
-          <Code lang="yaml" caption="registry/labels/customer.yaml" code={LABEL_YAML} />
+          <Code caption="registry/labels/customer.yaml" code={LABEL_YAML} />
         </div>
 
         <div id="p1-decide">
@@ -129,7 +129,7 @@ export default function Modelling() {
             typically an event or association node.
           </p>
 
-          <Code caption="reification" code={REIFICATION} />
+          <ReificationDiagram />
 
           <p className="mt-s" data-reveal>
             Prefer reification early for anything that models an <strong>event</strong>, a{" "}
@@ -158,7 +158,7 @@ export default function Modelling() {
           <Grid cols={2}>
             <div className="panel">
               <h4>Direction is semantic</h4>
-              <p className="small flat">Choose the direction that makes the edge read as a sentence, source to target. Never create both directions for the same fact — traversal is bidirectional in Cypher regardless.</p>
+              <p className="small flat">Choose the direction that makes the edge read as a sentence, source to target. Never create both directions for the same fact — a traversal can follow an edge either way regardless, so the second edge buys nothing and doubles the maintenance.</p>
             </div>
             <div className="panel">
               <h4>No duplicate parallel edges</h4>
@@ -186,6 +186,73 @@ export default function Modelling() {
               </p>
             </div>
           </Grid>
+        </div>
+
+        <div id="p1-change">
+          <h3 data-reveal>3.7 · Changing a model that is already live</h3>
+          <p data-reveal>
+            A model nobody is allowed to change is a model teams work around. The rule is not
+            &ldquo;don&rsquo;t change it&rdquo; — it is <strong>know which changes are safe, and pay the
+            cost of the ones that are not</strong>. A change is breaking if any existing consumer, query
+            or contract would have to change on the same day.
+          </p>
+
+          <div className="mb-m">
+            <Table head={["Change", "Class", "What it requires"]}>
+              <tr><td>Add an optional property</td><td className="c-ok">Safe</td><td>Registry update. No consumer action.</td></tr>
+              <tr><td>Add a label or relationship type</td><td className="c-ok">Safe</td><td>Registry update, and a contract that declares it.</td></tr>
+              <tr><td>Add an index</td><td className="c-ok">Safe</td><td>Capacity check; write throughput will drop slightly.</td></tr>
+              <tr><td>Widen an allowed-value list</td><td className="c-ok">Safe</td><td>Registry update. Consumers matching on the old values still work.</td></tr>
+              <tr><td>Add a facet label</td><td className="c-ok">Safe</td><td>Registry update — but every query author must be told, or they will miss the exclusion.</td></tr>
+              <tr><td>Make an optional property required</td><td className="c-stop">Breaking</td><td>Backfill every existing node first, then add the constraint. In that order, never the reverse.</td></tr>
+              <tr><td>Narrow an allowed-value list</td><td className="c-stop">Breaking</td><td>Find and fix the violations before the registry says they are impossible.</td></tr>
+              <tr><td>Rename a label, relationship type or property key</td><td className="c-stop">Breaking</td><td>Dual-write both names for a full deprecation window, then drop the old one.</td></tr>
+              <tr><td>Change an identity strategy</td><td className="c-stop">Breaking</td><td>New keys, a crosswalk, and full re-resolution. Treat it as a rebuild.</td></tr>
+              <tr><td>Change relationship direction</td><td className="c-stop">Breaking</td><td>Every consumer traversal is rewritten. Almost never worth it — get direction right at registration.</td></tr>
+              <tr><td>Reify an existing relationship into a node</td><td className="c-stop">Breaking</td><td>The change this standard tells you to avoid by reifying early (§3.4).</td></tr>
+              <tr><td>Remove anything</td><td className="c-stop">Breaking</td><td>Deprecation window, evidence of no reads, then delete.</td></tr>
+            </Table>
+          </div>
+
+          <h4 className="mb-s" data-reveal>The deprecation window</h4>
+          <p data-reveal>
+            Four steps, in order. The catalogue is what makes step three possible at all — without it,
+            nobody can enumerate the consumers of a label.
+          </p>
+          <ol className="phases full mb-m" data-reveal-group>
+            <li>
+              <span className="wk">Step 1</span>
+              <div><h4>Mark it, with a date</h4>
+              <p className="small flat mt-s">Deprecated in the registry, with a removal date. Nothing is
+                deprecated without a date — an open-ended deprecation is just a comment.</p></div>
+            </li>
+            <li>
+              <span className="wk">Step 2</span>
+              <div><h4>Dual-write</h4>
+              <p className="small flat mt-s">The same contract maintains the old and the new shape for at
+                least one full consumer release cycle. One contract, so the two cannot drift.</p></div>
+            </li>
+            <li>
+              <span className="wk">Step 3</span>
+              <div><h4>Tell the consumers you can name</h4>
+              <p className="small flat mt-s">The catalogue lists every tenant and contract that touches the
+                thing being removed. Notify them individually, not by broadcast.</p></div>
+            </li>
+            <li>
+              <span className="wk">Step 4</span>
+              <div><h4>Remove, once the reads have stopped</h4>
+              <p className="small flat mt-s">The window has closed <em>and</em> query metrics show nothing
+                reading it. Either condition alone is not enough.</p></div>
+            </li>
+          </ol>
+
+          <Note kind="warn" eyebrow="On graph-key versions">
+            <p>
+              The <code>.v1</code> suffix on a graph key exists for the rebuild you cannot migrate in
+              place. Use it sparingly: standing up <code>.v2</code> means every consumer re-points and two
+              graphs are maintained until they don&rsquo;t. It is the last resort, not the first.
+            </p>
+          </Note>
         </div>
       </div>
     </Band>

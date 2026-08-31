@@ -9,6 +9,8 @@ const TIERS = [
   ["Provenance properties", "Encouraged", "Required", "Enforced by constraint"],
   ["Backup", "None", "Snapshot on request", "Scheduled, tested restore"],
   ["Support", "Best effort", "Business hours", "Per service level agreement"],
+  ["Read access", "Anyone on the platform", "Named group, owner-approved", "Named group, recertified annually"],
+  ["Max classification", "Internal", "Up to confidential", "Up to restricted, with controls evidenced"],
   ["Default TTL", "60 days", "180 days, renewable", "None — annual recertification"],
 ];
 
@@ -45,11 +47,10 @@ const TIMELINE = [
 
 export default function Lifecycle() {
   return (
-    <Band id="p4" aud="biz ops eng">
+    <Band id="p4">
       <SectionHead
         index="06 · Pillar four"
         title="Tenant lifecycle"
-        aud={["Business & governance", "Platform ops", "Data engineering"]}
       >
         A graph is created in a moment and lives for years. Three tiers, explicit gates between them, and
         a reaping cycle that keeps the inventory honest without punishing experimentation.
@@ -67,8 +68,57 @@ export default function Lifecycle() {
           </Table>
         </div>
 
+
+        <div id="p4-access">
+          <h3 data-reveal>6.2 · Access and sensitivity</h3>
+          <p data-reveal>
+            Access is a property of the tenant, not of the pipeline that filled it. This is the part of
+            the standard that most often changes a team&rsquo;s design, because it forces a decision they
+            would otherwise defer.
+          </p>
+
+          <Grid cols={2}>
+            <div className="panel">
+              <h4>A tenant inherits the ceiling of its inputs</h4>
+              <p className="small flat">
+                A graph&rsquo;s classification is the <em>highest</em> classification of any contract
+                writing into it. Adding an unclassified source never lowers it. Plan the ceiling before
+                the first contract, because lowering it later means moving data out.
+              </p>
+            </div>
+            <div className="panel">
+              <h4>Grants go to named groups, per graph key</h4>
+              <p className="small flat">
+                Never to individuals — individual grants outlive the individual&rsquo;s reason for having
+                them. Each grant is reviewed at the tenant&rsquo;s recertification, alongside its owner.
+              </p>
+            </div>
+            <div className="panel span-all bl-stop">
+              <h4>There is no partial read</h4>
+              <p className="small flat">
+                Isolation is at the graph level. Anyone who can query a tenant can read all of it — every
+                label, every property, every edge. There is no property-level or node-level access
+                control to fall back on. <strong>If two audiences must see different subsets, that is two
+                tenants, not one tenant with a filter</strong>, and the split has to happen at design
+                time. This single constraint decides more tenant boundaries than any other rule in this
+                document.
+              </p>
+            </div>
+            <div className="panel span-all">
+              <h4>Personal data is handled per contract, not per graph</h4>
+              <p className="small flat">
+                Every contract lists its PII fields explicitly. A subject access request or an erasure is
+                executed contract by contract, using the source record identifier on each node to find
+                everything that originated from the withdrawn record — across every tenant that contract
+                writes to. This is only possible because provenance is mandatory (§4.4); without it,
+                erasure becomes a manual search.
+              </p>
+            </div>
+          </Grid>
+        </div>
+
         <div id="p4-promote">
-          <h3 data-reveal>6.2 · Promotion gates</h3>
+          <h3 data-reveal>6.3 · Promotion gates</h3>
           <p data-reveal>
             Promotion is a checklist, not a conversation. Tick these against a real tenant — the state is
             remembered in this browser so you can work through it over a few sittings.
@@ -89,7 +139,7 @@ export default function Lifecycle() {
         </div>
 
         <div id="p4-reap">
-          <h3 data-reveal>6.3 · Expiry and reaping</h3>
+          <h3 data-reveal>6.4 · Expiry and reaping</h3>
           <p data-reveal>
             Dead PoCs are the main cause of sandbox sprawl. This sequence is deliberately asymmetric:{" "}
             <strong>renewal is easy, deletion is slow.</strong> The goal is a true inventory, not friction.
@@ -117,7 +167,7 @@ export default function Lifecycle() {
         </div>
 
         <div id="p4-sandbox">
-          <h3 data-reveal>6.4 · Shared sandbox rules</h3>
+          <h3 data-reveal>6.5 · Shared sandbox rules</h3>
           <p data-reveal>
             The shared sandbox is the most valuable thing on the platform and the easiest to ruin. Four
             rules keep it usable.

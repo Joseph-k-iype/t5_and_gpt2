@@ -7,6 +7,31 @@ const PLURAL_OK = ["status","address","analysis","basis","business","access","pr
 const words = (s) => s.replace(/([a-z0-9])([A-Z])/g, "$1 $2").split(/[\s_]+/).filter(Boolean);
 const abbrevs = (s) => words(s).filter((w) => BANNED.includes(w.toLowerCase()));
 
+/* Postel's law: take whatever the reader types, then show them the conforming
+   form of it rather than only telling them it is wrong. */
+function suggest(kind, v) {
+  const words = v.replace(/([a-z0-9])([A-Z])/g, "$1 $2").split(/[\s_.\-]+/).filter(Boolean);
+  const pascal = words.map((w) => w[0].toUpperCase() + w.slice(1).toLowerCase()).join("");
+  const camel = pascal.charAt(0).toLowerCase() + pascal.slice(1);
+  const depluralise = (w) =>
+    /(ss|us|is)$/i.test(w) || !/s$/i.test(w) ? w : w.replace(/ies$/i, "y").replace(/s$/i, "");
+
+  switch (kind) {
+    case "label":  return depluralise(pascal);
+    case "facet":  return pascal;
+    case "rel":    return words.map((w) => w.toUpperCase()).join("_");
+    case "prop":   return camel.replace(/^_+/, "");
+    case "graph":  return v.toLowerCase().split(".").filter(Boolean).join(".");
+    case "index":  return "idx_" + words.map((w) => w.toLowerCase()).join("_").replace(/^idx_/, "");
+    case "contract": {
+      const parts = v.toLowerCase().split(".").filter((p) => p && p !== "ing");
+      const versioned = /^v\d+$/.test(parts[parts.length - 1]) ? parts : [...parts, "v1"];
+      return ["ing", ...versioned].join(".");
+    }
+    default: return v;
+  }
+}
+
 const KINDS = [
   { key: "label", label: "Node label", sample: "Customers" },
   { key: "facet", label: "Facet label", sample: "Sanctioned" },
@@ -90,6 +115,8 @@ export default function Linter() {
   const v = value.trim();
   const rules = v ? CHECKS[kind](v) : [];
   const failed = rules.filter((r) => !r.ok);
+  const fix = failed.length ? suggest(kind, v) : "";
+  const fixable = fix && fix !== v && !CHECKS[kind](fix).some((r) => !r.ok);
 
   return (
     <Tool title="Convention checker" hint="Type a name — rules evaluate as you go">
@@ -121,13 +148,21 @@ export default function Linter() {
         </label>
       </div>
 
-      <div id="lint-verdict" className={!v ? "" : failed.length ? "fail" : "pass"}>
+      <div id="lint-verdict" className={!v ? "idle" : failed.length ? "fail" : "pass"} role="status">
         {!v ? (
           "Type a name to check it."
         ) : failed.length ? (
           <><code>{v}</code> breaks {failed.length} rule{failed.length > 1 ? "s" : ""}</>
         ) : (
           <><code>{v}</code> conforms</>
+        )}
+        {fixable && (
+          <span className="lint-fix">
+            Try <code>{fix}</code>
+            <button type="button" className="btn btn-ghost btn-sm" onClick={() => setValue(fix)}>
+              Use this
+            </button>
+          </span>
         )}
       </div>
 

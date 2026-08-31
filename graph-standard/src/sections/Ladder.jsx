@@ -29,15 +29,20 @@ const PHASES = [
 
 export default function Ladder() {
   return (
-    <Band id="ladder" aud="biz ops eng">
+    <Band id="ladder">
       <SectionHead
         index="10 · Adoption"
         title="The conformance ladder"
-        aud={["Business & governance", "Platform ops", "Data engineering"]}
       >
         Adopt in stages rather than declaring everything non-compliant on day one. A standard that makes
         every existing team a violator on publication day gets ignored on publication day.
       </SectionHead>
+
+      <h3 className="mb-s" data-reveal>The four levels</h3>
+      <p data-reveal>
+        Each level is a superset of the one before it. A tenant sits at the highest level it fully
+        meets — partial credit for L3 while L2 is unmet is how standards become theatre.
+      </p>
 
       <div className="ladder full" data-reveal-group>
         {RUNGS.map((r) => (

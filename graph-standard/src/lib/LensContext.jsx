@@ -1,10 +1,20 @@
 import { createContext, useContext } from "react";
+import { isVisible } from "./nav.js";
 
 export const LensContext = createContext("all");
 
-/** Returns the class list for a block tagged with an audience. */
-export function useDim(aud) {
-  const lens = useContext(LensContext);
-  if (!aud || lens === "all") return "";
-  return aud.split(/\s+/).includes(lens) ? "" : "dim";
+export const useLens = () => useContext(LensContext);
+
+/**
+ * Whether a section survives the current audience filter.
+ * Filtering hides rather than fades: faded text is unreadable text, and a
+ * half-visible section reads as broken rather than as filtered out.
+ */
+export function useVisibleSection(sectionId) {
+  return isVisible(sectionId, useContext(LensContext));
 }
+
+/* Setting the lens from inside the document — the toolbar is not the only
+   place a reader should be able to choose their path. */
+export const LensSetContext = createContext(() => {});
+export const useSetLens = () => useContext(LensSetContext);

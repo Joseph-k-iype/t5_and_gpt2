@@ -10,8 +10,8 @@ const ROLES = [
 
 export default function Roles() {
   return (
-    <Band id="roles" aud="biz ops eng sci">
-      <SectionHead index="09 · Accountability" title="Roles" aud={["Everyone"]}>
+    <Band id="roles">
+      <SectionHead index="09 · Accountability" title="Roles">
         Registrations need a named human, not a distribution list. Ownership that belongs to everyone
         belongs to no one — and unowned graphs are how the current situation arose.
       </SectionHead>

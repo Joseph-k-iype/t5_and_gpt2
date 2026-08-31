@@ -1,6 +1,7 @@
 import { useRef } from "react";
 import FieldCanvas from "../shaders/FieldCanvas.jsx";
 import { useHeroTimeline } from "../lib/motion.js";
+import { NAV } from "../lib/nav.js";
 
 const META = [
   ["Scope", "Sandbox · Incubation · Production"],
@@ -46,7 +47,7 @@ export default function Masthead() {
 
         <div className="cue">
           <span className="track"><b /></span>
-          Scroll · 11 sections · about 40 minutes
+          Scroll · {NAV.length} sections · about 40 minutes
         </div>
       </div>
     </header>

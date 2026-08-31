@@ -1,7 +1,5 @@
-import { Band, SectionHead, Note, Table, Grid } from "../components/Primitives.jsx";
-import Code from "../components/Code.jsx";
+import { Band, SectionHead, Note, Table, Grid, Specimen } from "../components/Primitives.jsx";
 import Linter from "../components/Linter.jsx";
-import { NATURAL_KEY, MINTED_KEY } from "../lib/samples.js";
 
 const CONVENTIONS = [
   ["Graph key", <code>&lt;env&gt;.&lt;domain&gt;.&lt;usecase&gt;.v&lt;n&gt;</code>, <><code>prd.risk.kyc-network.v1</code><br /><code>dev.sandbox.shared</code></>],
@@ -25,11 +23,10 @@ const RULES = [
 
 export default function Identity() {
   return (
-    <Band id="p3" aud="eng sci ops">
+    <Band id="p3">
       <SectionHead
         index="05 · Pillar three"
         title="Naming and identity"
-        aud={["Data engineering", "Data science", "Platform ops"]}
       >
         Naming is cheap to standardise on day one and effectively impossible to standardise on day four
         hundred. Identity is what makes two graphs describe the same world.
@@ -111,7 +108,10 @@ export default function Identity() {
               <span className="eyebrow c-accent">Pattern A</span>
               <h4 className="tight">Namespaced natural key</h4>
               <p className="small">Use when a single authoritative source system owns the entity and its key is stable.</p>
-              <Code caption="" code={NATURAL_KEY} />
+              <Specimen
+                parts={["entityId = ", { var: "sourceSystem" }, " : ", { var: "labelSlug" }, " : ", { var: "naturalKey" }]}
+                example="corereg:customer:C-8842119"
+              />
               <p className="small flat mt-s">
                 <strong>Cheap, transparent, debuggable</strong>, and requires no crosswalk. It breaks if
                 the source re-keys, or if a second source starts describing the same entity.
@@ -121,11 +121,15 @@ export default function Identity() {
               <span className="eyebrow c-accent">Pattern B</span>
               <h4 className="tight">Minted enterprise identifier</h4>
               <p className="small">Use when multiple sources describe the same entity, or when the entity must survive source-system replacement.</p>
-              <Code caption="" code={MINTED_KEY} />
+              <Specimen
+                parts={["entityId = ", { var: "labelSlug" }, " : ", { var: "ULID or UUIDv7" }]}
+                example="customer:01HQ2X8N4K7P9M3T"
+              />
               <p className="small flat mt-s">
                 The mint is issued once by the identity service and never changes. Every source key that
-                resolves to it is recorded in a crosswalk:{" "}
-                <code>(:Customer)-[:IDENTIFIED_BY]-&gt;(:Identifier {"{"}system, value, confidence, resolvedAt{"}"})</code>.
+                resolves to it is recorded in a crosswalk — an <strong>Identifier</strong> node per source
+                key, carrying the system it came from, the value, a confidence and a resolution date,
+                joined to the entity by an <strong>identified by</strong> relationship.
               </p>
             </div>
           </Grid>
@@ -145,7 +149,7 @@ export default function Identity() {
             <li><strong>A <code>UNIQUE</code> constraint on <code>entityId</code> per label</strong> at production tier. Create the supporting range index first, resolve duplicates first, and verify with <code>db.constraints()</code> that it reached <code>OPERATIONAL</code> rather than <code>FAILED</code>.</li>
             <li><strong>Never key on a mutable business attribute.</strong> Not email, not name, not an account number that gets recycled.</li>
             <li><strong>Never key on the internal node ID.</strong> It is not stable across restore, rebuild, or graph copy.</li>
-            <li><strong>Entity resolution is a pipeline concern, not a query concern.</strong> Fuzzy matching happens upstream and produces either a mint assignment or an explicit <code>(:Customer)-[:SAME_AS {"{"}confidence, method, resolvedAt{"}"}]-&gt;(:Customer)</code> edge. Never let probabilistic matches silently collapse two nodes into one — the <code>SAME_AS</code> edge preserves the evidence and can be reversed.</li>
+            <li><strong>Entity resolution is a pipeline concern, not a query concern.</strong> Fuzzy matching happens upstream and produces either a mint assignment or an explicit <strong>same as</strong> relationship carrying the confidence, the method and the resolution date. Never let probabilistic matches silently collapse two nodes into one: the relationship preserves the evidence and can be reversed, a merge cannot.</li>
             <li><strong>Cross-tenant identity is declared, not enforced.</strong> Since graphs cannot be joined, two tenants using the same <code>entityId</code> for the same real-world entity is a convention held together by the catalogue. Registering that both align to the same canonical concept is what makes future federation possible.</li>
           </ul>
         </div>

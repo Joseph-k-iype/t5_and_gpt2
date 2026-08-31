@@ -52,7 +52,7 @@ export function useHeroTimeline(scopeRef) {
  * marked data-reveal-group stagger their direct children.
  * Elements are only hidden from JS, so the page reads fine without it.
  */
-export function useReveal(scopeRef) {
+export function useReveal(scopeRef, dep) {
   useEffect(() => {
     const root = scopeRef?.current || document.body;
     const ctx = gsap.context(() => {
@@ -82,7 +82,7 @@ export function useReveal(scopeRef) {
       });
     }, root);
     return () => ctx.revert();
-  }, [scopeRef]);
+  }, [scopeRef, dep]);
 }
 
 /** Reading progress, driven by ScrollTrigger rather than a scroll listener. */
@@ -100,7 +100,7 @@ export function useProgress(barRef) {
 }
 
 /** Each band carries a hairline that fills as you read through it. */
-export function useBandMarks(scopeRef) {
+export function useBandMarks(scopeRef, dep) {
   useEffect(() => {
     const root = scopeRef?.current || document.body;
     const ctx = gsap.context(() => {
@@ -115,7 +115,7 @@ export function useBandMarks(scopeRef) {
       });
     }, root);
     return () => ctx.revert();
-  }, [scopeRef]);
+  }, [scopeRef, dep]);
 }
 
 /** Pointer magnetism on the primary actions — small, and only on fine pointers. */

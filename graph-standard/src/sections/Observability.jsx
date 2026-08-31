@@ -3,11 +3,10 @@ import ScoreModel from "../components/ScoreModel.jsx";
 
 export default function Observability() {
   return (
-    <Band id="p5" aud="ops eng biz">
+    <Band id="p5">
       <SectionHead
         index="07 · Pillar five"
         title="Observability and lineage"
-        aud={["Platform ops", "Data engineering", "Business & governance"]}
       >
         A standard nobody measures is a preference. Everything here rolls up into one number per graph,
         published weekly, next to the owner&rsquo;s name.

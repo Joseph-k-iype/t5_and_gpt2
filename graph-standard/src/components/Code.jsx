@@ -1,7 +1,8 @@
 import { useRef, useState } from "react";
-import { highlight } from "../lib/highlight.js";
+import { highlightYaml } from "../lib/highlight.js";
 
-export default function Code({ lang = "cypher", caption, note, code }) {
+/** A registry or contract artefact, copyable as written. */
+export default function Code({ caption, code }) {
   const [label, setLabel] = useState("Copy");
   const raw = useRef(code);
   raw.current = code;
@@ -20,8 +21,8 @@ export default function Code({ lang = "cypher", caption, note, code }) {
   return (
     <figure className="code" data-reveal>
       <figcaption>
-        <span className="lang">{lang === "yaml" ? "YAML" : "Cypher"}</span>
-        <span className={note ? "c-stop" : undefined}>{caption}</span>
+        <span className="lang">YAML</span>
+        <span>{caption}</span>
         <span className="sp" />
         <button
           type="button"
@@ -32,7 +33,7 @@ export default function Code({ lang = "cypher", caption, note, code }) {
         </button>
       </figcaption>
       <pre>
-        <code dangerouslySetInnerHTML={{ __html: highlight(code, lang) }} />
+        <code dangerouslySetInnerHTML={{ __html: highlightYaml(code) }} />
       </pre>
     </figure>
   );

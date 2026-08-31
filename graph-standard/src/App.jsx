@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import Rail from "./components/Rail.jsx";
 import Toolbar from "./components/Toolbar.jsx";
+import FilterStatus from "./components/FilterStatus.jsx";
 import Palette from "./components/Palette.jsx";
 
 import Masthead from "./sections/Masthead.jsx";
@@ -19,12 +20,12 @@ import Ladder from "./sections/Ladder.jsx";
 import Appendix from "./sections/Appendix.jsx";
 import Colophon from "./sections/Colophon.jsx";
 
-import { LensContext } from "./lib/LensContext.jsx";
-import { FLAT_NAV } from "./lib/nav.js";
+import { LensContext, LensSetContext } from "./lib/LensContext.jsx";
+import { NAV, FLAT_NAV, countVisible, isVisible } from "./lib/nav.js";
 import useLocalState from "./lib/useLocalState.js";
-import { useReveal, useProgress, useBandMarks, useScrollRefresh } from "./lib/motion.js";
+import { useReveal, useProgress, useBandMarks, useScrollRefresh, ScrollTrigger } from "./lib/motion.js";
 
-function useActiveSection() {
+function useActiveSection(lens) {
   const [active, setActive] = useState("start");
 
   useEffect(() => {
@@ -42,7 +43,7 @@ function useActiveSection() {
     );
     targets.forEach((t) => io.observe(t));
     return () => io.disconnect();
-  }, []);
+  }, [lens]); // sections mount and unmount with the filter
 
   return active;
 }
@@ -50,17 +51,49 @@ function useActiveSection() {
 export default function App() {
   const [lens, setLens] = useLocalState("gs.lens", "all");
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [showTop, setShowTop] = useState(false);
   const barRef = useRef(null);
   const mainRef = useRef(null);
-  const active = useActiveSection();
+  const active = useActiveSection(lens);
 
   useProgress(barRef);
-  useReveal(mainRef);
-  useBandMarks(mainRef);
+  useReveal(mainRef, lens);
+  useBandMarks(mainRef, lens);
   useScrollRefresh();
+
+  const { shown, total } = countVisible(lens);
+
+  /* "You are here" — serial position and progress both need a location, not
+     just a percentage bar. */
+  const position = useMemo(() => {
+    const visible = NAV.filter((s) => isVisible(s.id, lens));
+    const idx = visible.findIndex(
+      (s) => s.id === active || (s.sub || []).some((x) => x.id === active)
+    );
+    if (idx < 0) return null;
+    return { num: idx + 1, total: visible.length, label: visible[idx].label };
+  }, [active, lens]);
 
   const openPalette = useCallback(() => setPaletteOpen(true), []);
   const closePalette = useCallback(() => setPaletteOpen(false), []);
+
+  const changeLens = useCallback((next) => {
+    setLens(next);
+    /* Layout changes underneath the reader, so put them somewhere sensible
+       rather than wherever the old scroll offset happens to land. */
+    requestAnimationFrame(() => {
+      ScrollTrigger.refresh();
+      const anchor = document.getElementById(next === "all" ? "top" : "start");
+      anchor?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }, [setLens]);
+
+  useEffect(() => {
+    const onScroll = () => setShowTop(window.scrollY > window.innerHeight * 1.5);
+    window.addEventListener("scroll", onScroll, { passive: true });
+    onScroll();
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
 
   useEffect(() => {
     const typing = (el) =>
@@ -79,13 +112,17 @@ export default function App() {
 
   return (
     <LensContext.Provider value={lens}>
+    <LensSetContext.Provider value={changeLens}>
+      <a className="skip" href="#start">Skip to the document</a>
       <div id="progress" ref={barRef} aria-hidden="true" />
 
       <div className="shell">
-        <Rail active={active} />
+        <Rail active={active} position={position} />
 
         <main className="main" ref={mainRef}>
-          <Toolbar lens={lens} setLens={setLens} onJump={openPalette} />
+          <Toolbar lens={lens} setLens={changeLens} onJump={openPalette} />
+          <FilterStatus lens={lens} shown={shown} total={total} onReset={() => changeLens("all")} />
+
           <Masthead />
           <Start />
           <Why />
@@ -104,6 +141,21 @@ export default function App() {
       </div>
 
       <Palette open={paletteOpen} onClose={closePalette} />
+
+      {showTop && (
+        <button
+          type="button"
+          className="to-top noprint"
+          aria-label="Back to top"
+          onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+            <path d="M8 13V3M3.5 7.5L8 3l4.5 4.5" fill="none" stroke="currentColor"
+                  strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </button>
+      )}
+    </LensSetContext.Provider>
     </LensContext.Provider>
   );
 }

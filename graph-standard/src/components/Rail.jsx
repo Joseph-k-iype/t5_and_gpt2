@@ -1,7 +1,10 @@
-import { NAV } from "../lib/nav.js";
+import { NAV, isVisible } from "../lib/nav.js";
+import { useLens } from "../lib/LensContext.jsx";
 
-export default function Rail({ active }) {
-  const openId = NAV.find(
+export default function Rail({ active, position }) {
+  const lens = useLens();
+  const sections = NAV.filter((s) => isVisible(s.id, lens));
+  const openId = sections.find(
     (s) => s.id === active || (s.sub || []).some((x) => x.id === active)
   )?.id;
 
@@ -25,9 +28,20 @@ export default function Rail({ active }) {
         </div>
       </div>
 
+      {position && (
+        <div className="rail-pos" aria-live="polite">
+          <span className="label">You are here</span>
+          <span className="v">
+            <b className="num">{position.num}</b>
+            <span className="of">of {position.total}</span>
+            {position.label}
+          </span>
+        </div>
+      )}
+
       <div className="toc">
         <ol>
-          {NAV.map((s) => (
+          {sections.map((s) => (
             <li key={s.id} className={openId === s.id ? "open" : undefined}>
               <a href={`#${s.id}`} className={active === s.id ? "on" : undefined}>
                 <i>{s.num}</i>

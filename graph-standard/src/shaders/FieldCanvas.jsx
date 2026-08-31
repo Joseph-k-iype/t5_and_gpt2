@@ -1,9 +1,11 @@
 import { useEffect, useRef } from "react";
 import { VERT, FRAG } from "./field.js";
 
-const PAPER = [0.945, 0.949, 0.933];
-const INK   = [0.137, 0.204, 0.561];
-const LINE  = [0.725, 0.757, 0.894];
+/* Matches --paper, --accent and --accent-line so the field and the page
+   are painted from the same palette. */
+const PAPER = [0.957, 0.949, 0.941]; // #F4F2F0
+const INK   = [0.702, 0.078, 0.110]; // #B3141C
+const LINE  = [0.914, 0.749, 0.749]; // #E9BFBF
 
 function compile(gl, type, src) {
   const sh = gl.createShader(type);

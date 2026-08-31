@@ -1,5 +1,5 @@
 import { Band, SectionHead } from "../components/Primitives.jsx";
-import { useDim } from "../lib/LensContext.jsx";
+import { useSetLens, useLens } from "../lib/LensContext.jsx";
 
 const PATHS = [
   {
@@ -28,7 +28,7 @@ const PATHS = [
     aud: "sci",
     eyebrow: "If you model or analyse",
     title: "The model decides what you can ask",
-    body: "The property-versus-node rule and the reification rule are the two that will constrain or liberate your queries two years from now. If you are doing GraphRAG or embeddings, read the open decision on vectors before you build.",
+    body: "The property-versus-node rule and the reification rule are the two that will constrain or liberate your work two years from now. If you are doing GraphRAG or embeddings, read the open decision on vectors before you build.",
     steps: [
       <><a href="#p1-decide">Property vs. node</a> — walk the interactive test.</>,
       <><a href="#p1-rels">Reification</a> — events, transactions and decisions are nodes.</>,
@@ -42,22 +42,32 @@ const PATHS = [
     body: "The catalogue's observed layer is the first thing to build, before any policy is ratified. You cannot govern an estate you have not measured, and the first inventory usually reframes everyone's priorities.",
     steps: [
       <><a href="#p6">The catalogue meta-graph</a> and its observed layer.</>,
-      <><a href="#ax-d">Appendix D</a> — the introspection queries the job runs.</>,
+      <><a href="#ax-d">Appendix D</a> — the measurements the daily job must produce.</>,
       <><a href="#p4-reap">Expiry and reaping</a> — the cure for sandbox sprawl.</>,
     ],
   },
 ];
 
 function PathCard({ path }) {
-  const dim = useDim(path.aud);
+  const setLens = useSetLens();
+  const lens = useLens();
+  const active = lens === path.aud;
+
   return (
-    <div className={"panel " + dim} data-aud={path.aud}>
+    <div className="panel">
       <span className="eyebrow">{path.eyebrow}</span>
       <h3 className="tight">{path.title}</h3>
       <p className="small">{path.body}</p>
-      <ol className="small flat">
+      <ol className="small">
         {path.steps.map((s, i) => <li key={i}>{s}</li>)}
       </ol>
+      <button
+        type="button"
+        className={"btn btn-sm " + (active ? "" : "btn-ghost")}
+        onClick={() => setLens(active ? "all" : path.aud)}
+      >
+        {active ? "Showing only these sections — undo" : "Hide everything else"}
+      </button>
     </div>
   );
 }
@@ -67,8 +77,9 @@ export default function Start() {
     <Band id="start" tight>
       <SectionHead index="00 · Orientation" title="Where to start">
         This is a long document because it has to be. Nobody needs to read all of it. Pick the path that
-        matches your job — or use the <strong>Read as</strong> filter at the top of the page to fade out
-        everything that isn&rsquo;t yours.
+        matches your job, and use <strong>Hide everything else</strong> to cut the document down to the
+        sections written for you — the filter at the top of the page does the same thing, and is always
+        one click from putting everything back.
       </SectionHead>
 
       <div className="grid g2 full" data-reveal-group>

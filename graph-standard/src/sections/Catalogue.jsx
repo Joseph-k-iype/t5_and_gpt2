@@ -1,17 +1,12 @@
-import { Band, SectionHead, Note, Grid } from "../components/Primitives.jsx";
-import Code from "../components/Code.jsx";
+import { Band, SectionHead, Note, Grid, Table } from "../components/Primitives.jsx";
 import MetaGraph from "../components/MetaGraph.jsx";
-import {
-  KEY_SAMPLING, Q_UNREGISTERED, Q_BLAST, Q_CONFIDENTIAL, Q_FEDERATION, Q_OWNERLESS,
-} from "../lib/samples.js";
 
 export default function Catalogue() {
   return (
-    <Band id="p6" aud="ops eng biz sci">
+    <Band id="p6">
       <SectionHead
         index="08 · Pillar six"
         title="The knowledge catalogue, as a meta-graph"
-        aud={["Everyone"]}
       >
         Build the catalogue of the graph estate <em>in</em> a graph. Every question about the estate is
         inherently relational — which labels does this team own, which contracts break if this source
@@ -57,8 +52,8 @@ export default function Catalogue() {
             <p>
               <strong>Observed but not declared</strong> is unregistered data.{" "}
               <strong>Declared but not observed</strong> is either a stale registration or a broken
-              pipeline. Both are actionable, and both are trivial Cypher once the two layers coexist in
-              one graph.
+              pipeline. Both are actionable, and both fall out of a single comparison once the two layers
+              coexist in one graph.
             </p>
           </Note>
 
@@ -112,23 +107,59 @@ export default function Catalogue() {
               per label — and a sample is a sample, so record the sample size alongside the result.
             </p>
           </Note>
-          <div className="mt-s">
-            <Code caption="per-label key sampling" code={KEY_SAMPLING} />
-          </div>
+          <p className="mt-s" data-reveal>
+            So the job samples: for each label, take a bounded number of nodes, union the property keys
+            found on them, and record the sample size next to the result. A key seen on 3 of 10,000
+            sampled nodes is a different finding from one seen on all of them, and the catalogue should
+            be able to tell them apart.
+          </p>
         </div>
 
         <div id="p6-queries">
-          <h3 data-reveal>8.4 · What it unlocks</h3>
+          <h3 data-reveal>8.4 · What it answers</h3>
           <p data-reveal>
-            These five queries are the reason the catalogue is a graph and not a spreadsheet. None of them
-            is answerable today.
+            Five questions that arrive regularly and that nobody can answer today. Each one is a walk
+            across the meta-graph — which is the whole reason the catalogue is a graph and not a
+            spreadsheet, because none of these is a lookup.
           </p>
-          <div className="stack-s">
-            <Code caption="unregistered labels, worst offenders first" code={Q_UNREGISTERED} />
-            <Code caption="blast radius of decommissioning a source" code={Q_BLAST} />
-            <Code caption="everywhere a confidential key is used" code={Q_CONFIDENTIAL} />
-            <Code caption="tenants modelling the same concept — federation candidates" code={Q_FEDERATION} />
-            <Code caption="ownerless graphs" code={Q_OWNERLESS} />
+
+          <Table head={["Question", "The walk across the catalogue", "Who asks, and when"]}>
+            <tr>
+              <td>Which labels exist in a tenant that nobody registered?</td>
+              <td>The observed layer for that tenant, minus its declared layer, ranked by node count so the biggest offenders surface first.</td>
+              <td>Graph steward, weekly</td>
+            </tr>
+            <tr>
+              <td>What breaks if we decommission this source system?</td>
+              <td>From the source system, to every contract reading it, to every tenant those contracts write, to the team that owns each one.</td>
+              <td>Architecture, before any decommission decision</td>
+            </tr>
+            <tr>
+              <td>Where does this confidential property key appear?</td>
+              <td>From the classification, to every property key carrying it, to every label declaring that key, to every tenant declaring that label.</td>
+              <td>Privacy and data protection, on request</td>
+            </tr>
+            <tr>
+              <td>Which tenants model the same concept?</td>
+              <td>From a canonical concept, to every label aligned to it, to the tenants declaring those labels — anything with more than one is a federation candidate.</td>
+              <td>Platform owner, quarterly</td>
+            </tr>
+            <tr>
+              <td>Which graphs have no owner?</td>
+              <td>Tenants with no owning team. The shortest walk in the catalogue and the most uncomfortable result.</td>
+              <td>Platform owner, monthly</td>
+            </tr>
+          </Table>
+
+          <div className="mt-m">
+            <Note eyebrow="Why this is a table and not a query">
+              <p>
+                A standard says what must be answerable and by whom. How each answer is computed belongs
+                to whoever builds the catalogue job, against the version of the platform they actually
+                have — and it will change when that version does. Pinning implementations into the
+                standard makes the standard wrong the first time the platform is upgraded.
+              </p>
+            </Note>
           </div>
         </div>
       </div>

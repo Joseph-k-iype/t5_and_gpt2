@@ -1,6 +1,4 @@
 import { Band, SectionHead, Note, Table, Grid } from "../components/Primitives.jsx";
-import Code from "../components/Code.jsx";
-import { IDEMPOTENT_WRITE } from "../lib/samples.js";
 
 const FIELDS = [
   ["contractId", <>Stable identifier, e.g. <code>ing.kyc.corereg.v2</code></>],
@@ -43,11 +41,10 @@ const REJECTS = [
 
 export default function Ingestion() {
   return (
-    <Band id="p2" aud="eng biz ops">
+    <Band id="p2">
       <SectionHead
         index="04 · Pillar two"
         title="Ingestion contracts"
-        aud={["Data engineering", "Business & governance", "Platform ops"]}
       >
         This is the single control that converts <em>&ldquo;any data can go into the graph from any
         source&rdquo;</em> into a governed estate. Everything else in this document depends on it.
@@ -86,7 +83,7 @@ export default function Ingestion() {
           <Grid cols={2}>
             <div className="panel">
               <h4>Upsert, don&rsquo;t blind-create</h4>
-              <p className="small flat">Default write pattern is <code>MERGE</code> on the identity key, then <code>SET</code> properties. Blind <code>CREATE</code> is permitted only for immutable event nodes.</p>
+              <p className="small flat">The default write matches on the identity key and then sets the mapped properties. Creating without matching first is permitted only for immutable event nodes, which cannot collide by definition.</p>
             </div>
             <div className="panel">
               <h4>Idempotency is mandatory</h4>
@@ -98,16 +95,54 @@ export default function Ingestion() {
             </div>
             <div className="panel">
               <h4>Batch, don&rsquo;t write node-by-node</h4>
-              <p className="small flat">Parameterised Cypher with <code>UNWIND</code> over a batch. Tune against your instance; start around <span className="num">1,000–10,000</span> elements and measure.</p>
+              <p className="small flat">One parameterised write per batch, not one per row. Tune the size against your instance; start around <span className="num">1,000–10,000</span> elements and measure rather than guessing.</p>
             </div>
             <div className="panel span-all">
               <h4>Index before bulk load, or index after — but decide deliberately</h4>
-              <p className="small flat">Indexes accelerate the <code>MERGE</code> lookup but add write overhead on every insert. For a large initial load, loading first and indexing after is usually faster; for incremental upserts, the index must already exist.</p>
+              <p className="small flat">An index accelerates the identity lookup on every upsert but adds overhead to every insert. For a large initial load, loading first and indexing after is usually faster; for incremental upserts, the index has to exist beforehand or every write degrades to a scan.</p>
             </div>
           </Grid>
-          <div className="mt-m">
-            <Code caption="the canonical idempotent write" code={IDEMPOTENT_WRITE} />
-          </div>
+          <h4 className="mt-l mb-s" data-reveal>The write sequence</h4>
+          <p data-reveal>
+            Five steps, in this order. Most write-path incidents are this order being broken — usually
+            validating after writing, or stamping provenance in a second pass that fails independently.
+          </p>
+          <ol className="phases full" data-reveal-group>
+            <li>
+              <span className="wk">Step 1</span>
+              <div><h4>Resolve identity for the whole batch</h4>
+              <p className="small flat mt-s">Every row gets its <code>entityId</code> before anything is
+                written. Identity resolution mid-write is how half-written batches happen.</p></div>
+            </li>
+            <li>
+              <span className="wk">Step 2</span>
+              <div><h4>Validate, and fail the batch — not the row</h4>
+              <p className="small flat mt-s">Check required properties, permitted labels and endpoint
+                pairs, and the volume tolerance. A partially applied batch is worse than a rejected one,
+                because nobody can tell which half landed.</p></div>
+            </li>
+            <li>
+              <span className="wk">Step 3</span>
+              <div><h4>Upsert on the identity key</h4>
+              <p className="small flat mt-s">Match on <code>entityId</code>, then set the mapped
+                properties. Blind creation only for immutable event nodes, which by definition cannot
+                collide.</p></div>
+            </li>
+            <li>
+              <span className="wk">Step 4</span>
+              <div><h4>Stamp provenance in the same write</h4>
+              <p className="small flat mt-s">The governance property set goes on in the same operation
+                that writes the data. A second pass can fail on its own and leave unattributable nodes —
+                which are indistinguishable from ungoverned ones.</p></div>
+            </li>
+            <li>
+              <span className="wk">Step 5</span>
+              <div><h4>Record the run</h4>
+              <p className="small flat mt-s">Counts written, updated and rejected; rejection reasons;
+                duration; and the source watermark reached. This is what the freshness and volume alerts
+                are computed from.</p></div>
+            </li>
+          </ol>
         </div>
 
         <div id="p2-gov">
