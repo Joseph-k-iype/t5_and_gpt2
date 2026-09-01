@@ -71,6 +71,9 @@ motion layer never executes.
 
 ## Commands
 
+The folder name contains spaces, so quote it when changing into it:
+`cd "graph data standards"`.
+
 ```bash
 npm install
 npm run dev            # local dev server
